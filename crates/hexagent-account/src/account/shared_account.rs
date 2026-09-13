@@ -16546,11 +16546,23 @@ impl SharedAccount {
         &self,
         venue_trade_id: &str,
     ) -> Result<usize, String> {
+        self.terminal_trade_backfill_sources(venue_trade_id)
+            .map(|(terminal, _)| terminal)
+    }
+
+    /// Background reconciliation evidence only. The second count contains
+    /// already-booked MATCHED/MINED/RETRYING legs awaiting terminal lifecycle;
+    /// it is telemetry, never authority to release an order reservation.
+    /// No state is added: the cold reader consumes the existing owner snapshots.
+    pub fn terminal_trade_backfill_sources(
+        &self,
+        venue_trade_id: &str,
+    ) -> Result<(usize, usize), String> {
         if venue_trade_id.trim().is_empty() {
-            return Ok(0);
+            return Ok((0, 0));
         }
         self.read_cold_state(|state| {
-            durable_terminal_trade_source_count_locked(state, venue_trade_id, wall_clock_ms())
+            terminal_trade_backfill_sources_locked(state, venue_trade_id, wall_clock_ms())
         })
     }
 
@@ -17921,18 +17933,38 @@ fn terminal_trade_id_matches(trade_key: &str, base_trade_id: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with(':'))
 }
 
+#[cfg(test)]
 fn durable_terminal_trade_source_count_locked(
     state: &SharedAccountState,
     venue_trade_id: &str,
     now_ms: u64,
 ) -> Result<usize, String> {
+    terminal_trade_backfill_sources_locked(state, venue_trade_id, now_ms)
+        .map(|(terminal, _)| terminal)
+}
+
+fn terminal_trade_backfill_sources_locked(
+    state: &SharedAccountState,
+    venue_trade_id: &str,
+    now_ms: u64,
+) -> Result<(usize, usize), String> {
     let mut sources = BTreeSet::new();
+    let mut pending = 0;
     for (trade_key, trade) in &state.trades {
         if terminal_trade_id_matches(trade_key, venue_trade_id)
             && matches!(trade.ownership.status.as_str(), "CONFIRMED" | "FAILED")
             && (trade.booked || trade.failed)
         {
             sources.insert(trade_key.clone());
+        } else if terminal_trade_id_matches(trade_key, venue_trade_id)
+            && trade.booked
+            && matches!(
+                trade.ownership.status.as_str(),
+                "MATCHED" | "MINED" | "RETRYING"
+            )
+        {
+            sources.insert(trade_key.clone());
+            pending += 1;
         }
     }
     for (trade_key, tombstone) in &state.retired_trade_ownership_tombstones {
@@ -17949,7 +17981,7 @@ fn durable_terminal_trade_source_count_locked(
             ));
         }
     }
-    Ok(sources.len())
+    Ok((sources.len() - pending, pending))
 }
 
 fn terminal_order_audit_complete_locked(state: &SharedAccountState, client_order_id: &str) -> bool {
@@ -22457,6 +22489,37 @@ mod tests {
                 .is_err(),
             "the terminal backfill authority must also reject live/retired overlap",
         );
+        let key = format!("{confirmed_id}:{oid}");
+        let retired = state
+            .retired_trade_ownership_tombstones
+            .remove(&key)
+            .unwrap();
+        for status in ["MATCHED", "MINED", "RETRYING", "CONFIRMED"] {
+            state.trades.get_mut(&key).unwrap().ownership.status = status.into();
+            let expected = if status == "CONFIRMED" {
+                (1, 0)
+            } else {
+                (0, 1)
+            };
+            assert_eq!(
+                terminal_trade_backfill_sources_locked(&state, confirmed_id, wall_clock_ms())
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                terminal_trade_backfill_sources_locked(&state, "unrelated", wall_clock_ms())
+                    .unwrap(),
+                (0, 0)
+            );
+        }
+        state.trades.get_mut(&key).unwrap().booked = false;
+        assert_eq!(
+            terminal_trade_backfill_sources_locked(&state, confirmed_id, wall_clock_ms()).unwrap(),
+            (0, 0)
+        );
+        state
+            .retired_trade_ownership_tombstones
+            .insert(key, retired);
         state.trades.clear();
         state
             .retired_trade_ownership_tombstones
