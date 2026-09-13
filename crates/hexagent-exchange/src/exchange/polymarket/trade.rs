@@ -1626,6 +1626,27 @@ impl<V: Clone> ExecutionReadMap<V> {
             len: self.len.saturating_sub(1),
         }
     }
+
+    /// Clone each affected shard once for a whole retirement batch. Unrelated
+    /// shards and already-published reader generations remain immutable.
+    fn with_removed_keys<'a>(&self, keys: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut shards = (*self.shards).clone();
+        let mut removed = 0;
+        for key in keys {
+            let index = Self::shard_index(key);
+            if shards[index].contains_key(key) {
+                Arc::make_mut(&mut shards[index]).remove(key);
+                removed += 1;
+            }
+        }
+        if removed == 0 {
+            return self.clone();
+        }
+        Self {
+            shards: Arc::new(shards),
+            len: self.len - removed,
+        }
+    }
 }
 
 impl<V> std::ops::Index<&str> for ExecutionReadMap<V> {
@@ -1755,7 +1776,7 @@ impl ExecutionStateOwner {
                 asset_ids,
                 owned_coids,
             } => {
-                reclaim_token_mappings(
+                let retired = reclaim_token_mappings(
                     &mut self.coid_to_oid,
                     &mut self.oid_to_coid,
                     &mut self.coid_to_token,
@@ -1765,11 +1786,10 @@ impl ExecutionStateOwner {
                 shared
                     .runtime_order_ownership
                     .remove_client_orders(&owned_coids);
-                // Settled-event retirement is cold and can remove many keys;
-                // rebuild once instead of cloning one shard per deletion.
-                next.coid_to_oid = ExecutionReadMap::from_hash_map(self.coid_to_oid.clone());
-                next.oid_to_coid = ExecutionReadMap::from_hash_map(self.oid_to_coid.clone());
-                next.coid_to_token = ExecutionReadMap::from_hash_map(self.coid_to_token.clone());
+                if retired.len() == 0 {
+                    return;
+                }
+                retired.apply_to(&mut next);
             }
             #[cfg(test)]
             ExecutionStateCommand::Clear => {
@@ -1798,6 +1818,8 @@ impl ExecutionStateOwner {
         shared.execution_state.store(Arc::new(next));
     }
 
+    // Exact previous full rebuild retained for focused before/after benchmarks.
+    #[cfg(test)]
     fn publish(&self, shared: &SharedState, open_changed: bool, identity_changed: bool) {
         let mut next = (*shared.execution_state.load_full()).clone();
         if open_changed {
@@ -3347,17 +3369,44 @@ fn is_http_425_backoff_active(
     }
 }
 
+#[derive(Default)]
+struct RetiredRuntimeMappings {
+    client_order_ids: Vec<String>,
+    normalized_order_ids: Vec<String>,
+}
+
+impl RetiredRuntimeMappings {
+    fn len(&self) -> usize {
+        self.client_order_ids.len()
+    }
+
+    fn apply_to(&self, next: &mut ExecutionStateSnapshot) {
+        if self.len() == 0 {
+            return;
+        }
+        next.coid_to_oid = next
+            .coid_to_oid
+            .with_removed_keys(self.client_order_ids.iter().map(String::as_str));
+        next.oid_to_coid = next
+            .oid_to_coid
+            .with_removed_keys(self.normalized_order_ids.iter().map(String::as_str));
+        next.coid_to_token = next
+            .coid_to_token
+            .with_removed_keys(self.client_order_ids.iter().map(String::as_str));
+    }
+}
+
 /// Remove every owned coid↔oid / coid↔token entry whose token is in
 /// `settling`, keeping sibling instances and all other events intact. Returns
-/// the count reclaimed. Pure (maps passed in) so it's unit-testable without a
-/// live `SharedState`. Callers hold all three map locks for the duration.
+/// the exact removed identities for one coherent immutable publication.
+/// The lifecycle owner is the sole writer of all three mutable maps.
 fn reclaim_token_mappings(
     coid_to_oid: &mut HashMap<String, String>,
     oid_to_coid: &mut HashMap<String, String>,
     coid_to_token: &mut HashMap<String, String>,
     settling: &[String],
     owned_coids: Option<&HashSet<String>>,
-) -> usize {
+) -> RetiredRuntimeMappings {
     let settling: std::collections::HashSet<&str> = settling.iter().map(|s| s.as_str()).collect();
     let stale: Vec<String> = coid_to_token
         .iter()
@@ -3366,13 +3415,19 @@ fn reclaim_token_mappings(
         })
         .map(|(coid, _)| coid.clone())
         .collect();
+    let mut normalized_order_ids = Vec::with_capacity(stale.len());
     for coid in &stale {
         if let Some(oid) = coid_to_oid.remove(coid) {
-            oid_to_coid.remove(&normalize_order_id(&oid));
+            let normalized = normalize_order_id(&oid);
+            oid_to_coid.remove(&normalized);
+            normalized_order_ids.push(normalized);
         }
         coid_to_token.remove(coid);
     }
-    stale.len()
+    RetiredRuntimeMappings {
+        client_order_ids: stale,
+        normalized_order_ids,
+    }
 }
 
 impl SharedState {
@@ -4960,6 +5015,7 @@ impl SharedState {
         }
         let retired_events = ready.len();
         let mut retired_runtime_mappings = 0usize;
+        let mut next = (*self.execution_state.load_full()).clone();
         for tokens in &ready {
             let owned_coids: HashSet<String> = execution
                 .coid_to_token
@@ -4971,21 +5027,26 @@ impl SharedState {
                 continue;
             }
             let token_list: Vec<String> = tokens.iter().cloned().collect();
-            retired_runtime_mappings =
-                retired_runtime_mappings.saturating_add(reclaim_token_mappings(
-                    &mut execution.coid_to_oid,
-                    &mut execution.oid_to_coid,
-                    &mut execution.coid_to_token,
-                    &token_list,
-                    Some(&owned_coids),
-                ));
+            let retired = reclaim_token_mappings(
+                &mut execution.coid_to_oid,
+                &mut execution.oid_to_coid,
+                &mut execution.coid_to_token,
+                &token_list,
+                Some(&owned_coids),
+            );
+            retired_runtime_mappings = retired_runtime_mappings.saturating_add(retired.len());
+            retired.apply_to(&mut next);
             self.enqueue_lifecycle_trace(LifecycleTraceJob::ForgetMany {
                 client_order_ids: owned_coids.clone(),
             });
             self.runtime_order_ownership
                 .remove_client_orders(&owned_coids);
         }
-        execution.publish(self, false, true);
+        // Event eviction normally retired these mappings already. Publish only
+        // actual removals, without rebuilding every unrelated identity map.
+        if retired_runtime_mappings > 0 {
+            self.execution_state.store(Arc::new(next));
+        }
         let retired_live_trades = ready
             .iter()
             .map(|tokens| live_position.prune_terminal_history(tokens))
@@ -12866,10 +12927,14 @@ impl ExchangeTrade for PolymarketTrade {
 }
 
 #[cfg(test)]
+#[path = "trade_retirement_tests.rs"]
+mod retirement_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn shutdown_test_trade(shutdown: ShutdownToken) -> PolymarketTrade {
+    pub(super) fn shutdown_test_trade(shutdown: ShutdownToken) -> PolymarketTrade {
         PolymarketTrade::new_with_pool_for_startup_query_repair_and_shutdown(
             "api-key",
             "c2VjcmV0",
@@ -13966,7 +14031,7 @@ mod tests {
             &["AUP".to_string(), "ADN".to_string()],
             None,
         );
-        assert_eq!(n, 2, "both event-A coids reclaimed");
+        assert_eq!(n.len(), 2, "both event-A coids reclaimed");
         // Event A fully purged from all three maps.
         assert!(!coid_to_oid.contains_key("c1") && !coid_to_oid.contains_key("c2"));
         assert!(!oid_to_coid.contains_key("a1") && !oid_to_coid.contains_key("a2"));
