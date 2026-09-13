@@ -213,7 +213,20 @@ impl RuntimeOwnershipIndex {
     }
 
     fn remove_client_orders(&self, client_order_ids: &HashSet<String>) {
+        if client_order_ids.is_empty() {
+            return;
+        }
         for slot in &self.slots {
+            // RCU publication pays outstanding reader debts even when the
+            // value is unchanged. A full-table CAS sweep used to make settled
+            // cleanup occupy the private lifecycle worker for tens of ms.
+            // Read unrelated slots only; recheck the predicate in the CAS
+            // closure so a concurrent replacement is never removed by mistake.
+            if !slot.load().as_ref().is_some_and(|entry| {
+                client_order_ids.contains(&entry.ownership.client_order_id)
+            }) {
+                continue;
+            }
             slot.rcu(|current| match current {
                 Some(entry) if client_order_ids.contains(&entry.ownership.client_order_id) => None,
                 _ => current.clone(),
@@ -3692,6 +3705,10 @@ impl SharedState {
                     log::error!("[PolymarketTrade] account owner binding failed: {error}");
                     return;
                 }
+                crate::latency::prepare_thread_stages(&[
+                    "polymarket.account.wallet_calibration.wait_including_grace",
+                    "polymarket.account.wallet_calibration.apply",
+                ]);
                 let _ = cold_ready_tx.send(());
                 let wallet_grace_tick = crossbeam_channel::tick(Duration::from_millis(10));
                 loop {
@@ -3767,6 +3784,10 @@ impl SharedState {
                 // the startup barrier, never on the first private lifecycle.
                 let latency_clock_ready = crate::latency::Instant::now();
                 crate::latency::record("polymarket.account.owner_started", latency_clock_ready);
+                crate::latency::prepare_thread_stages(&[
+                    "polymarket.account.settled_gc_coordinator_control_busy",
+                    "polymarket.account.settled_gc_coordinator_state_busy",
+                ]);
                 let _ = ready_tx.send(());
                 loop {
                     let Some(shared) = lifecycle_weak.upgrade() else {
@@ -13271,6 +13292,82 @@ mod tests {
         assert!(index.contains("  0XDeF "));
         index.remove("  0XdEf  ");
         assert!(index.get("DEF").is_none());
+    }
+
+    #[test]
+    fn runtime_ownership_bulk_retirement_preserves_unrelated_and_replayed_routes() {
+        let index = RuntimeOwnershipIndex::new();
+        for (oid, coid) in [
+            ("0xABC", "retired"),
+            ("0xDEF", "retired"),
+            ("0x123", "sibling"),
+        ] {
+            index.insert(oid, runtime_ownership(oid, coid)).unwrap();
+        }
+        let retained = index.find_entry("0xABC").unwrap();
+        let sibling = index.find_entry("0x123").unwrap();
+        let retired = HashSet::from(["retired".to_string()]);
+        index.remove_client_orders(&retired);
+        assert!(!index.contains("abc"));
+        assert!(!index.contains("def"));
+        assert_eq!(retained.ownership.client_order_id, "retired");
+        assert!(Arc::ptr_eq(&sibling, &index.find_entry("123").unwrap()));
+        index.remove_client_orders(&retired);
+        index.remove_client_orders(&HashSet::new());
+        assert!(Arc::ptr_eq(&sibling, &index.find_entry("123").unwrap()));
+        // A later authenticated replay may install a replacement route. A
+        // repeated old cleanup must preserve the new owner identity.
+        index
+            .insert("0xABC", runtime_ownership("0xABC", "replacement"))
+            .unwrap();
+        index.remove_client_orders(&retired);
+        assert_eq!(index.client_order_id("abc").as_deref(), Some("replacement"));
+    }
+
+    #[test]
+    #[ignore = "focused before/after benchmark of production runtime ownership retirement"]
+    fn benchmark_runtime_ownership_bulk_retirement() {
+        const N: usize = 1000;
+        const TARGETS: usize = 64;
+        let targets: Vec<_> = (0..TARGETS)
+            .map(|i| (format!("0x{:064x}", i), format!("target-{i}")))
+            .collect();
+        let coids: HashSet<_> = targets.iter().map(|(_, coid)| coid.clone()).collect();
+        for baseline in [true, false] {
+            let index = RuntimeOwnershipIndex::new();
+            for i in 1024..2048 {
+                let oid = format!("0x{i:064x}");
+                index
+                    .insert(&oid, runtime_ownership(&oid, "sibling"))
+                    .unwrap();
+            }
+            let mut samples = Vec::with_capacity(N);
+            for _ in 0..N {
+                for (oid, coid) in &targets {
+                    index.insert(oid, runtime_ownership(oid, coid)).unwrap();
+                }
+                let started = std::time::Instant::now();
+                if baseline {
+                    // Exact previous implementation retained for an A/B in
+                    // the same binary, allocator, table occupancy and process.
+                    for slot in &index.slots {
+                        slot.rcu(|current| match current {
+                            Some(entry) if coids.contains(&entry.ownership.client_order_id) => None,
+                            _ => current.clone(),
+                        });
+                    }
+                } else {
+                    index.remove_client_orders(&coids);
+                }
+                samples.push(started.elapsed().as_nanos() as u64);
+            }
+            assert!(index.contains(&format!("0x{:064x}", 1024)));
+            assert!(!index.contains(&targets[0].0));
+            samples.sort_unstable();
+            let q = |v: usize| samples[(N * v).div_ceil(1000) - 1];
+            eprintln!("runtime_retire_probe mode={} n={N} boundary=bulk_retire_entry_to_return table_capacity={} target_routes={TARGETS} unrelated_routes=1024 p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0",
+                if baseline {"baseline"} else {"read_filter"},RUNTIME_OWNERSHIP_CAPACITY,q(500),q(990),q(999),q(1000));
+        }
     }
 
     #[test]
