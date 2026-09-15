@@ -222,9 +222,11 @@ impl RuntimeOwnershipIndex {
             // cleanup occupy the private lifecycle worker for tens of ms.
             // Read unrelated slots only; recheck the predicate in the CAS
             // closure so a concurrent replacement is never removed by mistake.
-            if !slot.load().as_ref().is_some_and(|entry| {
-                client_order_ids.contains(&entry.ownership.client_order_id)
-            }) {
+            if !slot
+                .load()
+                .as_ref()
+                .is_some_and(|entry| client_order_ids.contains(&entry.ownership.client_order_id))
+            {
                 continue;
             }
             slot.rcu(|current| match current {
@@ -488,6 +490,65 @@ enum HistoricalOrderTradeAudit {
     Unavailable(String),
 }
 
+fn fetch_historical_order_trade_audit(
+    order_id: &str,
+    submitted_at_ms: u64,
+    mut get: impl FnMut(&str) -> Result<serde_json::Value, String>,
+) -> HistoricalOrderTradeAudit {
+    let after_secs = (submitted_at_ms / 1_000).saturating_sub(ORPHAN_TRADE_AUDIT_REWIND_SECS);
+    let mut cursor = String::new();
+    let mut seen_cursors = HashSet::new();
+    let mut matching_records = 0usize;
+    for page in 1..=ORPHAN_TRADE_AUDIT_MAX_PAGES {
+        let path = if cursor.is_empty() {
+            format!("{AUTHENTICATED_TRADES_PATH}?after={after_secs}")
+        } else {
+            format!("{AUTHENTICATED_TRADES_PATH}?after={after_secs}&next_cursor={cursor}")
+        };
+        let json = match get(&path) {
+            Ok(json) => json,
+            Err(error) => {
+                return HistoricalOrderTradeAudit::Unavailable(format!(
+                    "page={page} error={error}"
+                ));
+            }
+        };
+        let (records, next) = match authenticated_trade_page(json) {
+            Ok(page) => page,
+            Err(error) => {
+                return HistoricalOrderTradeAudit::Unavailable(format!(
+                    "page={page} schema={error}"
+                ));
+            }
+        };
+        matching_records = matching_records.saturating_add(
+            records
+                .iter()
+                .filter(|record| trade_record_references_order(record, order_id))
+                .count(),
+        );
+        if next.is_empty() || next == "LTE=" {
+            return if matching_records == 0 {
+                HistoricalOrderTradeAudit::CompleteNoFill {
+                    pages: page,
+                    after_secs,
+                }
+            } else {
+                HistoricalOrderTradeAudit::FoundFill {
+                    records: matching_records,
+                }
+            };
+        }
+        if !seen_cursors.insert(next.clone()) {
+            return HistoricalOrderTradeAudit::Incomplete { pages: page };
+        }
+        cursor = next;
+    }
+    HistoricalOrderTradeAudit::Incomplete {
+        pages: ORPHAN_TRADE_AUDIT_MAX_PAGES,
+    }
+}
+
 fn coid_wall_clock_ms(coid: &str) -> Option<u64> {
     let value = coid.rsplit('-').next()?.parse::<u64>().ok()?;
     // Millisecond ids have been used since the first durable ledger format.
@@ -521,22 +582,37 @@ fn trade_record_references_order(record: &serde_json::Value, order_id: &str) -> 
 fn authenticated_trade_page(
     json: serde_json::Value,
 ) -> Result<(Vec<serde_json::Value>, String), String> {
-    if let Some(records) = json.as_array() {
-        return Ok((records.clone(), String::new()));
-    }
-    let Some(object) = json.as_object() else {
-        return Err("response is neither an array nor an object".to_string());
-    };
+    let object = json
+        .as_object()
+        .ok_or_else(|| "trade audit requires explicit pagination object".to_string())?;
     let records = object
         .get("data")
         .and_then(serde_json::Value::as_array)
         .cloned()
         .ok_or_else(|| "response object has no array `data`".to_string())?;
-    let next = match object.get("next_cursor") {
-        None | Some(serde_json::Value::Null) => String::new(),
-        Some(serde_json::Value::String(next)) => next.clone(),
-        Some(_) => return Err("response has a non-string `next_cursor`".to_string()),
-    };
+    let next = object
+        .get("next_cursor")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "trade audit lacks explicit string next_cursor".to_string())?
+        .to_string();
+    for record in &records {
+        let nonempty = |value: Option<&serde_json::Value>| {
+            value
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        };
+        let taker = record
+            .get("taker_order_id")
+            .or_else(|| record.get("order_id"))
+            .or_else(|| record.get("orderID"));
+        let complete_makers = record
+            .get("maker_orders")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|orders| orders.iter().all(|order| nonempty(order.get("order_id"))));
+        if !nonempty(record.get("id")) || !nonempty(taker) || !complete_makers {
+            return Err("historical trade omits exact taker/maker order identity".to_string());
+        }
+    }
     Ok((records, next))
 }
 
@@ -645,37 +721,29 @@ impl RecoveredOrderCloseReason {
     }
 }
 
-/// The exception is deliberately recovery-scoped. A literal null remains an
-/// unavailable response for ordinary live/orphan lookups.
+/// The lookup is only a candidate for recovery. Callers must additionally
+/// prove a complete authenticated no-fill trade history before releasing any
+/// reservation; neither a null response nor event retirement alone suffices.
 fn recovered_order_close_reason(
     is_recovered: bool,
     event_has_ended: bool,
     unavailable: Option<&FetchUnavailable>,
 ) -> Option<RecoveredOrderCloseReason> {
-    is_recovered.then_some(())?;
-    if event_has_ended {
-        return Some(RecoveredOrderCloseReason::EventEnded);
-    }
-    unavailable
-        .is_some_and(FetchUnavailable::is_json_null)
+    (is_recovered && event_has_ended && unavailable.is_some_and(FetchUnavailable::is_json_null))
         .then_some(RecoveredOrderCloseReason::JsonNull)
 }
 
-/// Query-repair rows normally require an actual CLOB order lookup. The sole
-/// pre-I/O exception combines an event-end marker with a durable, reconciled
-/// FAILED-trade proof covering the order's complete original size. Neither
-/// proof alone is sufficient.
+/// Only a durable, reconciled FAILED-trade proof for the entire original size
+/// plus event retirement can bypass order I/O. Ordinary recovered orders must
+/// obtain order-specific and complete historical-trade evidence.
 fn prequery_recovered_order_close_reason(
     is_recovered: bool,
     event_has_ended: bool,
     requires_query_repair: bool,
     full_failed_trade_proof: bool,
 ) -> Option<RecoveredOrderCloseReason> {
-    if requires_query_repair && !full_failed_trade_proof {
-        None
-    } else {
-        recovered_order_close_reason(is_recovered, event_has_ended, None)
-    }
+    (is_recovered && event_has_ended && requires_query_repair && full_failed_trade_proof)
+        .then_some(RecoveredOrderCloseReason::EventEnded)
 }
 
 /// Event-end evidence is consulted only for an order restored from durable
@@ -1504,6 +1572,64 @@ pub(crate) struct TrackedOrder {
     pub instance_id: String,
 }
 
+/// Reconciliation runs on the background worker. Capture an owned identity
+/// before any GET, trade replay or terminal cleanup can remove `open_orders`.
+/// The retained ownership route also resolves duplicate/restarted terminal
+/// audits; absence or contradictory identity never creates a default Buy.
+fn validated_reconcile_order_identity(
+    account_id: &str,
+    client_order_id: &str,
+    order_id: &str,
+    execution: &ExecutionStateSnapshot,
+    ownership: Option<&OrderOwnership>,
+) -> std::result::Result<TrackedOrder, &'static str> {
+    let ownership = ownership.ok_or("missing_order_ownership")?;
+    if ownership.account_id != account_id
+        || ownership.client_order_id != client_order_id
+        || ownership.token_id.is_empty()
+        || order_id.is_empty()
+        || normalize_order_id(&ownership.order_id) != normalize_order_id(order_id)
+    {
+        return Err("contradictory_order_ownership");
+    }
+    if execution
+        .coid_to_oid
+        .get(client_order_id)
+        .is_some_and(|oid| normalize_order_id(oid) != normalize_order_id(order_id))
+        || execution
+            .oid_to_coid
+            .get(&normalize_order_id(order_id))
+            .is_some_and(|coid| coid != client_order_id)
+        || execution
+            .coid_to_token
+            .get(client_order_id)
+            .is_some_and(|token| token != &ownership.token_id)
+    {
+        return Err("contradictory_order_route");
+    }
+    let mut identity = TrackedOrder {
+        order_slot: ownership.order_slot,
+        symbol: ownership.token_id.clone(),
+        side: ownership.side,
+        instance_id: ownership.instance_id.clone(),
+    };
+    if let Some(tracked) = execution.open_orders.get(client_order_id) {
+        if tracked.symbol != identity.symbol
+            || tracked.side != identity.side
+            || tracked.instance_id != identity.instance_id
+            || (tracked.order_slot != OrderSlot::UNASSIGNED
+                && identity.order_slot != OrderSlot::UNASSIGNED
+                && tracked.order_slot != identity.order_slot)
+        {
+            return Err("contradictory_open_order_identity");
+        }
+        if tracked.order_slot != OrderSlot::UNASSIGNED {
+            identity.order_slot = tracked.order_slot;
+        }
+    }
+    Ok(identity)
+}
+
 /// Logging-only correlation retained for the same lifetime as the settled
 /// event audit. Economic state remains authoritative in SharedAccount.
 #[derive(Debug, Clone)]
@@ -1679,10 +1805,6 @@ enum ExecutionStateCommand {
     RemoveOpen {
         client_order_id: String,
     },
-    RetireMappings {
-        asset_ids: Vec<String>,
-        owned_coids: HashSet<String>,
-    },
     #[cfg(test)]
     Clear,
     #[cfg(test)]
@@ -1771,25 +1893,6 @@ impl ExecutionStateOwner {
             ExecutionStateCommand::RemoveOpen { client_order_id } => {
                 self.open_orders.remove(&client_order_id);
                 next.open_orders = next.open_orders.with_remove(&client_order_id);
-            }
-            ExecutionStateCommand::RetireMappings {
-                asset_ids,
-                owned_coids,
-            } => {
-                let retired = reclaim_token_mappings(
-                    &mut self.coid_to_oid,
-                    &mut self.oid_to_coid,
-                    &mut self.coid_to_token,
-                    &asset_ids,
-                    Some(&owned_coids),
-                );
-                shared
-                    .runtime_order_ownership
-                    .remove_client_orders(&owned_coids);
-                if retired.len() == 0 {
-                    return;
-                }
-                retired.apply_to(&mut next);
             }
             #[cfg(test)]
             ExecutionStateCommand::Clear => {
@@ -3763,6 +3866,8 @@ impl SharedState {
                 crate::latency::prepare_thread_stages(&[
                     "polymarket.account.wallet_calibration.wait_including_grace",
                     "polymarket.account.wallet_calibration.apply",
+                    "polymarket.account.route_reclaim.cold_drop",
+                    "polymarket.account.route_reclaim.retirement_age",
                 ]);
                 let _ = cold_ready_tx.send(());
                 let wallet_grace_tick = crossbeam_channel::tick(Duration::from_millis(10));
@@ -3774,6 +3879,7 @@ impl SharedState {
                         // Cold control remains single-writer and drains its
                         // explicit commands before the coalesced wallet wake.
                         loop {
+                            account_owner.reclaim_retired_routes();
                             if account_owner.lifecycle_mirror_receiver().try_recv().is_ok() {
                                 account_owner.execute_lifecycle_mirror();
                                 continue;
@@ -3809,6 +3915,7 @@ impl SharedState {
                         },
                         recv(wallet_grace_tick) -> _ => {
                             account_owner.execute_wallet_calibration();
+                            account_owner.reclaim_retired_routes();
                         },
                         recv(cold_shutdown_rx) -> phase => {
                             if matches!(phase, Ok(ShutdownPhase::Finished) | Err(_)) {
@@ -4991,6 +5098,28 @@ impl SharedState {
         Some(ownership)
     }
 
+    /// Cold worker lookup of an immutable identity retained through teardown.
+    fn reconcile_order_identity(
+        &self,
+        client_order_id: &str,
+        order_id: &str,
+    ) -> std::result::Result<TrackedOrder, &'static str> {
+        let execution = self.execution_snapshot();
+        // Runtime ownership survives terminal open-order removal. The durable
+        // fallback is restricted to this cold reconcile path, never cancel prep.
+        let ownership = self
+            .runtime_order_ownership
+            .get(order_id)
+            .or_else(|| self.account_state.order(client_order_id));
+        validated_reconcile_order_identity(
+            self.account_state.account_id(),
+            client_order_id,
+            order_id,
+            &execution,
+            ownership.as_ref(),
+        )
+    }
+
     /// Lock-free ownership probe for ambiguity checks on the private owner
     /// lane. A maker trade's top-level taker order normally belongs to another
     /// account; consulting the durable ledger for that negative lookup would
@@ -5042,8 +5171,8 @@ impl SharedState {
             self.runtime_order_ownership
                 .remove_client_orders(&owned_coids);
         }
-        // Event eviction normally retired these mappings already. Publish only
-        // actual removals, without rebuilding every unrelated identity map.
+        // This certificate completion is the sole runtime identity retirement
+        // point. Publish actual removals without rebuilding unrelated maps.
         if retired_runtime_mappings > 0 {
             self.execution_state.store(Arc::new(next));
         }
@@ -5059,11 +5188,9 @@ impl SharedState {
         (retired_events, retired_live_trades)
     }
 
-    /// Apply a live order status and restore every runtime structure that a
-    /// preceding terminal update may have torn down. Polymarket lifecycle
-    /// messages are not ordered, so Cancelled → Accepted is a valid
-    /// resurrection and must re-lock collateral and re-enter `open_orders`
-    /// as one cross-layer operation.
+    /// Apply a live order status on the lifecycle owner. A preceding terminal
+    /// cancellation remains stronger than reordered Accepted/PartiallyFilled
+    /// status pushes; private trade quantities use their independent lane.
     pub(crate) fn mark_order_live(
         &self,
         client_order_id: &str,
@@ -6754,8 +6881,8 @@ impl PolymarketTrade {
     /// ledger before strategy workers are allowed to quote. A recovered order
     /// keeps its owner instance's balance-changing maintenance blocked until
     /// an order-specific lookup supplies authoritative terminal metadata,
-    /// proves it cancelled/rejected, its event is durably known to have ended,
-    /// or its recovery-only lookup returns literal JSON `null`. Quote admission
+    /// proves it cancelled/rejected, or event retirement plus an absent lookup
+    /// and complete authenticated no-fill history prove no remaining risk. Quote admission
     /// continues under the original reservation. Once complete matched
     /// quantity and trade IDs are durable, exact private-trade replay continues
     /// concurrently under the resized reservation and strategy inventory bridge.
@@ -6768,58 +6895,11 @@ impl PolymarketTrade {
         order_id: &str,
         submitted_at_ms: u64,
     ) -> HistoricalOrderTradeAudit {
-        let after_secs = (submitted_at_ms / 1_000).saturating_sub(ORPHAN_TRADE_AUDIT_REWIND_SECS);
-        let mut cursor = String::new();
-        let mut seen_cursors = HashSet::new();
-        let mut matching_records = 0usize;
-        for page in 1..=ORPHAN_TRADE_AUDIT_MAX_PAGES {
-            let path = if cursor.is_empty() {
-                format!("{AUTHENTICATED_TRADES_PATH}?after={after_secs}")
-            } else {
-                format!("{AUTHENTICATED_TRADES_PATH}?after={after_secs}&next_cursor={cursor}")
-            };
-            let json = match self.shared.http_call_sync("GET", &path, "") {
-                Ok(json) => json,
-                Err(error) => {
-                    return HistoricalOrderTradeAudit::Unavailable(format!(
-                        "page={page} error={error}"
-                    ));
-                }
-            };
-            let (records, next) = match authenticated_trade_page(json) {
-                Ok(page) => page,
-                Err(error) => {
-                    return HistoricalOrderTradeAudit::Unavailable(format!(
-                        "page={page} schema={error}"
-                    ));
-                }
-            };
-            matching_records = matching_records.saturating_add(
-                records
-                    .iter()
-                    .filter(|record| trade_record_references_order(record, order_id))
-                    .count(),
-            );
-            if next.is_empty() || next == "LTE=" {
-                return if matching_records == 0 {
-                    HistoricalOrderTradeAudit::CompleteNoFill {
-                        pages: page,
-                        after_secs,
-                    }
-                } else {
-                    HistoricalOrderTradeAudit::FoundFill {
-                        records: matching_records,
-                    }
-                };
-            }
-            if !seen_cursors.insert(next.clone()) {
-                return HistoricalOrderTradeAudit::Incomplete { pages: page };
-            }
-            cursor = next;
-        }
-        HistoricalOrderTradeAudit::Incomplete {
-            pages: ORPHAN_TRADE_AUDIT_MAX_PAGES,
-        }
+        fetch_historical_order_trade_audit(order_id, submitted_at_ms, |path| {
+            self.shared
+                .http_call_sync("GET", path, "")
+                .map_err(|error| error.to_string())
+        })
     }
 
     pub fn reconcile_persisted_orphan_order_anomalies(&self) -> OrphanOrderStartupRepair {
@@ -7169,6 +7249,69 @@ impl PolymarketTrade {
         summary
     }
 
+    fn recover_absent_order_after_trade_audit(
+        &self,
+        ownership: &OrderOwnership,
+        order_id: &str,
+        is_recovered: bool,
+        event_has_ended: bool,
+        absence: &str,
+    ) -> Option<OrderUpdate> {
+        if !is_recovered || !event_has_ended {
+            return None;
+        }
+        // A no-fill history cannot override already observed matched quantity
+        // or a durable associated trade. Those need exact trade-id recovery.
+        if ownership.filled_quantity != 0.0
+            || ownership
+                .terminal_matched_quantity
+                .is_some_and(|quantity| quantity != 0.0)
+            || !ownership.terminal_trade_ids.is_empty()
+            || !ownership.quantity.is_finite()
+            || ownership.quantity <= 0.0
+            || ownership.order_id != order_id
+        {
+            return None;
+        }
+        let submitted_at_ms = coid_wall_clock_ms(&ownership.client_order_id)?;
+        match self.audit_historical_order_trades(order_id, submitted_at_ms) {
+            HistoricalOrderTradeAudit::CompleteNoFill { pages, after_secs } => {
+                let audit = AuthoritativeOrderAudit {
+                    original_size: Some(ownership.quantity.to_string()),
+                    size_matched: Some("0".to_string()),
+                    associate_trades: Vec::new(),
+                };
+                self.shared.commit_authoritative_terminal_audit(
+                    &ownership.client_order_id,
+                    OrderStatus::Cancelled,
+                    &audit,
+                );
+                if !self
+                    .shared
+                    .account_state
+                    .terminal_order_audit_complete(&ownership.client_order_id)
+                {
+                    return None;
+                }
+                self.shared
+                    .remove_order_resolved_as(&ownership.client_order_id, OrderStatus::Cancelled);
+                info!("[PolymarketTrade] recovered order no-fill proof coid={} orderID={} event_ended=true absence={} trade_pages={} after_secs={} oid_matches=0 terminal=Cancelled reservation_released=true",
+                    ownership.client_order_id, order_id, absence, pages, after_secs);
+                Some(Self::authoritative_recovery_update(
+                    ownership,
+                    order_id,
+                    OrderStatus::Cancelled,
+                    audit,
+                ))
+            }
+            result => {
+                warn!("[PolymarketTrade] recovered order absence lacks complete no-fill proof coid={} orderID={} audit={:?}; retaining reservation",
+                    ownership.client_order_id, order_id, result);
+                None
+            }
+        }
+    }
+
     pub fn reconcile_recovered_orders(&self) -> usize {
         self.reconcile_recovered_orders_with_updates().0
     }
@@ -7180,9 +7323,9 @@ impl PolymarketTrade {
     pub fn reconcile_recovered_orders_with_updates(&self) -> (usize, Vec<OrderUpdate>) {
         let _reconcile_stage =
             crate::latency::TimedStage::new("polymarket.recovery.reconcile_recovered_orders");
-        // Keep a single pass sub-second. The account worker is now woken on
-        // pending-audit edges and retries every 500 ms, so multi-second sleeps
-        // here would only serialize unrelated orders behind one slow replica.
+        // Keep ordinary retry sleeps short. Ended orders whose endpoint was
+        // retired may additionally need a bounded authenticated history scan;
+        // that cold proof must finish before any reservation is released.
         const RETRY_DELAYS_MS: &[u64] = &[0, 100, 250, 500];
         let mut replayed_updates = Vec::new();
 
@@ -7409,38 +7552,36 @@ impl PolymarketTrade {
                         }
                     }
                     FetchOrderResult::NotFound(evidence) => {
-                        if requires_query_repair
-                            && event_has_ended
-                            && attempt + 1 == RETRY_DELAYS_MS.len()
-                        {
-                            warn!(
-                                "[PolymarketTrade] startup query repair coid={} orderID={} not found after {} attempts evidence={} and event ended — closing recovered order",
-                                coid,
-                                order_id,
-                                RETRY_DELAYS_MS.len(),
-                                evidence,
-                            );
-                            replayed_updates.push(self.close_recovered_order(
-                                &ownership,
-                                &order_id,
-                                RecoveredOrderCloseReason::EventEnded.as_str(),
-                            ));
+                        if let Some(update) = self.recover_absent_order_after_trade_audit(
+                            &ownership,
+                            &order_id,
+                            is_recovered,
+                            event_has_ended,
+                            &evidence,
+                        ) {
+                            replayed_updates.push(update);
                         } else {
-                            warn!(
-                                "[PolymarketTrade] startup recovery coid={} orderID={} not found attempt={} evidence={} — retaining reservation",
-                                coid, order_id, attempt + 1, evidence,
-                            );
+                            warn!("[PolymarketTrade] startup recovery coid={} orderID={} absent attempt={} evidence={}; retaining reservation pending complete proof",
+                                coid, order_id, attempt + 1, evidence);
                         }
                     }
                     FetchOrderResult::Unavailable(kind)
-                        if recovered_order_close_reason(is_recovered, false, Some(&kind))
-                            == Some(RecoveredOrderCloseReason::JsonNull) =>
+                        if recovered_order_close_reason(
+                            is_recovered,
+                            event_has_ended,
+                            Some(&kind),
+                        )
+                        .is_some() =>
                     {
-                        replayed_updates.push(self.close_recovered_order(
+                        if let Some(update) = self.recover_absent_order_after_trade_audit(
                             &ownership,
                             &order_id,
-                            RecoveredOrderCloseReason::JsonNull.as_str(),
-                        ));
+                            is_recovered,
+                            event_has_ended,
+                            "order_lookup_json_null",
+                        ) {
+                            replayed_updates.push(update);
+                        }
                     }
                     FetchOrderResult::Unavailable(kind) => {
                         if fetch_unavailable_should_warn(&kind) {
@@ -7508,9 +7649,9 @@ impl PolymarketTrade {
         (unresolved, replayed_updates)
     }
 
-    /// Close only an order that is already in durable recovery. Event-end and
-    /// literal-null evidence prove that it is no longer open, but do not
-    /// rewrite already-observed fills or invent a terminal match quantity.
+    /// Close an ended recovered order whose complete original quantity is
+    /// already covered by a durable reconciled FAILED-trade proof. Ordinary
+    /// absent orders use the full authenticated historical audit above.
     fn close_recovered_order(
         &self,
         ownership: &OrderOwnership,
@@ -7533,7 +7674,7 @@ impl PolymarketTrade {
             reason,
         );
         OrderUpdate {
-            order_slot: Default::default(),
+            order_slot: ownership.order_slot,
             client_order_id: ownership.client_order_id.clone(),
             exchange: Exchange::Polymarket,
             symbol: ownership.token_id.clone(),
@@ -7569,7 +7710,7 @@ impl PolymarketTrade {
             .filter(|value| value.is_finite() && *value >= 0.0)
             .unwrap_or(ownership.filled_quantity);
         OrderUpdate {
-            order_slot: Default::default(),
+            order_slot: ownership.order_slot,
             client_order_id: ownership.client_order_id.clone(),
             exchange: Exchange::Polymarket,
             symbol: ownership.token_id.clone(),
@@ -7646,7 +7787,7 @@ impl PolymarketTrade {
             missing.evidence,
         );
         Some(OrderUpdate {
-            order_slot: Default::default(),
+            order_slot: missing.tracked.order_slot,
             client_order_id: missing.client_order_id.clone(),
             exchange: Exchange::Polymarket,
             symbol: missing.tracked.symbol.clone(),
@@ -7700,7 +7841,7 @@ impl PolymarketTrade {
                     coid,
                     (
                         TrackedOrder {
-                            order_slot: Default::default(),
+                            order_slot: order.order_slot,
                             symbol: order.token_id,
                             side: order.side,
                             instance_id: order.instance_id,
@@ -7717,12 +7858,6 @@ impl PolymarketTrade {
         let mut errors = Vec::new();
         let mut not_found = Vec::new();
         let mut retired_market_absent = Vec::new();
-        let recovered: HashSet<String> = self
-            .shared
-            .account_state
-            .recovery_pending_order_ids()
-            .into_iter()
-            .collect();
         for (coid, tracked, order_id) in tracked {
             let ownership = match self.shared.account_state.order(&coid) {
                 Some(ownership) => ownership,
@@ -7733,17 +7868,6 @@ impl PolymarketTrade {
                     continue;
                 }
             };
-            let is_recovered = recovered.contains(&coid);
-            if let Some(reason) = recovered_order_close_reason(
-                is_recovered,
-                self.shared
-                    .account_state
-                    .token_event_has_ended(&ownership.token_id),
-                None,
-            ) {
-                updates.push(self.close_recovered_order(&ownership, &order_id, reason.as_str()));
-                continue;
-            }
             let parallel_evidence = ownership.status == OrderStatus::NewOrderTimeout
                 || self
                     .shared
@@ -7763,17 +7887,6 @@ impl PolymarketTrade {
                     };
                     not_found.push(missing.clone());
                     retired_market_absent.push(missing);
-                    continue;
-                }
-                FetchOrderResult::Unavailable(kind)
-                    if recovered_order_close_reason(is_recovered, false, Some(&kind))
-                        == Some(RecoveredOrderCloseReason::JsonNull) =>
-                {
-                    updates.push(self.close_recovered_order(
-                        &ownership,
-                        &order_id,
-                        RecoveredOrderCloseReason::JsonNull.as_str(),
-                    ));
                     continue;
                 }
                 FetchOrderResult::Unavailable(kind) => {
@@ -7916,7 +8029,7 @@ impl PolymarketTrade {
                 .account_state
                 .resolve_private_event_anomaly(&format!("order:{}", normalize_order_id(&order_id)));
             updates.push(OrderUpdate {
-                order_slot: Default::default(),
+                order_slot: tracked.order_slot,
                 client_order_id: coid,
                 exchange: Exchange::Polymarket,
                 symbol: tracked.symbol,
@@ -8040,8 +8153,7 @@ impl PolymarketTrade {
     ///
     /// A pass is final only when `/cancel-all` has the complete expected
     /// schema with no failures, all locally known orders were audited (with
-    /// associated trades replayed, except the recovery-only ended-event/null
-    /// closure rule), and both runtime and durable pending-order registries are
+    /// associated trades replayed or complete recovery proof obtained), and both runtime and durable pending-order registries are
     /// empty.
     pub fn cancel_all_orders_until_final(&self, mut emit_update: impl FnMut(OrderUpdate)) -> usize {
         let retry_delays_ms = [0_u64, 100, 250, 500, 1_000, 2_000, 5_000];
@@ -8555,30 +8667,10 @@ impl PolymarketTrade {
         let owned_condition_id = condition_id.to_string();
         let asset_ids = asset_ids.to_vec();
         if let Err(error) = hexagent_runtime::background_jobs::try_submit(move || {
-            let owned_coids = shared
-                .account_state
-                .order_ids_for_instance_tokens(&instance_id, &retired_tokens);
-            let reclaimed = owned_coids.len();
-            let command = ExecutionStateCommand::RetireMappings {
-                asset_ids: asset_ids.clone(),
-                owned_coids: owned_coids.clone(),
-            };
-            if let Err(error) = shared
-                .account_lifecycle_tx
-                .try_send(AccountLifecycleJob::ExecutionState(command))
-            {
-                shared.user_feed_health.set_inventory_uncertain(true);
-                warn!(
-                    "[PolymarketTrade] settled runtime retirement queue unavailable instance={} condition={}: {}",
-                    instance_id,
-                    owned_condition_id,
-                    error,
-                );
-                return;
-            }
-            shared.enqueue_lifecycle_trace(LifecycleTraceJob::ForgetMany {
-                client_order_ids: owned_coids.clone(),
-            });
+            // Evicting the strategy FIFO is only a reference release. The
+            // owner GC certificate still has to prove all orders/trades are
+            // terminal. Removing OID mappings here strands live reservations
+            // outside every later query/private-replay path.
             if let Err(error) = shared.account_state.release_settled_event_audit(
                 &instance_id,
                 &owned_condition_id,
@@ -8591,8 +8683,7 @@ impl PolymarketTrade {
             }
             shared.request_settled_gc();
             info!(
-                "[PolymarketTrade] settled background cleanup retired {} runtime mapping(s); owner-thread ledger GC queued for {} token(s)",
-                reclaimed,
+                "[PolymarketTrade] settled audit reference released; runtime mappings retained until owner GC certificates complete for {} token(s)",
                 retired_tokens.len(),
             );
         }) {
@@ -9060,6 +9151,85 @@ impl PolymarketTrade {
         )
     }
 
+    /// All completion branches consume the identity captured before network
+    /// I/O. Never re-read `open_orders` after committing a terminal audit.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_reconciled_cancel(
+        &self,
+        permit: Option<&crate::http1_pool::Permit>,
+        coid: &str,
+        order_id: &str,
+        identity: TrackedOrder,
+        status: OrderStatus,
+        status_str: &str,
+        order_audit: Option<&AuthoritativeOrderAudit>,
+        retry_diagnostic: Option<String>,
+        updates: &mut Vec<OrderUpdate>,
+    ) {
+        let status = self.shared.effective_cancel_attempt_status(coid, status);
+        let authoritative_terminal_audit = order_audit.filter(|_| {
+            matches!(status_str, "MATCHED" | "MATCHED_NOT_BROADCASTED" | "FILLED")
+                || status_str.starts_with("CANCELED")
+                || status_str.starts_with("CANCELLED")
+        });
+        if status == OrderStatus::Cancelled || status == OrderStatus::Filled {
+            if let Some(audit) = authoritative_terminal_audit {
+                self.shared
+                    .commit_authoritative_terminal_audit(coid, status, audit);
+                if !audit.associate_trades.is_empty() {
+                    updates.extend(self.reconcile_orphans_with_permit(
+                        permit,
+                        &[],
+                        &[],
+                        &audit.associate_trades,
+                    ));
+                }
+                if self
+                    .shared
+                    .account_state
+                    .terminal_order_audit_complete(coid)
+                {
+                    self.shared.remove_order_resolved_as(coid, status);
+                }
+            } else {
+                self.shared.remove_order_as(coid, status);
+            }
+            // Clear the defensive-retry counter on conclusive resolution
+            // so a later unrelated unknown-status arm for the same coid
+            // starts fresh.
+            self.shared.reconcile_attempts.clear_cancel(coid);
+        }
+        info!(
+            "[PolymarketTrade] Reconcile cancel coid={} orderID={} → {:?} (server={})",
+            coid, order_id, status, status_str
+        );
+        updates.push(OrderUpdate {
+            order_slot: identity.order_slot,
+            client_order_id: coid.to_string(),
+            exchange: Exchange::Polymarket,
+            symbol: identity.symbol,
+            side: identity.side,
+            exchange_order_id: Some(order_id.to_string()),
+            status,
+            liquidity: None,
+            filled_quantity: 0.0,
+            remaining_quantity: 0.0,
+            avg_fill_price: 0.0,
+            timestamp_ns: now_ns(),
+            exchange_event_timestamp_ns: None,
+            trade_id: None,
+            // Metadata is valid only when that same GET returned an
+            // authoritative terminal status. A LIVE snapshot followed by
+            // an ambiguous retry DELETE must trigger another audit.
+            order_audit: authoritative_terminal_audit.cloned(),
+            error: if matches!(status, OrderStatus::Cancelled | OrderStatus::Filled) {
+                Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string())
+            } else {
+                retry_diagnostic
+            },
+        });
+    }
+
     fn reconcile_orphans_with_permit(
         &self,
         permit: Option<&crate::http1_pool::Permit>,
@@ -9086,6 +9256,18 @@ impl PolymarketTrade {
                         warn!(
                             "[PolymarketTrade] Reconcile: placement coid={} has no order_hash — keeping as orphan",
                             coid,
+                        );
+                        continue;
+                    }
+                };
+                let identity = match self.shared.reconcile_order_identity(coid, oid) {
+                    Ok(identity) if identity.symbol == *symbol && identity.side == *side => {
+                        identity
+                    }
+                    result => {
+                        warn!(
+                            "[orphan_metric] reconcile_identity_invalid=1 coid={} orderID={} operation=placement reason={} lock_release=forbidden",
+                            coid, oid, result.err().unwrap_or("contradictory_placement_identity"),
                         );
                         continue;
                     }
@@ -9142,7 +9324,7 @@ impl PolymarketTrade {
                         );
                         self.shared.remove_order_as(coid, OrderStatus::Rejected);
                         updates.push(OrderUpdate {
-                            order_slot: Default::default(),
+                            order_slot: identity.order_slot,
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -9233,12 +9415,7 @@ impl PolymarketTrade {
                             .shared
                             .mark_order_live(
                                 coid,
-                                self.shared
-                                    .execution_snapshot()
-                                    .open_orders
-                                    .get(coid)
-                                    .map(|tracked| tracked.order_slot)
-                                    .unwrap_or_default(),
+                                identity.order_slot,
                                 symbol,
                                 *side,
                                 &ownership.instance_id,
@@ -9250,7 +9427,7 @@ impl PolymarketTrade {
                             coid, oid, status, effective_size_matched,
                         );
                         updates.push(OrderUpdate {
-                            order_slot: Default::default(),
+                            order_slot: identity.order_slot,
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -9301,7 +9478,7 @@ impl PolymarketTrade {
                             coid, oid,
                         );
                         updates.push(OrderUpdate {
-                            order_slot: Default::default(),
+                            order_slot: identity.order_slot,
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -9380,7 +9557,7 @@ impl PolymarketTrade {
                             coid, oid, matched,
                         );
                         updates.push(OrderUpdate {
-                            order_slot: Default::default(),
+                            order_slot: identity.order_slot,
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -9429,7 +9606,7 @@ impl PolymarketTrade {
                         );
                         self.shared.remove_order_as(coid, OrderStatus::Rejected);
                         updates.push(OrderUpdate {
-                            order_slot: Default::default(),
+                            order_slot: identity.order_slot,
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -9484,6 +9661,16 @@ impl PolymarketTrade {
             if self.shared.in_http_425_backoff(coid) {
                 continue;
             }
+            let identity = match self.shared.reconcile_order_identity(coid, order_id) {
+                Ok(identity) => identity,
+                Err(reason) => {
+                    warn!(
+                        "[orphan_metric] reconcile_identity_invalid=1 coid={} orderID={} operation=cancel reason={} lock_release=forbidden",
+                        coid, order_id, reason,
+                    );
+                    continue;
+                }
+            };
             let fetch_result = self.fetch_order_by_id(coid, order_id, permit, false);
             // A 425 mid-iteration parks only this cancel orphan; unrelated
             // orders continue through the loop and can release their locks.
@@ -9675,79 +9862,17 @@ impl PolymarketTrade {
                     ORPHAN_RECONCILE_RETRY_AFTER_MS_PREFIX, backoff_ms, attempts,
                 ));
             }
-            let status = self.shared.effective_cancel_attempt_status(coid, status);
-            let authoritative_terminal_audit = order_audit.as_ref().filter(|_| {
-                matches!(
-                    status_str.as_str(),
-                    "MATCHED" | "MATCHED_NOT_BROADCASTED" | "FILLED"
-                ) || status_str.starts_with("CANCELED")
-                    || status_str.starts_with("CANCELLED")
-            });
-            if status == OrderStatus::Cancelled || status == OrderStatus::Filled {
-                if let Some(audit) = authoritative_terminal_audit {
-                    self.shared
-                        .commit_authoritative_terminal_audit(coid, status, audit);
-                    if !audit.associate_trades.is_empty() {
-                        updates.extend(self.reconcile_orphans_with_permit(
-                            permit,
-                            &[],
-                            &[],
-                            &audit.associate_trades,
-                        ));
-                    }
-                    if self
-                        .shared
-                        .account_state
-                        .terminal_order_audit_complete(coid)
-                    {
-                        self.shared.remove_order_resolved_as(coid, status);
-                    }
-                } else {
-                    self.shared.remove_order_as(coid, status);
-                }
-                // Clear the defensive-retry counter on conclusive resolution
-                // so a later unrelated unknown-status arm for the same coid
-                // starts fresh.
-                self.shared.reconcile_attempts.clear_cancel(coid);
-            }
-            info!(
-                "[PolymarketTrade] Reconcile cancel coid={} orderID={} → {:?} (server={})",
-                coid, order_id, status, status_str
-            );
-            let tracked = self
-                .shared
-                .execution_snapshot()
-                .open_orders
-                .get(coid)
-                .cloned();
-            let (symbol, side) = tracked
-                .map(|t| (t.symbol, t.side))
-                .unwrap_or_else(|| (String::new(), Side::Buy));
-            updates.push(OrderUpdate {
-                order_slot: Default::default(),
-                client_order_id: coid.clone(),
-                exchange: Exchange::Polymarket,
-                symbol,
-                side,
-                exchange_order_id: Some(order_id.clone()),
+            self.finish_reconciled_cancel(
+                permit,
+                coid,
+                order_id,
+                identity,
                 status,
-                liquidity: None,
-                filled_quantity: 0.0,
-                remaining_quantity: 0.0,
-                avg_fill_price: 0.0,
-                timestamp_ns: now_ns(),
-                exchange_event_timestamp_ns: None,
-                trade_id: None,
-                // Metadata is valid only when that same GET returned an
-                // authoritative terminal status. A LIVE snapshot followed by
-                // an ambiguous retry DELETE must trigger another audit.
-                order_audit: authoritative_terminal_audit.cloned(),
-                error: if matches!(status, OrderStatus::Cancelled | OrderStatus::Filled) {
-                    Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string())
-                } else {
-                    retry_diagnostic
-                },
-            });
+                &status_str,
+                order_audit.as_ref(),
+                retry_diagnostic,
+                &mut updates,
+            );
         }
 
         // The terminal order audit names the complete associated trade set.
@@ -12927,6 +13052,10 @@ impl ExchangeTrade for PolymarketTrade {
 }
 
 #[cfg(test)]
+#[path = "trade_reconcile_identity_tests.rs"]
+mod reconcile_identity_tests;
+
+#[cfg(test)]
 #[path = "trade_retirement_tests.rs"]
 mod retirement_tests;
 
@@ -13062,10 +13191,7 @@ mod tests {
         // Model the live ordering on the same bounded owner lane: definitive
         // terminal evidence wins first, followed by a delayed HTTP place ACK
         // and its duplicate replay.
-        shared.defer_lifecycle_account_apply(
-            "owner-late-place-ack",
-            OrderStatus::Rejected,
-        );
+        shared.defer_lifecycle_account_apply("owner-late-place-ack", OrderStatus::Rejected);
         shared.defer_place_ack_account_apply("owner-late-place-ack");
         shared.defer_place_ack_account_apply("owner-late-place-ack");
         let (barrier_tx, barrier_rx) = crossbeam_channel::bounded(1);
@@ -13077,10 +13203,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("account lifecycle owner stalled");
 
-        let order = shared
-            .account_state
-            .order("owner-late-place-ack")
-            .unwrap();
+        let order = shared.account_state.order("owner-late-place-ack").unwrap();
         assert_eq!(order.status, OrderStatus::Rejected);
         assert_eq!(order.reserved_cash, 0.0);
         assert_eq!(
@@ -13531,7 +13654,7 @@ mod tests {
         assert!(should_lookup_recovered_event_end(true));
         assert_eq!(
             prequery_recovered_order_close_reason(true, true, false, false),
-            Some(RecoveredOrderCloseReason::EventEnded),
+            None,
         );
         assert_eq!(
             prequery_recovered_order_close_reason(true, true, true, false),
@@ -13760,7 +13883,7 @@ mod tests {
     #[test]
     fn historical_trade_page_requires_complete_pagination_schema() {
         let (records, next) = authenticated_trade_page(serde_json::json!({
-            "data": [{"id": "trade-1"}],
+            "data": [{"id": "trade-1", "taker_order_id": "other", "maker_orders": []}],
             "next_cursor": "cursor-2",
         }))
         .unwrap();
@@ -13768,6 +13891,59 @@ mod tests {
         assert_eq!(next, "cursor-2");
         assert!(authenticated_trade_page(serde_json::json!({"data": {}})).is_err());
         assert!(authenticated_trade_page(serde_json::json!(null)).is_err());
+    }
+
+    #[test]
+    fn historical_no_fill_requires_complete_exact_identity_pagination() {
+        let record = |oid: &str| serde_json::json!({"id": "trade", "taker_order_id": "other", "maker_orders": [{"order_id": oid}]});
+        let mut page = 0;
+        let result = fetch_historical_order_trade_audit("target", 1_789_317_000_000, |path| {
+            page += 1;
+            if page == 1 {
+                assert!(!path.contains("next_cursor="));
+                Ok(serde_json::json!({"data": [record("unrelated")], "next_cursor": "second"}))
+            } else {
+                assert!(path.contains("next_cursor=second"));
+                Ok(serde_json::json!({"data": [record("0xTARGET")], "next_cursor": "LTE="}))
+            }
+        });
+        assert!(matches!(
+            result,
+            HistoricalOrderTradeAudit::FoundFill { records: 1 }
+        ));
+        let complete = fetch_historical_order_trade_audit("target", 1_789_317_000_000, |_| {
+            Ok(serde_json::json!({"data": [record("other")], "next_cursor": "LTE="}))
+        });
+        assert!(matches!(
+            complete,
+            HistoricalOrderTradeAudit::CompleteNoFill { pages: 1, .. }
+        ));
+        for payload in [
+            serde_json::json!({"data": [], "next_cursor": 7}),
+            serde_json::json!({"data": []}),
+            serde_json::json!([]),
+            serde_json::json!({"data": [{"id": "trade"}], "next_cursor": "LTE="}),
+            serde_json::json!({"data": [{"id": "trade", "taker_order_id": "other", "maker_orders": [{}]}], "next_cursor": "LTE="}),
+        ] {
+            assert!(matches!(
+                fetch_historical_order_trade_audit("target", 1_789_317_000_000, |_| Ok(
+                    payload.clone()
+                )),
+                HistoricalOrderTradeAudit::Unavailable(_)
+            ));
+        }
+        assert!(matches!(
+            fetch_historical_order_trade_audit("target", 1_789_317_000_000, |_| Err(
+                "transport".into()
+            )),
+            HistoricalOrderTradeAudit::Unavailable(_)
+        ));
+        assert!(matches!(
+            fetch_historical_order_trade_audit("target", 1_789_317_000_000, |_| Ok(
+                serde_json::json!({"data": [], "next_cursor": "again"})
+            )),
+            HistoricalOrderTradeAudit::Incomplete { pages: 2 }
+        ));
     }
 
     #[test]
@@ -14532,15 +14708,13 @@ mod tests {
             FetchOrderResult::Unavailable(ref kind) if !kind.is_json_null()
         ));
         let null = FetchUnavailable::InvalidResponse("null".to_string());
-        assert_eq!(
-            recovered_order_close_reason(true, false, Some(&null)),
-            Some(RecoveredOrderCloseReason::JsonNull),
-        );
-        assert_eq!(
-            recovered_order_close_reason(true, true, None),
-            Some(RecoveredOrderCloseReason::EventEnded),
-        );
+        assert_eq!(recovered_order_close_reason(true, false, Some(&null)), None,);
+        assert_eq!(recovered_order_close_reason(true, true, None), None,);
         assert_eq!(recovered_order_close_reason(false, true, Some(&null)), None);
+        assert_eq!(
+            recovered_order_close_reason(true, true, Some(&null)),
+            Some(RecoveredOrderCloseReason::JsonNull)
+        );
         assert_eq!(
             recovered_order_close_reason(
                 true,

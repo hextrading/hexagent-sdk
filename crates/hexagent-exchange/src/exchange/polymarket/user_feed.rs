@@ -5444,7 +5444,7 @@ mod tests {
     }
 
     #[test]
-    fn order_lifecycle_updates_release_on_cancel_and_restore_on_late_placement() {
+    fn order_lifecycle_updates_preserve_cancelled_reservation_on_late_placement() {
         let shared = owned_taker_shared(0.5);
         let placement = serde_json::json!({
             "event_type": "order", "type": "PLACEMENT", "id": "oid-1",
@@ -5475,28 +5475,38 @@ mod tests {
             .open_orders
             .contains_key("owner-1"));
 
-        let resurrection = serde_json::json!({
+        let late_placement = serde_json::json!({
             "event_type": "order", "type": "PLACEMENT", "id": "oid-1",
             "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
             "original_size": "10", "size_matched": "0",
         });
-        assert_eq!(
-            parse_user_event(&resurrection, &shared)[0].status,
-            OrderStatus::Accepted,
-        );
-        shared.flush_execution_state_for_test();
-        assert_eq!(
-            shared
-                .account_state
-                .instance_snapshot("owner")
-                .unwrap()
-                .reserved_cash,
-            5.0
-        );
-        assert!(shared
-            .execution_snapshot()
-            .open_orders
-            .contains_key("owner-1"));
+        for _ in 0..2 {
+            // Parsing preserves the venue event. The execution owner applies
+            // lifecycle ordering and must not reopen a cancelled remainder.
+            assert_eq!(
+                parse_user_event(&late_placement, &shared)[0].status,
+                OrderStatus::Accepted,
+            );
+            shared.flush_execution_state_for_test();
+            let order = shared.account_state.order("owner-1").unwrap();
+            assert_eq!(order.status, OrderStatus::Cancelled);
+            assert_eq!(order.terminal_matched_quantity, Some(0.0));
+            assert!(order.terminal_trade_ids_authoritative);
+            assert!(order.terminal_trade_ids.is_empty());
+            assert_eq!(order.reserved_cash, 0.0);
+            assert_eq!(
+                shared
+                    .account_state
+                    .instance_snapshot("owner")
+                    .unwrap()
+                    .reserved_cash,
+                0.0,
+            );
+            assert!(!shared
+                .execution_snapshot()
+                .open_orders
+                .contains_key("owner-1"));
+        }
 
         let shared = owned_taker_shared(0.5);
         let mut update = serde_json::json!({

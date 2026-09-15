@@ -7319,6 +7319,30 @@ impl ClobLocalBook {
     }
 }
 
+/// Cache buffers belong exclusively to the CLOB owner. Public events keep
+/// independently owned vectors, so later cache updates cannot mutate a queued
+/// snapshot. Reserve the full-book wire capacity during subscription setup;
+/// cumulative deltas exceeding that capacity retain full depth via Vec growth.
+fn empty_canonical_snapshot(symbol: &str) -> OrderBookSnapshot {
+    OrderBookSnapshot {
+        exchange: Exchange::Polymarket,
+        symbol: symbol.to_owned(),
+        bids: Vec::with_capacity(CLOB_BOOK_LEVEL_CAPACITY),
+        asks: Vec::with_capacity(CLOB_BOOK_LEVEL_CAPACITY),
+        exchange_timestamp_ns: 0,
+        local_timestamp_ns: 0,
+    }
+}
+
+fn update_canonical_snapshot(cached: &mut OrderBookSnapshot, snapshot: &OrderBookSnapshot) {
+    cached.exchange = snapshot.exchange;
+    cached.symbol.clone_from(&snapshot.symbol);
+    cached.bids.clone_from(&snapshot.bids);
+    cached.asks.clone_from(&snapshot.asks);
+    cached.exchange_timestamp_ns = snapshot.exchange_timestamp_ns;
+    cached.local_timestamp_ns = snapshot.local_timestamp_ns;
+}
+
 #[derive(Debug, Default)]
 struct ClobLocalBooks {
     /// Startup-resident token identities. Wire strings are borrowed from the
@@ -7356,8 +7380,16 @@ struct PendingHealthRecovery {
 
 impl ClobLocalBooks {
     fn new(specs: &[CanonicalEventSpec]) -> Self {
-        let mut state = Self::default();
+        let mut state = Self {
+            canonical_versions: HashMap::with_capacity(specs.len()),
+            canonical_books: HashMap::with_capacity(specs.len()),
+            ..Self::default()
+        };
         for spec in specs {
+            state
+                .canonical_books
+                .entry(spec.condition_id.clone())
+                .or_insert_with(|| empty_canonical_snapshot(&spec.up_token));
             if let Ok(tick) = Decimal::from_str(&spec.tick_size.to_string()) {
                 state.current_ticks.insert(spec.condition_id.clone(), tick);
             }
@@ -7611,12 +7643,15 @@ impl ClobLocalBooks {
             exchange_timestamp_ns: book.exchange_timestamp_ns,
             wire_sequence: book.wire_sequence,
         };
-        let role = self.roles.get(token).cloned();
-        let (condition_id, symbol, mirror_down) = match role {
-            Some(role) => (Some(role.condition_id), role.up_token, role.is_down),
+        let (condition_id, symbol, mirror_down) = match self.roles.get(token) {
+            Some(role) => (
+                Some(role.condition_id.as_str()),
+                role.up_token.clone(),
+                role.is_down,
+            ),
             None => (None, token.to_string(), false),
         };
-        if let Some(condition_id) = condition_id.as_ref() {
+        if let Some(condition_id) = condition_id {
             if self
                 .canonical_versions
                 .get(condition_id)
@@ -7627,15 +7662,30 @@ impl ClobLocalBooks {
         }
         let snapshot = book.snapshot(symbol, mirror_down, local_now)?;
         if let Some(condition_id) = condition_id {
-            self.canonical_versions
-                .insert(condition_id.clone(), version);
-            self.canonical_books.insert(condition_id, snapshot.clone());
+            if let Some(current) = self.canonical_versions.get_mut(condition_id) {
+                *current = version;
+            } else {
+                self.canonical_versions
+                    .insert(condition_id.to_owned(), version);
+            }
+            if let Some(cached) = self.canonical_books.get_mut(condition_id) {
+                // A fresh snapshot.clone() here triggered live mimalloc arena
+                // purge/madvise for 24 ms. Keep the startup buffers resident.
+                update_canonical_snapshot(cached, &snapshot);
+            } else {
+                // Compatibility for dynamically installed/test roles. Normal
+                // subscribed roles have their cache allocated by `new`.
+                self.canonical_books
+                    .insert(condition_id.to_owned(), snapshot.clone());
+            }
         }
         Some(MarketEvent::OrderBook(snapshot))
     }
 
     fn canonical_snapshot_for_token(&self, token: &str) -> Option<MarketEvent> {
         let role = self.roles.get(token)?;
+        // Startup-reserved empty buffers are not an authoritative book.
+        self.canonical_versions.get(&role.condition_id)?;
         self.canonical_books
             .get(&role.condition_id)
             .cloned()
@@ -9419,6 +9469,10 @@ mod clob_test_allocator {
 #[global_allocator]
 static CLOB_TEST_ALLOCATOR: clob_test_allocator::CountingAllocator =
     clob_test_allocator::CountingAllocator;
+
+#[cfg(test)]
+#[path = "clob_canonical_cache_tests.rs"]
+mod clob_canonical_cache_tests;
 
 #[cfg(test)]
 #[path = "clob_quantity_path_tests.rs"]

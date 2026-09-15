@@ -1,4 +1,5 @@
 use super::*;
+use crate::account::shared_account::SharedAccount;
 
 fn snapshot_fixture(routes: usize) -> ExecutionStateSnapshot {
     let mut coid_to_oid = HashMap::new();
@@ -99,26 +100,109 @@ fn retirement_publishes_coherent_identity_maps_and_preserves_replayed_routes() {
 }
 
 #[test]
-fn duplicate_retirement_command_does_not_republish_an_unchanged_snapshot() {
+fn retirement_requires_terminal_owner_certificate_and_duplicate_does_not_republish() {
     let shutdown = ShutdownToken::new();
     let trade = super::tests::shutdown_test_trade(shutdown.clone());
-    let shared = trade.shared_state();
+    let mut shared = trade.shared_state();
     shutdown.request();
     shutdown.finish();
     assert_eq!(shared.join_background_workers(), 3);
-    // The test thread takes ownership after the live owner has joined.
+    drop(trade);
+    // No production worker remains. Give this deterministic fixture an unbound
+    // account and make the test thread the sole execution/GC owner.
+    let shared = Arc::get_mut(&mut shared).expect("joined workers release shared state");
+    let account = Arc::new(SharedAccount::new("retirement-certificate"));
+    account.register_instance("owner", 1.0);
+    account
+        .apply_physical_snapshot(100.0, HashMap::new())
+        .unwrap();
+    account
+        .reserve_order(
+            "owner",
+            "owner-0",
+            &format!("0x{:064x}", 0),
+            "retiring",
+            Side::Buy,
+            1.0,
+            0.4,
+            0,
+        )
+        .unwrap();
+    account.mark_order_status("owner-0", OrderStatus::Accepted);
+    let tokens = vec!["retiring".into()];
+    account
+        .retain_settled_event_audit("owner", "condition", &tokens)
+        .unwrap();
+    account
+        .release_settled_event_audit("owner", "condition", &tokens)
+        .unwrap();
+    let mut cold_owner = account.register_settled_gc_cold_owner("owner").unwrap();
+    shared.account_state = Arc::clone(&account);
     let initial = snapshot_fixture(256);
-    let mut owner = ExecutionStateOwner::new(initial.clone());
+    let mut execution = ExecutionStateOwner::new(initial.clone());
+    let mut live_position = LivePositionManager::new();
     shared.execution_state.store(Arc::new(initial));
-    let command = || ExecutionStateCommand::RetireMappings {
-        asset_ids: vec!["retiring".into()],
-        owned_coids: HashSet::from(["owner-0".into()]),
-    };
-    owner.apply(&shared, command());
+    let before = shared.execution_state.load_full();
+
+    assert_eq!(
+        shared.finalize_ready_settled_audit_retirements(&mut execution, &mut live_position),
+        (0, 0)
+    );
+    assert!(
+        Arc::ptr_eq(&before, &shared.execution_state.load_full()),
+        "no certificate cannot retire routes"
+    );
+    cold_owner.poll_once().unwrap();
+    assert_eq!(
+        shared.finalize_ready_settled_audit_retirements(&mut execution, &mut live_position),
+        (0, 0)
+    );
+    assert!(
+        Arc::ptr_eq(&before, &shared.execution_state.load_full()),
+        "Accepted reserve must preserve query/replay identity"
+    );
+    assert_eq!(account.order("owner-0").unwrap().reserved_cash, 0.4);
+
+    account
+        .apply_authoritative_order_audit(
+            "owner-0",
+            OrderStatus::Cancelled,
+            &AuthoritativeOrderAudit {
+                original_size: Some("1".into()),
+                size_matched: Some("0".into()),
+                associate_trades: vec![],
+            },
+        )
+        .unwrap();
+    account.note_settled_gc_activity();
+    assert_eq!(
+        shared.finalize_ready_settled_audit_retirements(&mut execution, &mut live_position),
+        (0, 0)
+    );
+    assert!(
+        shared
+            .execution_snapshot()
+            .coid_to_oid
+            .contains_key("owner-0")
+    );
+    cold_owner.poll_once().unwrap();
+    assert_eq!(
+        shared
+            .finalize_ready_settled_audit_retirements(&mut execution, &mut live_position)
+            .0,
+        1
+    );
     let retired = shared.execution_state.load_full();
     assert!(!retired.coid_to_oid.contains_key("owner-0"));
     assert!(retired.coid_to_oid.contains_key("owner-64"));
-    owner.apply(&shared, command());
+    assert!(
+        before.coid_to_oid.contains_key("owner-0"),
+        "previous immutable reader remains valid"
+    );
+    assert_eq!(
+        shared.finalize_ready_settled_audit_retirements(&mut execution, &mut live_position),
+        (0, 0)
+    );
     assert!(Arc::ptr_eq(&retired, &shared.execution_state.load_full()));
 }
 
@@ -171,8 +255,18 @@ fn benchmark_retirement_snapshot_publication() {
             assert!(original.coid_to_oid.contains_key("owner-0"));
             samples.sort_unstable();
             let q = |v: usize| samples[(N * v).div_ceil(1000) - 1];
-            eprintln!("retirement_publication_probe mode={} n={N} routes={ROUTES} targets={targets} boundary=private_enqueue_to_dequeue_after_publication p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_peak=2 capacity=2 overflow=0",
-                if baseline {"full_rebuild"} else {"changed_shards"},q(500),q(990),q(999),q(1000));
+            eprintln!(
+                "retirement_publication_probe mode={} n={N} routes={ROUTES} targets={targets} boundary=private_enqueue_to_dequeue_after_publication p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_peak=2 capacity=2 overflow=0",
+                if baseline {
+                    "full_rebuild"
+                } else {
+                    "changed_shards"
+                },
+                q(500),
+                q(990),
+                q(999),
+                q(1000)
+            );
         }
     }
 }

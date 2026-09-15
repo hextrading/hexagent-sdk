@@ -11057,6 +11057,12 @@ impl Engine {
                                             snapshot.persistence_queue_overflows,
                                             account.wallet_calibration_coalesced(),
                                         );
+                                        let retired_routes = account.route_retirement_metrics();
+                                        info!(
+                                            "[account_route_reclaim_metric] account={} outstanding={} high_water={} backpressure={} reclaimed={}",
+                                            snapshot.account_id,
+                                            retired_routes.0, retired_routes.1, retired_routes.2, retired_routes.3,
+                                        );
                                         let reservation_acquisitions = snapshot
                                             .reservation_control_lock
                                             .acquisitions
