@@ -58,6 +58,9 @@ const SETTLED_GC_ORDERS_PER_OWNER_TURN: usize = 8;
 const SETTLED_GC_TRADES_PER_OWNER_TURN: usize = 8;
 const SETTLED_GC_TOMBSTONES_SCANNED_PER_OWNER_TURN: usize = 32;
 const ACCOUNT_OWNER_TASK_QUEUE_CAPACITY: usize = 4_096;
+#[path = "route_retirement.rs"]
+mod route_retirement;
+use route_retirement::{RetiredRouteBatch, RouteRetirementPermit, RouteRetirementQueue};
 /// Private order/trade lifecycle is lossless and outranks wallet calibration
 /// and all other cold account work. Saturation fails closed at the producer;
 /// the consumer is the dedicated private lifecycle owner.
@@ -254,6 +257,7 @@ pub struct SharedAccountOwnerState {
     wallet_rx: crossbeam_channel::Receiver<()>,
     lifecycle_mirror_rx: crossbeam_channel::Receiver<LifecycleMirrorDelta>,
     lifecycle_mirror_wake_rx: crossbeam_channel::Receiver<()>,
+    route_retirement_pending: std::cell::RefCell<Option<RetiredRouteBatch>>,
 }
 
 /// Receiving half of the lossless account-lifecycle lane. The exchange moves
@@ -306,6 +310,14 @@ impl SharedAccountOwnerState {
 
     pub fn execute_wallet_calibration(&self) {
         self.account.execute_pending_wallet_calibration();
+    }
+
+    /// Lowest-priority bounded destructor work on the existing cold owner.
+    /// Live private mutation and quote readers never drain this queue.
+    pub fn reclaim_retired_routes(&self) {
+        self.account
+            .route_retirement
+            .reclaim(&mut self.route_retirement_pending.borrow_mut());
     }
 
     pub fn execute_lifecycle_mirror(&self) {
@@ -1033,6 +1045,10 @@ mod batch_tests;
 #[path = "shared_account_route_bytes_tests.rs"]
 mod route_bytes_tests;
 
+#[cfg(test)]
+#[path = "shared_account_terminal_fee_tests.rs"]
+mod terminal_fee_tests;
+
 #[derive(Debug)]
 struct RouteShard {
     /// Readers consume an immutable ownership snapshot. Route mutation uses
@@ -1077,7 +1093,10 @@ impl ShardedRouteMap {
                 let mut next = (**current).clone();
                 next.retain(|key, owner| !remove(key, owner));
                 for (key, owner) in &additions[index] {
-                    if next.get(*key).is_none_or(|current| current.as_ref() != *owner) {
+                    if next
+                        .get(*key)
+                        .is_none_or(|current| current.as_ref() != *owner)
+                    {
                         next.insert(Arc::from(*key), Arc::from(*owner));
                     }
                 }
@@ -1088,7 +1107,18 @@ impl ShardedRouteMap {
 
     /// Bounded GC delta. Removal is conditional on ownership, including on
     /// CAS retry, so a newly rebound key cannot be removed by an old batch.
+    #[cfg(test)]
     fn apply_batch(&self, owner: &str, removals: &[String], additions: &[(String, String)]) {
+        self.apply_batch_retiring(owner, removals, additions, None);
+    }
+
+    fn apply_batch_retiring(
+        &self,
+        owner: &str,
+        removals: &[String],
+        additions: &[(String, String)],
+        mut retirement: Option<&mut RouteRetirementPermit<'_>>,
+    ) {
         let mut grouped: [Vec<(&str, Option<&str>)>; ROUTE_SHARD_COUNT] =
             std::array::from_fn(|_| Vec::new());
         for key in removals {
@@ -1102,17 +1132,23 @@ impl ShardedRouteMap {
             .enumerate()
             .filter(|(_, changes)| !changes.is_empty())
         {
-            self.shards[index].published.rcu(|current| {
+            let mut replaced = false;
+            let old = self.shards[index].published.rcu(|current| {
                 if changes.iter().all(|(key, value)| match value {
                     Some(value) => current.get(*key).is_some_and(|v| v.as_ref() == *value),
                     None => current.get(*key).is_none_or(|v| v.as_ref() != owner),
                 }) {
+                    replaced = false;
                     return Arc::clone(current);
                 }
+                replaced = true;
                 let mut next = (**current).clone();
                 for (key, value) in changes {
                     if let Some(value) = value {
-                        if next.get(*key).is_none_or(|current| current.as_ref() != *value) {
+                        if next
+                            .get(*key)
+                            .is_none_or(|current| current.as_ref() != *value)
+                        {
                             next.insert(Arc::from(*key), Arc::from(*value));
                         }
                     } else if next.get(*key).is_some_and(|v| v.as_ref() == owner) {
@@ -1121,6 +1157,11 @@ impl ShardedRouteMap {
                 }
                 Arc::new(next)
             });
+            if replaced {
+                if let Some(retirement) = retirement.as_deref_mut() {
+                    retirement.push(old);
+                }
+            }
         }
     }
 
@@ -1165,7 +1206,11 @@ impl ShardedRouteMap {
 
     fn remove(&self, key: &str) -> Option<String> {
         let shard = &self.shards[Self::shard_index(key)];
-        let previous = shard.published.load().get(key).map(|owner| owner.to_string());
+        let previous = shard
+            .published
+            .load()
+            .get(key)
+            .map(|owner| owner.to_string());
         if previous.is_some() {
             shard.published.rcu(|current| {
                 let mut next = (**current).clone();
@@ -5753,6 +5798,9 @@ pub struct SharedAccount {
     /// membership index forces an exact replay through the cold tombstone
     /// validator instead of letting the owner shard book it again.
     retired_trade_routes: ShardedRouteMap,
+    // GC reserves a bounded retirement credit before changing state. Only the
+    // existing cold account owner consumes obsolete immutable route snapshots.
+    route_retirement: RouteRetirementQueue,
     /// Only anomalous trade ids are present. Exact replays for those ids take
     /// the cold audit path until a verified replay clears the durable anomaly.
     anomalous_trade_keys: ArcSwap<HashSet<String>>,
@@ -6116,6 +6164,7 @@ impl SharedAccount {
             wallet_rx: wallet_receiver,
             lifecycle_mirror_rx,
             lifecycle_mirror_wake_rx,
+            route_retirement_pending: std::cell::RefCell::new(None),
         };
         Ok((handle, owner))
     }
@@ -6327,6 +6376,11 @@ impl SharedAccount {
             self.account_lifecycle_queue_overflows
                 .load(Ordering::Relaxed),
         )
+    }
+
+    /// Outstanding includes batches retained by slow readers, not just the queue.
+    pub fn route_retirement_metrics(&self) -> (usize, usize, u64, u64) {
+        self.route_retirement.metrics()
     }
 
     pub fn lifecycle_mirror_queue_metrics(&self) -> (usize, usize, u64, u64, u64) {
@@ -6704,7 +6758,11 @@ impl SharedAccount {
         let request = Arc::clone(request);
         crate::latency::record_ns(
             "polymarket.account.wallet_calibration.wait_including_grace",
-            request.submitted_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            request
+                .submitted_at
+                .elapsed()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64,
         );
         let apply_started = crate::latency::Instant::now();
         let result = self
@@ -6915,6 +6973,7 @@ impl SharedAccount {
             oid_routes: ShardedRouteMap::new(),
             trade_routes: ShardedRouteMap::new(),
             retired_trade_routes: ShardedRouteMap::new(),
+            route_retirement: RouteRetirementQueue::new(),
             anomalous_trade_keys: ArcSwap::from_pointee(HashSet::new()),
             anomalous_private_event_keys: ArcSwap::from_pointee(HashSet::new()),
             retired_order_audit_tombstones_fast: ArcSwap::from_pointee(HashMap::new()),
@@ -7093,7 +7152,13 @@ impl SharedAccount {
                     ),
                 );
             }
-            let terminal_failed_migrated = normalize_terminal_failed_state(&mut state);
+            // A historical live-status replay may have reopened only the
+            // lifecycle of an already released, fully audited ended order.
+            // Preserve its exact final trade proof before FAILED query repair
+            // can discard it and manufacture a new reservation.
+            let proven_terminal_migrated = normalize_proven_ended_terminal_orders(&mut state);
+            let terminal_failed_migrated =
+                normalize_terminal_failed_state(&mut state) || proven_terminal_migrated;
             if terminal_failed_migrated {
                 recompute_reconciliation(&mut state, "terminal FAILED ledger migration");
             }
@@ -7343,6 +7408,7 @@ impl SharedAccount {
             oid_routes: ShardedRouteMap::new(),
             trade_routes: ShardedRouteMap::new(),
             retired_trade_routes: ShardedRouteMap::new(),
+            route_retirement: RouteRetirementQueue::new(),
             anomalous_trade_keys: ArcSwap::from_pointee(HashSet::new()),
             anomalous_private_event_keys: ArcSwap::from_pointee(HashSet::new()),
             retired_order_audit_tombstones_fast: ArcSwap::from_pointee(
@@ -10714,7 +10780,10 @@ impl SharedAccount {
     /// Latest wallet/onchain-owner physical positions without materialising
     /// virtual instance ledgers, reservations, or lifecycle counters.
     pub fn physical_positions_snapshot_fast(&self) -> HashMap<String, f64> {
-        self.economic_snapshot_fast.load().physical_positions.clone()
+        self.economic_snapshot_fast
+            .load()
+            .physical_positions
+            .clone()
     }
 
     /// Persist the exchange fee curve for every outcome token in one event.
@@ -13334,9 +13403,9 @@ impl SharedAccount {
         let _ = self.mark_order_status_effective(client_order_id, status);
     }
 
-    /// Apply authoritative lifecycle evidence and return the state that won.
-    /// An explicit LIVE edge may resurrect a preceding cancellation because
-    /// exchange lifecycle messages are not ordered.
+    /// Apply lifecycle status and return the state that won. Reordered live
+    /// status cannot undo cancellation; late trade quantities and reversals
+    /// still apply through the independent trade-id-deduplicated lane.
     pub fn mark_order_status_effective(
         &self,
         client_order_id: &str,
@@ -13416,6 +13485,8 @@ impl SharedAccount {
                     && status != current_status)
                 || (current_status == OrderStatus::PartiallyFilled
                     && status == OrderStatus::Accepted)
+                || (current_status == OrderStatus::Cancelled
+                    && matches!(status, OrderStatus::Accepted | OrderStatus::PartiallyFilled))
                 || (matches!(
                     current_status,
                     OrderStatus::Cancelled | OrderStatus::Rejected
@@ -13431,81 +13502,24 @@ impl SharedAccount {
                 return Some(current_status);
             }
 
-            // Exchange lifecycle pushes are not ordered. If a cancellation
-            // is followed by an authoritative live status, restore the
-            // reservation from the durable order economics before exposing
-            // Accepted to callers. Merely changing `status` would leave the
-            // account with released collateral while the order is live.
-            if allow_terminal_resurrection
-                && current_status == OrderStatus::Cancelled
-                && matches!(status, OrderStatus::Accepted | OrderStatus::PartiallyFilled)
-            {
-                let (token_id, old_cash, old_qty, desired_cash, desired_qty) = {
-                    let order = lifecycle
-                        .orders
-                        .get_mut(client_order_id)
-                        .expect("order status read above");
-                    order.status = status;
-                    order.terminal_matched_quantity = None;
-                    order.terminal_trade_ids.clear();
-                    order.terminal_trade_ids_authoritative = false;
-                    let old_cash = order.reserved_cash;
-                    let old_qty = order.reserved_quantity;
-                    let (desired_cash, desired_qty) = desired_order_reservation(order);
-                    order.reserved_cash = desired_cash;
-                    order.reserved_quantity = desired_qty;
-                    (
-                        order.token_id.clone(),
-                        old_cash,
-                        old_qty,
-                        desired_cash,
-                        desired_qty,
-                    )
-                };
-                account.adjust_reservation(
-                    &token_id,
-                    desired_cash - old_cash,
-                    desired_qty - old_qty,
-                );
-                lifecycle.recovery_pending_orders.remove(client_order_id);
-                lifecycle.routine_cancel_audits.remove(client_order_id);
-                let clear_cancel_anomaly = lifecycle.cancel_audit_anomalies.remove(client_order_id);
-                Self::record_virtual_trade_mutation(
-                    &account,
-                    lifecycle,
-                    "",
-                    client_order_id,
-                    &token_id,
-                );
-                drop(mutation);
-                let persist_enqueue =
-                    DeferredLifecycleStageTimer::start(DeferredLifecycleStage::PersistEnqueue);
-                self.schedule_virtual_lifecycle_persist(&account, &lifecycle, client_order_id);
-                drop(persist_enqueue);
-                if clear_cancel_anomaly {
-                    self.clear_cancel_audit_anomaly(client_order_id);
-                }
-                return Some(status);
-            } else {
-                let token_id = lifecycle
-                    .orders
-                    .get_mut(client_order_id)
-                    .expect("order status read above")
-                    .token_id
-                    .clone();
-                lifecycle
-                    .orders
-                    .get_mut(client_order_id)
-                    .expect("order status read above")
-                    .status = status;
-                Self::record_virtual_trade_mutation(
-                    &account,
-                    lifecycle,
-                    "",
-                    client_order_id,
-                    &token_id,
-                );
-            }
+            let token_id = lifecycle
+                .orders
+                .get_mut(client_order_id)
+                .expect("order status read above")
+                .token_id
+                .clone();
+            lifecycle
+                .orders
+                .get_mut(client_order_id)
+                .expect("order status read above")
+                .status = status;
+            Self::record_virtual_trade_mutation(
+                &account,
+                lifecycle,
+                "",
+                client_order_id,
+                &token_id,
+            );
             drop(mutation);
             let persist_enqueue =
                 DeferredLifecycleStageTimer::start(DeferredLifecycleStage::PersistEnqueue);
@@ -15329,7 +15343,10 @@ impl SharedAccount {
                         &account,
                         &mut *lifecycle,
                         trade_key,
-                        if normalized == "FAILED" {
+                        // Principal/status rejected this replay. Fee economics
+                        // must follow the stored terminal state too: incoming
+                        // FAILED cannot refund only a CONFIRMED taker's fee.
+                        if applied.failed || applied.ownership.status == "FAILED" {
                             OrderStatus::Failed
                         } else {
                             OrderStatus::PartiallyFilled
@@ -15903,7 +15920,9 @@ impl SharedAccount {
                             state.uncertain_reason.clone(),
                             state.uncertain_since_ms,
                         );
-                        let fee_status = if normalized == "FAILED" {
+                        // Metadata repair may add a missing fee, but an
+                        // ignored status replay cannot reverse confirmed fees.
+                        let fee_status = if applied.failed || applied.ownership.status == "FAILED" {
                             OrderStatus::Failed
                         } else {
                             OrderStatus::PartiallyFilled
@@ -17026,6 +17045,17 @@ impl SharedAccount {
             "polymarket.account.settled_gc_owner_lifecycle_wait",
             lifecycle_wait_started,
         );
+        // Reserve reclamation capacity before any deletion or WAL capture.
+        // Standalone/unbound account tests and cold startup keep direct drop.
+        let mut retirement = if self.account_owner_lane_bound.load(Ordering::Acquire) {
+            let Some(permit) = self.route_retirement.try_reserve() else {
+                crate::latency::record_ns("polymarket.account.settled_gc_route_reclaim_busy", 1);
+                return Ok(SettledGcDeleteAttempt::Busy(request));
+            };
+            Some(permit)
+        } else {
+            None
+        };
         let SettledGcDeleteRequest {
             request_id,
             registration_id,
@@ -17204,12 +17234,23 @@ impl SharedAccount {
             .iter()
             .map(|(_, oid)| normalize_order_id(oid))
             .collect::<Vec<_>>();
-        self.retired_trade_routes
-            .apply_batch(&instance_id, &[], &retired_routes);
-        self.coid_routes.apply_batch(&instance_id, &coids, &[]);
-        self.oid_routes.apply_batch(&instance_id, &oids, &[]);
-        self.trade_routes
-            .apply_batch(&instance_id, &stale_trades, &[]);
+        self.retired_trade_routes.apply_batch_retiring(
+            &instance_id,
+            &[],
+            &retired_routes,
+            retirement.as_mut(),
+        );
+        self.coid_routes
+            .apply_batch_retiring(&instance_id, &coids, &[], retirement.as_mut());
+        self.oid_routes
+            .apply_batch_retiring(&instance_id, &oids, &[], retirement.as_mut());
+        self.trade_routes.apply_batch_retiring(
+            &instance_id,
+            &stale_trades,
+            &[],
+            retirement.as_mut(),
+        );
+        drop(retirement);
         crate::latency::record("polymarket.account.settled_gc_owner_routes", route_started);
         let remaining_rows =
             lifecycle.orders.has_tokens(&tokens) || lifecycle.trades.has_tokens(&tokens);
@@ -18654,6 +18695,7 @@ fn repair_failed_trade_under_reservations_for_query(
     state: &mut SharedAccountState,
 ) -> Result<(HashSet<String>, bool), String> {
     let failed_trade_keys_by_order = failed_trade_keys_by_order_for_query(state);
+    let ended_tokens = SharedAccount::ended_token_ids(state);
     let mut query_orders = state.startup_query_repair_orders.clone();
     let mut mutated = false;
 
@@ -18681,7 +18723,9 @@ fn repair_failed_trade_under_reservations_for_query(
         let Some(snapshot) = state.orders.get(&coid).cloned() else {
             continue;
         };
-        if snapshot.status == OrderStatus::Rejected {
+        if snapshot.status == OrderStatus::Rejected
+            || has_proven_released_ended_terminal_audit(state, &snapshot, &ended_tokens)
+        {
             continue;
         }
         let terminal_audit_references_failed = snapshot.terminal_trade_ids.iter().any(|expected| {
@@ -18912,6 +18956,90 @@ fn reservation_deficit_has_recovery_root(
                 _ => false,
             }
     })
+}
+
+/// Recover only a stale lifecycle, never economics or a frozen reservation.
+/// Market retirement and complete final trade roots are both required: a
+/// FAILED trade on a live market can still return its parent to the book.
+fn has_proven_released_ended_terminal_audit(
+    state: &SharedAccountState,
+    order: &OrderOwnership,
+    ended_tokens: &HashSet<String>,
+) -> bool {
+    if !ended_tokens.contains(&order.token_id)
+        || order.reserved_cash != 0.0
+        || order.reserved_quantity != 0.0
+        || !terminal_order_audit_complete_locked(state, &order.client_order_id)
+        || order
+            .terminal_matched_quantity
+            .is_none_or(|matched| matched + EPS < order.filled_quantity)
+    {
+        return false;
+    }
+    let covered = |ownership: &TradeOwnership| {
+        order
+            .terminal_trade_ids
+            .iter()
+            .any(|id| terminal_trade_id_matches(&ownership.trade_key, id))
+    };
+    state
+        .trades
+        .values()
+        .filter(|trade| trade_ownership_matches_order_root(&trade.ownership, order))
+        .all(|trade| {
+            covered(&trade.ownership)
+                && ((trade.ownership.status == "CONFIRMED"
+                    && trade.booked
+                    && trade.physical_booked
+                    && !trade.failed)
+                    || (trade.ownership.status == "FAILED"
+                        && trade.failed
+                        && trade.failure_reconciled
+                        && !trade.booked
+                        && !trade.physical_booked))
+        })
+        && state
+            .retired_trade_ownership_tombstones
+            .values()
+            .filter(|trade| trade_ownership_matches_order_root(&trade.ownership, order))
+            .all(|trade| {
+                covered(&trade.ownership)
+                    && !trade.authenticated_terminal_noop
+                    && matches!(trade.ownership.status.as_str(), "CONFIRMED" | "FAILED")
+            })
+}
+
+fn normalize_proven_ended_terminal_orders(state: &mut SharedAccountState) -> bool {
+    let ended_tokens = SharedAccount::ended_token_ids(state);
+    let proven: Vec<String> = state
+        .orders
+        .iter()
+        // Already-final rows without recovery markers cannot change here.
+        // Avoid rescanning their trade history during every cold restart.
+        .filter(|(coid, order)| {
+            !matches!(order.status, OrderStatus::Cancelled | OrderStatus::Filled)
+                || state.recovery_pending_orders.contains(*coid)
+                || state.routine_cancel_audits.contains(*coid)
+                || state.startup_query_repair_orders.contains(*coid)
+        })
+        .filter(|(_, order)| has_proven_released_ended_terminal_audit(state, order, &ended_tokens))
+        .map(|(coid, _)| coid.clone())
+        .collect();
+    let mut changed = false;
+    for coid in proven {
+        let order = state
+            .orders
+            .get_mut(&coid)
+            .expect("proof preserves order root");
+        if !matches!(order.status, OrderStatus::Cancelled | OrderStatus::Filled) {
+            order.status = OrderStatus::Filled;
+            changed = true;
+        }
+        changed |= state.recovery_pending_orders.remove(&coid);
+        changed |= state.routine_cancel_audits.remove(&coid);
+        changed |= state.startup_query_repair_orders.remove(&coid);
+    }
+    changed
 }
 
 fn normalize_terminal_failed_state(state: &mut SharedAccountState) -> bool {
@@ -22947,10 +23075,7 @@ mod tests {
         );
         for _ in 0..2 {
             assert_eq!(
-                account.mark_place_ack_status_effective(
-                    "a-late-place-ack",
-                    OrderStatus::Accepted,
-                ),
+                account.mark_place_ack_status_effective("a-late-place-ack", OrderStatus::Accepted,),
                 Some(OrderStatus::Cancelled),
             );
         }
@@ -22962,6 +23087,47 @@ mod tests {
             account.instance_snapshot("a").unwrap().reserved_positions["UP"],
             0.0,
         );
+    }
+
+    #[test]
+    fn delayed_private_status_cannot_erase_zero_match_audit_or_leak_other_owner_reserves() {
+        for side in [Side::Buy, Side::Sell] {
+            let account = seeded_account();
+            account
+                .reserve_order("a", "a-cancelled", "oid-a", "UP", side, 10.0, 0.5, 0)
+                .unwrap();
+            account
+                .reserve_order("b", "b-live", "oid-b", "UP", Side::Buy, 2.0, 0.5, 0)
+                .unwrap();
+            let other_reserved = account.instance_snapshot("b").unwrap().reserved_cash;
+            let audit = AuthoritativeOrderAudit {
+                original_size: Some("10".into()),
+                size_matched: Some("0".into()),
+                associate_trades: Vec::new(),
+            };
+            account
+                .apply_authoritative_order_audit("a-cancelled", OrderStatus::Cancelled, &audit)
+                .unwrap();
+            for status in [
+                OrderStatus::Accepted,
+                OrderStatus::PartiallyFilled,
+                OrderStatus::Accepted,
+            ] {
+                assert_eq!(
+                    account.mark_order_status_effective("a-cancelled", status),
+                    Some(OrderStatus::Cancelled)
+                );
+                let order = account.order("a-cancelled").unwrap();
+                assert_eq!(order.terminal_matched_quantity, Some(0.0));
+                assert!(order.terminal_trade_ids_authoritative);
+                assert!(order.terminal_trade_ids.is_empty());
+                assert_eq!((order.reserved_cash, order.reserved_quantity), (0.0, 0.0));
+                assert_eq!(
+                    account.instance_snapshot("b").unwrap().reserved_cash,
+                    other_reserved
+                );
+            }
+        }
     }
 
     #[test]
@@ -22996,7 +23162,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_after_cancelled_restores_remaining_reservation_atomically() {
+    fn accepted_after_cancelled_keeps_terminal_audit_and_does_not_restore_reservation() {
         let account = seeded_account();
         account
             .reserve_order(
@@ -23027,14 +23193,129 @@ mod tests {
 
         assert_eq!(
             account.mark_order_status_effective("a-resurrect", OrderStatus::Accepted),
-            Some(OrderStatus::Accepted),
+            Some(OrderStatus::Cancelled),
         );
         let restored = account.order("a-resurrect").unwrap();
-        assert_eq!(restored.status, OrderStatus::Accepted);
-        assert_eq!(restored.terminal_matched_quantity, None);
-        assert!((restored.reserved_cash - 3.3).abs() < 1e-12);
-        assert!((account.instance_snapshot("a").unwrap().reserved_cash - 3.3).abs() < 1e-12);
+        assert_eq!(restored.status, OrderStatus::Cancelled);
+        assert_eq!(restored.terminal_matched_quantity, Some(4.0));
+        assert_eq!(restored.reserved_cash, 0.0);
+        assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 0.0);
+        for status in [OrderStatus::PartiallyFilled, OrderStatus::Accepted] {
+            assert_eq!(
+                account.mark_order_status_effective("a-resurrect", status),
+                Some(OrderStatus::Cancelled)
+            );
+        }
+        // Private confirmation remains idempotent without reopening the
+        // cancelled remainder. Reversible failure is covered separately.
+        for status in ["CONFIRMED", "CONFIRMED"] {
+            account
+                .apply_trade_transition(
+                    "trade-resurrect",
+                    status,
+                    "a-resurrect",
+                    "oid-resurrect",
+                    "UP",
+                    Side::Buy,
+                    4.0,
+                    0.5,
+                )
+                .unwrap();
+            assert_eq!(
+                account.order("a-resurrect").unwrap().status,
+                OrderStatus::Cancelled
+            );
+            assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, 0.0);
+        }
         assert_eq!(account.monitoring_snapshot().recovery_pending_orders, 0);
+    }
+
+    #[test]
+    fn cancelled_remainder_stays_closed_through_late_mined_failure_reversal() {
+        for side in [Side::Buy, Side::Sell] {
+            let account = seeded_account();
+            let before = account.instance_snapshot("a").unwrap();
+            let sibling = account.instance_snapshot("b").unwrap();
+            account
+                .reserve_order(
+                    "a",
+                    "a-late-failure",
+                    "oid-late-failure",
+                    "UP",
+                    side,
+                    10.0,
+                    0.5,
+                    0,
+                )
+                .unwrap();
+            account.mark_cancelled_pending_audit("a-late-failure");
+            for status in ["MATCHED", "MINED", "FAILED", "FAILED", "MINED"] {
+                let result = account.apply_trade_transition_with_context(
+                    "trade-late-failure",
+                    status,
+                    "a-late-failure",
+                    "oid-late-failure",
+                    "UP",
+                    side,
+                    4.0,
+                    0.5,
+                    true,
+                    1,
+                );
+                assert!(
+                    result.ownership().is_some(),
+                    "{side:?} {status}: {result:?}"
+                );
+                assert_eq!(
+                    account.mark_order_status_effective(
+                        "a-late-failure",
+                        OrderStatus::PartiallyFilled
+                    ),
+                    Some(OrderStatus::Cancelled)
+                );
+                assert_eq!(
+                    account.mark_order_status_effective("a-late-failure", OrderStatus::Accepted),
+                    Some(OrderStatus::Cancelled)
+                );
+                if status == "MATCHED"
+                    || status == "MINED"
+                        && account.order("a-late-failure").unwrap().filled_quantity > 0.0
+                {
+                    let current = account.instance_snapshot("a").unwrap();
+                    let sign = if side == Side::Buy { 1.0 } else { -1.0 };
+                    assert_eq!(current.cash, before.cash - sign * 2.0);
+                    assert_eq!(current.positions["UP"], before.positions["UP"] + sign * 4.0);
+                }
+            }
+            let after = account.instance_snapshot("a").unwrap();
+            assert_eq!(after.cash, before.cash);
+            assert_eq!(after.positions["UP"], before.positions["UP"]);
+            assert_eq!(
+                account.order("a-late-failure").unwrap().filled_quantity,
+                0.0
+            );
+            assert_eq!(
+                account.order("a-late-failure").unwrap().status,
+                OrderStatus::Cancelled
+            );
+            let audit = AuthoritativeOrderAudit {
+                original_size: Some("10".into()),
+                size_matched: Some("4".into()),
+                associate_trades: vec!["trade-late-failure".into()],
+            };
+            account
+                .apply_authoritative_order_audit("a-late-failure", OrderStatus::Cancelled, &audit)
+                .unwrap();
+            assert!(account.terminal_order_audit_complete("a-late-failure"));
+            let released = account.order("a-late-failure").unwrap();
+            assert_eq!(
+                (released.reserved_cash, released.reserved_quantity),
+                (0.0, 0.0)
+            );
+            let sibling_after = account.instance_snapshot("b").unwrap();
+            assert_eq!(sibling_after.cash, sibling.cash);
+            assert_eq!(sibling_after.positions, sibling.positions);
+        }
     }
 
     #[test]
@@ -26820,25 +27101,20 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             wall_clock_ms(),
         ));
         {
-            let account = SharedAccount::new_persistent("settlement-retire-restart", &path).unwrap();
+            let account =
+                SharedAccount::new_persistent("settlement-retire-restart", &path).unwrap();
             account.register_instance("btc", 1.0);
             account
                 .register_token_interest("btc", "btc-event", "BTC-WIN", "BTC-LOSE")
                 .unwrap();
             account
-                .apply_physical_snapshot(
-                    100.0,
-                    HashMap::from([("BTC-WIN".into(), 30.0)]),
-                )
+                .apply_physical_snapshot(100.0, HashMap::from([("BTC-WIN".into(), 30.0)]))
                 .unwrap();
             account
                 .record_settlement_and_retire(
                     "btc",
                     "btc-event",
-                    &HashMap::from([
-                        ("BTC-WIN".into(), 1.0),
-                        ("BTC-LOSE".into(), 0.0),
-                    ]),
+                    &HashMap::from([("BTC-WIN".into(), 1.0), ("BTC-LOSE".into(), 0.0)]),
                 )
                 .unwrap();
             account.flush_persistence(Duration::from_secs(2)).unwrap();
@@ -28345,6 +28621,129 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         let error = SharedAccount::new_persistent("invalid", &path).unwrap_err();
         assert!(error.contains("invalid account ledger"), "{error}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ended_mixed_terminal_audit_survives_stale_partial_status_on_restart() {
+        let _guard = persistence_test_guard();
+        let account = SharedAccount::new("mixed-ended-restart");
+        account.register_instance("maker", 1.0);
+        account
+            .apply_physical_snapshot(100.0, HashMap::from([("UP".into(), 100.0)]))
+            .unwrap();
+        let coid = "btc01-1789317081690";
+        account
+            .reserve_order("maker", coid, "oid-mixed", "UP", Side::Sell, 16.0, 0.63, 0)
+            .unwrap();
+        for (id, quantity, terminal) in [
+            ("confirmed-a", 5.0, "CONFIRMED"),
+            ("failed", 8.596826, "FAILED"),
+            ("confirmed-b", 2.4, "CONFIRMED"),
+        ] {
+            for status in ["MATCHED", "MINED", terminal] {
+                assert!(account
+                    .apply_trade_transition_with_context(
+                        id,
+                        status,
+                        coid,
+                        "oid-mixed",
+                        "UP",
+                        Side::Sell,
+                        quantity,
+                        0.63,
+                        true,
+                        1
+                    )
+                    .ownership()
+                    .is_some());
+            }
+        }
+        let audit = AuthoritativeOrderAudit {
+            original_size: Some("16".into()),
+            size_matched: Some("15.996826".into()),
+            associate_trades: vec!["confirmed-a".into(), "failed".into(), "confirmed-b".into()],
+        };
+        account
+            .apply_authoritative_order_audit(coid, OrderStatus::Filled, &audit)
+            .unwrap();
+        account
+            .retain_settled_event_audit("maker", "ended", &["UP".into()])
+            .unwrap();
+        let mut state = account.read_cold_state(Clone::clone);
+        state.orders.get_mut(coid).unwrap().status = OrderStatus::PartiallyFilled;
+        assert!((state.orders[coid].filled_quantity - 7.4).abs() < 1e-8);
+        assert_eq!(state.orders[coid].reserved_quantity, 0.0);
+        assert!(state.trades["failed"].failure_reconciled);
+        let before = state.instances["maker"].clone();
+        for invalid in 0..5 {
+            let mut incomplete = state.clone();
+            match invalid {
+                0 => incomplete.settled_audit_references.clear(),
+                1 => {
+                    incomplete.trades.remove("confirmed-a");
+                }
+                2 => {
+                    incomplete
+                        .trades
+                        .get_mut("failed")
+                        .unwrap()
+                        .failure_reconciled = false
+                }
+                3 => incomplete.orders.get_mut(coid).unwrap().reserved_quantity = 8.6,
+                _ => {
+                    incomplete
+                        .trades
+                        .get_mut("confirmed-a")
+                        .unwrap()
+                        .ownership
+                        .status = "MINED".into()
+                }
+            }
+            assert!(
+                !normalize_proven_ended_terminal_orders(&mut incomplete),
+                "invalid proof {invalid}"
+            );
+            assert_eq!(incomplete.orders[coid].status, OrderStatus::PartiallyFilled);
+        }
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-mixed-ended-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms()
+        ));
+        for allow_query_repair in [false, true] {
+            write_persisted_account(
+                &path,
+                &PersistedAccount {
+                    version: PERSISTENCE_VERSION,
+                    account_id: "mixed-ended-restart".into(),
+                    persistence_generation: 0,
+                    state: state.clone(),
+                },
+            )
+            .unwrap();
+            let restored = if allow_query_repair {
+                SharedAccount::new_persistent_for_query_repair("mixed-ended-restart", &path)
+            } else {
+                SharedAccount::new_persistent("mixed-ended-restart", &path)
+            }
+            .unwrap();
+            let order = restored.order(coid).unwrap();
+            assert_eq!(order.status, OrderStatus::Filled);
+            assert_eq!(order.terminal_matched_quantity, Some(15.996826));
+            assert_eq!(
+                order.terminal_trade_ids,
+                ["confirmed-a", "confirmed-b", "failed"]
+            );
+            assert_eq!((order.reserved_cash, order.reserved_quantity), (0.0, 0.0));
+            assert!(restored.terminal_order_audit_complete(coid));
+            assert!(restored.startup_query_repair_pending_order_ids().is_empty());
+            assert_eq!(restored.monitoring_snapshot().recovery_pending_orders, 0);
+            let after = restored.instance_snapshot("maker").unwrap();
+            assert_eq!(after.cash, before.cash);
+            assert_eq!(after.positions, before.positions);
+            drop(restored);
+            remove_persistence_test_files(&path);
+        }
     }
 
     #[test]
