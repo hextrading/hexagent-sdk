@@ -13,8 +13,13 @@ const PLACE_GATE_REJECTION_LOG_INTERVAL_NS: u64 = 1_000_000_000;
 pub(crate) const HTTP_SLOW_SUCCESS_THRESHOLD: Duration = Duration::from_millis(500);
 
 #[inline]
-fn http_success_requires_retirement(elapsed: Duration) -> bool {
-    elapsed >= HTTP_SLOW_SUCCESS_THRESHOLD
+fn http_success_requires_retirement(role: crate::http1_pool::Role, elapsed: Duration) -> bool {
+    // A successful historical query can legitimately exceed the order latency
+    // budget on its isolated pool. It is not evidence of a failed order route.
+    matches!(
+        role,
+        crate::http1_pool::Role::Fast | crate::http1_pool::Role::Cancel
+    ) && elapsed >= HTTP_SLOW_SUCCESS_THRESHOLD
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +45,21 @@ struct ConnectionFailureClusterGate {
 }
 
 impl ConnectionFailureClusterGate {
+    fn note_slow_success(
+        &self,
+        role: crate::http1_pool::Role,
+        slot: usize,
+        elapsed: Duration,
+        now_ns: impl FnOnce() -> u64,
+    ) -> Option<(u32, bool, bool)> {
+        if !http_success_requires_retirement(role, elapsed) {
+            return None;
+        }
+        let now_ns = now_ns();
+        let (connections, entered) = self.note(now_ns, role, slot);
+        Some((connections, entered, self.place_blocked(now_ns)))
+    }
+
     fn note(&self, now_ns: u64, role: crate::http1_pool::Role, slot: usize) -> (u32, bool) {
         loop {
             let started = self.window_started_ns.load(Ordering::Acquire);
@@ -111,28 +131,28 @@ pub(crate) fn note_http_connection_failure(
     }
 }
 
-/// A response can prove that its connection is alive and still be unsafe for
-/// reuse. Every slow-success retires the exact measured logical-slot
-/// generation; correlation across two independent connections additionally
-/// pauses fresh placements while cancel and reconcile continue on their
-/// isolated, idempotent lanes.
+/// A slow successful place/cancel can identify an unsafe order connection.
+/// Retire its measured generation and correlate order-lane evidence for the
+/// placement gate. Successful queries/recovery requests stay on their isolated
+/// pools without affecting order admission; actual transport failures still
+/// enter `note_http_connection_failure` for every role.
 pub(crate) fn note_http_slow_success(
     role: crate::http1_pool::Role,
     slot: usize,
     elapsed: Duration,
 ) -> bool {
-    if !http_success_requires_retirement(elapsed) {
+    let Some((connections, entered, placement_gate_active)) =
+        connection_failure_gate().note_slow_success(role, slot, elapsed, crate::types::now_ns)
+    else {
         return false;
-    }
-    let now_ns = crate::types::now_ns();
-    let (connections, entered) = connection_failure_gate().note(now_ns, role, slot);
+    };
     warn!(
         "[connection_health_slow_success] action=retire_connection_generation trigger_role={:?} trigger_slot={} elapsed_ms={} cluster_connections={} placement_gate_active={}",
         role,
         slot,
         elapsed.as_millis(),
         connections,
-        connections >= CONNECTION_FAILURE_CLUSTER_CONNECTIONS,
+        placement_gate_active,
     );
     if entered {
         warn!(
@@ -389,13 +409,123 @@ mod tests {
     }
 
     #[test]
-    fn every_slow_success_requests_exact_generation_retirement() {
-        assert!(!http_success_requires_retirement(
-            HTTP_SLOW_SUCCESS_THRESHOLD - Duration::from_nanos(1),
-        ));
-        assert!(http_success_requires_retirement(
-            HTTP_SLOW_SUCCESS_THRESHOLD,
-        ));
+    fn only_order_roles_retire_slow_success_at_the_existing_threshold() {
+        use crate::http1_pool::Role;
+        for role in [Role::Fast, Role::Cancel] {
+            assert!(!http_success_requires_retirement(
+                role,
+                HTTP_SLOW_SUCCESS_THRESHOLD - Duration::from_nanos(1),
+            ));
+            assert!(http_success_requires_retirement(
+                role,
+                HTTP_SLOW_SUCCESS_THRESHOLD,
+            ));
+        }
+        for role in [Role::Query, Role::Reconcile, Role::GapReplay] {
+            for elapsed in [HTTP_SLOW_SUCCESS_THRESHOLD, Duration::from_secs(30)] {
+                assert!(!http_success_requires_retirement(role, elapsed));
+            }
+        }
+    }
+
+    #[test]
+    fn historical_query_replay_neither_retires_nor_arms_place_gate() {
+        use crate::http1_pool::Role;
+        let gate = ConnectionFailureClusterGate::default();
+        // The production startup completed 21 audits with 19 pages each.
+        // Four rotating query slots must not create cross-connection evidence.
+        for page in 0..399 {
+            assert_eq!(
+                gate.note_slow_success(Role::Query, page % 4, Duration::from_millis(700), || {
+                    panic!("irrelevant success must not read the incident clock")
+                }),
+                None,
+            );
+        }
+        assert_eq!(gate.window_started_ns.load(Ordering::Acquire), 0);
+        assert_eq!(gate.connection_mask.load(Ordering::Acquire), 0);
+        assert_eq!(gate.place_blocked_until_ns.load(Ordering::Acquire), 0);
+        assert!(!gate.place_blocked(1));
+    }
+
+    #[test]
+    fn slow_query_roles_cannot_extend_or_clear_an_existing_failure_deadline() {
+        use crate::http1_pool::Role;
+        let gate = ConnectionFailureClusterGate::default();
+        // This is also the unchanged real timeout/transport evidence path.
+        gate.note(100, Role::Fast, 0);
+        assert_eq!(gate.note(101, Role::Cancel, 0), (2, true));
+        let deadline = 101 + CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS;
+        let mask = gate.connection_mask.load(Ordering::Acquire);
+        for role in [Role::Query, Role::Reconcile, Role::GapReplay] {
+            assert_eq!(
+                gate.note_slow_success(role, 1, Duration::from_secs(30), || deadline - 1),
+                None,
+            );
+            assert!(gate.place_blocked(deadline - 1));
+            assert_eq!(
+                gate.place_blocked_until_ns.load(Ordering::Acquire),
+                deadline
+            );
+            assert_eq!(gate.connection_mask.load(Ordering::Acquire), mask);
+            assert_eq!(gate.window_started_ns.load(Ordering::Acquire), 100);
+        }
+        assert!(!gate.place_blocked(deadline));
+    }
+
+    #[test]
+    fn slow_order_success_retirement_keeps_duplicate_and_deadline_semantics() {
+        use crate::http1_pool::Role;
+        let gate = ConnectionFailureClusterGate::default();
+        let slow = HTTP_SLOW_SUCCESS_THRESHOLD;
+        assert_eq!(
+            gate.note_slow_success(Role::Fast, 0, slow, || 100),
+            Some((1, false, false))
+        );
+        assert_eq!(
+            gate.note_slow_success(Role::Fast, 0, slow, || 101),
+            Some((1, false, false))
+        );
+        assert_eq!(
+            gate.note_slow_success(Role::Cancel, 0, slow, || 102),
+            Some((2, true, true))
+        );
+        let first_deadline = 102 + CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS;
+        // A new correlation window has one connection, but the earlier five-
+        // second gate remains active. This is the logged deadline state.
+        let next_window = 100 + CONNECTION_FAILURE_CLUSTER_WINDOW_NS + 1;
+        assert_eq!(
+            gate.note_slow_success(Role::Fast, 1, slow, || next_window),
+            Some((1, false, true)),
+        );
+        assert_eq!(
+            gate.place_blocked_until_ns.load(Ordering::Acquire),
+            first_deadline
+        );
+        assert_eq!(
+            gate.note_slow_success(Role::Cancel, 1, slow, || next_window + 1),
+            Some((2, false, true)),
+        );
+        let extended_deadline = next_window + 1 + CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS;
+        assert!(gate.place_blocked(extended_deadline - 1));
+        assert!(!gate.place_blocked(extended_deadline));
+        assert_eq!(
+            gate.note_slow_success(Role::Fast, 2, slow, || extended_deadline),
+            Some((1, false, false)),
+        );
+    }
+
+    #[test]
+    fn real_failures_on_query_roles_still_gate_and_extend_the_deadline() {
+        use crate::http1_pool::Role;
+        let gate = ConnectionFailureClusterGate::default();
+        // `note_http_connection_failure` feeds this method without the
+        // successful-response role filter, for both Timeout and Transport.
+        assert_eq!(gate.note(100, Role::Query, 0), (1, false));
+        assert_eq!(gate.note(101, Role::Reconcile, 0), (2, true));
+        assert_eq!(gate.note(102, Role::GapReplay, 0), (3, false));
+        assert!(gate.place_blocked(102 + CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS - 1));
+        assert!(!gate.place_blocked(102 + CONNECTION_FAILURE_CLUSTER_PLACE_BLOCK_NS));
     }
 
     #[test]
