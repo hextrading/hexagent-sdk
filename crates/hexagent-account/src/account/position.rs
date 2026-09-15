@@ -151,12 +151,87 @@ fn valid_pending_order_fields(
         && quantity > 0.0
 }
 
+/// Compensated sums keep long-running add/reverse streams from accumulating
+/// avoidable cancellation error. This is derived, strategy-owner-local state;
+/// it is never serialized or shared with another thread.
+#[derive(Default)]
+struct TradeSum {
+    sum: f64,
+    correction: f64,
+}
+
+impl TradeSum {
+    fn add(&mut self, value: f64) {
+        let next = self.sum + value;
+        self.correction += if self.sum.abs() >= value.abs() {
+            (self.sum - next) + value
+        } else {
+            (value - next) + self.sum
+        };
+        self.sum = next;
+    }
+
+    fn value(&self) -> f64 {
+        self.sum + self.correction
+    }
+}
+
+#[derive(Default)]
+struct SymbolTradeTotals {
+    quantity: TradeSum,
+    available_quantity: TradeSum,
+}
+
+/// One entry per traded symbol, not per historical trade. The ledger remains
+/// canonical; this optional index only accelerates live owner-thread queries.
+#[derive(Default)]
+struct IncrementalQueries {
+    cash: TradeSum,
+    available_cash: TradeSum,
+    symbols: HashMap<String, SymbolTradeTotals>,
+}
+
+impl IncrementalQueries {
+    fn transition(&mut self, trade: &TradeRecord, previous: Option<TradeStatus>) {
+        let live = |status: Option<TradeStatus>| {
+            u8::from(status.is_some_and(|s| s != TradeStatus::Failed)) as f64
+        };
+        let confirmed = |status| u8::from(status == Some(TradeStatus::Confirmed)) as f64;
+        let live_delta = live(Some(trade.status)) - live(previous);
+        let confirmed_delta = confirmed(Some(trade.status)) - confirmed(previous);
+        if live_delta == 0.0 && confirmed_delta == 0.0 {
+            return;
+        }
+        let (cash, quantity) = match trade.side {
+            Side::Buy => (-trade.size * trade.price, trade.size - trade.shares_fee),
+            Side::Sell => (trade.size * trade.price - trade.usdc_fee, -trade.size),
+        };
+        self.cash.add(cash * live_delta);
+        self.available_cash.add(cash * match trade.side {
+            Side::Buy => live_delta,
+            Side::Sell => confirmed_delta,
+        });
+        // A newly traded symbol may allocate here, alongside the existing
+        // ledger insertion on the private-event lane. Queries never allocate.
+        let totals = if let Some(totals) = self.symbols.get_mut(&trade.asset_id) {
+            totals
+        } else {
+            self.symbols.entry(trade.asset_id.clone()).or_default()
+        };
+        totals.quantity.add(quantity * live_delta);
+        totals.available_quantity.add(quantity * match trade.side {
+            Side::Buy => confirmed_delta,
+            Side::Sell => live_delta,
+        });
+    }
+}
+
 /// Ledger-backed position / balance tracker.
 ///
 /// The canonical state is the trade list keyed by `trade_id`. Positions and
-/// balance are computed by iterating that ledger, so status transitions
-/// (Matched → Mined → Confirmed / Failed) automatically flow through to
-/// downstream queries without any direct mutation of cached quantities.
+/// balance are computed by iterating that ledger by default. Live strategy
+/// owners can opt into incremental queries; admitted lifecycle transitions
+/// then update a compact index without rescanning historical trades.
 ///
 /// `init_balance` and `init_positions` represent pre-existing state at
 /// bootstrap (seeded from an API snapshot, or from a prior event's
@@ -179,6 +254,7 @@ pub struct PositionManager {
     synthetic_counter: u64,
     maker_volume: f64,
     taker_volume: f64,
+    incremental_queries: Option<IncrementalQueries>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -194,6 +270,27 @@ pub struct PositionManagerSnapshot {
 }
 
 impl PositionManager {
+    /// Enable history-independent balance/quantity queries for a live strategy
+    /// owner. Build once during startup or restore; repeated calls are a no-op.
+    ///
+    /// The owning strategy thread mutates the index together with the ledger.
+    /// No new queues, workers, locks, or cross-thread readers are introduced.
+    /// Reads allocate nothing; a private trade for a previously unseen symbol
+    /// adds one index entry. Pending-order locks still fold only active orders.
+    /// Snapshots retain their v1 canonical schema and must be opted in again
+    /// after restore. Default (backtest) summation order stays byte-identical;
+    /// live queries use compensated incremental sums and can differ by ULPs.
+    pub fn enable_incremental_queries(&mut self) {
+        if self.incremental_queries.is_some() {
+            return;
+        }
+        let mut queries = IncrementalQueries::default();
+        for trade in self.trades.values() {
+            queries.transition(trade, None);
+        }
+        self.incremental_queries = Some(queries);
+    }
+
     pub fn new() -> Self {
         Self {
             init_balance: 0.0,
@@ -203,6 +300,7 @@ impl PositionManager {
             synthetic_counter: 0,
             maker_volume: 0.0,
             taker_volume: 0.0,
+            incremental_queries: None,
         }
     }
 
@@ -216,6 +314,7 @@ impl PositionManager {
             synthetic_counter: 0,
             maker_volume: 0.0,
             taker_volume: 0.0,
+            incremental_queries: None,
         }
     }
 
@@ -366,6 +465,7 @@ impl PositionManager {
             synthetic_counter: snapshot.synthetic_counter,
             maker_volume: snapshot.maker_volume,
             taker_volume: snapshot.taker_volume,
+            incremental_queries: None,
         })
     }
 
@@ -412,6 +512,7 @@ impl PositionManager {
             synthetic_counter: snapshot.synthetic_counter,
             maker_volume: 0.0,
             taker_volume: 0.0,
+            incremental_queries: None,
         };
         let mut booked_by_order: HashMap<String, f64> = HashMap::new();
         for row in rows {
@@ -611,11 +712,20 @@ impl PositionManager {
 
         if let Some(existing) = self.trades.get_mut(trade_id) {
             existing.status = status;
+            if let Some(queries) = &mut self.incremental_queries {
+                // Use the canonical record, not a within-tolerance replay's
+                // size/fee fields, so Failed reverses exactly what was booked.
+                queries.transition(existing, prev_status);
+            }
         } else {
-            self.trades.insert(trade_id.to_string(), TradeRecord {
+            let trade = TradeRecord {
                 trade_id: trade_id.to_string(), asset_id: asset_id.to_string(), side,
                 size, price, status, is_maker, usdc_fee, shares_fee,
-            });
+            };
+            if let Some(queries) = &mut self.incremental_queries {
+                queries.transition(&trade, None);
+            }
+            self.trades.insert(trade_id.to_string(), trade);
         }
 
         // Mirror the same sign onto the per-asset volume tracker so it
@@ -809,6 +919,9 @@ impl PositionManager {
     /// (Confirmed + Matched + Mined on both sides). Used by the quoter where
     /// full balance visibility is desired.
     pub fn balance(&self) -> f64 {
+        if let Some(queries) = &self.incremental_queries {
+            return self.init_balance + queries.cash.value();
+        }
         let mut b = self.init_balance;
         for t in self.trades.values() {
             if t.status == TradeStatus::Failed { continue; }
@@ -824,6 +937,10 @@ impl PositionManager {
     /// (Confirmed + pending Matched/Mined). Used by the quoter to compute
     /// inventory-based reservation prices against the fullest view.
     pub fn get_quantity(&self, symbol: &str) -> f64 {
+        if let Some(queries) = &self.incremental_queries {
+            return self.initial_quantity(symbol)
+                + queries.symbols.get(symbol).map_or(0.0, |totals| totals.quantity.value());
+        }
         let mut q = self.init_positions.get(symbol).copied().unwrap_or(0.0);
         for t in self.trades.values() {
             if t.status == TradeStatus::Failed || t.asset_id != symbol { continue; }
@@ -891,6 +1008,10 @@ impl PositionManager {
     ///                − Σ open BUY orders' (price × remaining_qty)
     /// ```
     pub fn available_cash(&self) -> f64 {
+        if let Some(queries) = &self.incremental_queries {
+            return (self.init_balance + queries.available_cash.value()
+                - self.locked_buy_cost()).max(0.0);
+        }
         let mut b = self.init_balance;
         for t in self.trades.values() {
             match t.status {
@@ -923,6 +1044,12 @@ impl PositionManager {
     ///                     − Σ open SELL orders' remaining_qty
     /// ```
     pub fn available_inventory(&self, outcome_id: &str) -> f64 {
+        if let Some(queries) = &self.incremental_queries {
+            return (self.initial_quantity(outcome_id)
+                + queries.symbols.get(outcome_id)
+                    .map_or(0.0, |totals| totals.available_quantity.value())
+                - self.locked_sell_qty(outcome_id)).max(0.0);
+        }
         let mut q = self.init_positions.get(outcome_id).copied().unwrap_or(0.0);
         for t in self.trades.values() {
             if t.status == TradeStatus::Failed || t.asset_id != outcome_id { continue; }
@@ -1053,6 +1180,192 @@ impl PositionManager {
 mod tests {
     use super::*;
     use crate::account::shared_account::TradeOwnership;
+
+    fn assert_query_equivalence(scanned: &PositionManager, indexed: &PositionManager) {
+        let close = |left: f64, right: f64| {
+            assert!((left - right).abs() <= 1e-9, "{left} != {right}");
+        };
+        close(scanned.balance(), indexed.balance());
+        close(scanned.available_cash(), indexed.available_cash());
+        for symbol in ["TOK", "OTHER", "MISSING"] {
+            close(scanned.get_quantity(symbol), indexed.get_quantity(symbol));
+            close(scanned.available_inventory(symbol), indexed.available_inventory(symbol));
+        }
+        assert_eq!(scanned.snapshot(), indexed.snapshot(), "derived index must not affect durable state");
+    }
+
+    #[test]
+    fn live_query_index_matches_ledger_across_fee_lifecycles_and_replays() {
+        let initial = HashMap::from([("TOK".into(), 20.0), ("OTHER".into(), 5.0)]);
+        let mut scanned = PositionManager::with_initial_quantities(initial.clone(), 100.0);
+        let mut indexed = PositionManager::with_initial_quantities(initial, 100.0);
+        indexed.enable_incremental_queries();
+        for (id, symbol, side, maker, usdc_fee, shares_fee, final_status) in [
+            ("a", "TOK", Side::Buy, false, 0.0, 0.02, TradeStatus::Confirmed),
+            ("b", "OTHER", Side::Sell, false, 0.03, 0.0, TradeStatus::Confirmed),
+            ("c", "TOK", Side::Buy, false, 0.0, 0.01, TradeStatus::Failed),
+            ("d", "OTHER", Side::Sell, false, 0.01, 0.0, TradeStatus::Failed),
+            ("e", "TOK", Side::Buy, true, 0.0, 0.0, TradeStatus::Confirmed),
+            ("f", "OTHER", Side::Sell, true, 0.0, 0.0, TradeStatus::Failed),
+        ] {
+            for status in [TradeStatus::Matched, TradeStatus::Matched, TradeStatus::Mined,
+                TradeStatus::Matched, final_status, final_status, TradeStatus::Mined]
+            {
+                let apply = |pm: &mut PositionManager| {
+                    pm.upsert_trade(id, symbol, side, 2.0, 0.4, status, maker,
+                        usdc_fee, shares_fee, None)
+                };
+                assert_eq!(apply(&mut scanned), apply(&mut indexed));
+                assert_query_equivalence(&scanned, &indexed);
+            }
+        }
+        // Replay can begin at a terminal state without earlier WS stages.
+        for status in [TradeStatus::Failed, TradeStatus::Confirmed] {
+            let id = format!("direct-{status:?}");
+            for pm in [&mut scanned, &mut indexed] {
+                pm.upsert_trade(&id, "TOK", Side::Sell, 1.25, 0.5, status,
+                    false, 0.004, 0.0, None);
+            }
+            assert_query_equivalence(&scanned, &indexed);
+        }
+        // An unrelated owner must retain its own seed and untouched ledger.
+        let mut isolated = PositionManager::with_initial_quantities(HashMap::new(), 7.0);
+        isolated.enable_incremental_queries();
+        assert_eq!(isolated.balance(), 7.0);
+        assert_eq!(isolated.get_quantity("TOK"), 0.0);
+    }
+
+    #[test]
+    fn live_query_index_preserves_conservative_reservations_and_seed_adjustments() {
+        let initial = HashMap::from([("TOK".into(), 10.0)]);
+        let mut scanned = PositionManager::with_initial_quantities(initial.clone(), 100.0);
+        let mut indexed = PositionManager::with_initial_quantities(initial, 100.0);
+        indexed.enable_incremental_queries();
+        for pm in [&mut scanned, &mut indexed] {
+            pm.register_pending_order("buy", "TOK", Side::Buy, 0.4, 4.0);
+            pm.register_pending_order("sell", "TOK", Side::Sell, 0.5, 4.0);
+            pm.upsert_trade("buy-fill", "TOK", Side::Buy, 2.0, 0.4,
+                TradeStatus::Matched, false, 0.0, 0.02, None);
+            pm.upsert_trade("sell-fill", "TOK", Side::Sell, 2.0, 0.5,
+                TradeStatus::Matched, false, 0.01, 0.0, None);
+            pm.apply_private_trade_reservation("buy", 2.0, 1);
+            pm.apply_private_trade_reservation("sell", 2.0, 1);
+        }
+        assert_query_equivalence(&scanned, &indexed);
+        assert_eq!(indexed.get_quantity("TOK"), 9.98);
+        assert!((indexed.available_cash() - 98.4).abs() < 1e-9);
+        assert_eq!(indexed.available_inventory("TOK"), 6.0,
+            "unconfirmed buys must not free sell inventory");
+        for pm in [&mut scanned, &mut indexed] {
+            pm.sync_pending_from_update(&ou("buy", Side::Buy,
+                OrderStatus::CancelOrderTimeout, 0.0, 0.0));
+            pm.upsert_trade("sell-fill", "TOK", Side::Sell, 2.0, 0.5,
+                TradeStatus::Failed, false, 0.01, 0.0, None);
+            pm.apply_private_trade_reservation("sell", 2.0, -1);
+            pm.upsert_trade("buy-fill", "TOK", Side::Buy, 2.0, 0.4,
+                TradeStatus::Confirmed, false, 0.0, 0.02, None);
+            pm.adjust_balance(-3.5);
+            pm.adjust_quantity("TOK", -1.25);
+            pm.adjust_quantity("OTHER", 2.0);
+        }
+        assert_query_equivalence(&scanned, &indexed);
+        for pm in [&mut scanned, &mut indexed] {
+            pm.remove_pending_order("buy");
+            pm.register_pending_order("sell", "OTHER", Side::Buy, 0.1, 3.0);
+            pm.sync_pending_from_update(&ou("sell", Side::Buy,
+                OrderStatus::Cancelled, 0.0, 0.0));
+            pm.sync_pending_from_update(&ou("sell", Side::Sell,
+                OrderStatus::Accepted, 0.5, 2.0));
+        }
+        assert_query_equivalence(&scanned, &indexed);
+    }
+
+    #[test]
+    fn live_query_index_uses_canonical_economics_on_tolerated_replay() {
+        let mut pm = PositionManager::with_initial_quantities(HashMap::new(), 100.0);
+        pm.enable_incremental_queries();
+        pm.upsert_trade("a", "TOK", Side::Buy, 2.0, 0.4,
+            TradeStatus::Matched, false, 0.0, 0.02, None);
+        assert!(!pm.upsert_trade("a", "TOK", Side::Sell, 2.0, 0.4,
+            TradeStatus::Failed, false, 0.0, 0.02, None).applied);
+        assert!((pm.get_quantity("TOK") - 1.98).abs() < 1e-9);
+        assert!(pm.upsert_trade("a", "TOK", Side::Buy, 2.0 + 1e-9, 0.4 + 1e-10,
+            TradeStatus::Failed, false, 0.0, 0.02 + 1e-11, None).applied);
+        assert_eq!(pm.get_quantity("TOK"), 0.0);
+        assert_eq!(pm.balance(), 100.0);
+        assert_eq!(pm.available_cash(), 100.0);
+    }
+
+    #[test]
+    fn live_query_index_rebuilds_from_v1_restore_and_compensates_reversals() {
+        let mut scanned = PositionManager::with_initial_quantities(
+            HashMap::from([("TOK".into(), 5.0)]), 100.0);
+        for (id, side, status) in [
+            ("a", Side::Buy, TradeStatus::Matched),
+            ("b", Side::Sell, TradeStatus::Confirmed),
+            ("c", Side::Buy, TradeStatus::Failed),
+        ] {
+            scanned.upsert_trade(id, "TOK", side, 1.0, 0.4, status, true, 0.0, 0.0, None);
+        }
+        scanned.register_pending_order("pending", "TOK", Side::Sell, 0.4, 2.0);
+        let encoded = serde_json::to_string(&scanned.snapshot()).unwrap();
+        assert!(!encoded.contains("incremental"));
+        let mut indexed = PositionManager::from_snapshot(serde_json::from_str(&encoded).unwrap()).unwrap();
+        assert!(indexed.incremental_queries.is_none());
+        indexed.enable_incremental_queries();
+        indexed.enable_incremental_queries();
+        assert_query_equivalence(&scanned, &indexed);
+        for pm in [&mut scanned, &mut indexed] {
+            pm.upsert_trade("a", "TOK", Side::Buy, 1.0, 0.4,
+                TradeStatus::Confirmed, true, 0.0, 0.0, None);
+        }
+        assert_query_equivalence(&scanned, &indexed);
+
+        let mut sum = TradeSum::default();
+        sum.add(1e16);
+        for _ in 0..10_000 { sum.add(0.01); }
+        sum.add(-1e16);
+        assert!((sum.value() - 100.0).abs() < 1e-9);
+        for _ in 0..10_000 { sum.add(-0.01); }
+        assert!(sum.value().abs() < 1e-9);
+    }
+
+    #[test]
+    fn live_query_index_restores_booked_trades_and_rebuilds_revised_fees() {
+        let positions = HashMap::from([("TOK".into(), Position {
+            quantity: 14.95, avg_price: 0.4, current_value: 0.0,
+        })]);
+        let mut row = RestoredTrade {
+            ownership: TradeOwnership {
+                account_id: "acct".into(), instance_id: "instance".into(),
+                trade_key: "restored".into(), client_order_id: "order".into(),
+                order_id: "oid".into(), token_id: "TOK".into(), side: Side::Buy,
+                quantity: 5.0, price: 0.4, status: "MATCHED".into(),
+                order_slot: Default::default(),
+            },
+            booked: true, usdc_fee: 0.0, shares_fee: 0.05,
+            virtual_fee_booked: true, is_maker: false,
+            match_time_secs: 1, ledger_generation: 1,
+        };
+        let mut pm = PositionManager::with_positions_and_restored_trades(
+            positions, 98.0, [row.clone()]);
+        pm.enable_incremental_queries();
+        assert_eq!(pm.available_inventory("TOK"), 10.0);
+        assert_eq!(pm.balance(), 98.0);
+        assert!(pm.upsert_trade("restored", "TOK", Side::Buy, 5.0, 0.4,
+            TradeStatus::Confirmed, false, 0.0, 0.05, None).applied);
+        assert!((pm.available_inventory("TOK") - 14.95).abs() < 1e-9);
+        // Authoritative late-fee reconciliation replaces the derived ledger
+        // from its immutable baseline, rather than mutating terminal economics.
+        row.ownership.status = "CONFIRMED".into();
+        row.shares_fee = 0.08;
+        let mut revised = PositionManager::rebuild_from_snapshot_baseline(pm.snapshot(), [row]).unwrap();
+        assert!(revised.incremental_queries.is_none());
+        revised.enable_incremental_queries();
+        assert!((revised.get_quantity("TOK") - 14.92).abs() < 1e-9);
+        assert!((revised.available_inventory("TOK") - 14.92).abs() < 1e-9);
+        assert_eq!(revised.balance(), 98.0);
+    }
 
     fn upsert(pm: &mut PositionManager, id: &str, status: TradeStatus) -> UpsertResult {
         pm.upsert_trade(id, "TOKEN", Side::Buy, 5.0, 0.4, status, true, 0.0, 0.0, None)
