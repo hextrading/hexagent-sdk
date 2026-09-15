@@ -1504,6 +1504,64 @@ pub(crate) struct TrackedOrder {
     pub instance_id: String,
 }
 
+/// Reconciliation runs on the background worker. Capture an owned identity
+/// before any GET, trade replay or terminal cleanup can remove `open_orders`.
+/// The retained ownership route also resolves duplicate/restarted terminal
+/// audits; absence or contradictory identity never creates a default Buy.
+fn validated_reconcile_order_identity(
+    account_id: &str,
+    client_order_id: &str,
+    order_id: &str,
+    execution: &ExecutionStateSnapshot,
+    ownership: Option<&OrderOwnership>,
+) -> std::result::Result<TrackedOrder, &'static str> {
+    let ownership = ownership.ok_or("missing_order_ownership")?;
+    if ownership.account_id != account_id
+        || ownership.client_order_id != client_order_id
+        || ownership.token_id.is_empty()
+        || order_id.is_empty()
+        || normalize_order_id(&ownership.order_id) != normalize_order_id(order_id)
+    {
+        return Err("contradictory_order_ownership");
+    }
+    if execution
+        .coid_to_oid
+        .get(client_order_id)
+        .is_some_and(|oid| normalize_order_id(oid) != normalize_order_id(order_id))
+        || execution
+            .oid_to_coid
+            .get(&normalize_order_id(order_id))
+            .is_some_and(|coid| coid != client_order_id)
+        || execution
+            .coid_to_token
+            .get(client_order_id)
+            .is_some_and(|token| token != &ownership.token_id)
+    {
+        return Err("contradictory_order_route");
+    }
+    let mut identity = TrackedOrder {
+        order_slot: ownership.order_slot,
+        symbol: ownership.token_id.clone(),
+        side: ownership.side,
+        instance_id: ownership.instance_id.clone(),
+    };
+    if let Some(tracked) = execution.open_orders.get(client_order_id) {
+        if tracked.symbol != identity.symbol
+            || tracked.side != identity.side
+            || tracked.instance_id != identity.instance_id
+            || (tracked.order_slot != OrderSlot::UNASSIGNED
+                && identity.order_slot != OrderSlot::UNASSIGNED
+                && tracked.order_slot != identity.order_slot)
+        {
+            return Err("contradictory_open_order_identity");
+        }
+        if tracked.order_slot != OrderSlot::UNASSIGNED {
+            identity.order_slot = tracked.order_slot;
+        }
+    }
+    Ok(identity)
+}
+
 /// Logging-only correlation retained for the same lifetime as the settled
 /// event audit. Economic state remains authoritative in SharedAccount.
 #[derive(Debug, Clone)]
@@ -4991,6 +5049,28 @@ impl SharedState {
         Some(ownership)
     }
 
+    /// Cold worker lookup of an immutable identity retained through teardown.
+    fn reconcile_order_identity(
+        &self,
+        client_order_id: &str,
+        order_id: &str,
+    ) -> std::result::Result<TrackedOrder, &'static str> {
+        let execution = self.execution_snapshot();
+        // Runtime ownership survives terminal open-order removal. The durable
+        // fallback is restricted to this cold reconcile path, never cancel prep.
+        let ownership = self
+            .runtime_order_ownership
+            .get(order_id)
+            .or_else(|| self.account_state.order(client_order_id));
+        validated_reconcile_order_identity(
+            self.account_state.account_id(),
+            client_order_id,
+            order_id,
+            &execution,
+            ownership.as_ref(),
+        )
+    }
+
     /// Lock-free ownership probe for ambiguity checks on the private owner
     /// lane. A maker trade's top-level taker order normally belongs to another
     /// account; consulting the durable ledger for that negative lookup would
@@ -7533,7 +7613,7 @@ impl PolymarketTrade {
             reason,
         );
         OrderUpdate {
-            order_slot: Default::default(),
+            order_slot: ownership.order_slot,
             client_order_id: ownership.client_order_id.clone(),
             exchange: Exchange::Polymarket,
             symbol: ownership.token_id.clone(),
@@ -7569,7 +7649,7 @@ impl PolymarketTrade {
             .filter(|value| value.is_finite() && *value >= 0.0)
             .unwrap_or(ownership.filled_quantity);
         OrderUpdate {
-            order_slot: Default::default(),
+            order_slot: ownership.order_slot,
             client_order_id: ownership.client_order_id.clone(),
             exchange: Exchange::Polymarket,
             symbol: ownership.token_id.clone(),
@@ -7646,7 +7726,7 @@ impl PolymarketTrade {
             missing.evidence,
         );
         Some(OrderUpdate {
-            order_slot: Default::default(),
+            order_slot: missing.tracked.order_slot,
             client_order_id: missing.client_order_id.clone(),
             exchange: Exchange::Polymarket,
             symbol: missing.tracked.symbol.clone(),
@@ -7700,7 +7780,7 @@ impl PolymarketTrade {
                     coid,
                     (
                         TrackedOrder {
-                            order_slot: Default::default(),
+                            order_slot: order.order_slot,
                             symbol: order.token_id,
                             side: order.side,
                             instance_id: order.instance_id,
@@ -7916,7 +7996,7 @@ impl PolymarketTrade {
                 .account_state
                 .resolve_private_event_anomaly(&format!("order:{}", normalize_order_id(&order_id)));
             updates.push(OrderUpdate {
-                order_slot: Default::default(),
+                order_slot: tracked.order_slot,
                 client_order_id: coid,
                 exchange: Exchange::Polymarket,
                 symbol: tracked.symbol,
@@ -9060,6 +9140,85 @@ impl PolymarketTrade {
         )
     }
 
+    /// All completion branches consume the identity captured before network
+    /// I/O. Never re-read `open_orders` after committing a terminal audit.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_reconciled_cancel(
+        &self,
+        permit: Option<&crate::http1_pool::Permit>,
+        coid: &str,
+        order_id: &str,
+        identity: TrackedOrder,
+        status: OrderStatus,
+        status_str: &str,
+        order_audit: Option<&AuthoritativeOrderAudit>,
+        retry_diagnostic: Option<String>,
+        updates: &mut Vec<OrderUpdate>,
+    ) {
+        let status = self.shared.effective_cancel_attempt_status(coid, status);
+        let authoritative_terminal_audit = order_audit.filter(|_| {
+            matches!(status_str, "MATCHED" | "MATCHED_NOT_BROADCASTED" | "FILLED")
+                || status_str.starts_with("CANCELED")
+                || status_str.starts_with("CANCELLED")
+        });
+        if status == OrderStatus::Cancelled || status == OrderStatus::Filled {
+            if let Some(audit) = authoritative_terminal_audit {
+                self.shared
+                    .commit_authoritative_terminal_audit(coid, status, audit);
+                if !audit.associate_trades.is_empty() {
+                    updates.extend(self.reconcile_orphans_with_permit(
+                        permit,
+                        &[],
+                        &[],
+                        &audit.associate_trades,
+                    ));
+                }
+                if self
+                    .shared
+                    .account_state
+                    .terminal_order_audit_complete(coid)
+                {
+                    self.shared.remove_order_resolved_as(coid, status);
+                }
+            } else {
+                self.shared.remove_order_as(coid, status);
+            }
+            // Clear the defensive-retry counter on conclusive resolution
+            // so a later unrelated unknown-status arm for the same coid
+            // starts fresh.
+            self.shared.reconcile_attempts.clear_cancel(coid);
+        }
+        info!(
+            "[PolymarketTrade] Reconcile cancel coid={} orderID={} → {:?} (server={})",
+            coid, order_id, status, status_str
+        );
+        updates.push(OrderUpdate {
+            order_slot: identity.order_slot,
+            client_order_id: coid.to_string(),
+            exchange: Exchange::Polymarket,
+            symbol: identity.symbol,
+            side: identity.side,
+            exchange_order_id: Some(order_id.to_string()),
+            status,
+            liquidity: None,
+            filled_quantity: 0.0,
+            remaining_quantity: 0.0,
+            avg_fill_price: 0.0,
+            timestamp_ns: now_ns(),
+            exchange_event_timestamp_ns: None,
+            trade_id: None,
+            // Metadata is valid only when that same GET returned an
+            // authoritative terminal status. A LIVE snapshot followed by
+            // an ambiguous retry DELETE must trigger another audit.
+            order_audit: authoritative_terminal_audit.cloned(),
+            error: if matches!(status, OrderStatus::Cancelled | OrderStatus::Filled) {
+                Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string())
+            } else {
+                retry_diagnostic
+            },
+        });
+    }
+
     fn reconcile_orphans_with_permit(
         &self,
         permit: Option<&crate::http1_pool::Permit>,
@@ -9086,6 +9245,18 @@ impl PolymarketTrade {
                         warn!(
                             "[PolymarketTrade] Reconcile: placement coid={} has no order_hash — keeping as orphan",
                             coid,
+                        );
+                        continue;
+                    }
+                };
+                let identity = match self.shared.reconcile_order_identity(coid, oid) {
+                    Ok(identity) if identity.symbol == *symbol && identity.side == *side => {
+                        identity
+                    }
+                    result => {
+                        warn!(
+                            "[orphan_metric] reconcile_identity_invalid=1 coid={} orderID={} operation=placement reason={} lock_release=forbidden",
+                            coid, oid, result.err().unwrap_or("contradictory_placement_identity"),
                         );
                         continue;
                     }
@@ -9142,7 +9313,7 @@ impl PolymarketTrade {
                         );
                         self.shared.remove_order_as(coid, OrderStatus::Rejected);
                         updates.push(OrderUpdate {
-                            order_slot: Default::default(),
+                            order_slot: identity.order_slot,
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -9233,12 +9404,7 @@ impl PolymarketTrade {
                             .shared
                             .mark_order_live(
                                 coid,
-                                self.shared
-                                    .execution_snapshot()
-                                    .open_orders
-                                    .get(coid)
-                                    .map(|tracked| tracked.order_slot)
-                                    .unwrap_or_default(),
+                                identity.order_slot,
                                 symbol,
                                 *side,
                                 &ownership.instance_id,
@@ -9250,7 +9416,7 @@ impl PolymarketTrade {
                             coid, oid, status, effective_size_matched,
                         );
                         updates.push(OrderUpdate {
-                            order_slot: Default::default(),
+                            order_slot: identity.order_slot,
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -9301,7 +9467,7 @@ impl PolymarketTrade {
                             coid, oid,
                         );
                         updates.push(OrderUpdate {
-                            order_slot: Default::default(),
+                            order_slot: identity.order_slot,
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -9380,7 +9546,7 @@ impl PolymarketTrade {
                             coid, oid, matched,
                         );
                         updates.push(OrderUpdate {
-                            order_slot: Default::default(),
+                            order_slot: identity.order_slot,
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -9429,7 +9595,7 @@ impl PolymarketTrade {
                         );
                         self.shared.remove_order_as(coid, OrderStatus::Rejected);
                         updates.push(OrderUpdate {
-                            order_slot: Default::default(),
+                            order_slot: identity.order_slot,
                             client_order_id: coid.clone(),
                             exchange: Exchange::Polymarket,
                             symbol: symbol.clone(),
@@ -9484,6 +9650,16 @@ impl PolymarketTrade {
             if self.shared.in_http_425_backoff(coid) {
                 continue;
             }
+            let identity = match self.shared.reconcile_order_identity(coid, order_id) {
+                Ok(identity) => identity,
+                Err(reason) => {
+                    warn!(
+                        "[orphan_metric] reconcile_identity_invalid=1 coid={} orderID={} operation=cancel reason={} lock_release=forbidden",
+                        coid, order_id, reason,
+                    );
+                    continue;
+                }
+            };
             let fetch_result = self.fetch_order_by_id(coid, order_id, permit, false);
             // A 425 mid-iteration parks only this cancel orphan; unrelated
             // orders continue through the loop and can release their locks.
@@ -9675,79 +9851,17 @@ impl PolymarketTrade {
                     ORPHAN_RECONCILE_RETRY_AFTER_MS_PREFIX, backoff_ms, attempts,
                 ));
             }
-            let status = self.shared.effective_cancel_attempt_status(coid, status);
-            let authoritative_terminal_audit = order_audit.as_ref().filter(|_| {
-                matches!(
-                    status_str.as_str(),
-                    "MATCHED" | "MATCHED_NOT_BROADCASTED" | "FILLED"
-                ) || status_str.starts_with("CANCELED")
-                    || status_str.starts_with("CANCELLED")
-            });
-            if status == OrderStatus::Cancelled || status == OrderStatus::Filled {
-                if let Some(audit) = authoritative_terminal_audit {
-                    self.shared
-                        .commit_authoritative_terminal_audit(coid, status, audit);
-                    if !audit.associate_trades.is_empty() {
-                        updates.extend(self.reconcile_orphans_with_permit(
-                            permit,
-                            &[],
-                            &[],
-                            &audit.associate_trades,
-                        ));
-                    }
-                    if self
-                        .shared
-                        .account_state
-                        .terminal_order_audit_complete(coid)
-                    {
-                        self.shared.remove_order_resolved_as(coid, status);
-                    }
-                } else {
-                    self.shared.remove_order_as(coid, status);
-                }
-                // Clear the defensive-retry counter on conclusive resolution
-                // so a later unrelated unknown-status arm for the same coid
-                // starts fresh.
-                self.shared.reconcile_attempts.clear_cancel(coid);
-            }
-            info!(
-                "[PolymarketTrade] Reconcile cancel coid={} orderID={} → {:?} (server={})",
-                coid, order_id, status, status_str
-            );
-            let tracked = self
-                .shared
-                .execution_snapshot()
-                .open_orders
-                .get(coid)
-                .cloned();
-            let (symbol, side) = tracked
-                .map(|t| (t.symbol, t.side))
-                .unwrap_or_else(|| (String::new(), Side::Buy));
-            updates.push(OrderUpdate {
-                order_slot: Default::default(),
-                client_order_id: coid.clone(),
-                exchange: Exchange::Polymarket,
-                symbol,
-                side,
-                exchange_order_id: Some(order_id.clone()),
+            self.finish_reconciled_cancel(
+                permit,
+                coid,
+                order_id,
+                identity,
                 status,
-                liquidity: None,
-                filled_quantity: 0.0,
-                remaining_quantity: 0.0,
-                avg_fill_price: 0.0,
-                timestamp_ns: now_ns(),
-                exchange_event_timestamp_ns: None,
-                trade_id: None,
-                // Metadata is valid only when that same GET returned an
-                // authoritative terminal status. A LIVE snapshot followed by
-                // an ambiguous retry DELETE must trigger another audit.
-                order_audit: authoritative_terminal_audit.cloned(),
-                error: if matches!(status, OrderStatus::Cancelled | OrderStatus::Filled) {
-                    Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string())
-                } else {
-                    retry_diagnostic
-                },
-            });
+                &status_str,
+                order_audit.as_ref(),
+                retry_diagnostic,
+                &mut updates,
+            );
         }
 
         // The terminal order audit names the complete associated trade set.
@@ -12925,6 +13039,10 @@ impl ExchangeTrade for PolymarketTrade {
         "polymarket-live"
     }
 }
+
+#[cfg(test)]
+#[path = "trade_reconcile_identity_tests.rs"]
+mod reconcile_identity_tests;
 
 #[cfg(test)]
 #[path = "trade_retirement_tests.rs"]
