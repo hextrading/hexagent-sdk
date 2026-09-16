@@ -43,7 +43,9 @@ impl ClobVersion {
     /// Live wire support is V2 only; legacy fee accounting remains available
     /// through FeeSettlement for historical ledgers and recorded simulation.
     pub fn fee_settlement(self) -> FeeSettlement {
-        match self { Self::V2 => FeeSettlement::CollateralV2 }
+        match self {
+            Self::V2 => FeeSettlement::CollateralV2,
+        }
     }
 
     /// Parse the live protocol selector; unsupported versions fail closed.
@@ -2244,10 +2246,6 @@ enum AccountLifecycleJob {
     },
     DeferredLifecycle(DeferredLifecycleJob),
     PrivateCold(super::user_feed::PrivateColdCommand),
-    DiagnosePrivate {
-        record: serde_json::Value,
-        completion: crossbeam_channel::Sender<super::user_feed::ParsedPrivateEvent>,
-    },
 }
 
 #[derive(Debug)]
@@ -3103,6 +3101,9 @@ pub struct SharedState {
     /// Live private events bypass the root router; replay and compatibility
     /// traffic retain the existing root path.
     strategy_private_routes: ArcSwap<HashMap<u16, crossbeam_channel::Sender<RoutedOrderUpdate>>>,
+    /// Startup-published message endpoint. Terminal REST backfill must pass
+    /// through the same private owner that freezes live execution economics.
+    private_apply_lane: OnceLock<super::user_feed::PrivateApplyLane>,
     /// client_order_id → token_id (outcome asset). Written alongside the
     /// coid↔oid maps at registration and kept for the SAME lifetime, so the
     /// event-expiry sweep can purge an event's mappings by its outcome
@@ -3725,20 +3726,44 @@ impl SharedState {
         apply(&mut live_position)
     }
 
-    fn diagnose_private_record_on_owner(
+    pub(crate) fn install_private_apply_lane(
+        &self,
+        lane: super::user_feed::PrivateApplyLane,
+    ) -> std::result::Result<(), String> {
+        self.private_apply_lane
+            .set(lane)
+            .map_err(|_| "private apply lane already installed".to_string())
+    }
+
+    fn replay_terminal_record_on_private_owner(
         &self,
         record: serde_json::Value,
-    ) -> std::result::Result<super::user_feed::ParsedPrivateEvent, String> {
+    ) -> std::result::Result<super::user_feed::ReplayApplySummary, String> {
         if self.account_state.is_account_owner_thread() {
-            return Err("private reconcile diagnosis cannot wait on its own account owner".into());
+            return Err("terminal replay cannot wait on its own cold account owner".into());
         }
-        let (completion, result) = crossbeam_channel::bounded(1);
-        self.account_lifecycle_tx
-            .send(AccountLifecycleJob::DiagnosePrivate { record, completion })
-            .map_err(|_| "account owner lifecycle lane is closed".to_string())?;
-        result
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|error| format!("account owner private diagnosis timed out: {error}"))
+        let lane = self
+            .private_apply_lane
+            .get()
+            .cloned()
+            .ok_or_else(|| "terminal replay private owner is not installed".to_string())?;
+        let certificate = self.user_feed_health.recovery_certificate();
+        let generation = self.user_feed_health.current_recovery_delivery_generation()?;
+        if self.user_feed_health.recovery_certificate() != certificate {
+            return Err("terminal replay recovery context changed before enqueue".into());
+        }
+        // Existing background reconciliation already waited for cold diagnosis.
+        // Waiting here never blocks the quote/private/cold owner. If timeout
+        // follows enqueue, the accepted message retains ownership; later exact
+        // replay is idempotent and reservations stay subject to the audit.
+        async_rt::block_on_runtime(async move {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                lane.replay_terminal_record(record, generation, certificate),
+            )
+            .await
+            .map_err(|_| "terminal replay private owner timed out".to_string())?
+        })
     }
 
     fn take_request_buffer(&self) -> Option<BytesMut> {
@@ -3884,16 +3909,6 @@ impl SharedState {
                     private_replay,
                     command,
                 );
-            }
-            AccountLifecycleJob::DiagnosePrivate { record, completion } => {
-                let parsed = super::user_feed::parse_user_event_diagnosed_owned(
-                    &record,
-                    self,
-                    live_position,
-                    private_replay,
-                );
-                self.publish_live_position_watermark(live_position.last_match_time_secs());
-                let _ = completion.send(parsed);
             }
         }
     }
@@ -6716,6 +6731,7 @@ impl PolymarketTrade {
             runtime_order_ownership: recovered_runtime_ownership,
             strategy_owner_by_instance: ArcSwap::from_pointee(HashMap::new()),
             strategy_private_routes: ArcSwap::from_pointee(HashMap::new()),
+            private_apply_lane: OnceLock::new(),
             probe_order_ids: ProbeOrderIdRing::default(),
             probe_orphan_owner,
             auth,
@@ -7247,7 +7263,11 @@ impl PolymarketTrade {
                         terminal_trade_ids_authoritative: false,
                         price: identity.price,
                         fee_rate_bps,
-                        cash_fee_per_share: Some(if identity.side == Side::Buy { identity.price * fee_rate_bps as f64 / 10_000.0 } else { 0.0 }),
+                        cash_fee_per_share: Some(if identity.side == Side::Buy {
+                            identity.price * fee_rate_bps as f64 / 10_000.0
+                        } else {
+                            0.0
+                        }),
                         reserved_cash: reserve_cash,
                         reserved_quantity: reserve_quantity,
                         status: OrderStatus::Pending,
@@ -7870,7 +7890,10 @@ impl PolymarketTrade {
     /// feed reconnect, including associated trades missed by the stream.
     pub(crate) fn reconcile_runtime_open_orders_with_updates(&self) -> RuntimeOrderRecovery {
         let pass = self.reconcile_runtime_open_orders_pass();
-        RuntimeOrderRecovery { updates: pass.updates, errors: pass.errors }
+        RuntimeOrderRecovery {
+            updates: pass.updates,
+            errors: pass.errors,
+        }
     }
 
     /// Run a complete runtime order audit without discarding successful rows
@@ -10016,8 +10039,9 @@ impl PolymarketTrade {
         }
 
         // The terminal order audit names the complete associated trade set.
-        // Replay missing IDs through the same parser used by WS/gap recovery,
-        // leaving PositionManager as the sole dedup/accounting authority.
+        // Replay missing IDs through the same owner used by WS/gap recovery.
+        // That owner freezes economics once and delivers strategy messages;
+        // returning them again here would create a second delivery lane.
         for trade_id in pending_trade_ids {
             let reply = fetch_terminal_trade_records(trade_id, |path| {
                 permit
@@ -10119,20 +10143,15 @@ impl PolymarketTrade {
                         .entry("event_type".to_string())
                         .or_insert(serde_json::Value::String("trade".to_string()));
                 }
-                let parsed = match self.shared.diagnose_private_record_on_owner(record) {
-                    Ok(parsed) => parsed,
+                let applied = match self.shared.replay_terminal_record_on_private_owner(record) {
+                    Ok(applied) => applied,
                     Err(error) => {
                         rejection_reasons.push(error);
                         continue;
                     }
                 };
-                if let Some(reason) = parsed.rejection_reason {
-                    rejection_reasons.push(reason);
-                } else if parsed.valid_business_event && parsed.updates.is_empty() {
-                    validated_no_update += 1;
-                }
-                matched += parsed.updates.len();
-                updates.extend(parsed.updates);
+                validated_no_update += applied.durable_skips;
+                matched += applied.applied;
             }
             if !rejection_reasons.is_empty() {
                 warn!(
@@ -10143,13 +10162,13 @@ impl PolymarketTrade {
             }
             if rejection_reasons.is_empty() {
                 info!(
-                    "[orphan_metric] terminal_trade_backfill_received=1 account_id={} trade_id={} records={} updates={} validated_no_update={} lock_release=subject_to_order_audit",
+                    "[orphan_metric] terminal_trade_backfill_received=1 account_id={} trade_id={} records={} private_owner_events={} validated_no_update={} lock_release=subject_to_order_audit",
                     self.shared.account_state.account_id(), trade_id, record_count, matched, validated_no_update,
                 );
             }
             if matched > 0 {
                 debug!(
-                    "[orphan_metric] terminal_trade_backfill_updates={} trade_id={}",
+                    "[orphan_metric] terminal_trade_backfill_private_owner_events={} trade_id={}",
                     matched, trade_id,
                 );
             } else if rejection_reasons.is_empty() {
@@ -13773,7 +13792,7 @@ mod tests {
             terminal_trade_ids_authoritative: false,
             price: 0.5,
             fee_rate_bps: 0,
-                cash_fee_per_share: None,
+            cash_fee_per_share: None,
             reserved_cash: 5.0,
             reserved_quantity: 0.0,
             status: OrderStatus::Pending,
@@ -14047,7 +14066,7 @@ mod tests {
             terminal_trade_ids_authoritative: true,
             price: 0.5,
             fee_rate_bps: 0,
-                cash_fee_per_share: None,
+            cash_fee_per_share: None,
             reserved_cash: 1.5,
             reserved_quantity: 0.0,
             status: OrderStatus::Filled,
