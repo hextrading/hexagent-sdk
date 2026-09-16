@@ -3388,10 +3388,11 @@ fn clob_thread_cpu_ns() -> u64 {
 
 #[cfg(target_os = "linux")]
 struct ClobPerfTrigger {
-    price_change_apply_elapsed: Duration,
+    trigger_stage: &'static str,
+    triggering_stage_elapsed: Duration,
     total_handler_elapsed: Duration,
     /// The same in-place parser buffer that produced the tail. Ownership is
-    /// transferred only after a >=5 ms price-change apply tail, so ordinary
+    /// transferred only after a >=5 ms price-change or >=10 ms handler tail, so ordinary
     /// frames retain the zero-copy String -> Vec path and perform no capture
     /// allocation.
     frame: Vec<u8>,
@@ -3535,6 +3536,8 @@ fn clob_frame_structure_summary(frame: &[u8]) -> serde_json::Value {
 #[cfg(target_os = "linux")]
 struct ClobPerfRing {
     tx: crossbeam_channel::Sender<ClobPerfTrigger>,
+    last_trigger_ns: u64,
+    high_water: usize,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -3624,8 +3627,8 @@ impl ClobPerfRing {
                     let structure = clob_frame_structure_summary(&trigger.frame);
                     let replay = replay_clob_resident_tape(&trigger.frame, 1_024);
                     let summary = serde_json::json!({
-                        "trigger_stage": "price_change_apply",
-                        "triggering_stage_us": trigger.price_change_apply_elapsed.as_micros(),
+                        "trigger_stage": trigger.trigger_stage,
+                        "triggering_stage_us": trigger.triggering_stage_elapsed.as_micros(),
                         "total_handler_us": trigger.total_handler_elapsed.as_micros(),
                         "phases_us": {
                             "simd_json": trigger.phases.json_decode_ns / 1_000,
@@ -3657,14 +3660,15 @@ impl ClobPerfRing {
                         warn!("[clob_perf_frame] action=write_summary_failed output={} error={}", summary_output, error);
                     }
                     warn!(
-                        "[clob_perf_ring] action=frozen trigger_stage=price_change_apply tid={} frequency_hz={} output={} frame_output={} summary_output={} status={:?} triggering_stage_us={} total_handler_us={} frame_bytes={} simd_json_us={} book_apply_us={} price_change_apply_us={} event_construction_us={} parse_only_replay_n={} parse_only_replay_p50_us={} parse_only_replay_p99_us={} parse_only_replay_p999_us={} parse_only_replay_max_us={} parse_only_replay_cpu_p50_us={} parse_only_replay_cpu_p99_us={} parse_only_replay_cpu_p999_us={} parse_only_replay_cpu_max_us={} parse_only_replay_errors={}",
+                        "[clob_perf_ring] action=frozen trigger_stage={} tid={} frequency_hz={} output={} frame_output={} summary_output={} status={:?} triggering_stage_us={} total_handler_us={} frame_bytes={} simd_json_us={} book_apply_us={} price_change_apply_us={} event_construction_us={} parse_only_replay_n={} parse_only_replay_p50_us={} parse_only_replay_p99_us={} parse_only_replay_p999_us={} parse_only_replay_max_us={} parse_only_replay_cpu_p50_us={} parse_only_replay_cpu_p99_us={} parse_only_replay_cpu_p999_us={} parse_only_replay_cpu_max_us={} parse_only_replay_errors={}",
+                        trigger.trigger_stage,
                         tid,
                         frequency,
                         output,
                         frame_output,
                         summary_output,
                         status,
-                        trigger.price_change_apply_elapsed.as_micros(),
+                        trigger.triggering_stage_elapsed.as_micros(),
                         trigger.total_handler_elapsed.as_micros(),
                         trigger.frame.len(),
                         trigger.phases.json_decode_ns / 1_000,
@@ -3685,7 +3689,11 @@ impl ClobPerfRing {
                 }
             });
         match spawn {
-            Ok(_) => Some(Self { tx }),
+            Ok(_) => Some(Self {
+                tx,
+                last_trigger_ns: 0,
+                high_water: 0,
+            }),
             Err(error) => {
                 warn!("[clob_perf_ring] action=thread_spawn_failed error={error}");
                 None
@@ -3693,13 +3701,11 @@ impl ClobPerfRing {
         }
     }
 
-    fn trigger(&self, trigger: ClobPerfTrigger) {
-        static HIGH_WATER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let depth = self.tx.len().saturating_add(1);
-        HIGH_WATER.fetch_max(depth.min(2), Ordering::Relaxed);
+    fn trigger(&mut self, trigger: ClobPerfTrigger) {
+        self.high_water = self.high_water.max(self.tx.len().saturating_add(1).min(2));
         crate::latency::record_ns(
             "polymarket.ws.clob_perf_ring_queue_high_water",
-            HIGH_WATER.load(Ordering::Relaxed) as u64,
+            self.high_water as u64,
         );
         if self.tx.try_send(trigger).is_err() {
             crate::latency::record_ns("polymarket.ws.clob_perf_ring_overflow", 1);
@@ -3707,37 +3713,46 @@ impl ClobPerfRing {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn clob_perf_trigger_stage(
+    total: Duration,
+    phases: ClobFramePhaseTimings,
+) -> Option<(&'static str, Duration)> {
+    let apply = Duration::from_nanos(phases.price_change_apply_ns);
+    if apply >= CLOB_RARE_PRICE_CHANGE_APPLY_TAIL {
+        Some(("price_change_apply", apply))
+    } else if total >= CLOB_RARE_HANDLER_TAIL {
+        Some(("read_handler", total))
+    } else {
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn maybe_trigger_clob_perf(
-    ring: Option<&ClobPerfRing>,
+    ring: Option<&mut ClobPerfRing>,
     total_handler_elapsed: Duration,
     frame: Vec<u8>,
     phases: ClobFramePhaseTimings,
 ) {
-    static LAST_TRIGGER_NS: AtomicU64 = AtomicU64::new(0);
     const COOLDOWN_NS: u64 = 300_000_000_000;
-    let price_change_apply_elapsed = Duration::from_nanos(phases.price_change_apply_ns);
-    if price_change_apply_elapsed < CLOB_RARE_PRICE_CHANGE_APPLY_TAIL {
+    let Some((trigger_stage, triggering_stage_elapsed)) =
+        clob_perf_trigger_stage(total_handler_elapsed, phases)
+    else {
         return;
-    }
+    };
     let Some(ring) = ring else {
         return;
     };
-    let now_ns = now_ns();
-    loop {
-        let previous = LAST_TRIGGER_NS.load(Ordering::Acquire);
-        if previous != 0 && now_ns.saturating_sub(previous) < COOLDOWN_NS {
-            return;
-        }
-        if LAST_TRIGGER_NS
-            .compare_exchange(previous, now_ns, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            break;
-        }
+    let now = now_ns();
+    // Only this CLOB reader owns the cooldown; no process-global sampler.
+    if ring.last_trigger_ns != 0 && now.saturating_sub(ring.last_trigger_ns) < COOLDOWN_NS {
+        return;
     }
+    ring.last_trigger_ns = now;
     ring.trigger(ClobPerfTrigger {
-        price_change_apply_elapsed,
+        trigger_stage,
+        triggering_stage_elapsed,
         total_handler_elapsed,
         frame,
         phases,
@@ -3796,7 +3811,7 @@ impl ClobPerfRing {
 
 #[cfg(not(target_os = "linux"))]
 fn maybe_trigger_clob_perf(
-    _ring: Option<&ClobPerfRing>,
+    _ring: Option<&mut ClobPerfRing>,
     _total_handler_elapsed: Duration,
     _frame: Vec<u8>,
     _phases: ClobFramePhaseTimings,
@@ -3867,11 +3882,13 @@ impl ClobThreadResourceSampler {
 
     fn tail_delta(
         &self,
-        frame_start: ClobThreadResourceSnapshot,
+        parse_cpu_ns: u64,
         wall: Duration,
     ) -> (u64, u64, ClobThreadResourceSnapshot, u64) {
         let now = clob_thread_resource_snapshot();
-        let cpu_ns = now.cpu_ns.saturating_sub(frame_start.cpu_ns);
+        // CPU endpoint was captured with parse/apply, before forwarding.
+        // getrusage deltas still span the explicitly reported baseline frames.
+        let cpu_ns = parse_cpu_ns;
         let wall_ns = wall.as_nanos().min(u64::MAX as u128) as u64;
         let resource_delta = ClobThreadResourceSnapshot {
             cpu_ns,
@@ -4750,7 +4767,7 @@ async fn clob_ws_task(
     let mut next_lane_id = 1_u64;
     let mut diagnostic_sampler = ClobDiagnosticSampler::default();
     let mut thread_resource_sampler = ClobThreadResourceSampler::default();
-    let clob_perf_ring = ClobPerfRing::start();
+    let mut clob_perf_ring = ClobPerfRing::start();
     let mut parser = ResidentClobParser::new();
     let repair_generation_epoch = Arc::new(AtomicU64::new(0));
     let was_previously_subscribed = subscribed_once.load(Ordering::Relaxed);
@@ -5847,7 +5864,7 @@ async fn clob_ws_task(
                             {
                                 let (cpu_ns, preempted_ns, resources, resource_span_frames) =
                                     thread_resource_sampler.tail_delta(
-                                        resource_start,
+                                        parse_cpu_ns,
                                         parse_apply_elapsed,
                                     );
                                 if read_handler_elapsed >= CLOB_RARE_HANDLER_TAIL {
@@ -5897,7 +5914,7 @@ async fn clob_ws_task(
                                     });
                                 }
                                 maybe_trigger_clob_perf(
-                                    clob_perf_ring.as_ref(),
+                                    clob_perf_ring.as_mut(),
                                     read_handler_elapsed,
                                     frame_bytes,
                                     frame_phases,
@@ -8741,6 +8758,19 @@ impl ClobLocalBooks {
     }
 }
 
+/// `apply_price_change` already coalesces books with push_latest_order_book.
+/// Move that owned buffer into an empty frame batch instead of allocating and
+/// freeing a second Vec. Nonempty JSON-array batches retain newest-wire order.
+fn append_canonical_clob_events(target: &mut Vec<MarketEvent>, incoming: Vec<MarketEvent>) {
+    if target.is_empty() {
+        *target = incoming;
+    } else {
+        for event in incoming {
+            push_latest_order_book(target, event);
+        }
+    }
+}
+
 fn push_latest_order_book(events: &mut Vec<MarketEvent>, event: MarketEvent) {
     let MarketEvent::OrderBook(incoming) = &event else {
         events.push(event);
@@ -9016,10 +9046,12 @@ fn process_clob_frame_in_place_observed(
                     );
                 batch.bbo_change_snapshots =
                     batch.bbo_change_snapshots.saturating_add(bbo_snapshots);
-                batch.repair_tokens.extend(repair_tokens);
-                for event in events {
-                    push_latest_order_book(&mut batch.events, event);
+                if batch.repair_tokens.is_empty() {
+                    batch.repair_tokens = repair_tokens;
+                } else {
+                    batch.repair_tokens.extend(repair_tokens);
                 }
+                append_canonical_clob_events(&mut batch.events, events);
             }
             DecodedClobFrame::BestBidAsk(fields) => {
                 batch.wire.best_bid_asks = batch.wire.best_bid_asks.saturating_add(1);

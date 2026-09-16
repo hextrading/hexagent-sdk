@@ -3,6 +3,9 @@
 //! Implements `ExchangeTrade` for submitting and canceling orders via the
 //! Polymarket CLOB REST API, with EIP-712 order signing and HMAC request auth.
 
+mod http_phase_audit;
+use http_phase_audit::{HttpPhaseAudit, HttpPhaseContext, HttpPhaseRecord};
+
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hasher;
@@ -240,7 +243,12 @@ impl RuntimeOwnershipIndex {
     #[cfg(test)]
     fn clear(&self) {
         for slot in &self.slots {
-            slot.store(None);
+            // Match production retirement's sparse publication: storing None
+            // into all 65,536 empty slots repeatedly scans every ArcSwap reader
+            // accumulated by the full suite and can starve the test barrier.
+            if slot.load().is_some() {
+                slot.store(None);
+            }
         }
     }
 }
@@ -2095,6 +2103,7 @@ enum LifecycleTraceJob {
 
 #[derive(Debug)]
 enum AuditJob {
+    HttpPhase(HttpPhaseRecord),
     Attempt(AttemptAuditJob),
     Lifecycle(LifecycleTraceJob),
     PrivateDiagnostic(PrivateDiagnosticJob),
@@ -2748,7 +2757,10 @@ async fn execute_http_on(
     path: &str,
     headers: &super::auth::AuthHeaders,
     body: Bytes,
+    audit: &HttpPhaseAudit,
+    context: HttpPhaseContext,
 ) -> HttpReply {
+    let request_started_ns = now_ns();
     debug_assert_ne!(attempt_id, 0, "every HTTP dispatch requires an attempt ID");
     // Lazily derived — only the error branches need it, and parsing the
     // URL eagerly cost a full `Url::parse` + allocs on every request.
@@ -2782,7 +2794,8 @@ async fn execute_http_on(
     {
         Ok(response) => response,
         Err(error) => {
-            record_http1_phase_timings(client.role(), client.slot(), error.timings);
+            let response_received_ns = now_ns();
+            let timings = error.timings;
             let elapsed_ns = error.timings.total_ns;
             let attempted =
                 error.kind != crate::instrumented_http1::InstrumentedHttp1ErrorKind::InvalidRequest;
@@ -2810,10 +2823,31 @@ async fn execute_http_on(
                     &reply,
                 );
             }
+            audit.publish(HttpPhaseRecord {
+                context,
+                attempt_id,
+                role: client.role(),
+                slot: client.slot(),
+                request_started_ns,
+                response_received_ns,
+                completed_ns: now_ns(),
+                status: 0,
+                outcome: match error.kind {
+                    crate::instrumented_http1::InstrumentedHttp1ErrorKind::Timeout => "timeout",
+                    crate::instrumented_http1::InstrumentedHttp1ErrorKind::Transport => {
+                        "transport_error"
+                    }
+                    crate::instrumented_http1::InstrumentedHttp1ErrorKind::InvalidRequest => {
+                        "invalid_request"
+                    }
+                },
+                timings,
+            });
             return reply;
         }
     };
-    record_http1_phase_timings(client.role(), client.slot(), response.timings);
+    let response_received_ns = now_ns();
+    let timings = response.timings;
     client.note_transport_success();
     let elapsed_ns = response.timings.total_ns;
     let status = response.status;
@@ -2841,6 +2875,24 @@ async fn execute_http_on(
         status.as_u16(),
         &reply,
     );
+    audit.publish(HttpPhaseRecord {
+        context,
+        attempt_id,
+        role: client.role(),
+        slot: client.slot(),
+        request_started_ns,
+        response_received_ns,
+        completed_ns: now_ns(),
+        status: status.as_u16(),
+        outcome: if reply.is_ok() {
+            "ok"
+        } else if status.is_success() {
+            "invalid_response"
+        } else {
+            "http_error"
+        },
+        timings,
+    });
     reply
 }
 
@@ -2960,11 +3012,24 @@ async fn execute_http_with_cancel_connection_failure_hedge(
     path: &str,
     headers: &super::auth::AuthHeaders,
     body: Bytes,
+    audit: &HttpPhaseAudit,
+    context: HttpPhaseContext,
 ) -> HttpReply {
     let role = client.role();
     let slot = client.slot();
     let hedge_body = (method == reqwest::Method::DELETE).then(|| body.clone());
-    let first = execute_http_on(client.clone(), attempt_id, method, url, path, headers, body).await;
+    let first = execute_http_on(
+        client.clone(),
+        attempt_id,
+        method,
+        url,
+        path,
+        headers,
+        body,
+        audit,
+        context,
+    )
+    .await;
     if !cancel_connection_failure_hedge_allowed(method, &first) {
         return first;
     }
@@ -2991,6 +3056,12 @@ async fn execute_http_with_cancel_connection_failure_hedge(
         path,
         headers,
         hedge_body,
+        audit,
+        HttpPhaseContext {
+            leg: 1,
+            runtime_queue_ns: 0,
+            ..context
+        },
     )
     .await;
     drop(hedge_permit);
@@ -3318,6 +3389,7 @@ pub struct SharedState {
     /// the audit record and logs loudly, never an account/lifecycle mutation.
     /// This lane has no replay because attempt timing is operational telemetry.
     attempt_audit_tx: crossbeam_channel::Sender<AuditJob>,
+    http_phase_audit: Arc<HttpPhaseAudit>,
     shutdown_token: ShutdownToken,
     background_worker_control_tx: crossbeam_channel::Sender<BackgroundWorkerControl>,
     background_workers_joined: std::sync::atomic::AtomicBool,
@@ -4156,6 +4228,7 @@ impl SharedState {
             .spawn(move || {
                 let mut lifecycle_traces = HashMap::new();
                 let mut structured_recorder = OrderAttemptRecorder::new();
+                let mut last_flush = std::time::Instant::now();
                 // Audit formatting/export is explicitly lower priority than
                 // lifecycle/account mutation and has its own bounded lane.
                 crate::os_tune::pin_background("polymarket-execution-audit");
@@ -4163,6 +4236,24 @@ impl SharedState {
                     let Some(shared) = weak.upgrade() else {
                         break;
                     };
+                    if last_flush.elapsed() >= Duration::from_secs(1) {
+                        if let Err(error) = shared
+                            .http_phase_audit
+                            .write_metrics(
+                                &mut structured_recorder,
+                                shared.account_state.account_id(),
+                            )
+                            .and_then(|_| {
+                                structured_recorder
+                                    .writer
+                                    .as_mut()
+                                    .map_or(Ok(()), |writer| writer.flush())
+                            })
+                        {
+                            log::error!("[http_phase_audit] flush failed: {error}");
+                        }
+                        last_flush = std::time::Instant::now();
+                    }
                     if shutdown.is_finished() {
                         while let Ok(job) = rx.try_recv() {
                             shared.write_audit_job(
@@ -4170,6 +4261,21 @@ impl SharedState {
                                 &mut structured_recorder,
                                 job,
                             );
+                        }
+                        if let Err(error) = shared
+                            .http_phase_audit
+                            .write_metrics(
+                                &mut structured_recorder,
+                                shared.account_state.account_id(),
+                            )
+                            .and_then(|_| {
+                                structured_recorder
+                                    .writer
+                                    .as_mut()
+                                    .map_or(Ok(()), |writer| writer.flush())
+                            })
+                        {
+                            log::error!("[http_phase_audit] shutdown flush failed: {error}");
                         }
                         break;
                     }
@@ -4183,6 +4289,7 @@ impl SharedState {
                             Err(_) => break,
                         },
                         recv(shutdown_rx) -> _ => continue,
+                        default(Duration::from_secs(1)) => {},
                     }
                 }
             })
@@ -4707,6 +4814,14 @@ impl SharedState {
         job: AuditJob,
     ) {
         match job {
+            AuditJob::HttpPhase(job) => {
+                record_http1_phase_timings(job.role, job.slot, job.timings);
+                if let Err(error) =
+                    structured_recorder.write_record(&job.value(self.account_state.account_id()))
+                {
+                    log::error!("[http_phase_audit] write failed: {error}");
+                }
+            }
             AuditJob::Attempt(job) => self.write_attempt_audit(structured_recorder, job),
             AuditJob::Lifecycle(job) => {
                 self.write_lifecycle_trace(lifecycle_traces, structured_recorder, job)
@@ -6022,8 +6137,12 @@ impl SharedState {
             let iid_a = self.instance_id.clone();
             let account_id = self.account_state.account_id().to_string();
             let auth_failure_blocked = Arc::clone(&self.auth_failure_blocked);
+            let phase_audit = Arc::clone(&self.http_phase_audit);
+            let phase_kind = http_phase_audit::request_kind(rec_kind, stage);
             let enqueued_at = crate::latency::Instant::now();
             async_rt::order_handle().spawn(async move {
+                let runtime_queue_ns =
+                    enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 crate::latency::record(runtime_queue_stage, enqueued_at);
                 let network_started = crate::latency::Instant::now();
                 let reply = execute_http_with_cancel_connection_failure_hedge(
@@ -6035,6 +6154,13 @@ impl SharedState {
                     &path_owned,
                     &headers,
                     body_owned,
+                    &phase_audit,
+                    HttpPhaseContext {
+                        root_attempt_id: attempt_id,
+                        leg: 0,
+                        kind: phase_kind,
+                        runtime_queue_ns,
+                    },
                 )
                 .await;
                 observe_authenticated_reply_gate(
@@ -6172,9 +6298,13 @@ impl SharedState {
             let account_id = self.account_state.account_id().to_string();
             let auth_failure_blocked = Arc::clone(&self.auth_failure_blocked);
             let request_buffers = Arc::clone(&self.request_buffers);
+            let phase_audit = Arc::clone(&self.http_phase_audit);
+            let phase_kind = http_phase_audit::request_kind(rec_kind, stage);
             let enqueued_at = crate::latency::Instant::now();
             let timing_a = Arc::clone(&timing);
             async_rt::order_handle().spawn(async move {
+                let runtime_queue_ns =
+                    enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 crate::latency::record(runtime_queue_stage, enqueued_at);
                 let network_started = crate::latency::Instant::now();
                 // Keep one cheap Bytes handle so the unique allocation can be
@@ -6190,6 +6320,13 @@ impl SharedState {
                     &path_a,
                     &headers,
                     body_a,
+                    &phase_audit,
+                    HttpPhaseContext {
+                        root_attempt_id: attempt_id,
+                        leg: 0,
+                        kind: phase_kind,
+                        runtime_queue_ns,
+                    },
                 )
                 .await;
                 observe_authenticated_reply_gate(
@@ -6778,6 +6915,7 @@ impl PolymarketTrade {
             settled_gc_tx,
             account_maintenance_tx,
             account_lifecycle_tx,
+            http_phase_audit: Arc::new(HttpPhaseAudit::new(attempt_audit_tx.clone())),
             attempt_audit_tx,
             shutdown_token,
             background_worker_control_tx,
