@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 use log::{info, warn};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use sha2::{Digest, Sha256};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -34,9 +36,31 @@ struct ReplayRow {
 /// deliberately opt-in: complete tapes replay byte-for-byte as before.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReplayOptions {
+    pub time_policy: ReplayTimePolicy,
     pub bootstrap_binary_open: bool,
     pub binary_open_delay_ns: u64,
     pub binary_open_max_backfill_ns: u64,
+}
+
+/// Which clock partitions warmup and strategy replay. The strict policy uses
+/// recorded receive visibility for *all* rows, including instruments. Callers
+/// must use the same policy for adjacent warmup/replay windows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReplayTimePolicy {
+    #[default]
+    LegacySourceTime,
+    ArrivalTimeStrict,
+}
+
+impl ReplayOptions {
+    fn validate(self) -> Result<()> {
+        if self.time_policy == ReplayTimePolicy::ArrivalTimeStrict && self.bootstrap_binary_open {
+            return Err(anyhow!(
+                "ArrivalTimeStrict is incompatible with future binary-open bootstrap"
+            ));
+        }
+        Ok(())
+    }
 }
 
 const REPLAYER_BATCH_ROWS: usize = 8_192;
@@ -299,7 +323,16 @@ fn replay_cache_fingerprint(
     hash.update(source.as_bytes());
     hash.update(start_ns.to_le_bytes());
     hash.update(end_ns.to_le_bytes());
-    hash.update([options.bootstrap_binary_open as u8, 0, 0, 0, 0, 0, 0, 0]);
+    hash.update([
+        options.bootstrap_binary_open as u8,
+        options.time_policy as u8,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]);
     hash.update(options.binary_open_delay_ns.to_le_bytes());
     hash.update(options.binary_open_max_backfill_ns.to_le_bytes());
     for path in files {
@@ -448,20 +481,18 @@ impl MarketReplayer {
         let start_ns = start.timestamp_nanos_opt().unwrap_or(0) as u64;
         let end_ns = end.timestamp_nanos_opt().unwrap_or(0) as u64;
 
-        // Discover Parquet files and filter by time range
+        options.validate()?;
+        // A source-time filename cannot exclude late arrivals in strict mode.
+        // Inspect receive-time footer bounds across every discovered source file;
+        // unknown bounds are decoded and validated by the loader, never guessed.
+        let discovery_started = Instant::now();
         let all_files = discover_parquet_files(data_dir, exchange, symbol)?;
-        let start_secs = start_ns / 1_000_000_000;
-        let end_secs = end_ns / 1_000_000_000;
-        let files: Vec<PathBuf> = all_files
-            .into_iter()
-            .filter(|f| match extract_file_timestamp(f) {
-                Some((ts, duration)) => {
-                    let file_end = ts + duration;
-                    file_end > start_secs && ts < end_secs
-                }
-                None => true,
-            })
-            .collect();
+        let discovered_files = all_files.len();
+        let files = select_replay_files(all_files, start_ns, end_ns, options.time_policy)?;
+        if options.time_policy == ReplayTimePolicy::ArrivalTimeStrict {
+            info!("[Replayer] ArrivalTimeStrict discovery source={exchange}/{symbol} discovered_files={} selected_files={} footer_scan_ms={}",
+                discovered_files, files.len(), discovery_started.elapsed().as_millis());
+        }
 
         if files.is_empty() {
             return Err(anyhow!(
@@ -853,6 +884,388 @@ impl Drop for MarketReplayer {
     }
 }
 
+/// Only use trustworthy receive bounds to exclude a file. Unknown/null/zero
+/// provenance forces decoding (and a clear strict-mode error if invalid).
+fn row_group_receive_bounds(
+    group: &parquet::file::metadata::RowGroupMetaData,
+) -> Option<(u64, u64)> {
+    use parquet::file::statistics::Statistics;
+    let column = group
+        .columns()
+        .iter()
+        .find(|column| column.column_descr().path().string() == "local_timestamp_ns")?;
+    let Statistics::Int64(stats) = column.statistics()? else {
+        return None;
+    };
+    if stats.null_count_opt().unwrap_or(1) != 0 {
+        return None;
+    }
+    let (&min, &max) = (stats.min_opt()?, stats.max_opt()?);
+    if min <= 0 || max < min {
+        return None;
+    }
+    Some((min as u64, max as u64))
+}
+
+fn recorded_receive_bounds(path: &Path) -> Result<Option<(u64, u64)>> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
+    let mut bounds: Option<(u64, u64)> = None;
+    for group in builder.metadata().row_groups() {
+        if group.num_rows() == 0 {
+            continue;
+        }
+        let Some((min, max)) = row_group_receive_bounds(group) else {
+            return Ok(None);
+        };
+        bounds = Some(match bounds {
+            Some((previous_min, previous_max)) => (previous_min.min(min), previous_max.max(max)),
+            None => (min, max),
+        });
+    }
+    Ok(bounds)
+}
+
+fn select_replay_files(
+    all_files: Vec<PathBuf>,
+    start_ns: u64,
+    end_ns: u64,
+    policy: ReplayTimePolicy,
+) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for path in all_files {
+        let include = match policy {
+            ReplayTimePolicy::LegacySourceTime => match extract_file_timestamp(&path) {
+                Some((ts, duration)) => {
+                    ts + duration > start_ns / 1_000_000_000 && ts < end_ns / 1_000_000_000
+                }
+                None => true,
+            },
+            ReplayTimePolicy::ArrivalTimeStrict => match recorded_receive_bounds(&path) {
+                Ok(Some((min, max))) => max >= start_ns && min < end_ns,
+                Ok(None) => true,
+                Err(error) => {
+                    return Err(anyhow!(
+                        "cannot establish receive coverage for {}: {error}",
+                        path.display()
+                    ))
+                }
+            },
+        };
+        if include {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+// Strict replay uses bounded offline merge runs. It processes disjoint receive
+// intervals one at a time, so ordinary hourly/sharded tapes start after the first
+// interval, not after decoding the whole replay window. Overlapping filenames or
+// unknown footer bounds are merged before delivery; filenames are never clocks.
+const STRICT_MERGE_FAN_IN: usize = 32;
+// Merge output may temporarily double these bytes, plus one bounded event.
+// Ordinary non-overlapping row groups do not create any scratch runs.
+const STRICT_MAX_GROUP_RUN_BYTES: u64 = 512 * 1024 * 1024;
+struct StrictScratch {
+    directory: PathBuf,
+    next_run: usize,
+}
+impl StrictScratch {
+    fn new() -> Result<Self> {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "hexagent-arrival-replay-{}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            uuid::Uuid::new_v4(),
+        ));
+        std::fs::create_dir(&directory)?;
+        Ok(Self {
+            directory,
+            next_run: 0,
+        })
+    }
+    fn next_path(&mut self) -> PathBuf {
+        let path = self.directory.join(format!("{:010}.run", self.next_run));
+        self.next_run += 1;
+        path
+    }
+}
+impl Drop for StrictScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn write_strict_row(writer: &mut impl Write, row: &ReplayRow) -> Result<u64> {
+    let payload = rmp_serde::to_vec(&row.event)?;
+    if payload.is_empty() || payload.len() > REPLAY_CACHE_MAX_EVENT_BYTES {
+        return Err(anyhow!(
+            "invalid strict replay event size {}",
+            payload.len()
+        ));
+    }
+    writer.write_all(&row.local_timestamp_ns.to_le_bytes())?;
+    writer.write_all(&(payload.len() as u32).to_le_bytes())?;
+    writer.write_all(&payload)?;
+    Ok(12 + payload.len() as u64)
+}
+
+struct StrictRunReader {
+    reader: BufReader<File>,
+    payload: Vec<u8>,
+}
+impl StrictRunReader {
+    fn open(path: &Path) -> Result<Self> {
+        Ok(Self {
+            reader: BufReader::with_capacity(64 * 1024, File::open(path)?),
+            payload: Vec::new(),
+        })
+    }
+    fn next(&mut self) -> Result<Option<ReplayRow>> {
+        let mut prefix = [0_u8; 12];
+        if self.reader.read(&mut prefix[..1])? == 0 {
+            return Ok(None);
+        }
+        self.reader.read_exact(&mut prefix[1..])?;
+        let local_timestamp_ns = u64::from_le_bytes(prefix[..8].try_into().unwrap());
+        let length = u32::from_le_bytes(prefix[8..].try_into().unwrap()) as usize;
+        if length == 0 || length > REPLAY_CACHE_MAX_EVENT_BYTES {
+            return Err(anyhow!("invalid strict replay run event length {length}"));
+        }
+        self.payload.resize(length, 0);
+        self.reader.read_exact(&mut self.payload)?;
+        let event = rmp_serde::from_slice(&self.payload)?;
+        Ok(Some(ReplayRow {
+            local_timestamp_ns,
+            event,
+        }))
+    }
+}
+
+/// Contiguous input run order is the stable tie-breaker. Multi-pass merging
+/// therefore retains original discovered-file order and row order at equal ns.
+fn merge_strict_runs(
+    paths: &[PathBuf],
+    mut emit: impl FnMut(ReplayRow) -> Result<bool>,
+) -> Result<()> {
+    let mut readers = paths
+        .iter()
+        .map(|path| StrictRunReader::open(path))
+        .collect::<Result<Vec<_>>>()?;
+    let mut heads: Vec<Option<ReplayRow>> = (0..paths.len()).map(|_| None).collect();
+    let mut heap = BinaryHeap::with_capacity(paths.len());
+    for (index, reader) in readers.iter_mut().enumerate() {
+        if let Some(row) = reader.next()? {
+            heap.push(Reverse((row.local_timestamp_ns, index)));
+            heads[index] = Some(row);
+        }
+    }
+    while let Some(Reverse((_, index))) = heap.pop() {
+        if !emit(heads[index].take().expect("merge heap owns a head"))? {
+            return Ok(());
+        }
+        if let Some(row) = readers[index].next()? {
+            heap.push(Reverse((row.local_timestamp_ns, index)));
+            heads[index] = Some(row);
+        }
+    }
+    Ok(())
+}
+
+struct StrictSourceSlice {
+    path: PathBuf,
+    row_group: usize,
+    rows: usize,
+}
+
+fn strict_file_groups(
+    files: Vec<PathBuf>,
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<Vec<Vec<StrictSourceSlice>>> {
+    let mut spans = Vec::new();
+    for (file_index, path) in files.into_iter().enumerate() {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&path)?)?;
+        for (row_group, group) in builder.metadata().row_groups().iter().enumerate() {
+            let (min, max) = row_group_receive_bounds(group).unwrap_or((0, u64::MAX));
+            if max < start_ns || min >= end_ns || group.num_rows() == 0 {
+                continue;
+            }
+            spans.push((
+                min,
+                max,
+                (file_index, row_group),
+                StrictSourceSlice {
+                    path: path.clone(),
+                    row_group,
+                    rows: group.num_rows() as usize,
+                },
+            ));
+        }
+    }
+    spans.sort_by_key(|entry| (entry.0, entry.2));
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut last_max = 0;
+    for (min, max, index, slice) in spans {
+        if !current.is_empty() && min > last_max {
+            current.sort_by_key(|entry: &((usize, usize), StrictSourceSlice)| entry.0);
+            groups.push(current.drain(..).map(|entry| entry.1).collect());
+            last_max = 0;
+        }
+        last_max = last_max.max(max);
+        current.push((index, slice));
+    }
+    if !current.is_empty() {
+        current.sort_by_key(|entry| entry.0);
+        groups.push(current.into_iter().map(|entry| entry.1).collect());
+    }
+    Ok(groups)
+}
+
+fn stream_strict_replay_files(
+    files: Vec<PathBuf>,
+    start_ns: u64,
+    end_ns: u64,
+    source: &str,
+    options: ReplayOptions,
+    batch_tx: &crossbeam_channel::Sender<std::result::Result<ReplayBatch, String>>,
+    mut cache_writer: Option<ReplayCacheWriter>,
+) -> Result<()> {
+    let started = Instant::now();
+    let groups = strict_file_groups(files, start_ns, end_ns)?;
+    let group_count = groups.len();
+    let mut scratch = StrictScratch::new()?;
+    let mut loaded_rows = 0;
+    let mut max_group_scratch_bytes = 0;
+    let mut first_delivery_ms = None;
+    for group in groups {
+        // A disjoint row group fitting one bounded batch needs no scratch run.
+        if group.len() == 1 && group[0].rows <= REPLAYER_BATCH_ROWS {
+            let slice = &group[0];
+            let mut consumer_open = true;
+            stream_parquet_event_batches_selected(
+                &slice.path,
+                start_ns,
+                end_ns,
+                options.time_policy,
+                Some(vec![slice.row_group]),
+                |rows| {
+                    first_delivery_ms.get_or_insert_with(|| started.elapsed().as_millis());
+                    consumer_open = send_replay_rows(
+                        batch_tx,
+                        &slice.path,
+                        &mut loaded_rows,
+                        rows,
+                        &mut cache_writer,
+                    );
+                    consumer_open
+                },
+            )?;
+            if !consumer_open {
+                return Ok(());
+            }
+            continue;
+        }
+        let mut runs = Vec::new();
+        let mut group_scratch_bytes = 0;
+        for slice in &group {
+            let mut decode_error = None;
+            stream_parquet_event_batches_selected(
+                &slice.path,
+                start_ns,
+                end_ns,
+                options.time_policy,
+                Some(vec![slice.row_group]),
+                |mut rows| {
+                    rows.sort_by_key(|row| row.local_timestamp_ns);
+                    let run_path = scratch.next_path();
+                    let result = (|| -> Result<()> {
+                        let mut writer =
+                            BufWriter::with_capacity(64 * 1024, File::create(&run_path)?);
+                        for row in &rows {
+                            let bytes = write_strict_row(&mut writer, row)?;
+                            group_scratch_bytes += bytes;
+                            if group_scratch_bytes > STRICT_MAX_GROUP_RUN_BYTES {
+                                return Err(anyhow!("strict receive overlap exceeds {} scratch bytes; shard tape by receive time or provide valid row-group receive bounds", STRICT_MAX_GROUP_RUN_BYTES));
+                            }
+                        }
+                        writer.flush()?;
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        decode_error = Some(error);
+                        return false;
+                    }
+                    runs.push(run_path);
+                    true
+                },
+            )?;
+            if let Some(error) = decode_error {
+                return Err(error);
+            }
+        }
+        max_group_scratch_bytes = max_group_scratch_bytes.max(group_scratch_bytes);
+        while runs.len() > STRICT_MERGE_FAN_IN {
+            let mut next = Vec::new();
+            for chunk in runs.chunks(STRICT_MERGE_FAN_IN) {
+                let path = scratch.next_path();
+                let mut writer = BufWriter::with_capacity(64 * 1024, File::create(&path)?);
+                merge_strict_runs(chunk, |row| {
+                    write_strict_row(&mut writer, &row)?;
+                    Ok(true)
+                })?;
+                writer.flush()?;
+                drop(writer);
+                for old in chunk {
+                    std::fs::remove_file(old)?;
+                }
+                next.push(path);
+            }
+            runs = next;
+        }
+        let mut output = Vec::with_capacity(REPLAYER_BATCH_ROWS);
+        let mut consumer_open = true;
+        merge_strict_runs(&runs, |row| {
+            output.push(row);
+            if output.len() == REPLAYER_BATCH_ROWS {
+                first_delivery_ms.get_or_insert_with(|| started.elapsed().as_millis());
+                consumer_open = send_replay_rows(
+                    batch_tx,
+                    &scratch.directory,
+                    &mut loaded_rows,
+                    std::mem::replace(&mut output, Vec::with_capacity(REPLAYER_BATCH_ROWS)),
+                    &mut cache_writer,
+                );
+            }
+            Ok(consumer_open)
+        })?;
+        if consumer_open && !output.is_empty() {
+            first_delivery_ms.get_or_insert_with(|| started.elapsed().as_millis());
+            consumer_open = send_replay_rows(
+                batch_tx,
+                &scratch.directory,
+                &mut loaded_rows,
+                output,
+                &mut cache_writer,
+            );
+        }
+        if !consumer_open {
+            return Ok(());
+        }
+        for path in runs {
+            std::fs::remove_file(path)?;
+        }
+    }
+    info!("[Replayer] ArrivalTimeStrict source={} groups={} rows={} first_delivery_ms={} max_group_run_bytes={} merge_fan_in={}",
+        source, group_count, loaded_rows, first_delivery_ms.unwrap_or(0), max_group_scratch_bytes, STRICT_MERGE_FAN_IN);
+    if let Some(writer) = cache_writer {
+        writer.finish()?;
+    }
+    Ok(())
+}
+
 fn stream_replay_files(
     files: Vec<PathBuf>,
     start_ns: u64,
@@ -862,6 +1275,20 @@ fn stream_replay_files(
     batch_tx: crossbeam_channel::Sender<std::result::Result<ReplayBatch, String>>,
     mut cache_writer: Option<ReplayCacheWriter>,
 ) {
+    if options.time_policy == ReplayTimePolicy::ArrivalTimeStrict {
+        if let Err(error) = stream_strict_replay_files(
+            files,
+            start_ns,
+            end_ns,
+            source,
+            options,
+            &batch_tx,
+            cache_writer,
+        ) {
+            let _ = batch_tx.send(Err(format!("ArrivalTimeStrict source={source}: {error}")));
+        }
+        return;
+    }
     let candidate_files = files.len();
     let mut loaded_files = 0_usize;
     let mut loaded_rows = 0_u64;
@@ -869,33 +1296,39 @@ fn stream_replay_files(
         let mut consumer_open = true;
         let mut bootstrap_done = !options.bootstrap_binary_open;
         let mut bootstrap_rows = Vec::new();
-        let result = stream_parquet_event_batches(&path, start_ns, end_ns, |mut rows| {
-            if rows.is_empty() {
-                return true;
-            }
-            if !bootstrap_done {
-                bootstrap_rows.append(&mut rows);
-                if binary_open_bootstrap_ready(&bootstrap_rows)
-                    || bootstrap_rows.len() >= REPLAYER_BOOTSTRAP_MAX_ROWS
-                {
-                    let mut combined = std::mem::take(&mut bootstrap_rows);
-                    let repair = bootstrap_binary_event_open(&mut combined, options);
-                    log_binary_open_repair(source, &path, repair);
-                    bootstrap_done = true;
-                    consumer_open = send_replay_rows(
-                        &batch_tx,
-                        &path,
-                        &mut loaded_rows,
-                        combined,
-                        &mut cache_writer,
-                    );
+        let result = stream_parquet_event_batches(
+            &path,
+            start_ns,
+            end_ns,
+            options.time_policy,
+            |mut rows| {
+                if rows.is_empty() {
+                    return true;
                 }
-                return consumer_open;
-            }
-            consumer_open =
-                send_replay_rows(&batch_tx, &path, &mut loaded_rows, rows, &mut cache_writer);
-            consumer_open
-        });
+                if !bootstrap_done {
+                    bootstrap_rows.append(&mut rows);
+                    if binary_open_bootstrap_ready(&bootstrap_rows)
+                        || bootstrap_rows.len() >= REPLAYER_BOOTSTRAP_MAX_ROWS
+                    {
+                        let mut combined = std::mem::take(&mut bootstrap_rows);
+                        let repair = bootstrap_binary_event_open(&mut combined, options);
+                        log_binary_open_repair(source, &path, repair);
+                        bootstrap_done = true;
+                        consumer_open = send_replay_rows(
+                            &batch_tx,
+                            &path,
+                            &mut loaded_rows,
+                            combined,
+                            &mut cache_writer,
+                        );
+                    }
+                    return consumer_open;
+                }
+                consumer_open =
+                    send_replay_rows(&batch_tx, &path, &mut loaded_rows, rows, &mut cache_writer);
+                consumer_open
+            },
+        );
         if consumer_open && !bootstrap_rows.is_empty() {
             let mut combined = std::mem::take(&mut bootstrap_rows);
             let repair = bootstrap_binary_event_open(&mut combined, options);
@@ -1368,6 +1801,18 @@ fn stream_parquet_event_batches(
     path: &Path,
     start_ns: u64,
     end_ns: u64,
+    time_policy: ReplayTimePolicy,
+    emit: impl FnMut(Vec<ReplayRow>) -> bool,
+) -> Result<u64> {
+    stream_parquet_event_batches_selected(path, start_ns, end_ns, time_policy, None, emit)
+}
+
+fn stream_parquet_event_batches_selected(
+    path: &Path,
+    start_ns: u64,
+    end_ns: u64,
+    time_policy: ReplayTimePolicy,
+    row_groups: Option<Vec<usize>>,
     mut emit: impl FnMut(Vec<ReplayRow>) -> bool,
 ) -> Result<u64> {
     // Defensive size check before opening the parquet builder.
@@ -1384,6 +1829,11 @@ fn stream_parquet_event_batches(
     let file = std::fs::File::open(path)?;
     let builder =
         ParquetRecordBatchReaderBuilder::try_new(file)?.with_batch_size(REPLAYER_BATCH_ROWS);
+    let builder = if let Some(row_groups) = row_groups {
+        builder.with_row_groups(row_groups)
+    } else {
+        builder
+    };
     let reader = builder.build()?;
 
     let mut total_rows = 0_u64;
@@ -1443,10 +1893,24 @@ fn stream_parquet_event_batches(
         let (ts_arr, local_ts_arr, exchange_arr, etype_arr, symbol_arr) =
             match (ts_col, local_ts_col, exchange_col, etype_col, symbol_col) {
                 (Some(a), Some(b), Some(c), Some(d), Some(e)) => (a, b, c, d, e),
-                _ => continue, // missing required columns
+                _ if time_policy == ReplayTimePolicy::ArrivalTimeStrict => {
+                    return Err(anyhow!(
+                        "{}: missing required recorded timestamp/schema columns",
+                        path.display()
+                    ));
+                }
+                _ => continue, // legacy missing required columns
             };
 
         for i in 0..n {
+            if time_policy == ReplayTimePolicy::ArrivalTimeStrict
+                && (local_ts_arr.is_null(i) || local_ts_arr.value(i) == 0)
+            {
+                return Err(anyhow!(
+                    "{}: missing/null/zero recorded receive timestamp at batch row {i}",
+                    path.display()
+                ));
+            }
             let local_ts = local_ts_arr.value(i);
 
             let exchange_ts = ts_arr.value(i);
@@ -1468,7 +1932,13 @@ fn stream_parquet_event_batches(
             //   never saw the fx update, and no `[fx] usdt/usd` log
             //   fired. Filtering by event time fixes that semantically
             //   for any future-time-stamped backfill.
-            if event_type != "instrument" && (exchange_ts < start_ns || exchange_ts >= end_ns) {
+            let in_window = match time_policy {
+                ReplayTimePolicy::LegacySourceTime => {
+                    event_type == "instrument" || (exchange_ts >= start_ns && exchange_ts < end_ns)
+                }
+                ReplayTimePolicy::ArrivalTimeStrict => local_ts >= start_ns && local_ts < end_ns,
+            };
+            if !in_window {
                 continue;
             }
             let symbol = symbol_arr.value(i);
@@ -1650,16 +2120,326 @@ fn stream_parquet_event_batches(
 /// collection path.
 fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<ReplayRow>> {
     let mut rows = Vec::new();
-    stream_parquet_event_batches(path, start_ns, end_ns, |batch| {
-        rows.extend(batch);
-        true
-    })?;
+    stream_parquet_event_batches(
+        path,
+        start_ns,
+        end_ns,
+        ReplayTimePolicy::LegacySourceTime,
+        |batch| {
+            rows.extend(batch);
+            true
+        },
+    )?;
     Ok(rows)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_receive_fixture(
+        path: &Path,
+        entries: &[(u64, Option<u64>, f64)],
+        row_group_rows: usize,
+    ) {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp_ns", DataType::UInt64, false),
+            Field::new("local_timestamp_ns", DataType::UInt64, true),
+            Field::new("exchange", DataType::Utf8, false),
+            Field::new("event_type", DataType::Utf8, false),
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("bid_price", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(
+                    entries.iter().map(|e| e.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    entries.iter().map(|e| e.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(vec!["binance"; entries.len()])),
+                Arc::new(StringArray::from(vec!["quote"; entries.len()])),
+                Arc::new(StringArray::from(vec!["BTCUSDT"; entries.len()])),
+                Arc::new(Float64Array::from(
+                    entries.iter().map(|e| e.2).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_size(row_group_rows)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    fn receive_fixture_rows(
+        directory: &Path,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Result<Vec<(u64, u64, f64)>> {
+        let mut replay = MarketReplayer::new_with_options(
+            directory,
+            "binance",
+            "BTCUSDT",
+            DateTime::from_timestamp_nanos(start_ns as i64),
+            DateTime::from_timestamp_nanos(end_ns as i64),
+            ReplayOptions {
+                time_policy: ReplayTimePolicy::ArrivalTimeStrict,
+                ..ReplayOptions::default()
+            },
+        )?;
+        let mut rows = Vec::new();
+        while let Some((receive, event)) = replay.next_event()? {
+            let MarketEvent::Quote(quote) = event else {
+                panic!("expected quote")
+            };
+            assert_eq!(receive, quote.local_timestamp_ns);
+            rows.push((receive, quote.exchange_timestamp_ns, quote.bid_price));
+        }
+        Ok(rows)
+    }
+
+    #[test]
+    fn arrival_strict_partitions_adjacent_windows_by_receive_across_source_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = 1_789_307_400_000_000_000;
+        let prior = directory.path().join("binance/BTCUSDT/20260913_12.parquet");
+        let later = directory.path().join("binance/BTCUSDT/20260913_15.parquet");
+        // Filename/source-time exclusion would miss both directions. Equal
+        // receive messages and identical duplicate rows are legitimate inputs.
+        write_receive_fixture(
+            &prior,
+            &[
+                (base - 10, Some(base - 1), 1.0),
+                (base - 9, Some(base), 2.0),
+                (base - 9, Some(base), 2.0),
+                (base - 8, Some(base + 1), 3.0),
+            ],
+            2,
+        );
+        write_receive_fixture(
+            &later,
+            &[
+                (base + 10, Some(base - 2), 4.0),
+                (base + 11, Some(base), 5.0),
+                (base + 12, Some(base + 2), 6.0),
+            ],
+            2,
+        );
+        let warmup = receive_fixture_rows(directory.path(), base - 3, base).unwrap();
+        let replay = receive_fixture_rows(directory.path(), base, base + 3).unwrap();
+        let full = receive_fixture_rows(directory.path(), base - 3, base + 3).unwrap();
+        assert_eq!(
+            warmup,
+            vec![(base - 2, base + 10, 4.0), (base - 1, base - 10, 1.0)]
+        );
+        assert_eq!(
+            replay.iter().map(|r| r.2).collect::<Vec<_>>(),
+            vec![2.0, 2.0, 5.0, 3.0, 6.0]
+        );
+        assert_eq!([warmup, replay].concat(), full);
+        assert_eq!(full.len(), 7);
+    }
+
+    #[test]
+    fn arrival_strict_merges_receive_regressions_across_batches_and_row_groups() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = 1_789_307_400_000_000_000;
+        let count = REPLAYER_BATCH_ROWS * 2 + 17;
+        let entries = (0..count)
+            .map(|index| {
+                (
+                    base + index as u64,
+                    Some(base + (count - index) as u64),
+                    index as f64,
+                )
+            })
+            .collect::<Vec<_>>();
+        write_receive_fixture(
+            &directory.path().join("binance/BTCUSDT/20260913_13.parquet"),
+            &entries,
+            REPLAYER_BATCH_ROWS + 100,
+        );
+        let rows = receive_fixture_rows(directory.path(), base, base + count as u64 + 1).unwrap();
+        assert_eq!(rows.len(), count);
+        assert!(rows.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        assert_eq!(
+            rows[0],
+            (base + 1, base + count as u64 - 1, (count - 1) as f64)
+        );
+        assert_eq!(rows[count - 1], (base + count as u64, base, 0.0));
+    }
+
+    #[test]
+    fn arrival_strict_rejects_missing_receive_provenance_and_future_bootstrap() {
+        let base = 1_789_307_400_000_000_000;
+        for receive in [None, Some(0)] {
+            let directory = tempfile::tempdir().unwrap();
+            write_receive_fixture(
+                &directory.path().join("binance/BTCUSDT/20260913_13.parquet"),
+                &[(base, receive, 1.0)],
+                REPLAYER_BATCH_ROWS,
+            );
+            let error = receive_fixture_rows(directory.path(), base, base + 10).unwrap_err();
+            assert!(
+                error.to_string().contains("recorded receive timestamp"),
+                "{error}"
+            );
+        }
+        let error = ReplayOptions {
+            time_policy: ReplayTimePolicy::ArrivalTimeStrict,
+            bootstrap_binary_open: true,
+            ..ReplayOptions::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(error.to_string().contains("future binary-open bootstrap"));
+        ReplayOptions::default().validate().unwrap();
+    }
+
+    #[test]
+    fn arrival_strict_stable_ties_survive_multiple_merge_passes() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = 1_789_307_400_000_000_000;
+        let count = (STRICT_MERGE_FAN_IN + 1) * 128;
+        let entries = (0..count)
+            .map(|index| (base - index as u64, Some(base), index as f64))
+            .collect::<Vec<_>>();
+        write_receive_fixture(
+            &directory.path().join("binance/BTCUSDT/20260913_13.parquet"),
+            &entries,
+            128,
+        );
+        let rows = receive_fixture_rows(directory.path(), base, base + 1).unwrap();
+        assert_eq!(rows.len(), count);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(*row, (base, base - index as u64, index as f64));
+        }
+    }
+
+    #[test]
+    fn arrival_strict_instruments_obey_the_same_receive_cutoff() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("instruments.parquet");
+        let base = 1_789_307_400_000_000_000;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp_ns", DataType::UInt64, false),
+            Field::new("local_timestamp_ns", DataType::UInt64, false),
+            Field::new("exchange", DataType::Utf8, false),
+            Field::new("event_type", DataType::Utf8, false),
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("data_json", DataType::Utf8, false),
+        ]));
+        let json = serde_json::to_string(&MarketEvent::Instrument(binary_option(
+            "2026-09-13T13:50:00Z",
+        )))
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![base - 10; 3])),
+                Arc::new(UInt64Array::from(vec![base - 1, base, base + 1])),
+                Arc::new(StringArray::from(vec!["polymarket"; 3])),
+                Arc::new(StringArray::from(vec!["instrument"; 3])),
+                Arc::new(StringArray::from(vec!["up"; 3])),
+                Arc::new(StringArray::from(vec![json.as_str(); 3])),
+            ],
+        )
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let mut times = Vec::new();
+        for (start, end) in [(base - 1, base), (base, base + 2)] {
+            let mut window = Vec::new();
+            stream_parquet_event_batches(
+                &path,
+                start,
+                end,
+                ReplayTimePolicy::ArrivalTimeStrict,
+                |rows| {
+                    for row in rows {
+                        assert!(matches!(row.event, MarketEvent::Instrument(_)));
+                        window.push(row.local_timestamp_ns);
+                    }
+                    true
+                },
+            )
+            .unwrap();
+            times.push(window);
+        }
+        assert_eq!(times, vec![vec![base - 1], vec![base, base + 1]]);
+    }
+
+    #[test]
+    fn arrival_strict_missing_receive_column_is_an_error_not_an_empty_stream() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing_receive.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "timestamp_ns",
+            DataType::UInt64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt64Array::from(vec![100]))])
+                .unwrap();
+        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let error = stream_parquet_event_batches(
+            &path,
+            1,
+            200,
+            ReplayTimePolicy::ArrivalTimeStrict,
+            |_| true,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("missing required recorded timestamp/schema columns"));
+    }
+
+    #[test]
+    fn arrival_strict_cache_cannot_hit_a_legacy_source_filtered_entry() {
+        let files = Vec::new();
+        let legacy = replay_cache_fingerprint(
+            &files,
+            "binance/BTCUSDT",
+            100,
+            200,
+            ReplayOptions::default(),
+        );
+        let strict = replay_cache_fingerprint(
+            &files,
+            "binance/BTCUSDT",
+            100,
+            200,
+            ReplayOptions {
+                time_policy: ReplayTimePolicy::ArrivalTimeStrict,
+                ..ReplayOptions::default()
+            },
+        );
+        assert_ne!(legacy, strict);
+    }
 
     fn binary_option(start: &str) -> Instrument {
         Instrument::BinaryOption(BinaryOption {
@@ -1724,6 +2504,7 @@ mod tests {
             bootstrap_binary_open: true,
             binary_open_delay_ns: 20_000_000,
             binary_open_max_backfill_ns: 5_000_000_000,
+            ..ReplayOptions::default()
         };
 
         let repair = bootstrap_binary_event_open(&mut rows, options);
@@ -1769,6 +2550,7 @@ mod tests {
                 bootstrap_binary_open: true,
                 binary_open_delay_ns: 20_000_000,
                 binary_open_max_backfill_ns: 5_000_000_000,
+                ..ReplayOptions::default()
             },
         );
         assert!(!repair.instrument_retimed);
@@ -2174,6 +2956,7 @@ mod tests {
                 bootstrap_binary_open: true,
                 binary_open_delay_ns: 20_000_000,
                 binary_open_max_backfill_ns: 5_000_000_000,
+                ..ReplayOptions::default()
             },
         );
         assert_ne!(changed_file, changed_repair);
@@ -2210,8 +2993,6 @@ mod tests {
             source: "cache-error-test".to_string(),
         };
         let error = replayer.next_event().unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("synthetic corrupt replay cache"));
+        assert!(error.to_string().contains("synthetic corrupt replay cache"));
     }
 }

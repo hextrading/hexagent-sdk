@@ -27,13 +27,21 @@
 //! P2: real book + cross-outcome synthetic book + taker. P3: resting queue
 //! model. P4: timeout/orphan + RTT calibration refinement.
 
+pub mod admission;
 pub mod book;
 pub mod clock;
 pub mod event;
+pub mod evidence;
 pub mod exchange;
 pub mod feed;
 pub mod latency;
 pub mod simulator;
+pub mod timing;
 pub mod wallet;
 
+pub use admission::ObservedAdmissionReplay;
+pub use evidence::{
+    ArrivalEvidence, ArrivalEvidenceReplay, BookContinuityMode, BookContinuityReplay,
+};
 pub use simulator::{SimV2Config, Simulator};
+pub use timing::{CancelTiming, CancelTimingMode};

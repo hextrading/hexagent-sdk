@@ -1,11 +1,13 @@
 //! Single-lane event scheduler for sim_v2.
 //!
-//! A min-heap keyed by `(when, seq)`. `when` is wall-clock ns; `seq` is a
+//! A min-heap keyed by `(when, deadline_priority, seq)`. `when` is wall-clock ns; `seq` is a
 //! monotonic insertion counter giving a deterministic FIFO tiebreak at equal
 //! `when` (so a v2 run is byte-reproducible given the same RNG seed). The
 //! The simulator owns one instance for the server lane and one for the
 //! strategy-delivery lane. Event payload rides inside the heap item; `Ord`
-//! compares only `(when, seq)` so `SimEvent` itself need not be `Ord`.
+//! compares the scheduling key only, so `SimEvent` itself need not be `Ord`.
+//! Explicit evidence invalidations precede ordinary work at the same time;
+//! deadline timers run after ordinary replies. Legacy relative ordering is unchanged.
 
 use std::collections::BinaryHeap;
 
@@ -14,12 +16,15 @@ use super::event::SimEvent;
 struct HeapItem {
     when: u64,
     seq: u64,
+    deadline_priority: u8,
     ev: SimEvent,
 }
 
 impl PartialEq for HeapItem {
     fn eq(&self, other: &Self) -> bool {
-        self.when == other.when && self.seq == other.seq
+        self.when == other.when
+            && self.deadline_priority == other.deadline_priority
+            && self.seq == other.seq
     }
 }
 impl Eq for HeapItem {}
@@ -28,7 +33,11 @@ impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // BinaryHeap is a max-heap; invert so the smallest (when, seq) pops
         // first.
-        (other.when, other.seq).cmp(&(self.when, self.seq))
+        (other.when, other.deadline_priority, other.seq).cmp(&(
+            self.when,
+            self.deadline_priority,
+            self.seq,
+        ))
     }
 }
 impl PartialOrd for HeapItem {
@@ -52,7 +61,51 @@ impl Scheduler {
     pub fn push(&mut self, when: u64, ev: SimEvent) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.heap.push(HeapItem { when, seq, ev });
+        self.heap.push(HeapItem {
+            when,
+            seq,
+            deadline_priority: 1,
+            ev,
+        });
+    }
+
+    /// A response exactly on its deadline wins; normal equal-time events keep
+    /// their existing FIFO ordering. Only request-deadline timers use this lane.
+    pub fn push_deadline(&mut self, when: u64, ev: SimEvent) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.heap.push(HeapItem {
+            when,
+            seq,
+            deadline_priority: 2,
+            ev,
+        });
+    }
+
+    /// Explicit gap/reconnect invalidation precedes feed and order work at
+    /// the same time. Used only by an opt-in offline evidence journal.
+    pub fn push_invalidation(&mut self, when: u64, ev: SimEvent) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.heap.push(HeapItem {
+            when,
+            seq,
+            deadline_priority: 0,
+            ev,
+        });
+    }
+
+    pub fn peek_is_invalidation(&self) -> bool {
+        self.heap
+            .peek()
+            .is_some_and(|item| item.deadline_priority == 0)
+    }
+
+    pub fn len(&self) -> usize {
+        self.heap.len()
+    }
+    pub fn capacity(&self) -> usize {
+        self.heap.capacity()
     }
 
     /// Wall-clock time of the next event, without consuming it.

@@ -334,6 +334,10 @@ impl std::fmt::Display for RunMode {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecordingConfig {
+    /// Opt-in raw Polymarket WS/protocol sidecars on the existing recorder.
+    /// Public-feed authority; never an automatically verified instance journal.
+    #[serde(default)]
+    pub book_protocol_evidence: bool,
     #[serde(default = "default_output_dir")]
     pub output_dir: String,
     #[serde(default = "default_file_prefix")]
@@ -346,6 +350,7 @@ pub struct RecordingConfig {
 impl Default for RecordingConfig {
     fn default() -> Self {
         Self {
+            book_protocol_evidence: false,
             output_dir: default_output_dir(),
             file_prefix: default_file_prefix(),
             paper_data_dir: default_paper_data_dir(),
@@ -373,6 +378,36 @@ pub struct BacktestConfig {
     /// parquet continue to replay independently.
     #[serde(default)]
     pub market_data_health_replay_path: String,
+    /// Use recorded receive time for both warm-up and strategy replay cutoffs.
+    /// Strict mode rejects missing receive timestamps and future opening-book
+    /// bootstrap; false retains the historical source-time archive contract.
+    #[serde(default)]
+    pub sim_replay_arrival_time_strict: bool,
+    /// Keep venue source timestamps immutable on the sim_v2 server lane;
+    /// use separate monotonic timestamps for scheduling and fill application.
+    #[serde(default)]
+    pub sim_v2_raw_server_clock: bool,
+    /// Evaluate venue admission using the server book, independently of the
+    /// strategy's receive-time freshness. Unknown server coverage aborts.
+    #[serde(default)]
+    pub sim_v2_strict_admission: bool,
+    /// Explicit conservative missing-book hypothesis for diagnostic full runs:
+    /// emit a simulator-data-unknown rejection instead of aborting. These are
+    /// counted separately from observed/venue post-only rejections.
+    #[serde(default)]
+    pub sim_v2_admission_unknown_reject: bool,
+    /// Bounded per-place evidence, drained outside strategy callbacks to a
+    /// simulator-only JSONL file in the run's working directory.
+    #[serde(default)]
+    pub sim_v2_admission_audit: bool,
+    /// Offline admission evidence policy. Empty/legacy_age retains v2 behavior;
+    /// snapshot_hold_estimated is a sensitivity assumption, never verification.
+    #[serde(default)]
+    pub sim_v2_book_continuity_mode: String,
+    /// Optional explicit owner/token/session protocol journal. Historical
+    /// normalized book rows cannot manufacture these missing observations.
+    #[serde(default)]
+    pub sim_v2_book_continuity_evidence_path: String,
     /// sim_v2 only — repair legacy rotating-event tapes whose Instrument and
     /// first full books were recorded a few seconds after the scheduled open.
     /// The first observed book is held backward as an opening seed; the
@@ -560,6 +595,19 @@ pub struct BacktestConfig {
     /// until finality. 0 preserves immediate cancellation at engine arrival.
     #[serde(default)]
     pub sim_v2_cancel_finality_delay_frac: f64,
+    /// Offline opt-in: partition the existing total RTT into network/processing/network.
+    #[serde(default = "default_sim_v2_cancel_timing_mode")]
+    pub sim_v2_cancel_timing_mode: String,
+    /// Estimated fixed cancel processing budget (ms), capped to each total RTT.
+    #[serde(default)]
+    pub sim_v2_cancel_processing_ms: u64,
+    /// Assumed processing share of total RTT, basis points in [0,10000).
+    /// Used only by staged_rtt_fraction; fixed milliseconds and finality must be zero.
+    #[serde(default)]
+    pub sim_v2_cancel_processing_fraction_bps: u16,
+    /// Bounded offline transition audit; drain outside strategy callbacks.
+    #[serde(default)]
+    pub sim_v2_execution_timing_audit: bool,
     /// Include exchange-side cancel finality in the client deadline. This can
     /// turn an otherwise fast DELETE response into CancelOrderTimeout while
     /// the cancellation still resolves later through the orphan reconciler.
@@ -860,6 +908,34 @@ pub struct BacktestConfig {
     /// client pools (see `async_rt::FAST_TIMEOUT` / `CANCEL_TIMEOUT`).
     #[serde(default = "default_sim_client_timeout_ms")]
     pub sim_client_timeout_ms: u64,
+
+    /// Optional independent cancel deadline. Zero retains the legacy shared
+    /// client timeout; measured live profiles can use e.g. place=2s/cancel=4s.
+    #[serde(default)]
+    pub sim_cancel_timeout_ms: u64,
+
+    /// Independent reconciliation transport deadline in strict lifecycle mode.
+    /// Zero inherits the cancel deadline. Timed-out queries preserve uncertain
+    /// order state; subsequent private execution evidence remains authoritative.
+    #[serde(default)]
+    pub sim_reconcile_timeout_ms: u64,
+
+    /// Deliver taker economics through the private lane independently of the
+    /// HTTP matched response. Opt-in permits controlled lifecycle ablations.
+    #[serde(default)]
+    pub sim_v2_separate_taker_private_fills: bool,
+
+    /// Disable only when the supplied request RTT already budgets matching
+    /// processing (e.g. recorded-command replay); legacy profiles retain it.
+    #[serde(default = "default_true")]
+    pub sim_v2_taker_overhead_enabled: bool,
+
+    /// Optional observed new-place admission intervals (UTC nanosecond CSV).
+    /// Diagnostic replay only: rejected attempts do not consume HTTP samples;
+    /// cancellation, reconciliation and resting fills continue during a gate.
+    /// A configured unreadable or invalid file fails startup.
+    #[serde(default)]
+    pub sim_v2_observed_admission_path: String,
 
     /// Window in ms during which a cancel arriving after a fill is
     /// reported as `Filled` (the live "matched orders can't be
@@ -1203,6 +1279,13 @@ impl Default for BacktestConfig {
             replay_cache_dir: String::new(),
             market_data_health_replay_path: String::new(),
             sim_v2_bootstrap_binary_open: false,
+            sim_replay_arrival_time_strict: false,
+            sim_v2_raw_server_clock: false,
+            sim_v2_strict_admission: false,
+            sim_v2_admission_unknown_reject: false,
+            sim_v2_admission_audit: false,
+            sim_v2_book_continuity_mode: "legacy_age".to_owned(),
+            sim_v2_book_continuity_evidence_path: String::new(),
             sim_v2_binary_open_delay_ms: default_sim_v2_binary_open_delay_ms(),
             sim_v2_binary_open_max_backfill_ms: default_sim_v2_binary_open_max_backfill_ms(),
             sim_v2_ahead_frac: default_sim_v2_ahead_frac(),
@@ -1242,6 +1325,10 @@ impl Default for BacktestConfig {
             sim_v2_replay_self_depth_fifo_replacement: false,
             sim_v2_replay_self_taker_depth_rate: 0.0,
             sim_v2_cancel_finality_delay_frac: 0.0,
+            sim_v2_cancel_timing_mode: default_sim_v2_cancel_timing_mode(),
+            sim_v2_cancel_processing_ms: 0,
+            sim_v2_cancel_processing_fraction_bps: 0,
+            sim_v2_execution_timing_audit: false,
             sim_v2_cancel_finality_counts_toward_timeout: false,
             sim_v2_place_ack_uncertainty_rate: 0.0,
             sim_v2_cancel_ack_uncertainty_rate: 0.0,
@@ -1293,6 +1380,11 @@ impl Default for BacktestConfig {
             sim_latency_correlation: default_sim_latency_correlation(),
             sim_latency_cross_correlation: default_sim_latency_cross_correlation(),
             sim_client_timeout_ms: default_sim_client_timeout_ms(),
+            sim_cancel_timeout_ms: 0,
+            sim_reconcile_timeout_ms: 0,
+            sim_v2_separate_taker_private_fills: false,
+            sim_v2_taker_overhead_enabled: true,
+            sim_v2_observed_admission_path: String::new(),
             sim_matched_cant_cancel_window_ms: default_sim_matched_cant_cancel_window_ms(),
             sim_strategy_warmup_secs: 0.0,
             sim_rtt_mode: default_sim_rtt_mode(),
@@ -1803,6 +1895,13 @@ impl Config {
         let mut config: Config = root_value
             .try_into()
             .map_err(|e| anyhow::anyhow!("config deserialise error: {}", e))?;
+        if config.backtest.sim_replay_arrival_time_strict
+            && config.backtest.sim_v2_bootstrap_binary_open
+        {
+            anyhow::bail!(
+                "sim_replay_arrival_time_strict forbids future binary-open book bootstrap"
+            );
+        }
 
         // Per-strategy params_file: load + merge.
         //
@@ -2471,4 +2570,8 @@ mod shared_secrets_tests {
         };
         assert_eq!(p2.endpoints(), vec!["https://primary.example".to_string()]);
     }
+}
+
+fn default_sim_v2_cancel_timing_mode() -> String {
+    "legacy_l2_multiplier".into()
 }

@@ -8,6 +8,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -267,6 +268,29 @@ impl ParquetBuffer {
         self.asks_json.push(None);
         self.data_json
             .push(Some(serde_json::to_string(event).unwrap_or_default()));
+    }
+
+    fn push_book_protocol(&mut self, record: &super::protocol::BookProtocolRecord) -> Result<()> {
+        let json = serde_json::to_string(record)?;
+        // An absent venue timestamp is represented as zero plus explicit None
+        // in data_json, never replaced with local time and called venue time.
+        self.timestamp_ns
+            .push(record.exchange_timestamp_ns.unwrap_or(0));
+        self.local_timestamp_ns.push(record.local_timestamp_ns);
+        self.exchange.push("polymarket".to_owned());
+        self.event_type.push("book_protocol_evidence".to_owned());
+        self.symbol.push(record.token.clone());
+        self.side.push(None);
+        self.price.push(None);
+        self.quantity.push(None);
+        self.bid_price.push(None);
+        self.ask_price.push(None);
+        self.bid_qty.push(None);
+        self.ask_qty.push(None);
+        self.bids_json.push(None);
+        self.asks_json.push(None);
+        self.data_json.push(Some(json));
+        Ok(())
     }
 
     fn push_market_data_health(
@@ -568,6 +592,9 @@ impl Drop for ParquetBuffer {
 /// - **Other exchanges**: `{output_dir}/{exchange}/{symbol}/{YYYYMMDD_HH}.parquet`
 ///   Hourly rotation.
 pub struct MarketRecorder {
+    /// Raw public feed evidence is independent of normalized-token lifecycle
+    /// routing and therefore remains recordable before Instrument delivery.
+    protocol_output: Option<BufWriter<File>>,
     output_dir: PathBuf,
     /// Keyed by file_key → buffer
     buffers: HashMap<String, ParquetBuffer>,
@@ -591,10 +618,78 @@ pub struct MarketRecorder {
 }
 
 impl MarketRecorder {
+    pub fn start_book_protocol(&mut self, path: &std::path::Path) -> Result<()> {
+        anyhow::ensure!(
+            self.protocol_output.is_none(),
+            "protocol writer already initialized"
+        );
+        self.protocol_output = Some(BufWriter::with_capacity(
+            256 * 1024,
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?,
+        ));
+        Ok(())
+    }
+
+    pub fn flush_book_protocol(&mut self) -> Result<()> {
+        if let Some(writer) = self.protocol_output.as_mut() {
+            writer.flush()?;
+        }
+        Ok(())
+    }
+    /// Recorder-worker-only entry point, using the existing bounded row-group
+    /// flush lifecycle. No new worker is created. The caller must route the
+    /// compact protocol message to this worker; do not invoke from a quote
+    /// callback. Current normalized MarketEvent rows cannot synthesize it.
+    pub fn record_book_protocol(
+        &mut self,
+        record: &super::protocol::BookProtocolRecord,
+    ) -> Result<()> {
+        record.validate().map_err(anyhow::Error::msg)?;
+        if record.owner_scope == super::BookProtocolOwnerScope::PublicFeed {
+            anyhow::ensure!(
+                record.iid == "feed:polymarket",
+                "unrecognized public feed authority"
+            );
+            let writer = self
+                .protocol_output
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("public protocol writer not initialized"))?;
+            serde_json::to_writer(&mut *writer, record)?;
+            writer.write_all(b"\n")?;
+            return Ok(());
+        }
+        let (key, path) = self
+            .resolve_file("polymarket", &record.token, record.local_timestamp_ns)
+            .ok_or_else(|| {
+                anyhow::anyhow!("protocol record has no active token/event recorder route")
+            })?;
+        anyhow::ensure!(
+            key.rsplit('-')
+                .next()
+                .and_then(|part| part.parse::<u64>().ok())
+                == Some(record.event_epoch),
+            "protocol recorder token/event route mismatch"
+        );
+        self.rotate_buffer(&key);
+        let buffer = self
+            .buffers
+            .entry(key)
+            .or_insert_with(|| ParquetBuffer::new(path));
+        buffer.prepare_for_row()?;
+        buffer.push_book_protocol(record)?;
+        buffer.flush_if_full()?;
+        self.total_event_count += 1;
+        Ok(())
+    }
+
     pub fn new(output_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&output_dir)?;
         info!("[Recorder] Output dir: {}", output_dir.display());
         Ok(Self {
+            protocol_output: None,
             output_dir,
             bar_buffers: HashMap::new(),
             buffers: HashMap::new(),
@@ -1375,6 +1470,63 @@ mod tests {
         assert!(buffer.timestamp_ns.is_empty());
         assert!(buffer.pending_batch.is_none());
         assert!(tempdir.path().join("quotes.part-000001.parquet").is_file());
+    }
+
+    #[test]
+    fn book_protocol_worker_api_preserves_raw_fields_and_rejects_wrong_event() {
+        use super::super::protocol::{BookProtocolKind, BookProtocolRecord};
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut recorder = MarketRecorder::new(tempdir.path().to_path_buf()).unwrap();
+        recorder
+            .write_event(&MarketEvent::EventStart {
+                exchange: crate::types::Exchange::Polymarket,
+                symbol: "series:btc-updown-5m".into(),
+                event_id: "event-a".into(),
+                event_start_ns: 1,
+            })
+            .unwrap();
+        recorder
+            .write_event(&binary_option("event-a", "btc-updown-5m-300", "up"))
+            .unwrap();
+        let mut row = BookProtocolRecord {
+            owner_scope: super::super::BookProtocolOwnerScope::StrategyInstance,
+            iid: "owner".into(),
+            token: "up".into(),
+            event_epoch: 300,
+            connection_id: 7,
+            session_id: 8,
+            kind: BookProtocolKind::Gap,
+            wire_message_type: "disconnect".into(),
+            venue_sequence: None,
+            venue_previous_sequence: None,
+            recorder_sequence: 123,
+            exchange_timestamp_ns: None,
+            local_timestamp_ns: 500,
+            venue_book_hash: None,
+            event_id: None,
+            raw_exchange_timestamp: None,
+            frame_sequence: 0,
+        };
+        recorder.record_book_protocol(&row).unwrap();
+        let key = recorder.token_to_file_key["up"].clone();
+        let buffer = &recorder.buffers[&key];
+        let last = buffer.event_type.len() - 1;
+        assert_eq!(buffer.event_type[last], "book_protocol_evidence");
+        assert_eq!(buffer.timestamp_ns[last], 0);
+        assert_eq!(buffer.local_timestamp_ns[last], 500);
+        let decoded: BookProtocolRecord =
+            serde_json::from_str(buffer.data_json[last].as_deref().unwrap()).unwrap();
+        assert_eq!(decoded.venue_sequence, None);
+        assert_eq!(decoded.exchange_timestamp_ns, None);
+        assert_eq!(decoded.recorder_sequence, 123);
+        assert_eq!(decoded.session_id, 8);
+        let count = recorder.total_event_count;
+        row.event_epoch = 600;
+        assert!(recorder.record_book_protocol(&row).is_err());
+        row.event_epoch = 300;
+        row.token = "foreign-token".into();
+        assert!(recorder.record_book_protocol(&row).is_err());
+        assert_eq!(recorder.total_event_count, count);
     }
 
     #[test]
