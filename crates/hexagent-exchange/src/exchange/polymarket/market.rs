@@ -23,6 +23,7 @@ use crate::exchange::{
     ws_send, ExchangeMarket, WsHealth, POLYMARKET_RTDS_PING_INTERVAL, POLYMARKET_RTDS_PING_PAYLOAD,
     POLYMARKET_WS_HEALTH_LOG_INTERVAL, POLYMARKET_WS_HEARTBEAT_INTERVAL, WS_CONNECT_TIMEOUT,
 };
+use crate::recorder::{BookProtocolKind, BookProtocolRoute, BookProtocolSession, BookProtocolSink};
 use crate::types::*;
 
 const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -1445,6 +1446,25 @@ struct CanonicalEventSpec {
 struct ClobSubscription {
     tokens: Vec<String>,
     canonical_events: Vec<CanonicalEventSpec>,
+    protocol_routes: Vec<BookProtocolRoute>,
+}
+
+/// Only an explicit event slug suffix supplies the epoch. Static/non-epoch
+/// markets retain unknown; receipt/source clocks never infer event identity.
+fn protocol_event_epoch(slug: &str) -> Option<u64> {
+    let (_, suffix) = slug.rsplit_once('-')?;
+    (suffix.len() == 10)
+        .then(|| suffix.parse::<u64>().ok())
+        .flatten()
+        .filter(|v| *v > 0)
+}
+
+fn protocol_binding(
+    sink: &Option<BookProtocolSink>,
+    subscription: &ClobSubscription,
+) -> Option<(BookProtocolSink, Vec<BookProtocolRoute>)> {
+    sink.as_ref()
+        .map(|sink| (sink.clone(), subscription.protocol_routes.clone()))
 }
 
 /// Commit routing against the books actually carried by the connected lanes.
@@ -1499,6 +1519,7 @@ struct SymbolState {
 #[allow(dead_code)]
 struct MarketState {
     event_id: String,
+    event_epoch: Option<u64>,
     start_ns: u64,
     end_ns: u64,
     symbols: Vec<SymbolState>,
@@ -1761,6 +1782,7 @@ impl ClobEventReceiver {
 }
 
 pub struct PolymarketMarket {
+    book_protocol_sink: Option<BookProtocolSink>,
     series: Vec<SeriesState>,
     /// Maps CLOB token_id → index into `series`, so we can tag events with the series symbol.
     token_to_series: HashMap<String, usize>,
@@ -1806,6 +1828,7 @@ impl PolymarketMarket {
 
     pub fn with_liveness(liveness: Arc<PolymarketLiveness>) -> Self {
         Self {
+            book_protocol_sink: None,
             series: Vec::new(),
             token_to_series: HashMap::new(),
             pending_events: VecDeque::new(),
@@ -1832,6 +1855,11 @@ impl PolymarketMarket {
     /// the same execution path that just stalled.
     pub fn force_clob_runtime_fallback(&mut self) {
         self.clob_runtime_fallback = true;
+    }
+
+    /// Startup-owned public-feed lane, independent of every strategy account.
+    pub fn set_book_protocol_sink(&mut self, sink: BookProtocolSink) {
+        self.book_protocol_sink = Some(sink);
     }
 
     /// Set the engine's market_tx and shutdown flag so RTDS task can send events directly.
@@ -1889,6 +1917,20 @@ impl PolymarketMarket {
         ClobSubscription {
             tokens,
             canonical_events,
+            protocol_routes: self
+                .series
+                .iter()
+                .flat_map(|series| {
+                    series.market.symbols.iter().filter_map(|symbol| {
+                        BookProtocolRoute::new(
+                            &symbol.token_id,
+                            &symbol._condition_id,
+                            series.market.event_epoch,
+                        )
+                        .ok()
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -1896,6 +1938,15 @@ impl PolymarketMarket {
         let mut subscription = self.current_clob_subscription();
         for event in self.future_events.values() {
             for market in accepted_binary_markets(&event.markets, true) {
+                for token in &market.clob_token_ids {
+                    if let Ok(route) = BookProtocolRoute::new(
+                        token,
+                        &market.condition_id,
+                        protocol_event_epoch(&event.slug),
+                    ) {
+                        subscription.protocol_routes.push(route);
+                    }
+                }
                 subscription
                     .tokens
                     .extend(market.clob_token_ids.iter().cloned());
@@ -2247,6 +2298,7 @@ impl PolymarketMarket {
 
                         self.series[i].market = MarketState {
                             event_id: event.id,
+                            event_epoch: protocol_event_epoch(&event.slug),
                             start_ns: now,
                             end_ns,
                             symbols: symbols_state,
@@ -2814,6 +2866,7 @@ type ClobSocketReadResult =
     Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>;
 
 struct ClobConnection {
+    protocol: Option<BookProtocolSession>,
     lane_id: u64,
     /// Stable identity of the subscribed token set. Active and standby lanes
     /// may exchange ownership without reseeding only when this generation is
@@ -3894,6 +3947,7 @@ where
 async fn connect_clob_lane(
     tokens: &[String],
     lane_id: u64,
+    protocol: Option<(BookProtocolSink, Vec<BookProtocolRoute>)>,
 ) -> std::result::Result<ClobConnection, String> {
     let stream = match tokio::time::timeout(
         WS_CONNECT_TIMEOUT,
@@ -3934,6 +3988,7 @@ async fn connect_clob_lane(
     let (write, read) = stream.split();
     let connected_at = Instant::now();
     let mut lane = ClobConnection {
+        protocol: protocol.map(|(sink, routes)| sink.session(&routes, now_ns())),
         lane_id,
         token_generation: clob_token_generation(tokens),
         write,
@@ -3968,12 +4023,13 @@ fn spawn_clob_standby_connect(
     tokens: Vec<String>,
     lane_id: u64,
     delay: Duration,
+    protocol: Option<(BookProtocolSink, Vec<BookProtocolRoute>)>,
 ) -> tokio::task::JoinHandle<std::result::Result<ClobConnection, String>> {
     tokio::spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        connect_clob_lane(&tokens, lane_id).await
+        connect_clob_lane(&tokens, lane_id, protocol).await
     })
 }
 
@@ -3988,13 +4044,19 @@ fn spawn_clob_seeded_candidate(
     subscription: ClobSubscription,
     lane_id: u64,
     delay: Duration,
+    protocol_sink: Option<BookProtocolSink>,
 ) -> tokio::task::JoinHandle<std::result::Result<ClobSeededCandidate, String>> {
     tokio::spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
         let started = Instant::now();
-        let mut lane = connect_clob_lane(&subscription.tokens, lane_id).await?;
+        let mut lane = connect_clob_lane(
+            &subscription.tokens,
+            lane_id,
+            protocol_binding(&protocol_sink, &subscription),
+        )
+        .await?;
         let mut books = ClobLocalBooks::new(&subscription.canonical_events);
         let mut parser = ResidentClobParser::new();
         let mut seed_events = Vec::with_capacity(subscription.tokens.len() * 2);
@@ -4008,6 +4070,10 @@ fn spawn_clob_seeded_candidate(
             let received_at = Instant::now();
             match message {
                 Message::Text(text) => {
+                    if let Some(protocol) = lane.protocol.as_mut() {
+                        let receive_ns = now_ns();
+                        protocol.capture_raw(text.as_bytes(), receive_ns, "candidate");
+                    }
                     lane.record_raw(received_at);
                     let body = text.trim();
                     if body.eq_ignore_ascii_case("PONG") {
@@ -4028,7 +4094,7 @@ fn spawn_clob_seeded_candidate(
                     // allocation without a second per-frame copy.
                     let mut frame_bytes = text.into_bytes();
                     let mut frame_phases = ClobFramePhaseTimings::default();
-                    let batch = process_clob_frame_in_place(
+                    let batch = process_clob_frame_in_place_observed(
                         &mut frame_bytes,
                         &mut parser,
                         &mut books,
@@ -4037,6 +4103,7 @@ fn spawn_clob_seeded_candidate(
                         received_at,
                         now_ns(),
                         &mut frame_phases,
+                        lane.protocol.as_mut(),
                     );
                     frame_phases.record();
                     lane.burst.record_frame(received_at, frame_len);
@@ -4404,9 +4471,7 @@ fn can_promote_seeded_clob_generation(
     expected_generation: u64,
     all_tokens_seeded: bool,
 ) -> bool {
-    standby_generation != 0
-        && standby_generation == expected_generation
-        && all_tokens_seeded
+    standby_generation != 0 && standby_generation == expected_generation && all_tokens_seeded
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4425,6 +4490,9 @@ async fn handle_clob_standby_read(
     let received_at = Instant::now();
     match result {
         Some(Ok(Message::Text(text))) => {
+            if let Some(protocol) = lane.protocol.as_mut() {
+                protocol.capture_raw(text.as_bytes(), now_ns(), "standby");
+            }
             let body = text.trim();
             if body.eq_ignore_ascii_case("PING") {
                 lane.record_raw(received_at);
@@ -4539,6 +4607,7 @@ fn promote_clob_standby(
     repair_superseded_attempts: &mut HashMap<String, u8>,
     liveness: &PolymarketLiveness,
     reason: &str,
+    protocol_sink: &Option<BookProtocolSink>,
 ) -> bool {
     let now = Instant::now();
     let Some(mut promoted) = standby.take() else {
@@ -4580,6 +4649,11 @@ fn promote_clob_standby(
     let old_lane_id = active.lane_id;
     let old_peer = active.peer_addr;
     std::mem::swap(active, &mut promoted);
+    if let Some(protocol) = active.protocol.as_mut() {
+        // The selected book came from the previous active session. A standby
+        // drain does not establish a normalized book/sequence chain.
+        protocol.gap("standby_promoted_inherited_other_session_book", now_ns());
+    }
     super::network_incident::update_ws_peers(active.peer_addr, None);
     // Delineate active processing from the preceding drain-only standby
     // window. The promoted socket and its kernel receive queue stay intact.
@@ -4613,6 +4687,7 @@ fn promote_clob_standby(
         subscription.tokens.clone(),
         replacement_lane_id,
         Duration::ZERO,
+        protocol_binding(&protocol_sink, &subscription),
     ));
     crate::latency::record_ns(
         "polymarket.ws.clob_hot_failover",
@@ -4638,6 +4713,7 @@ async fn clob_ws_task(
     shutdown: Arc<AtomicBool>,
     subscribed_once: Arc<AtomicBool>,
     liveness: Arc<PolymarketLiveness>,
+    protocol_sink: Option<BookProtocolSink>,
 ) {
     // A sibling task on the same runtime distinguishes runtime-wide timer
     // starvation from delay inside this socket loop's biased select. If only
@@ -4727,7 +4803,13 @@ async fn clob_ws_task(
         );
         let active_lane_id = next_lane_id;
         next_lane_id = next_lane_id.saturating_add(1);
-        let mut active = match connect_clob_lane(&wire_subscription.tokens, active_lane_id).await {
+        let mut active = match connect_clob_lane(
+            &wire_subscription.tokens,
+            active_lane_id,
+            protocol_binding(&protocol_sink, &wire_subscription),
+        )
+        .await
+        {
             Ok(lane) => lane,
             Err(error) => {
                 announce_clob_not_ready(
@@ -4763,6 +4845,7 @@ async fn clob_ws_task(
             wire_subscription.tokens.clone(),
             standby_lane_id,
             Duration::ZERO,
+            protocol_binding(&protocol_sink, &wire_subscription),
         ));
         let mut pending_cutover: Option<(ClobSubscription, bool)> = None;
         let mut reconnect_subscription = wire_subscription.clone();
@@ -4867,7 +4950,7 @@ async fn clob_ws_task(
                             candidate_connect = Some(spawn_clob_seeded_candidate(
                                 new_subscription,
                                 lane_id,
-                                Duration::ZERO,
+                                Duration::ZERO, protocol_sink.clone(),
                             ));
                             info!(
                                 "[clob_cutover_prepare] lane_id={} current_tokens={} target_tokens={} action=keep_active_until_l2_seed",
@@ -4943,7 +5026,7 @@ async fn clob_ws_task(
                             standby_connect = Some(spawn_clob_standby_connect(
                                 wire_subscription.tokens.clone(),
                                 lane_id,
-                                Duration::ZERO,
+                                Duration::ZERO, protocol_binding(&protocol_sink, &wire_subscription),
                             ));
                         }
                         Ok(Err(error)) => {
@@ -4954,7 +5037,7 @@ async fn clob_ws_task(
                                 candidate_connect = Some(spawn_clob_seeded_candidate(
                                     target,
                                     lane_id,
-                                    CLOB_STANDBY_RECONNECT_DELAY,
+                                    CLOB_STANDBY_RECONNECT_DELAY, protocol_sink.clone(),
                                 ));
                             }
                         }
@@ -4966,7 +5049,7 @@ async fn clob_ws_task(
                                 candidate_connect = Some(spawn_clob_seeded_candidate(
                                     target,
                                     lane_id,
-                                    CLOB_STANDBY_RECONNECT_DELAY,
+                                    CLOB_STANDBY_RECONNECT_DELAY, protocol_sink.clone(),
                                 ));
                             }
                         }
@@ -4989,7 +5072,7 @@ async fn clob_ws_task(
                             let lane_id = next_lane_id;
                             next_lane_id = next_lane_id.saturating_add(1);
                             standby_connect = Some(spawn_clob_standby_connect(
-                                wire_subscription.tokens.clone(), lane_id, CLOB_STANDBY_RECONNECT_DELAY,
+                                wire_subscription.tokens.clone(), lane_id, CLOB_STANDBY_RECONNECT_DELAY, protocol_binding(&protocol_sink, &wire_subscription),
                             ));
                         }
                         Ok(Ok(lane)) if clob_peers_are_anti_affine(active.peer_addr, lane.peer_addr) => {
@@ -5024,7 +5107,7 @@ async fn clob_ws_task(
                             standby_connect = Some(spawn_clob_standby_connect(
                                 wire_subscription.tokens.clone(),
                                 lane_id,
-                                CLOB_STANDBY_RECONNECT_DELAY,
+                                CLOB_STANDBY_RECONNECT_DELAY, protocol_binding(&protocol_sink, &wire_subscription),
                             ));
                         }
                         Ok(Err(error)) => {
@@ -5034,7 +5117,7 @@ async fn clob_ws_task(
                             standby_connect = Some(spawn_clob_standby_connect(
                                 wire_subscription.tokens.clone(),
                                 lane_id,
-                                CLOB_STANDBY_RECONNECT_DELAY,
+                                CLOB_STANDBY_RECONNECT_DELAY, protocol_binding(&protocol_sink, &wire_subscription),
                             ));
                         }
                         Err(error) => {
@@ -5044,7 +5127,7 @@ async fn clob_ws_task(
                             standby_connect = Some(spawn_clob_standby_connect(
                                 wire_subscription.tokens.clone(),
                                 lane_id,
-                                CLOB_STANDBY_RECONNECT_DELAY,
+                                CLOB_STANDBY_RECONNECT_DELAY, protocol_binding(&protocol_sink, &wire_subscription),
                             ));
                         }
                     }
@@ -5342,7 +5425,7 @@ async fn clob_ws_task(
                             standby_connect = Some(spawn_clob_standby_connect(
                                 wire_subscription.tokens.clone(),
                                 lane_id,
-                                CLOB_STANDBY_RECONNECT_DELAY,
+                                CLOB_STANDBY_RECONNECT_DELAY, protocol_binding(&protocol_sink, &wire_subscription),
                             ));
                         }
                     }
@@ -5563,13 +5646,14 @@ async fn clob_ws_task(
                                 standby_connect = Some(spawn_clob_standby_connect(
                                     wire_subscription.tokens.clone(),
                                     lane_id,
-                                    reconnect_delay,
+                                    reconnect_delay, protocol_binding(&protocol_sink, &wire_subscription),
                                 ));
                             }
                             continue;
                         }
                         ClobLaneRead::Active(result) => result,
                     };
+                    let protocol_receive_ns = active.protocol.as_ref().map(|_| now_ns());
                     active.burst.record_socket_polls(active.read.take_poll_window());
                     let msg = match result {
                         Some(Ok(message)) => message,
@@ -5581,6 +5665,9 @@ async fn clob_ws_task(
                                 error,
                                 health.clob_summary(now),
                             );
+                            if let Some(protocol) = active.protocol.as_mut() {
+                                protocol.gap("active_socket_read_error", protocol_receive_ns.expect("enabled protocol receive clock"));
+                            }
                             if promote_clob_standby(
                                 &mut active,
                                 &mut standby,
@@ -5596,7 +5683,7 @@ async fn clob_ws_task(
                                 &mut repairs_in_flight,
                                 &mut repair_superseded_attempts,
                                 &liveness,
-                                &failover_reason,
+                                &failover_reason, &protocol_sink,
                             ) {
                                 continue;
                             }
@@ -5614,6 +5701,9 @@ async fn clob_ws_task(
                                 "[Polymarket] active WS closed — failover/reconnect; {}",
                                 health.clob_summary(now),
                             );
+                            if let Some(protocol) = active.protocol.as_mut() {
+                                protocol.gap("active_socket_stream_closed", protocol_receive_ns.expect("enabled protocol receive clock"));
+                            }
                             if promote_clob_standby(
                                 &mut active,
                                 &mut standby,
@@ -5629,7 +5719,7 @@ async fn clob_ws_task(
                                 &mut repairs_in_flight,
                                 &mut repair_superseded_attempts,
                                 &liveness,
-                                failover_reason,
+                                failover_reason, &protocol_sink,
                             ) {
                                 continue;
                             }
@@ -5644,6 +5734,9 @@ async fn clob_ws_task(
                     let received_at = Instant::now();
                     match msg {
                         Message::Text(text) => {
+                            if let Some(protocol) = active.protocol.as_mut() {
+                                protocol.capture_raw(text.as_bytes(), protocol_receive_ns.expect("enabled protocol receive clock"), "active");
+                            }
                             // Record only non-Close transport traffic here.
                             // Previously the unconditional call above the
                             // match made every close diagnostic report
@@ -5675,7 +5768,7 @@ async fn clob_ws_task(
                             let frame_len = text.len();
                             let mut frame_bytes = text.into_bytes();
                             let mut frame_phases = ClobFramePhaseTimings::default();
-                            let mut batch = process_clob_frame_in_place(
+                            let mut batch = process_clob_frame_in_place_observed(
                                 &mut frame_bytes,
                                 &mut parser,
                                 &mut books,
@@ -5684,6 +5777,7 @@ async fn clob_ws_task(
                                 received_at,
                                 now_ns(),
                                 &mut frame_phases,
+                                active.protocol.as_mut(),
                             );
                             frame_phases.record();
                             let parse_apply_elapsed = t_parse.elapsed();
@@ -5893,6 +5987,9 @@ async fn clob_ws_task(
                             } else {
                                 "active server close"
                             };
+                            if let Some(protocol) = active.protocol.as_mut() {
+                                protocol.gap("active_socket_close_frame", protocol_receive_ns.expect("enabled protocol receive clock"));
+                            }
                             if promote_clob_standby(
                                 &mut active,
                                 &mut standby,
@@ -5908,7 +6005,7 @@ async fn clob_ws_task(
                                 &mut repairs_in_flight,
                                 &mut repair_superseded_attempts,
                                 &liveness,
-                                failover_reason,
+                                failover_reason, &protocol_sink,
                             ) {
                                 continue;
                             }
@@ -8596,6 +8693,79 @@ fn subscribed_token(tokens: &[String], token: &str) -> bool {
     tokens.iter().any(|subscribed| subscribed == token)
 }
 
+/// Borrow the already decoded tape. No JSON reparsing, formatting or heap
+/// allocation. Unknown heartbeat semantics never become SequenceHeartbeat.
+fn observe_clob_protocol_value(
+    value: ClobTapeValue<'_, '_>,
+    protocol: &mut BookProtocolSession,
+) -> Option<()> {
+    let object = value.as_object()?;
+    let wire = object
+        .get("event_type")
+        .and_then(tape_input_str)
+        .unwrap_or("");
+    if wire != "book" && wire != "price_change" {
+        return Some(());
+    }
+    let unsigned = |value| -> Option<Option<u64>> {
+        match tape_optional_unsigned(value)? {
+            None => Some(None),
+            Some(value) => value.as_u64().map(Some),
+        }
+    };
+    let raw_timestamp = unsigned(object.get("timestamp"))?;
+    let source_ns = match raw_timestamp {
+        Some(0) => return None,
+        Some(raw) if raw < 1_000_000_000_000_000 => Some(raw.checked_mul(1_000_000)?),
+        Some(raw) => Some(raw),
+        None => None,
+    };
+    // These values are preserved only if the wire actually provides them.
+    // Their presence alone does not certify venue sequence-chain semantics.
+    let sequence = unsigned(object.get("sequence"))?;
+    let previous = unsigned(object.get("previous_sequence"))?;
+    let receive_ns = protocol.receive_ns();
+    if wire == "book" {
+        let hash = match object.get("hash") {
+            None => None,
+            Some(value) if value.is_null() => None,
+            Some(value) => Some(tape_input_str(value)?),
+        };
+        protocol.record(
+            tape_input_str(object.get("asset_id")?)?,
+            BookProtocolKind::Snapshot,
+            wire,
+            sequence,
+            previous,
+            raw_timestamp,
+            source_ns,
+            receive_ns,
+            hash,
+        );
+    } else if let Some(changes) = object.get("price_changes") {
+        for change in &changes.as_array()? {
+            let entry = change.as_object()?;
+            let hash = match entry.get("hash") {
+                None => None,
+                Some(value) if value.is_null() => None,
+                Some(value) => Some(tape_input_str(value)?),
+            };
+            protocol.record(
+                tape_input_str(entry.get("asset_id")?)?,
+                BookProtocolKind::Delta,
+                wire,
+                sequence,
+                previous,
+                raw_timestamp,
+                source_ns,
+                receive_ns,
+                hash,
+            );
+        }
+    }
+    Some(())
+}
+
 #[cfg(test)]
 fn process_clob_frame(
     text: &str,
@@ -8629,11 +8799,38 @@ fn process_clob_frame_in_place(
     local_now: u64,
     phases: &mut ClobFramePhaseTimings,
 ) -> ClobParsedBatch {
+    process_clob_frame_in_place_observed(
+        parse_buffer,
+        parser,
+        books,
+        _tokens,
+        active_tokens,
+        received_at,
+        local_now,
+        phases,
+        None,
+    )
+}
+
+fn process_clob_frame_in_place_observed(
+    parse_buffer: &mut [u8],
+    parser: &mut ResidentClobParser,
+    books: &mut ClobLocalBooks,
+    _tokens: &[String],
+    active_tokens: &[String],
+    received_at: Instant,
+    local_now: u64,
+    phases: &mut ClobFramePhaseTimings,
+    mut protocol: Option<&mut BookProtocolSession>,
+) -> ClobParsedBatch {
     let mut batch = ClobParsedBatch::default();
     if parse_buffer.is_empty() {
         return batch;
     }
     if parse_buffer.len() > CLOB_MAX_FRAME_BYTES {
+        if let Some(protocol) = protocol.as_deref_mut() {
+            protocol.invalid_frame(protocol.receive_ns());
+        }
         batch.wire.parse_errors = 1;
         batch.diagnostics.push(ClobDiagnostic {
             key: "parse_error",
@@ -8668,6 +8865,11 @@ fn process_clob_frame_in_place(
         let mut apply_value = |value: ClobTapeValue<'_, '_>| -> std::result::Result<(), &'static str> {
         let decode_started = crate::latency::Instant::now();
         let frame = decode_clob_tape_value(value)?;
+        if let Some(protocol) = protocol.as_deref_mut() {
+            if observe_clob_protocol_value(value, protocol).is_none() {
+                protocol.invalid_frame(protocol.receive_ns());
+            }
+        }
         phases.json_decode_ns = phases.json_decode_ns.saturating_add(
             decode_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
         );
@@ -8878,6 +9080,9 @@ fn process_clob_frame_in_place(
     let (processing, simd_json_ns) = match parsed {
         Ok(parsed) => parsed,
         Err(error) => {
+            if let Some(protocol) = protocol.as_deref_mut() {
+                protocol.invalid_frame(protocol.receive_ns());
+            }
             batch.wire.parse_errors = 1;
             batch.diagnostics.push(ClobDiagnostic {
                 key: "parse_error",
@@ -8888,6 +9093,9 @@ fn process_clob_frame_in_place(
     };
     phases.json_decode_ns = phases.json_decode_ns.saturating_add(simd_json_ns);
     if let Err(error) = processing {
+        if let Some(protocol) = protocol.as_deref_mut() {
+            protocol.invalid_frame(protocol.receive_ns());
+        }
         batch.wire.parse_errors = 1;
         batch.diagnostics.push(ClobDiagnostic {
             key: "parse_error",
@@ -9138,6 +9346,7 @@ impl ExchangeMarket for PolymarketMarket {
             shutdown,
             self.clob_subscribed_once.clone(),
             self.liveness.clone(),
+            self.book_protocol_sink.clone(),
         );
         let join = if self.clob_runtime_fallback {
             warn!("[Polymarket] CLOB reader using general-runtime fallback after external stall");
@@ -9249,6 +9458,7 @@ impl ExchangeMarket for PolymarketMarket {
 
                 let market = MarketState {
                     event_id: event.id.clone(),
+                    event_epoch: protocol_event_epoch(&event.slug),
                     start_ns: now_ns(),
                     end_ns,
                     symbols: symbols_state,
@@ -9318,6 +9528,7 @@ impl ExchangeMarket for PolymarketMarket {
 
                 let market = MarketState {
                     event_id: event.id.clone(),
+                    event_epoch: protocol_event_epoch(&event.slug),
                     start_ns: now_ns(),
                     end_ns: u64::MAX, // No expiry for slug-based subscriptions
                     symbols: symbols_state,
@@ -9481,6 +9692,10 @@ mod clob_quantity_path_tests;
 #[cfg(test)]
 #[path = "clob_recovery_tests.rs"]
 mod clob_recovery_tests;
+
+#[cfg(test)]
+#[path = "book_protocol_capture_tests.rs"]
+mod book_protocol_capture_tests;
 
 #[cfg(test)]
 mod clob_event_lane_tests {
@@ -10338,6 +10553,7 @@ mod pick_current_event_tests {
             interval_minutes: -1,
             market: MarketState {
                 event_id: "expired".to_string(),
+                event_epoch: None,
                 start_ns: started_ns.saturating_sub(300_000_000_000),
                 end_ns: started_ns.saturating_sub(1),
                 symbols: Vec::new(),
@@ -10398,6 +10614,7 @@ mod pick_current_event_tests {
             interval_minutes: -1,
             market: MarketState {
                 event_id: "expired".to_string(),
+                event_epoch: None,
                 start_ns: started_ns.saturating_sub(300_000_000_000),
                 end_ns: started_ns.saturating_sub(1),
                 symbols: vec![SymbolState {
@@ -10475,6 +10692,7 @@ mod pick_current_event_tests {
             interval_minutes: -1,
             market: MarketState {
                 event_id: "expired".to_string(),
+                event_epoch: None,
                 start_ns: current_end_secs
                     .saturating_sub(300)
                     .saturating_mul(1_000_000_000),
@@ -10522,6 +10740,7 @@ mod pick_current_event_tests {
             interval_minutes: -1,
             market: MarketState {
                 event_id: "current-event".to_string(),
+                event_epoch: None,
                 start_ns: base.saturating_sub(180).saturating_mul(1_000_000_000),
                 end_ns: current_end_secs.saturating_mul(1_000_000_000),
                 symbols: vec![SymbolState {
@@ -10598,6 +10817,7 @@ mod pick_current_event_tests {
             interval_minutes: -1,
             market: MarketState {
                 event_id: "current-event".to_string(),
+                event_epoch: None,
                 start_ns: base.saturating_sub(180).saturating_mul(1_000_000_000),
                 end_ns: current_end_secs.saturating_mul(1_000_000_000),
                 symbols: Vec::new(),
@@ -10631,6 +10851,7 @@ mod pick_current_event_tests {
             interval_minutes: -1,
             market: MarketState {
                 event_id: "seed-event".to_string(),
+                event_epoch: None,
                 start_ns: base.saturating_sub(300).saturating_mul(1_000_000_000),
                 end_ns: base.saturating_mul(1_000_000_000),
                 symbols: Vec::new(),
@@ -10702,6 +10923,7 @@ mod pick_current_event_tests {
                     interval_minutes: -1,
                     market: MarketState {
                         event_id: format!("old-{name}"),
+                        event_epoch: None,
                         start_ns: started_ns.saturating_sub(300_000_000_000),
                         end_ns: started_ns.saturating_sub(1),
                         symbols: vec![SymbolState {

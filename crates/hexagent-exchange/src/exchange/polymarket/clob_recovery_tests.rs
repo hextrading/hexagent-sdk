@@ -32,6 +32,7 @@ fn bbo_history_is_bounded_ordered_and_allocation_free() {
 
 fn subscription(tokens: &[&str]) -> ClobSubscription {
     ClobSubscription {
+        protocol_routes: Vec::new(),
         tokens: tokens.iter().map(|s| s.to_string()).collect(),
         canonical_events: vec![],
     }

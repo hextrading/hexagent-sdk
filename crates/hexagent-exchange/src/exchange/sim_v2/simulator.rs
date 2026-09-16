@@ -14,15 +14,34 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use crate::exchange::sim::per_event_rtt::EventRttOverride;
-use crate::types::{Exchange, Instrument, OrderRequest, OrderStatus, OrderUpdate, Side, Signal};
+use crate::types::{
+    Exchange, Instrument, OrderRequest, OrderSlot, OrderStatus, OrderUpdate, Side, Signal,
+};
 
+use super::admission::ObservedAdmissionReplay;
 use super::clock::Scheduler;
 use super::event::{ReachAction, SimEvent};
-use super::exchange::{FillAuditRow, MakerOrderAuditRow, SimExchangeV2};
+use super::evidence::{ArrivalEvidence, BookContinuityMode, BookContinuityReplay, ContinuityKind};
+use super::exchange::{
+    AdmissionAuditRow, AdmissionAuditStats, FillAuditRow, MakerOrderAuditRow, SimExchangeV2,
+};
 use super::feed::ServerFeed;
 use super::latency::LatencyModel;
+use super::timing::{
+    inline_identity, CancelTiming, CancelTimingMode, CancelTimingStats, ExecutionStage,
+    ExecutionTimingAudit, ExecutionTimingRow, ExecutionTimingStats,
+};
 use crate::exchange::sim::latency::LatencyProfile;
-use crate::recorder::ReplayOptions;
+use crate::recorder::{ReplayOptions, ReplayTimePolicy};
+
+// Offline recovery lane: simulator-owned, lossless, hard bounded. Saturation
+// aborts the replay explicitly instead of omitting a private fill.
+const MAX_PENDING_PRIVATE_FILLS: usize = 16_384;
+const MAX_HTTP_DEADLINES: usize = 16_384;
+const MAX_ADMISSION_FEEDBACK: usize = 16_384;
+// A numerical retry guard, not a fitted network-latency estimate. PM2's local
+// ExecutorRejected handler releases the slot without immediately re-quoting.
+const ADMISSION_FEEDBACK_NS: u64 = 1_000_000;
 
 pub struct SimV2Config {
     pub data_dir: String,
@@ -33,6 +52,14 @@ pub struct SimV2Config {
     pub bootstrap_binary_open: bool,
     pub binary_open_delay_ns: u64,
     pub binary_open_max_backfill_ns: u64,
+    /// Opt-in receive-time start/end selection, independent of server clocks.
+    pub replay_arrival_time_strict: bool,
+    /// Opt-in raw source/receive clocks with monotonic DES application time.
+    pub raw_server_clock: bool,
+    pub strict_admission: bool,
+    pub admission_unknown_reject: bool,
+    pub admission_audit: bool,
+    pub book_continuity_mode: BookContinuityMode,
     pub place_p50_ms: f64,
     pub place_p95_ms: f64,
     pub place_p99_ms: f64,
@@ -43,6 +70,13 @@ pub struct SimV2Config {
     pub rho_cross: f64,
     pub seed: u64,
     pub client_timeout_ns: u64,
+    /// Zero inherits the placement deadline for legacy replay parity.
+    pub cancel_timeout_ns: u64,
+    /// Zero inherits cancel cap in strict lifecycle mode; legacy mode ignores it.
+    pub reconcile_timeout_ns: u64,
+    /// Opt-in independent taker private pushes and send-time HTTP deadlines.
+    /// False preserves legacy replay scheduling until independently validated.
+    pub separate_taker_private_fills: bool,
     /// Per-instance starting USDC (enables balance gating when seeded).
     pub wallet_usdc_by_iid: HashMap<String, f64>,
     /// Per-instance per-event split shares (CTF split mirror; credited at each
@@ -83,6 +117,10 @@ pub struct SimV2Config {
     /// Multiplier of sampled cancel L2 reserved for exchange-side matching
     /// finality before cancellation becomes effective. Values above 1 model
     /// processing tails beyond the nominal response boundary.
+    pub cancel_timing_mode: CancelTimingMode,
+    pub cancel_processing_ns: u64,
+    pub cancel_processing_fraction_bps: u16,
+    pub execution_timing_audit: bool,
     pub cancel_finality_delay_frac: f64,
     pub cancel_finality_counts_toward_timeout: bool,
     pub place_ack_uncertainty_rate: f64,
@@ -216,7 +254,30 @@ pub struct Simulator {
     core: SimExchangeV2,
     latency: LatencyModel,
     client_timeout_ns: u64,
+    cancel_timeout_ns: u64,
+    reconcile_timeout_ns: u64,
+    reconcile_timeouts: u64,
+    query_timeout_feedback_pending: usize,
+    query_timeout_feedback_high_water: usize,
+    separate_taker_private_fills: bool,
+    /// One entry per queued deadline, true until an HTTP reply completes it.
+    /// Completed entries remain until their timer pops, bounding canceled timers
+    /// as well as active attempts. All state belongs to this replay thread.
+    http_deadlines: HashMap<u64, bool>,
+    next_http_request_id: u64,
+    http_deadline_high_water: usize,
+    observed_admission: Option<ObservedAdmissionReplay>,
+    admission_rejected_places: u64,
+    admission_pending_feedback: usize,
+    admission_feedback_high_water: usize,
     timeouts: u64,
+    cancel_timing_mode: CancelTimingMode,
+    cancel_processing_ns: u64,
+    cancel_processing_fraction_bps: u16,
+    staged_cancel_requests: u64,
+    staged_cancel_capped: u64,
+    execution_timing: ExecutionTimingAudit,
+    last_dispatched_request_id: Option<u64>,
     cancel_finality_delay_frac: f64,
     cancel_finality_counts_toward_timeout: bool,
     cancel_finality_delayed: u64,
@@ -234,6 +295,7 @@ pub struct Simulator {
     /// Trade-id keyed private fills missed on the primary lane. Single-writer
     /// simulator ownership makes recovery lossless without a shared account.
     pending_private_fills: HashMap<String, OrderUpdate>,
+    private_fill_recovery_high_water: usize,
     per_event_rtt: Option<HashMap<u64, EventRttOverride>>,
     dynamic_taker_overhead_by_event: Option<HashMap<u64, (f64, f64, f64)>>,
     last_dynamic_overhead_event: Option<u64>,
@@ -397,7 +459,26 @@ fn dynamic_markout_strength(
 
 impl Simulator {
     pub fn new(cfg: SimV2Config) -> Result<Self> {
-        let feed = ServerFeed::new_with_replay_options(
+        anyhow::ensure!(
+            cfg.cancel_timing_mode == CancelTimingMode::LegacyL2Multiplier
+                || cfg.separate_taker_private_fills,
+            "staged_rtt_budget requires separate_taker_private_fills for explicit HTTP deadlines"
+        );
+        anyhow::ensure!(
+            cfg.book_continuity_mode == BookContinuityMode::LegacyAge
+                || (cfg.strict_admission && cfg.raw_server_clock),
+            "experimental book continuity requires strict admission and raw server clocks"
+        );
+        anyhow::ensure!(
+            cfg.cancel_processing_fraction_bps < 10_000,
+            "cancel processing fraction must be below 10000 bps"
+        );
+        anyhow::ensure!(
+            cfg.cancel_timing_mode != CancelTimingMode::StagedRttFraction
+                || (cfg.cancel_processing_ns == 0 && cfg.cancel_finality_delay_frac == 0.0),
+            "staged_rtt_fraction forbids fixed cancel processing and legacy finality"
+        );
+        let feed = ServerFeed::new_with_clock_options(
             Path::new(&cfg.data_dir),
             &cfg.sources,
             cfg.start,
@@ -406,7 +487,13 @@ impl Simulator {
                 bootstrap_binary_open: cfg.bootstrap_binary_open,
                 binary_open_delay_ns: cfg.binary_open_delay_ns,
                 binary_open_max_backfill_ns: cfg.binary_open_max_backfill_ns,
+                time_policy: if cfg.replay_arrival_time_strict {
+                    ReplayTimePolicy::ArrivalTimeStrict
+                } else {
+                    ReplayTimePolicy::LegacySourceTime
+                },
             },
+            cfg.raw_server_clock,
         )?;
         // Record-replay (or any pre-built) profile wins; otherwise build the
         // legacy scalar Empirical from the calibrated p50/p95/p99 anchors.
@@ -436,6 +523,12 @@ impl Simulator {
         // Censoring threshold for the per-event timeout-rate injection — must
         // equal the engine's timeout boundary (`rtt > client_timeout_ns`).
         latency.set_client_timeout_ms(cfg.client_timeout_ns as f64 / 1_000_000.0);
+        let cancel_timeout_ns = if cfg.cancel_timeout_ns == 0 {
+            cfg.client_timeout_ns
+        } else {
+            cfg.cancel_timeout_ns
+        };
+        latency.set_cancel_timeout_ms(cancel_timeout_ns as f64 / 1_000_000.0);
         latency.set_taker_overhead_anchors(
             cfg.taker_overhead_p50_ms,
             cfg.taker_overhead_p95_ms,
@@ -446,7 +539,16 @@ impl Simulator {
             cfg.wallet_usdc_by_iid,
             cfg.split_by_iid,
         );
+        core.configure_admission(
+            cfg.strict_admission,
+            cfg.admission_unknown_reject,
+            cfg.admission_audit,
+        );
+        core.configure_book_continuity(cfg.book_continuity_mode);
         core.configure(cfg.ahead_frac, cfg.matched_cant_cancel_window_ns);
+        core.configure_durable_terminal_status(
+            cfg.cancel_timing_mode == CancelTimingMode::StagedRttFraction,
+        );
         core.configure_dynamic_ahead_frac(cfg.dynamic_ahead_frac_strength);
         core.configure_partial_depletion_queue(cfg.partial_depletion_queue_strength);
         core.configure_adverse_sel(cfg.adverse_sel_rate, cfg.adverse_scale_ticks);
@@ -454,9 +556,7 @@ impl Simulator {
         core.configure_unexplained_depletion_execution(cfg.unexplained_depletion_exec_rate);
         core.configure_depletion_trade_evidence(cfg.depletion_trade_evidence_mult);
         core.configure_depletion_no_evidence_prior(cfg.depletion_no_evidence_exec_frac);
-        core.configure_depletion_evidence_min_shrink(
-            cfg.depletion_evidence_min_shrink_frac,
-        );
+        core.configure_depletion_evidence_min_shrink(cfg.depletion_evidence_min_shrink_frac);
         core.configure_inferred_maker_residual(
             cfg.inferred_maker_residual_rate,
             cfg.inferred_maker_residual_fraction,
@@ -491,7 +591,27 @@ impl Simulator {
             core,
             latency,
             client_timeout_ns: cfg.client_timeout_ns,
+            cancel_timeout_ns,
+            reconcile_timeout_ns: cfg.reconcile_timeout_ns,
+            reconcile_timeouts: 0,
+            query_timeout_feedback_pending: 0,
+            query_timeout_feedback_high_water: 0,
+            separate_taker_private_fills: cfg.separate_taker_private_fills,
+            http_deadlines: HashMap::with_capacity(MAX_HTTP_DEADLINES),
+            next_http_request_id: 0,
+            http_deadline_high_water: 0,
+            observed_admission: None,
+            admission_rejected_places: 0,
+            admission_pending_feedback: 0,
+            admission_feedback_high_water: 0,
             timeouts: 0,
+            cancel_timing_mode: cfg.cancel_timing_mode,
+            cancel_processing_ns: cfg.cancel_processing_ns,
+            cancel_processing_fraction_bps: cfg.cancel_processing_fraction_bps,
+            staged_cancel_requests: 0,
+            staged_cancel_capped: 0,
+            execution_timing: ExecutionTimingAudit::new(cfg.execution_timing_audit),
+            last_dispatched_request_id: None,
             cancel_finality_delay_frac: if cfg.cancel_finality_delay_frac.is_finite() {
                 cfg.cancel_finality_delay_frac.clamp(0.0, 64.0)
             } else {
@@ -510,7 +630,8 @@ impl Simulator {
             private_fills_recovered: 0,
             reconcile_requests: 0,
             reconcile_updates: 0,
-            pending_private_fills: HashMap::new(),
+            pending_private_fills: HashMap::with_capacity(MAX_PENDING_PRIVATE_FILLS),
+            private_fill_recovery_high_water: 0,
             per_event_rtt: cfg.per_event_rtt,
             dynamic_taker_overhead_by_event: cfg.dynamic_taker_overhead_by_event,
             last_dynamic_overhead_event: None,
@@ -542,8 +663,7 @@ impl Simulator {
             use_batch_orders: cfg.use_batch_orders,
             fill_markout_horizon_ns: cfg.fill_markout_horizon_ns,
             markout_on: cfg.fill_markout_vn > 0.0 && cfg.fill_markout_horizon_ns > 0,
-            book_markout_on: cfg.book_fill_markout_vn > 0.0
-                && cfg.fill_markout_horizon_ns > 0,
+            book_markout_on: cfg.book_fill_markout_vn > 0.0 && cfg.fill_markout_horizon_ns > 0,
             base_fill_markout_vn: cfg.fill_markout_vn.max(0.0),
             dynamic_fill_markout: cfg.dynamic_fill_markout,
             dynamic_markout_spot_vol: cfg.dynamic_markout_spot_vol,
@@ -648,6 +768,95 @@ impl Simulator {
     }
 
     #[allow(dead_code)]
+    /// Install already parsed immutable intervals before replay. Only local
+    /// new-order admission consults them; server matching continues normally.
+    pub fn set_observed_admission_replay(&mut self, replay: ObservedAdmissionReplay) {
+        self.observed_admission = Some(replay);
+    }
+
+    /// Startup-only bounded journal. The existing server DES owns all records;
+    /// invalidations win equal-time ties before feed/matching. Positive proof
+    /// observations follow their books; immutable archive intervals are bound
+    /// atomically during book capture, before any matching. No I/O/new worker.
+    pub fn set_book_continuity_replay(&mut self, replay: BookContinuityReplay) {
+        assert_eq!(
+            self.server_clock_ns, 0,
+            "continuity journal must be installed before replay"
+        );
+        self.core.bind_continuity_owner(replay.owner_iid);
+        self.core.install_archive_coverage(replay.archive);
+        for record in replay.records {
+            if matches!(record.kind, ContinuityKind::Gap | ContinuityKind::Reconnect) {
+                self.server_sched
+                    .push_invalidation(record.apply_ns, SimEvent::BookContinuity(record));
+            } else {
+                self.server_sched
+                    .push(record.apply_ns, SimEvent::BookContinuity(record));
+            }
+        }
+    }
+
+    /// (rejected places, pending feedback, high-water, hard capacity).
+    pub fn observed_admission_stats(&self) -> (u64, usize, usize, usize) {
+        (
+            self.admission_rejected_places,
+            self.admission_pending_feedback,
+            self.admission_feedback_high_water,
+            MAX_ADMISSION_FEEDBACK,
+        )
+    }
+
+    fn reject_observed_admission(&mut self, action: &ReachAction, t_emit: u64) -> bool {
+        let ReachAction::Place(order) = action else {
+            return false;
+        };
+        if !self
+            .observed_admission
+            .as_ref()
+            .is_some_and(|gate| gate.blocked(t_emit))
+        {
+            return false;
+        }
+        assert!(self.admission_pending_feedback < MAX_ADMISSION_FEEDBACK,
+            "sim_v2 admission feedback capacity exceeded; replay aborted without dropping lifecycle state");
+        self.core.register_dispatched_order(order);
+        self.core.retain_order_message(&order.client_order_id);
+        self.admission_rejected_places += 1;
+        self.admission_pending_feedback += 1;
+        self.admission_feedback_high_water = self
+            .admission_feedback_high_water
+            .max(self.admission_pending_feedback);
+        let deliver = t_emit
+            .max(self.strategy_clock_ns)
+            .saturating_add(ADMISSION_FEEDBACK_NS);
+        self.strategy_sched.push(
+            deliver,
+            SimEvent::AdmissionRejected(OrderUpdate {
+                client_order_id: order.client_order_id.clone(),
+                exchange: order.exchange,
+                symbol: order.symbol.clone(),
+                side: order.side,
+                exchange_order_id: None,
+                status: OrderStatus::ExecutorRejected,
+                liquidity: None,
+                filled_quantity: 0.0,
+                remaining_quantity: order.quantity,
+                avg_fill_price: order.price.unwrap_or(0.0),
+                timestamp_ns: deliver,
+                exchange_event_timestamp_ns: None,
+                trade_id: None,
+                order_audit: None,
+                error: Some("observed_connection_admission_blocked".into()),
+                order_slot: order.order_slot,
+            }),
+        );
+        true
+    }
+
+    pub fn set_taker_overhead_enabled(&mut self, enabled: bool) {
+        self.latency.set_taker_overhead_enabled(enabled);
+    }
+
     pub fn client_timeout_ns(&self) -> u64 {
         self.client_timeout_ns
     }
@@ -661,6 +870,10 @@ impl Simulator {
     /// server lane: `(count, max_regression_ns)`.
     pub fn server_time_regression_stats(&self) -> (u64, u64) {
         self.feed.server_time_regression_stats()
+    }
+
+    pub fn raw_older_books_dropped(&self) -> u64 {
+        self.core.raw_older_books_dropped
     }
 
     /// (taker_fills, maker_fills, rejects) from the matching core.
@@ -702,8 +915,193 @@ impl Simulator {
         (self.cancel_finality_delayed, self.cancel_finality_matched)
     }
 
+    pub fn cancel_timing_stats(&self) -> CancelTimingStats {
+        CancelTimingStats {
+            mode: self.cancel_timing_mode,
+            processing_requested_ns: self.cancel_processing_ns,
+            processing_fraction_bps: self.cancel_processing_fraction_bps,
+            staged_requests: self.staged_cancel_requests,
+            processing_capped_requests: self.staged_cancel_capped,
+        }
+    }
+
+    /// Immutable preview for command adapters; does not sample or advance RNG.
+    pub fn cancel_timing_preview(&self, dispatch: u64, l1: u64, l2: u64) -> Option<CancelTiming> {
+        match self.cancel_timing_mode {
+            CancelTimingMode::LegacyL2Multiplier => None,
+            CancelTimingMode::StagedRttBudget => Some(self.latency.partition_cancel_budget(
+                dispatch,
+                l1,
+                l2,
+                self.cancel_processing_ns,
+            )),
+            CancelTimingMode::StagedRttFraction => Some(CancelTiming::fraction(
+                dispatch,
+                l1,
+                l2,
+                self.cancel_processing_fraction_bps,
+            )),
+        }
+    }
+
+    pub fn last_dispatched_request_id(&self) -> Option<u64> {
+        self.last_dispatched_request_id
+    }
+    pub fn execution_timing_stats(&self) -> ExecutionTimingStats {
+        self.execution_timing.stats()
+    }
+    pub fn drain_execution_timing_audit(
+        &mut self,
+    ) -> impl Iterator<Item = ExecutionTimingRow> + '_ {
+        self.execution_timing.drain()
+    }
+
+    fn audit_transition(
+        &mut self,
+        stage: ExecutionStage,
+        coid: &str,
+        request_id: Option<u64>,
+        actual_ns: u64,
+        scheduled_ns: Option<u64>,
+        deadline_ns: Option<u64>,
+        timing: Option<CancelTiming>,
+        update: Option<&OrderUpdate>,
+    ) {
+        if !self.execution_timing.enabled() {
+            return;
+        }
+        let (iid, token, slot) =
+            self.core
+                .order_timing_identity(coid)
+                .unwrap_or(("", "", OrderSlot::UNASSIGNED));
+        self.execution_timing.push(ExecutionTimingRow {
+            schema_version: 1,
+            stage,
+            coid: inline_identity(coid),
+            iid: inline_identity(iid),
+            token: inline_identity(update.map_or(token, |u| u.symbol.as_str())),
+            trade_id: inline_identity(update.and_then(|u| u.trade_id.as_deref()).unwrap_or("")),
+            order_slot: update.map_or(slot, |u| u.order_slot),
+            request_id,
+            actual_ns,
+            scheduled_ns,
+            deadline_ns,
+            status: update.map(|u| u.status),
+            fill_quantity: update.map_or(0.0, |u| u.filled_quantity),
+            timing,
+            exchange_event_timestamp_ns: update.and_then(|u| u.exchange_event_timestamp_ns),
+        });
+    }
+
+    fn audit_batch_transition(
+        &mut self,
+        stage: ExecutionStage,
+        iid: &str,
+        request_id: u64,
+        actual_ns: u64,
+        timing: Option<CancelTiming>,
+        deadline_ns: Option<u64>,
+    ) {
+        if !self.execution_timing.enabled() {
+            return;
+        }
+        self.execution_timing.push(ExecutionTimingRow {
+            schema_version: 1,
+            stage,
+            coid: inline_identity(""),
+            iid: inline_identity(iid),
+            token: inline_identity(""),
+            trade_id: inline_identity(""),
+            order_slot: OrderSlot::UNASSIGNED,
+            request_id: Some(request_id),
+            actual_ns,
+            scheduled_ns: None,
+            deadline_ns,
+            status: None,
+            fill_quantity: 0.0,
+            timing,
+            exchange_event_timestamp_ns: None,
+        });
+    }
+
     /// (place ack-loss, cancel ack-loss, private fills recovered later,
     /// reconcile requests, updates returned by reconciliation).
+    pub fn reconcile_timeout_stats(&self) -> u64 {
+        self.reconcile_timeouts
+    }
+
+    pub fn query_timeout_feedback_stats(&self) -> (usize, usize, usize) {
+        (
+            self.query_timeout_feedback_pending,
+            self.query_timeout_feedback_high_water,
+            MAX_HTTP_DEADLINES,
+        )
+    }
+
+    fn schedule_query_timeout(&mut self, update: OrderUpdate) {
+        assert!(self.query_timeout_feedback_pending < MAX_HTTP_DEADLINES,
+            "sim_v2 query timeout feedback capacity exceeded; replay aborted without dropping lifecycle state");
+        self.query_timeout_feedback_pending += 1;
+        self.query_timeout_feedback_high_water = self
+            .query_timeout_feedback_high_water
+            .max(self.query_timeout_feedback_pending);
+        self.core.retain_order_message(&update.client_order_id);
+        self.strategy_sched
+            .push(update.timestamp_ns, SimEvent::QueryTimeout(update));
+    }
+
+    fn query_timeout_update(
+        &self,
+        coid: &str,
+        symbol: &str,
+        side: Side,
+        oid: Option<String>,
+        cancel: bool,
+        deadline: u64,
+    ) -> OrderUpdate {
+        OrderUpdate {
+            client_order_id: coid.to_string(),
+            exchange: Exchange::Polymarket,
+            symbol: symbol.to_string(),
+            side,
+            exchange_order_id: oid,
+            status: if cancel {
+                OrderStatus::CancelOrderTimeout
+            } else {
+                OrderStatus::NewOrderTimeout
+            },
+            liquidity: None,
+            filled_quantity: 0.0,
+            remaining_quantity: 0.0,
+            avg_fill_price: 0.0,
+            timestamp_ns: deadline,
+            exchange_event_timestamp_ns: None,
+            trade_id: None,
+            order_audit: None,
+            error: Some("sim_v2_reconcile_timeout".into()),
+            order_slot: self
+                .order_owner(coid)
+                .map_or(OrderSlot::UNASSIGNED, |(_, slot)| slot),
+        }
+    }
+
+    pub fn http_deadline_stats(&self) -> (usize, usize, usize) {
+        (
+            self.http_deadlines.len(),
+            self.http_deadline_high_water,
+            MAX_HTTP_DEADLINES,
+        )
+    }
+
+    /// (current, high-water, hard capacity); overflow aborts rather than drops.
+    pub fn private_fill_recovery_stats(&self) -> (usize, usize, usize) {
+        (
+            self.pending_private_fills.len(),
+            self.private_fill_recovery_high_water,
+            MAX_PENDING_PRIVATE_FILLS,
+        )
+    }
+
     pub fn lifecycle_uncertainty_stats(&self) -> (u64, u64, u64, u64, u64) {
         (
             self.place_ack_uncertain,
@@ -729,6 +1127,21 @@ impl Simulator {
 
     pub fn maker_order_audit_rows(&self) -> Vec<MakerOrderAuditRow> {
         self.core.maker_order_audit_rows()
+    }
+
+    pub fn drain_admission_audit(
+        &mut self,
+    ) -> std::collections::vec_deque::Drain<'_, AdmissionAuditRow> {
+        self.core.drain_admission_audit()
+    }
+
+    pub fn admission_audit_stats(&self) -> AdmissionAuditStats {
+        self.core.admission_audit_stats()
+    }
+
+    /// Immutable routing metadata from the simulator's existing bounded evidence.
+    pub fn order_owner(&self, coid: &str) -> Option<(&str, OrderSlot)> {
+        self.core.order_owner(coid)
     }
 
     pub fn order_evidence_stats(&self) -> super::exchange::OrderEvidenceStats {
@@ -831,12 +1244,14 @@ impl Simulator {
     /// Dynamic ahead-fraction diagnostics: cancel-resync count, mean and range.
     pub fn dynamic_ahead_frac_stats(&self) -> Option<(u64, f64, f64, f64)> {
         let c = &self.core;
-        (c.dynamic_ahead_frac_n > 0).then(|| (
-            c.dynamic_ahead_frac_n,
-            c.dynamic_ahead_frac_sum / c.dynamic_ahead_frac_n as f64,
-            c.dynamic_ahead_frac_min,
-            c.dynamic_ahead_frac_max,
-        ))
+        (c.dynamic_ahead_frac_n > 0).then(|| {
+            (
+                c.dynamic_ahead_frac_n,
+                c.dynamic_ahead_frac_sum / c.dynamic_ahead_frac_n as f64,
+                c.dynamic_ahead_frac_min,
+                c.dynamic_ahead_frac_max,
+            )
+        })
     }
 
     /// # book-through adverse fills produced (diagnostic for
@@ -938,12 +1353,14 @@ impl Simulator {
 
     pub fn dynamic_deep_queue_stats(&self) -> Option<(u64, f64, f64, f64)> {
         let c = &self.core;
-        (c.dynamic_deep_queue_n > 0).then(|| (
-            c.dynamic_deep_queue_n,
-            c.dynamic_deep_queue_decay_sum / c.dynamic_deep_queue_n as f64,
-            c.dynamic_deep_queue_decay_min,
-            c.dynamic_deep_queue_decay_max,
-        ))
+        (c.dynamic_deep_queue_n > 0).then(|| {
+            (
+                c.dynamic_deep_queue_n,
+                c.dynamic_deep_queue_decay_sum / c.dynamic_deep_queue_n as f64,
+                c.dynamic_deep_queue_decay_min,
+                c.dynamic_deep_queue_decay_max,
+            )
+        })
     }
 
     /// Trade-flow taker competition diagnostics:
@@ -1077,6 +1494,11 @@ impl Simulator {
         };
         if !take_server {
             return self.step_strategy_sched();
+        }
+        if server_when.is_some_and(|server| feed_when.is_some_and(|feed| server == feed))
+            && self.server_sched.peek_is_invalidation()
+        {
+            return self.step_server_sched();
         }
         if feed_when.is_some_and(|feed| server_when.is_none_or(|server| feed <= server)) {
             self.step_feed()
@@ -1394,29 +1816,31 @@ impl Simulator {
         } else {
             let canon = self.core.canonical_token(&trade.symbol);
             let cutoff = when.saturating_sub(self.dynamic_markout_lookback_ns);
-            self.markout_mid_history.get_mut(&canon).and_then(|history| {
-                while history
-                    .front()
-                    .is_some_and(|(front_ts, _)| *front_ts < cutoff)
-                {
-                    history.pop_front();
-                }
-                if history.is_empty() {
-                    return None;
-                }
-                let (lo, hi) = history
-                    .iter()
-                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (_, mid)| {
-                        (lo.min(*mid), hi.max(*mid))
-                    });
-                let tick = self
-                    .markout_tick_by_symbol
-                    .get(&canon)
-                    .copied()
-                    .unwrap_or(0.01)
-                    .max(1e-6);
-                Some(1.0 + (hi - lo).max(0.0) / tick)
-            })
+            self.markout_mid_history
+                .get_mut(&canon)
+                .and_then(|history| {
+                    while history
+                        .front()
+                        .is_some_and(|(front_ts, _)| *front_ts < cutoff)
+                    {
+                        history.pop_front();
+                    }
+                    if history.is_empty() {
+                        return None;
+                    }
+                    let (lo, hi) = history
+                        .iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (_, mid)| {
+                            (lo.min(*mid), hi.max(*mid))
+                        });
+                    let tick = self
+                        .markout_tick_by_symbol
+                        .get(&canon)
+                        .copied()
+                        .unwrap_or(0.01)
+                        .max(1e-6);
+                    Some(1.0 + (hi - lo).max(0.0) / tick)
+                })
         };
         let Some(vol_state) = state else {
             self.core
@@ -1498,7 +1922,7 @@ impl Simulator {
         if let Some((when, ev)) = self.feed.next_server_event() {
             self.server_clock_ns = self.server_clock_ns.max(when);
             match ev {
-                SimEvent::ServerBook(ob) => {
+                SimEvent::ServerBook(ob, timing) => {
                     // Book-through adverse fills (a resting order the contra just
                     // swept through) surface here, delivered like trade fills
                     // after a ws fill-push delay. Empty unless book_through_rate>0.
@@ -1510,14 +1934,18 @@ impl Simulator {
                     } else {
                         None
                     };
-                    let fills = self.core.on_orderbook_fwd(&ob, fwd_mid);
+                    let fills = if self.feed.raw_server_clock() {
+                        self.core.on_orderbook_at(&ob, &timing, fwd_mid)
+                    } else {
+                        self.core.on_orderbook_observed(&ob, &timing, fwd_mid)
+                    };
                     self.observe_causal_taker_races(when);
                     self.observe_markout_book(&ob);
                     for fill in fills {
                         self.schedule_private_fill(fill, when);
                     }
                 }
-                SimEvent::ServerTrade(t) => {
+                SimEvent::ServerTrade(t, timing) => {
                     // P3: maker fills from queue drain. Each fill is pushed back
                     // to the strategy after a ws fill-push delay (sampled once
                     // per fill), so it surfaces via FillToStrategy later.
@@ -1532,19 +1960,23 @@ impl Simulator {
                     } else {
                         None
                     };
-                    let fills = self.core.on_trade_tick_fwd(&t, fwd_mid);
+                    let fills = if self.feed.raw_server_clock() {
+                        self.core.on_trade_tick_at(&t, &timing, fwd_mid)
+                    } else {
+                        self.core.on_trade_tick_fwd(&t, fwd_mid)
+                    };
                     for fill in fills {
                         self.schedule_private_fill(fill, when);
                     }
                 }
-                SimEvent::ServerInstrument(i) => {
+                SimEvent::ServerInstrument(i, _) => {
                     self.core.on_instrument(&i);
                     self.observe_markout_instrument(&i);
                     self.apply_per_event_rtt(&i);
                     self.apply_dynamic_taker_windows(&i);
                     self.apply_dynamic_taker_overhead(&i);
                 }
-                SimEvent::ServerTickSize(tsc) => self.core.on_tick_size_change(&tsc),
+                SimEvent::ServerTickSize(tsc, _) => self.core.on_tick_size_change(&tsc),
                 _ => {}
             }
         }
@@ -1556,7 +1988,33 @@ impl Simulator {
     /// reconciliation/trade backfill. The trade id and economics are unchanged,
     /// so the strategy's normal idempotent private-fill path remains authoritative.
     fn schedule_private_fill(&mut self, mut fill: OrderUpdate, exchange_when: u64) {
-        let push = self.latency.sample_fill_push(exchange_when);
+        if self.cancel_timing_mode == CancelTimingMode::StagedRttFraction {
+            assert!(
+                fill.exchange_event_timestamp_ns
+                    .is_none_or(|ts| ts == exchange_when),
+                "private execution match clock differs from exchange match event"
+            );
+            fill.exchange_event_timestamp_ns = Some(exchange_when);
+        }
+        self.audit_transition(
+            ExecutionStage::PrivateMatched,
+            &fill.client_order_id,
+            None,
+            exchange_when,
+            None,
+            None,
+            None,
+            Some(&fill),
+        );
+        self.core.retain_order_message(&fill.client_order_id);
+        let push = if self.separate_taker_private_fills
+            && fill.liquidity == Some(crate::types::Liquidity::Taker)
+        {
+            fill.exchange_event_timestamp_ns = Some(exchange_when);
+            self.latency.sample_taker_fill_push(exchange_when)
+        } else {
+            self.latency.sample_fill_push(exchange_when)
+        };
         let primary_deliver = exchange_when.saturating_add(push);
         let identity = fill
             .trade_id
@@ -1574,12 +2032,27 @@ impl Simulator {
         };
         fill.timestamp_ns = deliver;
         let strategy_deliver = deliver.max(self.strategy_clock_ns);
+        self.audit_transition(
+            ExecutionStage::PrivateScheduled,
+            &fill.client_order_id,
+            None,
+            exchange_when,
+            Some(strategy_deliver),
+            None,
+            None,
+            Some(&fill),
+        );
         if recovered {
             let trade_id = fill
                 .trade_id
                 .clone()
                 .expect("simulated maker fill must have a trade id");
+            assert!(self.pending_private_fills.len() < MAX_PENDING_PRIVATE_FILLS,
+                "sim_v2 private fill recovery capacity exceeded; replay aborted without dropping a fill");
             self.pending_private_fills.insert(trade_id.clone(), fill);
+            self.private_fill_recovery_high_water = self
+                .private_fill_recovery_high_water
+                .max(self.pending_private_fills.len());
             self.strategy_sched
                 .push(strategy_deliver, SimEvent::PrivateFillRecovery { trade_id });
         } else {
@@ -1593,13 +2066,91 @@ impl Simulator {
     /// Schedule an ack for strategy delivery at `deliver`. Under timeout
     /// (suppress_ack) the strategy already got a *Timeout and will reconcile —
     /// suppress Accepted/Rejected/Cancelled, but ALWAYS deliver fills.
-    fn deliver_ack(&mut self, mut u: OrderUpdate, deliver: u64, suppress_ack: bool) {
-        let is_fill = matches!(u.status, OrderStatus::Filled | OrderStatus::PartiallyFilled);
-        if !suppress_ack || is_fill {
-            let strategy_deliver = deliver.max(self.strategy_clock_ns);
-            u.timestamp_ns = strategy_deliver;
-            self.strategy_sched
-                .push(strategy_deliver, SimEvent::AckToStrategy(u));
+    fn deliver_ack(
+        &mut self,
+        mut u: OrderUpdate,
+        deliver: u64,
+        suppress_ack: bool,
+        request_id: Option<u64>,
+    ) {
+        let is_fill = u.trade_id.is_some() && u.filled_quantity != 0.0;
+        let strategy_deliver = deliver.max(self.strategy_clock_ns);
+        if let Some(request_id) = request_id {
+            if is_fill {
+                // A matched-cannot-cancel reply can repeat an execution. Keep
+                // that immutable trade on the private lane; HTTP carries no
+                // economic delta, and normal trade-id deduplication still wins.
+                if self.cancel_timing_mode == CancelTimingMode::LegacyL2Multiplier {
+                    let mut private = u.clone();
+                    private.timestamp_ns = strategy_deliver;
+                    self.audit_transition(
+                        ExecutionStage::PrivateScheduled,
+                        &private.client_order_id,
+                        Some(request_id),
+                        self.server_clock_ns,
+                        Some(strategy_deliver),
+                        None,
+                        None,
+                        Some(&private),
+                    );
+                    self.core.retain_order_message(&private.client_order_id);
+                    self.strategy_sched
+                        .push(strategy_deliver, SimEvent::FillToStrategy(private));
+                }
+                // Staged mode: HTTP cannot create or accelerate a private
+                // notification. The actual match already scheduled its
+                // lossless primary/recovery event with the immutable trade id.
+                u.filled_quantity = 0.0;
+                u.avg_fill_price = 0.0;
+                u.trade_id = None;
+                u.liquidity = None;
+            }
+            self.audit_transition(
+                if suppress_ack {
+                    ExecutionStage::HttpSuppressed
+                } else {
+                    ExecutionStage::HttpScheduled
+                },
+                &u.client_order_id,
+                Some(request_id),
+                self.server_clock_ns,
+                Some(strategy_deliver),
+                None,
+                None,
+                Some(&u),
+            );
+            if !suppress_ack {
+                u.timestamp_ns = strategy_deliver;
+                self.core.retain_order_message(&u.client_order_id);
+                self.strategy_sched.push(
+                    strategy_deliver,
+                    SimEvent::HttpReplyToStrategy {
+                        request_id,
+                        update: u,
+                    },
+                );
+            }
+        } else {
+            self.audit_transition(
+                if suppress_ack {
+                    ExecutionStage::HttpSuppressed
+                } else {
+                    ExecutionStage::HttpScheduled
+                },
+                &u.client_order_id,
+                None,
+                self.server_clock_ns,
+                Some(strategy_deliver),
+                None,
+                None,
+                Some(&u),
+            );
+            if !suppress_ack || is_fill {
+                u.timestamp_ns = strategy_deliver;
+                self.core.retain_order_message(&u.client_order_id);
+                self.strategy_sched
+                    .push(strategy_deliver, SimEvent::AckToStrategy(u));
+            }
         }
     }
 
@@ -1610,13 +2161,80 @@ impl Simulator {
         self.server_clock_ns = self.server_clock_ns.max(when);
         let when = self.server_clock_ns;
         match ev {
+            SimEvent::BookContinuity(record) => {
+                self.core.observe_book_continuity(&record, when);
+                Vec::new()
+            }
             SimEvent::OrderReachesEngine {
                 action,
+                arrival_evidence,
                 l2_ns,
                 suppress_ack,
+                request_id,
+                cancel_timing,
             } => {
+                match &action {
+                    ReachAction::Place(o) => self.core.release_order_message(&o.client_order_id),
+                    ReachAction::Cancel {
+                        client_order_id, ..
+                    } => self.core.release_order_message(client_order_id),
+                    ReachAction::Reconcile {
+                        pending_places,
+                        pending_cancels,
+                        ..
+                    } => {
+                        for (coid, ..) in pending_places {
+                            self.core.release_order_message(coid);
+                        }
+                        for (coid, _) in pending_cancels {
+                            self.core.release_order_message(coid);
+                        }
+                    }
+                    ReachAction::CancelAll { .. } | ReachAction::CancelAllOwned { .. } => {}
+                }
                 // core uses `when` (server time) for matching + recent_fills.
                 match action {
+                    ReachAction::Reconcile {
+                        pending_places,
+                        pending_cancels,
+                        pending_trade_ids,
+                    } => {
+                        let deliver = when.saturating_add(l2_ns).max(self.strategy_clock_ns);
+                        let updates = self.core.reconcile(&pending_places, &pending_cancels, when);
+                        if !suppress_ack {
+                            self.reconcile_updates += updates.len() as u64;
+                        }
+                        for update in updates {
+                            self.deliver_ack(update, deliver, suppress_ack, None);
+                        }
+                        // Timed-out HTTP cannot deliver fetched trades. Keep
+                        // the independent private/account fallback intact.
+                        if !suppress_ack {
+                            for trade_id in pending_trade_ids {
+                                if let Some(mut fill) = self.pending_private_fills.remove(&trade_id)
+                                {
+                                    // Transfer the pending recovery reference to this
+                                    // earlier fill delivery; the fallback becomes a no-op.
+                                    fill.timestamp_ns = deliver;
+                                    self.audit_transition(
+                                        ExecutionStage::PrivateScheduled,
+                                        &fill.client_order_id,
+                                        None,
+                                        when,
+                                        Some(deliver),
+                                        None,
+                                        None,
+                                        Some(&fill),
+                                    );
+                                    self.core
+                                        .record_fill_delivery(&fill.client_order_id, deliver);
+                                    self.reconcile_updates += 1;
+                                    self.strategy_sched
+                                        .push(deliver, SimEvent::FillToStrategy(fill));
+                                }
+                            }
+                        }
+                    }
                     ReachAction::Place(o) => {
                         if self.core.would_cross(&o, when) {
                             // Genuine taker: defer the actual book-match to the
@@ -1644,13 +2262,17 @@ impl Simulator {
                                     );
                                 }
                             }
+                            self.core.retain_order_message(&o.client_order_id);
                             self.server_sched.push(
                                 match_at,
                                 SimEvent::TakerMatch {
                                     order: o,
+                                    arrival_ns: when,
+                                    arrival_evidence,
                                     l2_ns,
                                     overhead_ns: overhead,
                                     suppress_ack,
+                                    request_id,
                                 },
                             );
                         } else {
@@ -1659,23 +2281,65 @@ impl Simulator {
                             // (the book the resting order faces shortly after entry)
                             // for the q_ahead-init blend.
                             self.prime_next_books(&o.symbol, when, self.maker_race_horizon_ns);
-                            let u = self.core.submit_order(&o, when);
-                            self.deliver_ack(u, when.saturating_add(l2_ns), suppress_ack);
+                            let u = self.core.submit_order_with_arrival_evidence(
+                                &o,
+                                when,
+                                None,
+                                when,
+                                arrival_evidence,
+                            );
+                            self.deliver_ack(
+                                u,
+                                when.saturating_add(l2_ns),
+                                suppress_ack,
+                                request_id,
+                            );
                         }
                     }
                     ReachAction::Cancel {
                         exchange,
                         client_order_id,
                     } => {
-                        let ack_deliver_ns = when.saturating_add(l2_ns);
-                        let delay_ns = ((l2_ns as f64) * self.cancel_finality_delay_frac)
-                            .round()
-                            .clamp(0.0, u64::MAX as f64) as u64;
+                        self.audit_transition(
+                            ExecutionStage::CancelArrived,
+                            &client_order_id,
+                            request_id,
+                            when,
+                            None,
+                            None,
+                            cancel_timing,
+                            None,
+                        );
+                        let delay_ns = cancel_timing.map_or_else(
+                            || {
+                                ((l2_ns as f64) * self.cancel_finality_delay_frac)
+                                    .round()
+                                    .clamp(0.0, u64::MAX as f64)
+                                    as u64
+                            },
+                            |timing| timing.processing_ns,
+                        );
+                        let ack_deliver_ns = if cancel_timing.is_some() {
+                            when.saturating_add(delay_ns).saturating_add(l2_ns)
+                        } else {
+                            when.saturating_add(l2_ns)
+                        };
                         if delay_ns == 0 {
                             let u = self.core.cancel_order(exchange, &client_order_id, when);
-                            self.deliver_ack(u, ack_deliver_ns, suppress_ack);
+                            self.audit_transition(
+                                ExecutionStage::CancelEffective,
+                                &client_order_id,
+                                request_id,
+                                when,
+                                Some(ack_deliver_ns),
+                                None,
+                                cancel_timing,
+                                Some(&u),
+                            );
+                            self.deliver_ack(u, ack_deliver_ns, suppress_ack, request_id);
                         } else {
                             self.cancel_finality_delayed += 1;
+                            self.core.retain_order_message(&client_order_id);
                             self.server_sched.push(
                                 when.saturating_add(delay_ns),
                                 SimEvent::CancelFinalizes {
@@ -1683,14 +2347,45 @@ impl Simulator {
                                     client_order_id,
                                     ack_deliver_ns,
                                     suppress_ack,
+                                    request_id,
+                                    cancel_timing,
                                 },
                             );
                         }
                     }
+                    ReachAction::CancelAllOwned {
+                        exchange,
+                        instance_id,
+                        symbols,
+                    } => {
+                        let timing =
+                            cancel_timing.expect("scoped cancel-all requires staged timing");
+                        let id =
+                            request_id.expect("scoped cancel-all requires HTTP attempt identity");
+                        self.audit_batch_transition(
+                            ExecutionStage::CancelArrived,
+                            &instance_id,
+                            id,
+                            when,
+                            Some(timing),
+                            None,
+                        );
+                        self.server_sched.push(
+                            when.saturating_add(timing.processing_ns),
+                            SimEvent::CancelAllFinalizes {
+                                exchange,
+                                instance_id,
+                                symbols,
+                                timing,
+                                suppress_ack,
+                                request_id: id,
+                            },
+                        );
+                    }
                     ReachAction::CancelAll { exchange, symbol } => {
                         let d = when.saturating_add(l2_ns);
                         for u in self.core.cancel_all(exchange, &symbol, when) {
-                            self.deliver_ack(u, d, suppress_ack);
+                            self.deliver_ack(u, d, suppress_ack, request_id);
                         }
                     }
                 }
@@ -1701,20 +2396,115 @@ impl Simulator {
                 client_order_id,
                 ack_deliver_ns,
                 suppress_ack,
+                request_id,
+                cancel_timing,
             } => {
+                self.core.release_order_message(&client_order_id);
                 let u = self.core.cancel_order(exchange, &client_order_id, when);
                 if u.status == OrderStatus::Filled {
                     self.cancel_finality_matched += 1;
                 }
-                self.deliver_ack(u, ack_deliver_ns.max(when), suppress_ack);
+                let deliver = cancel_timing.map_or(ack_deliver_ns.max(when), |timing| {
+                    when.saturating_add(timing.network_l2_ns)
+                });
+                self.audit_transition(
+                    ExecutionStage::CancelEffective,
+                    &client_order_id,
+                    request_id,
+                    when,
+                    Some(deliver),
+                    None,
+                    cancel_timing,
+                    Some(&u),
+                );
+                self.deliver_ack(u, deliver, suppress_ack, request_id);
+                Vec::new()
+            }
+            SimEvent::CancelAllFinalizes {
+                exchange,
+                instance_id,
+                symbols,
+                timing,
+                suppress_ack,
+                request_id,
+            } => {
+                let updates = self
+                    .core
+                    .cancel_all_owned(exchange, &instance_id, &symbols, when);
+                let deliver = when
+                    .saturating_add(timing.network_l2_ns)
+                    .max(self.strategy_clock_ns);
+                self.audit_batch_transition(
+                    ExecutionStage::CancelEffective,
+                    &instance_id,
+                    request_id,
+                    when,
+                    Some(timing),
+                    None,
+                );
+                self.audit_batch_transition(
+                    if suppress_ack {
+                        ExecutionStage::HttpSuppressed
+                    } else {
+                        ExecutionStage::HttpScheduled
+                    },
+                    &instance_id,
+                    request_id,
+                    when,
+                    None,
+                    None,
+                );
+                for update in &updates {
+                    self.audit_transition(
+                        ExecutionStage::CancelEffective,
+                        &update.client_order_id,
+                        Some(request_id),
+                        when,
+                        Some(deliver),
+                        None,
+                        Some(timing),
+                        Some(update),
+                    );
+                    self.audit_transition(
+                        if suppress_ack {
+                            ExecutionStage::HttpSuppressed
+                        } else {
+                            ExecutionStage::HttpScheduled
+                        },
+                        &update.client_order_id,
+                        Some(request_id),
+                        when,
+                        Some(deliver),
+                        None,
+                        None,
+                        Some(update),
+                    );
+                    if !suppress_ack {
+                        self.core.retain_order_message(&update.client_order_id);
+                    }
+                }
+                if !suppress_ack {
+                    self.strategy_sched.push(
+                        deliver,
+                        SimEvent::CancelAllHttpReply {
+                            request_id,
+                            instance_id,
+                            updates,
+                        },
+                    );
+                }
                 Vec::new()
             }
             SimEvent::TakerMatch {
                 order,
+                arrival_ns,
+                arrival_evidence,
                 l2_ns,
                 overhead_ns,
                 suppress_ack,
+                request_id,
             } => {
+                self.core.release_order_message(&order.client_order_id);
                 // Re-match against the (now possibly moved) book: still crossing
                 // → taker fill; moved away → rests (miss) or cancels per type.
                 // Causal mode consumes the minimum volume observed since this
@@ -1729,9 +2519,13 @@ impl Simulator {
                     self.prime_taker_window(&order.symbol, when, self.taker_race_horizon_ns);
                     None
                 };
-                let u = self
-                    .core
-                    .submit_order_with_taker_race_cap(&order, when, causal_race_cap);
+                let u = self.core.submit_order_with_arrival_evidence(
+                    &order,
+                    when,
+                    causal_race_cap,
+                    arrival_ns,
+                    arrival_evidence,
+                );
                 let is_fill =
                     matches!(u.status, OrderStatus::Filled | OrderStatus::PartiallyFilled);
                 // Filled taker: residual overhead/2 + L2 to the ack. Missed→rest:
@@ -1741,7 +2535,36 @@ impl Simulator {
                 } else {
                     when.saturating_add(l2_ns)
                 };
-                self.deliver_ack(u, deliver, suppress_ack);
+                if self.separate_taker_private_fills && is_fill {
+                    let mut http = u.clone();
+                    // Polymarket POST MATCHED is a Filled acknowledgement even
+                    // when the private execution is partial. Zero-economic
+                    // Filled enters the same orphan/query path as live.
+                    http.status = OrderStatus::Filled;
+                    http.filled_quantity = 0.0;
+                    http.avg_fill_price = 0.0;
+                    http.trade_id = None;
+                    http.liquidity = None;
+                    http.exchange_event_timestamp_ns = Some(when);
+                    // Always deliver the private execution, even if HTTP times
+                    // out. No economic quantity is applied through the reply.
+                    self.schedule_private_fill(u, when);
+                    self.deliver_ack(http, deliver, suppress_ack, request_id);
+                } else {
+                    if is_fill {
+                        self.audit_transition(
+                            ExecutionStage::PrivateMatched,
+                            &u.client_order_id,
+                            None,
+                            when,
+                            None,
+                            None,
+                            None,
+                            Some(&u),
+                        );
+                    }
+                    self.deliver_ack(u, deliver, suppress_ack, request_id);
+                }
                 Vec::new()
             }
             // Strategy deliveries never enter the server scheduler.
@@ -1759,23 +2582,211 @@ impl Simulator {
         };
         self.strategy_clock_ns = self.strategy_clock_ns.max(when);
         match ev {
-            SimEvent::AckToStrategy(mut u) | SimEvent::FillToStrategy(mut u) => {
+            SimEvent::QueryTimeout(mut update) => {
+                self.core.release_order_message(&update.client_order_id);
+                self.query_timeout_feedback_pending -= 1;
+                update.timestamp_ns = self.strategy_clock_ns;
+                vec![update]
+            }
+            SimEvent::AdmissionRejected(mut update) => {
+                self.core.release_order_message(&update.client_order_id);
+                self.admission_pending_feedback -= 1;
+                update.timestamp_ns = self.strategy_clock_ns;
+                vec![update]
+            }
+            SimEvent::HttpReplyToStrategy {
+                request_id,
+                mut update,
+            } => {
+                self.core.release_order_message(&update.client_order_id);
+                let deliver = self
+                    .http_deadlines
+                    .get_mut(&request_id)
+                    .is_some_and(|pending| {
+                        let was_pending = *pending;
+                        *pending = false;
+                        was_pending
+                    });
+                self.audit_transition(
+                    if deliver {
+                        ExecutionStage::HttpDelivered
+                    } else {
+                        ExecutionStage::HttpLateDiscarded
+                    },
+                    &update.client_order_id,
+                    Some(request_id),
+                    self.strategy_clock_ns,
+                    None,
+                    None,
+                    None,
+                    Some(&update),
+                );
+                if deliver {
+                    update.timestamp_ns = self.strategy_clock_ns;
+                    vec![update]
+                } else {
+                    Vec::new()
+                }
+            }
+            SimEvent::RequestDeadline {
+                request_id,
+                mut timeout,
+            } => {
+                self.core.release_order_message(&timeout.client_order_id);
+                if self.http_deadlines.remove(&request_id) == Some(true) {
+                    self.timeouts += 1;
+                    self.audit_transition(
+                        ExecutionStage::HttpDeadline,
+                        &timeout.client_order_id,
+                        Some(request_id),
+                        self.strategy_clock_ns,
+                        None,
+                        Some(when),
+                        None,
+                        Some(&timeout),
+                    );
+                    timeout.timestamp_ns = self.strategy_clock_ns;
+                    vec![timeout]
+                } else {
+                    Vec::new()
+                }
+            }
+            SimEvent::CancelAllDeadline {
+                request_id,
+                instance_id,
+            } => {
+                if self.http_deadlines.remove(&request_id) == Some(true) {
+                    self.timeouts += 1;
+                    self.audit_batch_transition(
+                        ExecutionStage::HttpDeadline,
+                        &instance_id,
+                        request_id,
+                        self.strategy_clock_ns,
+                        None,
+                        Some(when),
+                    );
+                }
+                Vec::new()
+            }
+            SimEvent::CancelAllHttpReply {
+                request_id,
+                instance_id,
+                mut updates,
+            } => {
+                let deliver = self
+                    .http_deadlines
+                    .get_mut(&request_id)
+                    .is_some_and(|pending| {
+                        let was_pending = *pending;
+                        *pending = false;
+                        was_pending
+                    });
+                self.audit_batch_transition(
+                    if deliver {
+                        ExecutionStage::HttpDelivered
+                    } else {
+                        ExecutionStage::HttpLateDiscarded
+                    },
+                    &instance_id,
+                    request_id,
+                    self.strategy_clock_ns,
+                    None,
+                    None,
+                );
+                for update in &mut updates {
+                    self.core.release_order_message(&update.client_order_id);
+                    self.audit_transition(
+                        if deliver {
+                            ExecutionStage::HttpDelivered
+                        } else {
+                            ExecutionStage::HttpLateDiscarded
+                        },
+                        &update.client_order_id,
+                        Some(request_id),
+                        self.strategy_clock_ns,
+                        None,
+                        None,
+                        None,
+                        Some(update),
+                    );
+                    update.timestamp_ns = self.strategy_clock_ns;
+                }
+                if deliver {
+                    updates
+                } else {
+                    Vec::new()
+                }
+            }
+            SimEvent::AckToStrategy(mut u) => {
+                self.core.release_order_message(&u.client_order_id);
+                let stage = if matches!(
+                    u.status,
+                    OrderStatus::NewOrderTimeout | OrderStatus::CancelOrderTimeout
+                ) {
+                    ExecutionStage::HttpDeadline
+                } else {
+                    ExecutionStage::HttpDelivered
+                };
+                self.audit_transition(
+                    stage,
+                    &u.client_order_id,
+                    None,
+                    self.strategy_clock_ns,
+                    None,
+                    None,
+                    None,
+                    Some(&u),
+                );
+                if u.trade_id.is_some() && u.filled_quantity != 0.0 {
+                    self.audit_transition(
+                        ExecutionStage::PrivateDelivered,
+                        &u.client_order_id,
+                        None,
+                        self.strategy_clock_ns,
+                        None,
+                        None,
+                        None,
+                        Some(&u),
+                    );
+                }
                 u.timestamp_ns = self.strategy_clock_ns;
                 vec![u]
             }
-            SimEvent::PrivateFillRecovery { trade_id } => {
-                self.pending_private_fills.remove(&trade_id).map_or_else(
-                    Vec::new,
-                    |mut update| {
-                        self.core.record_fill_delivery(
-                            &update.client_order_id,
-                            self.strategy_clock_ns,
-                        );
-                        update.timestamp_ns = self.strategy_clock_ns;
-                        vec![update]
-                    },
-                )
+            SimEvent::FillToStrategy(mut u) => {
+                self.core.release_order_message(&u.client_order_id);
+                self.audit_transition(
+                    ExecutionStage::PrivateDelivered,
+                    &u.client_order_id,
+                    None,
+                    self.strategy_clock_ns,
+                    None,
+                    None,
+                    None,
+                    Some(&u),
+                );
+                u.timestamp_ns = self.strategy_clock_ns;
+                vec![u]
             }
+            SimEvent::PrivateFillRecovery { trade_id } => self
+                .pending_private_fills
+                .remove(&trade_id)
+                .map_or_else(Vec::new, |mut update| {
+                    self.audit_transition(
+                        ExecutionStage::PrivateDelivered,
+                        &update.client_order_id,
+                        None,
+                        self.strategy_clock_ns,
+                        None,
+                        None,
+                        None,
+                        Some(&update),
+                    );
+                    self.core.release_order_message(&update.client_order_id);
+                    self.core
+                        .record_fill_delivery(&update.client_order_id, self.strategy_clock_ns);
+                    update.timestamp_ns = self.strategy_clock_ns;
+                    vec![update]
+                }),
             // Server-side events never enter the strategy scheduler.
             _ => Vec::new(),
         }
@@ -1785,8 +2796,7 @@ impl Simulator {
     /// (single-API-call) signal, schedules `OrderReachesEngine` at `emit + L1`,
     /// and stashes `L2` for the eventual ack delivery.
     pub fn submit(&mut self, sig: &Signal, t_emit: u64) {
-        // Reconcile: resolve orphans against current core state; deliver after a
-        // (cancel-side) round trip.
+        self.validate_staged_cancel_owner(sig);
         if let Signal::ReconcilePolymarket {
             pending_places,
             pending_cancels,
@@ -1796,32 +2806,136 @@ impl Simulator {
         {
             self.reconcile_requests += 1;
             let (l1, l2) = self.latency.sample_cancel_split(t_emit);
-            let deliver = t_emit
-                .saturating_add(l1)
-                .saturating_add(l2)
-                .max(self.strategy_clock_ns);
-            let updates = self
-                .core
-                .reconcile(pending_places, pending_cancels, deliver);
-            self.reconcile_updates += updates.len() as u64;
-            for u in updates {
-                self.strategy_sched
-                    .push(deliver, SimEvent::AckToStrategy(u));
-            }
-            for trade_id in pending_trade_ids {
-                if let Some(mut fill) = self.pending_private_fills.remove(trade_id) {
-                    fill.timestamp_ns = deliver;
-                    self.core
-                        .record_fill_delivery(&fill.client_order_id, deliver);
-                    self.reconcile_updates += 1;
-                    self.strategy_sched
-                        .push(deliver, SimEvent::FillToStrategy(fill));
+            let inherited = if self.cancel_timeout_ns > 0 {
+                self.cancel_timeout_ns
+            } else {
+                self.client_timeout_ns
+            };
+            let cap = if self.reconcile_timeout_ns > 0 {
+                self.reconcile_timeout_ns
+            } else {
+                inherited
+            };
+            let query_timed_out = self.separate_taker_private_fills && l1.saturating_add(l2) > cap;
+            if query_timed_out {
+                self.reconcile_timeouts += 1;
+                let deadline = t_emit.saturating_add(cap).max(self.strategy_clock_ns);
+                for (coid, symbol, side, _price, hash) in pending_places {
+                    let update = self.query_timeout_update(
+                        coid,
+                        symbol,
+                        *side,
+                        hash.clone(),
+                        false,
+                        deadline,
+                    );
+                    self.schedule_query_timeout(update);
+                }
+                for (coid, oid) in pending_cancels {
+                    let (symbol, side) = self
+                        .core
+                        .order_identity_symbol_side(coid)
+                        .unwrap_or_else(|| (String::new(), Side::Buy));
+                    let update = self.query_timeout_update(
+                        coid,
+                        &symbol,
+                        side,
+                        Some(oid.clone()),
+                        true,
+                        deadline,
+                    );
+                    self.schedule_query_timeout(update);
                 }
             }
+            let reach = t_emit.saturating_add(l1).max(self.server_clock_ns);
+            for (coid, ..) in pending_places {
+                self.core.retain_order_message(coid);
+            }
+            for (coid, _) in pending_cancels {
+                self.core.retain_order_message(coid);
+            }
+            self.server_sched.push(
+                reach,
+                SimEvent::OrderReachesEngine {
+                    arrival_evidence: ArrivalEvidence::modeled(t_emit.saturating_add(l1)),
+                    action: ReachAction::Reconcile {
+                        pending_places: pending_places.clone(),
+                        pending_cancels: pending_cancels.clone(),
+                        pending_trade_ids: pending_trade_ids.clone(),
+                    },
+                    l2_ns: l2,
+                    suppress_ack: query_timed_out,
+                    request_id: None,
+                    cancel_timing: None,
+                },
+            );
             return;
         }
 
-        let (actions, cancel_only) = expand_signal(sig);
+        let (mut actions, mut cancel_only) = if self.cancel_timing_mode.is_staged() {
+            match sig {
+                Signal::CancelAll {
+                    exchange,
+                    symbol,
+                    instance_id,
+                    ..
+                } => {
+                    assert!(
+                        !instance_id.is_empty(),
+                        "staged cancel-all requires an explicit owner"
+                    );
+                    (
+                        vec![ReachAction::CancelAllOwned {
+                            exchange: *exchange,
+                            instance_id: instance_id.clone(),
+                            symbols: if symbol.is_empty() {
+                                Vec::new()
+                            } else {
+                                vec![symbol.clone()]
+                            },
+                        }],
+                        true,
+                    )
+                }
+                Signal::PolymarketCancelAllOrders {
+                    market,
+                    asset_ids,
+                    instance_id,
+                    ..
+                } => {
+                    assert!(
+                        !instance_id.is_empty(),
+                        "staged cancel-all requires an explicit owner"
+                    );
+                    assert!(
+                        market.is_none() || !asset_ids.is_empty(),
+                        "market cancel requires explicit asset ids"
+                    );
+                    (
+                        vec![ReachAction::CancelAllOwned {
+                            exchange: Exchange::Polymarket,
+                            instance_id: instance_id.clone(),
+                            symbols: if market.is_some() {
+                                asset_ids.clone()
+                            } else {
+                                Vec::new()
+                            },
+                        }],
+                        true,
+                    )
+                }
+                _ => expand_signal(sig),
+            }
+        } else {
+            expand_signal(sig)
+        };
+        if self.observed_admission.is_some() {
+            let before = actions.len();
+            actions.retain(|action| !self.reject_observed_admission(action, t_emit));
+            if actions.len() != before {
+                cancel_only = actions.iter().all(action_is_cancel);
+            }
+        }
         if actions.is_empty() {
             return;
         }
@@ -1856,15 +2970,205 @@ impl Simulator {
         }
     }
 
+    /// Offline recorded-request replay. Each command retains its observed RTT
+    /// budget while L1/L2 is an explicit caller assumption. This does not bypass
+    /// exchange matching, finality, timeout, or private-lifecycle behavior.
+    pub fn submit_with_latency_split(
+        &mut self,
+        sig: &Signal,
+        t_emit: u64,
+        l1: u64,
+        l2: u64,
+    ) -> Result<()> {
+        self.submit_with_latency_split_and_arrival_evidence(
+            sig,
+            t_emit,
+            l1,
+            l2,
+            ArrivalEvidence::modeled(t_emit.saturating_add(l1)),
+        )
+    }
+
+    /// Recorded bounds annotate a modeled point. They do not reschedule the
+    /// request or inject an acceptance/fill outcome into matching.
+    pub fn submit_with_latency_split_and_arrival_evidence(
+        &mut self,
+        sig: &Signal,
+        t_emit: u64,
+        l1: u64,
+        l2: u64,
+        evidence: ArrivalEvidence,
+    ) -> Result<()> {
+        self.validate_staged_cancel_owner(sig);
+        self.last_dispatched_request_id = None;
+        anyhow::ensure!(
+            evidence.selected_ns == t_emit.saturating_add(l1),
+            "arrival evidence selected point disagrees with modeled split"
+        );
+        let (mut actions, _) = expand_signal(sig);
+        anyhow::ensure!(
+            actions.len() == 1
+                && matches!(
+                    &actions[0],
+                    ReachAction::Place(_) | ReachAction::Cancel { .. }
+                ),
+            "recorded replay requires exactly one place or cancel request"
+        );
+        let action = actions.remove(0);
+        if !self.reject_observed_admission(&action, t_emit) {
+            self.dispatch_action_with_evidence(action, t_emit, l1, l2, evidence);
+        }
+        Ok(())
+    }
+
+    /// Offline transport observation. A recorded HTTP timeout is only a lower
+    /// bound on the request lifetime. It cannot manufacture a completed reply
+    /// or undo exchange-side processing. Matching uses the same estimated point.
+    pub fn submit_with_latency_split_and_transport_observation(
+        &mut self,
+        sig: &Signal,
+        t_emit: u64,
+        l1: u64,
+        l2: u64,
+        evidence: ArrivalEvidence,
+        http_response_observed: bool,
+    ) -> Result<()> {
+        self.validate_staged_cancel_owner(sig);
+        self.last_dispatched_request_id = None;
+        anyhow::ensure!(
+            evidence.selected_ns == t_emit.saturating_add(l1),
+            "arrival evidence selected point disagrees with modeled split"
+        );
+        let (mut actions, _) = expand_signal(sig);
+        anyhow::ensure!(
+            actions.len() == 1
+                && matches!(
+                    &actions[0],
+                    ReachAction::Place(_) | ReachAction::Cancel { .. }
+                ),
+            "recorded replay requires exactly one place or cancel request"
+        );
+        let action = actions.remove(0);
+        if !self.reject_observed_admission(&action, t_emit) {
+            self.dispatch_action_with_transport(
+                action,
+                t_emit,
+                l1,
+                l2,
+                evidence,
+                http_response_observed,
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_staged_cancel_owner(&self, signal: &Signal) {
+        if !self.cancel_timing_mode.is_staged() {
+            return;
+        }
+        let validate = |coid: &str, iid: &str, exchange: Exchange| {
+            assert!(!iid.is_empty() && self.core.order_matches_owner_and_exchange(coid, iid, exchange),
+                "sim_v2 staged cancel has missing or conflicting owner or exchange; request not dispatched");
+        };
+        match signal {
+            Signal::CancelOrder {
+                client_order_id,
+                instance_id,
+                exchange,
+                ..
+            } => validate(client_order_id, instance_id, *exchange),
+            Signal::BatchCancelOrders {
+                client_order_ids,
+                instance_id,
+                exchange,
+                ..
+            } => {
+                for coid in client_order_ids {
+                    validate(coid, instance_id, *exchange);
+                }
+            }
+            Signal::BatchUpdateOrders {
+                cancel_client_order_ids,
+                instance_id,
+                exchange,
+                ..
+            }
+            | Signal::ReplaceOrder {
+                cancel_client_order_ids,
+                instance_id,
+                exchange,
+                ..
+            } => {
+                for coid in cancel_client_order_ids {
+                    validate(coid, instance_id, *exchange);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Schedule one action's engine-reach event and, when its round trip
     /// `l1 + l2` exceeds `client_timeout`, the suppressed-ack `*Timeout`
     /// delivered to the strategy. Shared by the batched (one RTT) and
     /// split (per-action RTT) dispatch paths.
     fn dispatch_action(&mut self, action: ReachAction, t_emit: u64, l1: u64, l2: u64) {
+        self.dispatch_action_with_evidence(
+            action,
+            t_emit,
+            l1,
+            l2,
+            ArrivalEvidence::modeled(t_emit.saturating_add(l1)),
+        )
+    }
+
+    fn dispatch_action_with_evidence(
+        &mut self,
+        action: ReachAction,
+        t_emit: u64,
+        l1: u64,
+        l2: u64,
+        arrival_evidence: ArrivalEvidence,
+    ) {
+        self.dispatch_action_with_transport(action, t_emit, l1, l2, arrival_evidence, true);
+    }
+
+    fn dispatch_action_with_transport(
+        &mut self,
+        action: ReachAction,
+        t_emit: u64,
+        l1: u64,
+        l2: u64,
+        arrival_evidence: ArrivalEvidence,
+        http_response_observed: bool,
+    ) {
         if let ReachAction::Place(order) = &action {
+            self.core.register_dispatched_order(order);
             self.begin_causal_taker_race(order, t_emit);
         }
-        let response_l2 = if self.cancel_finality_counts_toward_timeout
+        let cancel_timing = if action_is_cancel(&action) {
+            self.cancel_timing_preview(t_emit, l1, l2)
+        } else {
+            None
+        };
+        let (l1, l2, arrival_evidence) = if let Some(timing) = cancel_timing {
+            self.staged_cancel_requests += 1;
+            self.staged_cancel_capped += u64::from(timing.processing_capped);
+            (
+                timing.network_l1_ns,
+                timing.network_l2_ns,
+                ArrivalEvidence::modeled(timing.nominal_arrival_ns),
+            )
+        } else {
+            (l1, l2, arrival_evidence)
+        };
+        let timeout_ns = if action_is_cancel(&action) && self.cancel_timeout_ns > 0 {
+            self.cancel_timeout_ns
+        } else {
+            self.client_timeout_ns
+        };
+        let response_l2 = if let Some(timing) = cancel_timing {
+            timing.processing_ns.saturating_add(l2)
+        } else if self.cancel_finality_counts_toward_timeout
             && matches!(&action, ReachAction::Cancel { .. })
         {
             let finality = ((l2 as f64) * self.cancel_finality_delay_frac)
@@ -1875,7 +3179,7 @@ impl Simulator {
             l2
         };
         let rtt = l1.saturating_add(response_l2);
-        let forced_uncertain = if rtt <= self.client_timeout_ns {
+        let forced_uncertain = if rtt <= timeout_ns {
             match &action {
                 ReachAction::Place(order)
                     if self.place_ack_uncertainty_rate > 0.0
@@ -1905,27 +3209,109 @@ impl Simulator {
         } else {
             false
         };
-        let timed_out = rtt > self.client_timeout_ns || forced_uncertain;
+        let timed_out = rtt > timeout_ns || forced_uncertain || !http_response_observed;
         // This explicit cross-lane message is the only way a local request can
         // affect the matching engine. Never rewind an already-advanced server
         // lane even if the two recorded wall clocks have transient skew.
         let reach = t_emit.saturating_add(l1).max(self.server_clock_ns);
-        if timed_out {
+        let request_id = if let ReachAction::CancelAllOwned { instance_id, .. } = &action {
+            assert!(
+                self.http_deadlines.len() < MAX_HTTP_DEADLINES,
+                "sim_v2 HTTP deadline capacity exceeded; scoped cancel-all aborted"
+            );
+            let id = self.next_http_request_id;
+            self.next_http_request_id =
+                id.checked_add(1).expect("sim_v2 HTTP request id exhausted");
+            self.http_deadlines.insert(id, true);
+            self.http_deadline_high_water =
+                self.http_deadline_high_water.max(self.http_deadlines.len());
+            let deadline = t_emit
+                .saturating_add(timeout_ns)
+                .max(self.strategy_clock_ns);
+            self.strategy_sched.push_deadline(
+                deadline,
+                SimEvent::CancelAllDeadline {
+                    request_id: id,
+                    instance_id: instance_id.clone(),
+                },
+            );
+            Some(id)
+        } else if self.separate_taker_private_fills {
+            let deadline = t_emit
+                .saturating_add(timeout_ns)
+                .max(self.strategy_clock_ns);
+            self.timeout_update(&action, deadline).map(|timeout| {
+                assert!(self.http_deadlines.len() < MAX_HTTP_DEADLINES,
+                    "sim_v2 HTTP deadline capacity exceeded; replay aborted without dropping lifecycle state");
+                let id = self.next_http_request_id;
+                self.next_http_request_id = id.checked_add(1).expect("sim_v2 HTTP request id exhausted");
+                self.http_deadlines.insert(id, true);
+                self.http_deadline_high_water = self.http_deadline_high_water.max(self.http_deadlines.len());
+                self.core.retain_order_message(&timeout.client_order_id);
+                self.strategy_sched.push_deadline(deadline, SimEvent::RequestDeadline { request_id: id, timeout });
+                id
+            })
+        } else {
+            None
+        };
+        self.last_dispatched_request_id = request_id;
+        if let ReachAction::Cancel {
+            client_order_id, ..
+        } = &action
+        {
+            self.audit_transition(
+                ExecutionStage::CancelDispatched,
+                client_order_id,
+                request_id,
+                t_emit,
+                Some(reach),
+                Some(t_emit.saturating_add(timeout_ns)),
+                cancel_timing,
+                None,
+            );
+        } else if let ReachAction::CancelAllOwned { instance_id, .. } = &action {
+            self.audit_batch_transition(
+                ExecutionStage::CancelDispatched,
+                instance_id,
+                request_id.unwrap(),
+                t_emit,
+                cancel_timing,
+                Some(t_emit.saturating_add(timeout_ns)),
+            );
+        }
+        if timed_out && request_id.is_none() {
             self.timeouts += 1;
             let timeout_deliver = t_emit
-                .saturating_add(self.client_timeout_ns)
+                .saturating_add(timeout_ns)
                 .max(self.strategy_clock_ns);
             if let Some(u) = self.timeout_update(&action, timeout_deliver) {
+                self.core.retain_order_message(&u.client_order_id);
                 self.strategy_sched
                     .push(timeout_deliver, SimEvent::AckToStrategy(u));
             }
+        }
+        match &action {
+            ReachAction::Place(o) => self.core.retain_order_message(&o.client_order_id),
+            ReachAction::Cancel {
+                client_order_id, ..
+            } => self.core.retain_order_message(client_order_id),
+            _ => {}
         }
         self.server_sched.push(
             reach,
             SimEvent::OrderReachesEngine {
                 action,
+                arrival_evidence,
                 l2_ns: l2,
-                suppress_ack: timed_out,
+                cancel_timing,
+                // Strict mode lets the actual client reply race its timer.
+                // Only an intentionally missing reply is suppressed here.
+                suppress_ack: if request_id.is_some() {
+                    forced_uncertain || !http_response_observed
+                } else {
+                    timed_out
+                },
+                request_id,
             },
         );
     }
@@ -1949,7 +3335,7 @@ impl Simulator {
             } => {
                 let (symbol, side) = self
                     .core
-                    .order_symbol_side(client_order_id)
+                    .order_identity_symbol_side(client_order_id)
                     .unwrap_or_else(|| (String::new(), Side::Buy));
                 // CRITICAL: the strategy's CancelOrderTimeout handler only
                 // logs + reconciles when `exchange_order_id` is `Some` (it
@@ -1968,8 +3354,14 @@ impl Simulator {
                 )
             }
             // Cancel-all timeouts aren't modelled (rare; emergency path).
-            ReachAction::CancelAll { .. } => return None,
+            ReachAction::CancelAll { .. }
+            | ReachAction::CancelAllOwned { .. }
+            | ReachAction::Reconcile { .. } => return None,
         };
+        let order_slot = self
+            .core
+            .order_owner(&coid)
+            .map_or(OrderSlot::UNASSIGNED, |(_, slot)| slot);
         Some(OrderUpdate {
             client_order_id: coid,
             exchange: Exchange::Polymarket,
@@ -1986,7 +3378,7 @@ impl Simulator {
             trade_id: None,
             order_audit: None,
             error: None,
-            order_slot: Default::default(),
+            order_slot,
         })
     }
 }
@@ -1997,7 +3389,9 @@ impl Simulator {
 fn action_is_cancel(a: &ReachAction) -> bool {
     matches!(
         a,
-        ReachAction::Cancel { .. } | ReachAction::CancelAll { .. }
+        ReachAction::Cancel { .. }
+            | ReachAction::CancelAll { .. }
+            | ReachAction::CancelAllOwned { .. }
     )
 }
 
@@ -2129,7 +3523,27 @@ mod tests {
             ),
             latency,
             client_timeout_ns: 500_000_000,
+            cancel_timeout_ns: 0,
+            reconcile_timeout_ns: 0,
+            reconcile_timeouts: 0,
+            query_timeout_feedback_pending: 0,
+            query_timeout_feedback_high_water: 0,
+            separate_taker_private_fills: false,
+            http_deadlines: HashMap::with_capacity(MAX_HTTP_DEADLINES),
+            next_http_request_id: 0,
+            http_deadline_high_water: 0,
+            observed_admission: None,
+            admission_rejected_places: 0,
+            admission_pending_feedback: 0,
+            admission_feedback_high_water: 0,
             timeouts: 0,
+            cancel_timing_mode: CancelTimingMode::LegacyL2Multiplier,
+            cancel_processing_ns: 0,
+            cancel_processing_fraction_bps: 0,
+            staged_cancel_requests: 0,
+            staged_cancel_capped: 0,
+            execution_timing: ExecutionTimingAudit::new(false),
+            last_dispatched_request_id: None,
             cancel_finality_delay_frac: 0.0,
             cancel_finality_counts_toward_timeout: false,
             cancel_finality_delayed: 0,
@@ -2144,7 +3558,8 @@ mod tests {
             private_fills_recovered: 0,
             reconcile_requests: 0,
             reconcile_updates: 0,
-            pending_private_fills: HashMap::new(),
+            pending_private_fills: HashMap::with_capacity(MAX_PENDING_PRIVATE_FILLS),
+            private_fill_recovery_high_water: 0,
             per_event_rtt: None,
             dynamic_taker_overhead_by_event: None,
             last_dynamic_overhead_event: None,
@@ -2226,7 +3641,27 @@ mod tests {
             ),
             latency,
             client_timeout_ns: 500_000_000,
+            cancel_timeout_ns: 0,
+            reconcile_timeout_ns: 0,
+            reconcile_timeouts: 0,
+            query_timeout_feedback_pending: 0,
+            query_timeout_feedback_high_water: 0,
+            separate_taker_private_fills: false,
+            http_deadlines: HashMap::with_capacity(MAX_HTTP_DEADLINES),
+            next_http_request_id: 0,
+            http_deadline_high_water: 0,
+            observed_admission: None,
+            admission_rejected_places: 0,
+            admission_pending_feedback: 0,
+            admission_feedback_high_water: 0,
             timeouts: 0,
+            cancel_timing_mode: CancelTimingMode::LegacyL2Multiplier,
+            cancel_processing_ns: 0,
+            cancel_processing_fraction_bps: 0,
+            staged_cancel_requests: 0,
+            staged_cancel_capped: 0,
+            execution_timing: ExecutionTimingAudit::new(false),
+            last_dispatched_request_id: None,
             cancel_finality_delay_frac: 0.0,
             cancel_finality_counts_toward_timeout: false,
             cancel_finality_delayed: 0,
@@ -2241,7 +3676,8 @@ mod tests {
             private_fills_recovered: 0,
             reconcile_requests: 0,
             reconcile_updates: 0,
-            pending_private_fills: HashMap::new(),
+            pending_private_fills: HashMap::with_capacity(MAX_PENDING_PRIVATE_FILLS),
+            private_fill_recovery_high_water: 0,
             per_event_rtt: None,
             dynamic_taker_overhead_by_event: None,
             last_dynamic_overhead_event: None,
@@ -2386,6 +3822,244 @@ mod tests {
     }
 
     #[test]
+    fn arrival_evidence_annotations_preserve_matching_and_deferred_taker_identity() {
+        use super::super::evidence::{ArrivalEvidenceKind, EvidenceClockDomain};
+        for taker in [false, true] {
+            let run = |annotate: bool| {
+                let mut sim = sim_with_fixed_rtt(100);
+                sim.set_taker_overhead_enabled(false);
+                sim.core.configure_admission(true, false, true);
+                sim.core.on_orderbook(&OrderBookSnapshot {
+                    exchange: Exchange::Polymarket,
+                    symbol: "tok".into(),
+                    bids: vec![PriceLevel {
+                        price: 0.5,
+                        quantity: 100.0,
+                    }],
+                    asks: vec![PriceLevel {
+                        price: 0.7,
+                        quantity: 100.0,
+                    }],
+                    exchange_timestamp_ns: 100,
+                    local_timestamp_ns: 120,
+                });
+                let emit = 1_000_000_000;
+                let mut signal = place_signal("same-owner-order");
+                if let Signal::NewOrder(order) = &mut signal {
+                    if taker {
+                        order.post_only = false;
+                        order.price = Some(0.8);
+                    }
+                }
+                let mut evidence = ArrivalEvidence::modeled(emit + 50_000_000);
+                if annotate {
+                    evidence.kind = ArrivalEvidenceKind::MeasuredClientInterval;
+                    evidence.lower_ns = Some(emit);
+                    evidence.upper_ns = Some(emit + 100_000_000);
+                    evidence.clock_domain = EvidenceClockDomain::ClientWall;
+                    evidence.provenance_row = Some(1);
+                }
+                sim.submit_with_latency_split_and_arrival_evidence(
+                    &signal, emit, 50_000_000, 50_000_000, evidence,
+                )
+                .unwrap();
+                let mut updates = Vec::new();
+                while sim.peek_when().is_some() {
+                    updates.extend(sim.step());
+                }
+                let rows: Vec<_> = sim.drain_admission_audit().collect();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].arrival_evidence, evidence);
+                assert_eq!(rows[0].request_arrival_ns, emit + 50_000_000);
+                assert_eq!(rows[0].arrival_evidence.selected_kind, "modeled_split");
+                serde_json::to_vec(&updates).unwrap()
+            };
+            assert_eq!(
+                run(false),
+                run(true),
+                "evidence annotations must not inject observed execution outcomes"
+            );
+        }
+    }
+
+    #[test]
+    fn arrival_evidence_retains_nominal_point_when_scheduler_floor_moves_application() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.core.configure_admission(false, false, true);
+        let emit = 1_000_000_000;
+        sim.server_clock_ns = emit + 70_000_000;
+        let evidence = ArrivalEvidence::modeled(emit + 50_000_000);
+        sim.submit_with_latency_split_and_arrival_evidence(
+            &place_signal("floored"),
+            emit,
+            50_000_000,
+            50_000_000,
+            evidence,
+        )
+        .unwrap();
+        sim.step();
+        let row = sim.drain_admission_audit().next().unwrap();
+        assert_eq!(row.arrival_evidence.selected_ns, emit + 50_000_000);
+        assert_eq!(row.request_arrival_ns, emit + 70_000_000);
+    }
+
+    #[test]
+    fn arrival_evidence_empty_verified_journal_is_unknown_and_owner_isolated() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.core.configure_admission(true, true, true);
+        sim.core
+            .configure_book_continuity(BookContinuityMode::RequireVerified);
+        sim.set_book_continuity_replay(
+            BookContinuityReplay::from_reader(std::io::Cursor::new(""), "owner").unwrap(),
+        );
+        sim.core.on_orderbook(&OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            bids: vec![],
+            asks: vec![],
+            exchange_timestamp_ns: 100,
+            local_timestamp_ns: 120,
+        });
+        let mut signal = place_signal("verified-missing");
+        if let Signal::NewOrder(order) = &mut signal {
+            order.instance_id = "owner".into();
+        }
+        sim.submit_with_latency_split(&signal, 1_000_000_000, 10, 10)
+            .unwrap();
+        sim.step();
+        let row = sim.drain_admission_audit().next().unwrap();
+        assert_eq!(row.coverage, "continuity_unproven");
+        assert!(!row.eligible && !row.covered);
+        let mut other = sim_with_fixed_rtt(100);
+        other
+            .submit_with_latency_split(&place_signal("other-sim"), 1_000_000_000, 10, 10)
+            .unwrap();
+        let mut statuses = Vec::new();
+        while other.peek_when().is_some() {
+            statuses.extend(other.step().into_iter().map(|u| u.status));
+        }
+        assert_eq!(statuses, vec![OrderStatus::Accepted]);
+    }
+
+    #[test]
+    fn continuity_same_time_gap_precedes_feed_and_existing_maker_matching() {
+        use super::super::evidence::{BookContinuityRecord, ContinuityKind};
+        for gap_enabled in [false, true] {
+            let mut sim = sim_with_fixed_rtt(100);
+            sim.core.configure_admission(true, true, true);
+            sim.core
+                .configure_book_continuity(BookContinuityMode::SnapshotHoldEstimated);
+            sim.core.configure_book_through(1.0);
+            sim.core.on_instrument(&Instrument::BinaryOption(
+                crate::types::instrument::BinaryOption {
+                    exchange: Exchange::Polymarket,
+                    id: "event".into(),
+                    question: "q".into(),
+                    condition_id: "c".into(),
+                    series_slug: "btc-updown-5m".into(),
+                    slug: "btc-updown-5m-300".into(),
+                    clob_token_ids: vec!["tok".into(), "other".into()],
+                    outcomes: vec!["Up".into(), "Down".into()],
+                    outcome_prices: vec![],
+                    active: true,
+                    closed: false,
+                    volume: 0.0,
+                    liquidity: 0.0,
+                    tick_size: 0.01,
+                    order_min_size: 5.0,
+                    group_item_title: String::new(),
+                    event_start_time: String::new(),
+                    base_fee: 0,
+                    fee_exponent: 0.0,
+                    fee_rate: 0.0,
+                },
+            ));
+            let gap = BookContinuityRecord {
+                iid: "owner".into(),
+                token: "tok".into(),
+                event_epoch: 300,
+                evidence_id: 1,
+                kind: ContinuityKind::Gap,
+                session_id: 1,
+                sequence: None,
+                previous_sequence: None,
+                source_ns: None,
+                receive_ns: 200,
+                apply_ns: 200,
+                book_source_ns: None,
+                book_receive_ns: None,
+                provenance: "fixture:explicit_gap".into(),
+            };
+            let rows = if gap_enabled {
+                serde_json::to_vec(&gap).unwrap()
+            } else {
+                vec![]
+            };
+            sim.set_book_continuity_replay(
+                BookContinuityReplay::from_reader(std::io::Cursor::new(rows), "owner").unwrap(),
+            );
+            let mut book = OrderBookSnapshot {
+                exchange: Exchange::Polymarket,
+                symbol: "tok".into(),
+                bids: vec![PriceLevel {
+                    price: 0.6,
+                    quantity: 100.0,
+                }],
+                asks: vec![PriceLevel {
+                    price: 0.7,
+                    quantity: 100.0,
+                }],
+                exchange_timestamp_ns: 100,
+                local_timestamp_ns: 100,
+            };
+            sim.core.on_orderbook(&book);
+            let Signal::NewOrder(mut maker) = place_signal("resting") else {
+                unreachable!()
+            };
+            maker.instance_id = "owner".into();
+            assert_eq!(
+                sim.core.submit_order(&maker, 110).status,
+                OrderStatus::Accepted
+            );
+            assert!(sim
+                .core
+                .on_trade_tick(&TradeTick {
+                    exchange: Exchange::Polymarket,
+                    symbol: "tok".into(),
+                    exchange_trade_id: None,
+                    side: Side::Sell,
+                    price: 0.6,
+                    quantity: 10.0,
+                    exchange_timestamp_ns: 150,
+                    local_timestamp_ns: 150
+                })
+                .is_empty());
+            book.exchange_timestamp_ns = 200;
+            book.local_timestamp_ns = 200;
+            book.asks[0].price = 0.5;
+            sim.feed.test_push_server_event(
+                200,
+                SimEvent::ServerBook(
+                    book,
+                    super::super::event::ServerEventTime {
+                        raw_source_ns: 200,
+                        recorded_receive_ns: 200,
+                        reconstructed_source_ns: None,
+                        effective_apply_ns: 200,
+                        stream_index: 0,
+                        stream_sequence: 1,
+                    },
+                ),
+            );
+            let mut filled = 0.0;
+            while sim.peek_when().is_some() {
+                filled += sim.step().iter().map(|u| u.filled_quantity).sum::<f64>();
+            }
+            assert_eq!(filled, if gap_enabled { 0.0 } else { 10.0 });
+        }
+    }
+
+    #[test]
     fn causal_taker_race_observes_outbound_transit() {
         let mut sim = sim_with_fixed_rtt(100);
         sim.causal_matching = true;
@@ -2479,9 +4153,7 @@ mod tests {
 
         fn describe(depth: usize, mut samples: Vec<u64>) {
             samples.sort_unstable();
-            let at = |fraction: f64| {
-                samples[((samples.len() - 1) as f64 * fraction) as usize]
-            };
+            let at = |fraction: f64| samples[((samples.len() - 1) as f64 * fraction) as usize];
             println!(
                 "SIMV2_TAKER_RACE_BENCH n={} median_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth={} overflow=0 boundary=observe_causal_taker_races",
                 samples.len(),
@@ -2626,13 +4298,19 @@ mod tests {
         assert_eq!(updates[0].status, OrderStatus::Cancelled);
         assert_eq!(updates[1].status, OrderStatus::PartiallyFilled);
         assert!(updates[0].timestamp_ns < updates[1].timestamp_ns);
-        let audit = updates[0].order_audit.as_ref().expect("cancel preserves unseen matched risk");
+        let audit = updates[0]
+            .order_audit
+            .as_ref()
+            .expect("cancel preserves unseen matched risk");
         assert_eq!(audit.original_size.as_deref(), Some("10"));
         assert_eq!(audit.size_matched.as_deref(), Some("9.994"));
         assert_eq!(audit.associate_trades, vec![trade_id]);
         assert_eq!(updates[0].filled_quantity, 0.0);
         assert_eq!(updates[1].filled_quantity, 9.994);
-        assert!(updates[1].order_audit.is_none(), "private fill semantics are unchanged");
+        assert!(
+            updates[1].order_audit.is_none(),
+            "private fill semantics are unchanged"
+        );
         assert_eq!(updates[0].timestamp_ns, cancel_emit + 100_000_000);
         assert_eq!(updates[1].timestamp_ns, filled_at + 500_000_000);
     }
@@ -2759,6 +4437,457 @@ mod tests {
         assert_eq!(recon_status, Some(OrderStatus::Accepted));
     }
 
+    fn separated_taker_sim(private_delay_ms: u64) -> (Simulator, Signal) {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.separate_taker_private_fills = true;
+        sim.set_taker_overhead_enabled(false);
+        sim.latency
+            .set_fill_push_mult(private_delay_ms as f64 / 50.0);
+        sim.core.on_orderbook(&OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            bids: vec![],
+            asks: vec![PriceLevel {
+                price: 0.6,
+                quantity: 100.0,
+            }],
+            exchange_timestamp_ns: 1,
+            local_timestamp_ns: 1,
+        });
+        let mut signal = place_signal("taker-private");
+        if let Signal::NewOrder(order) = &mut signal {
+            order.post_only = false;
+            order.order_type = crate::types::OrderType::Fak;
+            order.order_slot = OrderSlot::with_generation(2, 17);
+        }
+        (sim, signal)
+    }
+
+    #[test]
+    fn taker_private_and_http_can_arrive_in_either_order_without_double_economics() {
+        for private_delay_ms in [10, 200] {
+            let (mut sim, signal) = separated_taker_sim(private_delay_ms);
+            sim.submit(&signal, 1_000_000_000);
+            let mut updates = Vec::new();
+            while sim.peek_when().is_some() {
+                updates.extend(sim.step());
+            }
+            assert_eq!(updates.len(), 2);
+            let http = updates.iter().find(|u| u.trade_id.is_none()).unwrap();
+            let private = updates.iter().find(|u| u.trade_id.is_some()).unwrap();
+            assert_eq!(http.timestamp_ns, 1_100_000_000);
+            assert_eq!(http.filled_quantity, 0.0);
+            assert_eq!(http.liquidity, None);
+            assert_eq!(private.filled_quantity, 10.0);
+            assert_eq!(private.exchange_event_timestamp_ns, Some(1_050_000_000));
+            assert_eq!(
+                private.timestamp_ns,
+                1_050_000_000 + private_delay_ms * 1_000_000
+            );
+            assert_eq!(private.order_slot, OrderSlot::with_generation(2, 17));
+            assert_eq!(http.order_slot, private.order_slot);
+            assert_eq!(updates.iter().map(|u| u.filled_quantity).sum::<f64>(), 10.0);
+        }
+    }
+
+    #[test]
+    fn partial_fak_http_is_matched_and_private_retains_actual_quantity() {
+        let (mut sim, signal) = separated_taker_sim(200);
+        sim.core.on_orderbook(&OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            bids: vec![],
+            asks: vec![PriceLevel {
+                price: 0.6,
+                quantity: 5.0,
+            }],
+            exchange_timestamp_ns: 2,
+            local_timestamp_ns: 2,
+        });
+        sim.submit(&signal, 1_000_000_000);
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].status, OrderStatus::Filled);
+        assert_eq!(updates[0].filled_quantity, 0.0);
+        assert_eq!(updates[0].trade_id, None);
+        assert_eq!(updates[1].status, OrderStatus::PartiallyFilled);
+        assert_eq!(updates[1].filled_quantity, 5.0);
+        assert!(
+            sim.core.order_symbol_side("taker-private").is_none(),
+            "FAK residual cannot rest"
+        );
+        let audit = sim.core.reconcile(
+            &[("taker-private".into(), "tok".into(), Side::Buy, 0.6, None)],
+            &[],
+            2_000_000_000,
+        );
+        assert_eq!(audit[0].status, OrderStatus::Cancelled);
+        assert_eq!(
+            audit[0]
+                .order_audit
+                .as_ref()
+                .unwrap()
+                .size_matched
+                .as_deref(),
+            Some("5")
+        );
+        assert_eq!(
+            audit[0].order_audit.as_ref().unwrap().associate_trades,
+            vec![updates[1].trade_id.clone().unwrap()]
+        );
+    }
+
+    fn observed_gate(start: u64, end: u64) -> ObservedAdmissionReplay {
+        let csv = format!(
+            "start_ns,end_ns,duration_seconds\n{start},{end},{}\n",
+            (end - start) as f64 / 1e9
+        );
+        ObservedAdmissionReplay::from_reader(std::io::Cursor::new(csv)).unwrap()
+    }
+
+    #[test]
+    fn reconcile_timeout_returns_uncertainty_and_suppresses_late_state() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.separate_taker_private_fills = true;
+        sim.reconcile_timeout_ns = 40_000_000;
+        seed_front_order(&mut sim, "query-timeout");
+        sim.submit(
+            &Signal::ReconcilePolymarket {
+                pending_places: vec![],
+                pending_cancels: vec![("query-timeout".into(), "simv2-query-timeout".into())],
+                pending_trade_ids: vec![],
+                instance_id: String::new(),
+            },
+            1_000_000_000,
+        );
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, OrderStatus::CancelOrderTimeout);
+        assert_eq!(updates[0].timestamp_ns, 1_040_000_000);
+        assert!(updates[0].order_audit.is_none());
+        assert!(sim.core.order_symbol_side("query-timeout").is_some());
+        assert_eq!(sim.reconcile_timeout_stats(), 1);
+    }
+
+    #[test]
+    fn timed_out_trade_query_does_not_accelerate_or_drop_private_fallback() {
+        let (mut sim, signal) = separated_taker_sim(10);
+        let Signal::NewOrder(order) = signal else {
+            unreachable!()
+        };
+        sim.private_fill_reconcile_rate = 1.0;
+        sim.private_fill_reconcile_delay_ns = 750_000_000;
+        sim.reconcile_timeout_ns = 40_000_000;
+        let fill = sim.core.submit_order(&order, 1_000_000_000);
+        let trade_id = fill.trade_id.clone().unwrap();
+        sim.schedule_private_fill(fill, 1_000_000_000);
+        let fallback_when = sim.peek_strategy_when().unwrap();
+        sim.submit(
+            &Signal::ReconcilePolymarket {
+                pending_places: vec![],
+                pending_cancels: vec![],
+                pending_trade_ids: vec![trade_id.clone()],
+                instance_id: String::new(),
+            },
+            1_100_000_000,
+        );
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].trade_id, Some(trade_id));
+        assert_eq!(updates[0].filled_quantity, 10.0);
+        assert_eq!(updates[0].timestamp_ns, fallback_when);
+        assert_eq!(sim.reconcile_timeout_stats(), 1);
+        assert_eq!(sim.private_fill_recovery_stats().0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "query timeout feedback capacity exceeded")]
+    fn query_timeout_feedback_is_bounded_without_dropping_private_state() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.separate_taker_private_fills = true;
+        sim.reconcile_timeout_ns = 1;
+        seed_front_order(&mut sim, "query-bound");
+        let signal = Signal::ReconcilePolymarket {
+            pending_places: vec![],
+            pending_cancels: vec![("query-bound".into(), "oid".into())],
+            pending_trade_ids: vec![],
+            instance_id: String::new(),
+        };
+        for _ in 0..=MAX_HTTP_DEADLINES {
+            sim.submit(&signal, 1);
+        }
+    }
+
+    #[test]
+    fn observed_admission_blocks_before_sampling_and_recovers_on_boundary() {
+        let mut sim = sim_with_fixed_rtt(100);
+        let mut control = sim_with_fixed_rtt(100);
+        let profile = LatencyModel::empirical_profile(50.0, 150.0, 300.0, 0.4);
+        sim.latency = LatencyModel::new(profile.clone(), profile.clone(), 0.3, 11);
+        control.latency = LatencyModel::new(profile.clone(), profile, 0.3, 11);
+        sim.set_observed_admission_replay(observed_gate(1_000_000_000, 2_000_000_000));
+        let mut rejected = place_signal("blocked");
+        if let Signal::NewOrder(order) = &mut rejected {
+            order.order_slot = OrderSlot::with_generation(3, 9);
+        }
+        sim.submit(&rejected, 1_000_000_000);
+        assert_eq!(
+            sim.peek_server_when(),
+            None,
+            "rejected place never leaves local lane"
+        );
+        assert_eq!(
+            sim.latency.sample_place_split(1_001_000_000),
+            control.latency.sample_place_split(1_001_000_000)
+        );
+        let update = sim.step();
+        assert_eq!(update[0].status, OrderStatus::ExecutorRejected);
+        assert_eq!(update[0].order_slot, OrderSlot::with_generation(3, 9));
+        assert_eq!(
+            update[0].timestamp_ns,
+            1_000_000_000 + ADMISSION_FEEDBACK_NS
+        );
+        assert_eq!(
+            sim.observed_admission_stats(),
+            (1, 0, 1, MAX_ADMISSION_FEEDBACK)
+        );
+        sim.submit(&place_signal("recovered"), 2_000_000_000);
+        assert!(sim.peek_server_when().is_some());
+        let mut replies = Vec::new();
+        while sim.peek_when().is_some() {
+            replies.extend(sim.step());
+        }
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].status, OrderStatus::Accepted);
+        assert_eq!(sim.observed_admission_stats().0, 1);
+    }
+
+    #[test]
+    fn observed_admission_keeps_resting_fills_cancels_and_queries_running() {
+        let mut sim = sim_with_fixed_rtt(100);
+        seed_front_order(&mut sim, "resting");
+        sim.set_observed_admission_replay(observed_gate(1_000_000_000, 2_000_000_000));
+        let fills = sim.core.on_trade_tick(&TradeTick {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            exchange_trade_id: None,
+            price: 0.6,
+            quantity: 4.0,
+            side: Side::Sell,
+            exchange_timestamp_ns: 1_000_000_000,
+            local_timestamp_ns: 1_000_000_000,
+        });
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].filled_quantity, 4.0);
+        sim.submit(&cancel_signal("resting", 1_000_000_001), 1_000_000_001);
+        sim.submit(
+            &Signal::ReconcilePolymarket {
+                pending_places: vec![],
+                pending_cancels: vec![("resting".into(), "simv2-resting".into())],
+                pending_trade_ids: vec![],
+                instance_id: String::new(),
+            },
+            1_000_000_002,
+        );
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 2);
+        assert!(updates.iter().all(|u| u.status == OrderStatus::Cancelled));
+        assert_eq!(sim.observed_admission_stats().0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "admission feedback capacity exceeded")]
+    fn observed_admission_feedback_overflow_is_lossless_fail_stop() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.set_observed_admission_replay(observed_gate(1, 1_000_000_000));
+        for index in 0..=MAX_ADMISSION_FEEDBACK {
+            sim.submit(&place_signal(&format!("gate-{index}")), 1);
+        }
+    }
+
+    #[test]
+    fn strict_deadline_counts_additive_overhead_and_suppresses_late_http() {
+        let (mut sim, signal) = separated_taker_sim(10);
+        sim.set_taker_overhead_enabled(true);
+        sim.latency
+            .set_taker_overhead_anchors(1000.0, 1001.0, 1002.0);
+        sim.client_timeout_ns = 110_000_000; // network RTT100ms fits, processing does not
+        sim.submit(&signal, 1_000_000_000);
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates[0].status, OrderStatus::NewOrderTimeout);
+        assert_eq!(updates[0].timestamp_ns, 1_110_000_000);
+        assert_eq!(updates.iter().filter(|u| u.trade_id.is_some()).count(), 1);
+        assert_eq!(updates.iter().filter(|u| u.trade_id.is_none()).count(), 1);
+        assert_eq!(updates.iter().map(|u| u.filled_quantity).sum::<f64>(), 10.0);
+        assert_eq!(sim.http_deadline_stats().0, 0);
+    }
+
+    #[test]
+    fn strict_deadline_uses_actual_no_fill_reply_and_response_wins_exact_tie() {
+        for (rtt, deadline, expected) in [
+            (100_000_000, 100_000_000, OrderStatus::Cancelled),
+            (100_000_001, 100_000_000, OrderStatus::NewOrderTimeout),
+        ] {
+            let (mut sim, mut signal) = separated_taker_sim(10);
+            // Nonmarketable FAK returns an actual zero-fill cancellation.
+            if let Signal::NewOrder(order) = &mut signal {
+                order.price = Some(0.5);
+            }
+            sim.client_timeout_ns = deadline;
+            sim.submit_with_latency_split(&signal, 1_000_000_000, rtt / 2, rtt - rtt / 2)
+                .unwrap();
+            let mut updates = Vec::new();
+            while sim.peek_when().is_some() {
+                updates.extend(sim.step());
+            }
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].status, expected);
+            assert_eq!(updates[0].timestamp_ns, 1_000_000_000 + deadline);
+            assert_eq!(updates[0].filled_quantity, 0.0);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "HTTP deadline capacity exceeded")]
+    fn strict_http_timer_capacity_bounds_completed_but_queued_deadlines() {
+        let (mut sim, _) = separated_taker_sim(10);
+        for index in 0..=MAX_HTTP_DEADLINES {
+            let signal = place_signal(&format!("timer-{index}"));
+            sim.submit_with_latency_split(&signal, 1, 1, 1).unwrap();
+            sim.step(); // request arrival
+            sim.step(); // HTTP completes; canceled deadline still occupies its slot
+        }
+    }
+
+    #[test]
+    fn taker_timeout_suppresses_http_without_losing_private_execution() {
+        let (mut sim, signal) = separated_taker_sim(10);
+        sim.client_timeout_ns = 20_000_000;
+        sim.submit(&signal, 1_000_000_000);
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].status, OrderStatus::NewOrderTimeout);
+        assert_eq!(updates[0].filled_quantity, 0.0);
+        assert_eq!(updates[1].filled_quantity, 10.0);
+        assert!(updates[1].trade_id.is_some());
+    }
+
+    #[test]
+    fn per_kind_deadlines_distinguish_three_second_place_and_cancel() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.separate_taker_private_fills = true;
+        sim.client_timeout_ns = 2_000_000_000;
+        sim.cancel_timeout_ns = 4_000_000_000;
+        sim.submit_with_latency_split(&place_signal("deadline"), 1_000_000_000, 0, 3_000_000_000)
+            .unwrap();
+        let cancel = cancel_signal("deadline", 1_000_000_001);
+        sim.submit_with_latency_split(&cancel, 1_000_000_001, 0, 3_000_000_000)
+            .unwrap();
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(
+            updates.iter().map(|u| u.status).collect::<Vec<_>>(),
+            vec![OrderStatus::NewOrderTimeout, OrderStatus::Cancelled]
+        );
+        assert_eq!(updates[0].timestamp_ns, 3_000_000_000);
+        assert_eq!(updates[1].timestamp_ns, 4_000_000_001);
+        assert_eq!(sim.timeout_stats().0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "private fill recovery capacity exceeded")]
+    fn private_recovery_overflow_aborts_instead_of_dropping_fills() {
+        let (mut sim, signal) = separated_taker_sim(10);
+        let Signal::NewOrder(order) = signal else {
+            unreachable!()
+        };
+        let fill = sim.core.submit_order(&order, 1);
+        sim.private_fill_reconcile_rate = 1.0;
+        sim.private_fill_reconcile_delay_ns = 1_000_000;
+        for index in 0..=MAX_PENDING_PRIVATE_FILLS {
+            let mut execution = fill.clone();
+            execution.trade_id = Some(format!("capacity-{index}"));
+            sim.schedule_private_fill(execution, 1);
+        }
+    }
+
+    #[test]
+    fn reconcile_observes_state_at_query_arrival_not_emission() {
+        let mut sim = sim_with_fixed_rtt(100);
+        let mut place = place_signal("query-race");
+        if let Signal::NewOrder(order) = &mut place {
+            order.order_slot = OrderSlot::with_generation(5, 19);
+        }
+        sim.submit_with_latency_split(&place, 1_000_000_000, 25_000_000, 1)
+            .unwrap();
+        // At query emission the order has not reached the core. At its 50ms
+        // outbound arrival it is resting, so the delayed response is Accepted.
+        sim.submit(
+            &Signal::ReconcilePolymarket {
+                pending_places: vec![("query-race".into(), "tok".into(), Side::Buy, 0.6, None)],
+                pending_cancels: vec![],
+                pending_trade_ids: vec![],
+                instance_id: String::new(),
+            },
+            1_000_000_000,
+        );
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 2);
+        assert!(updates.iter().all(|u| u.status == OrderStatus::Accepted));
+        assert!(updates
+            .iter()
+            .all(|u| u.order_slot == OrderSlot::with_generation(5, 19)));
+        assert_eq!(updates[1].timestamp_ns, 1_100_000_000);
+        assert_eq!(updates[1].exchange_event_timestamp_ns, Some(1_050_000_000));
+    }
+
+    #[test]
+    fn timeout_before_exchange_arrival_keeps_owner_and_generation() {
+        let mut sim = sim_with_fixed_rtt(100);
+        sim.client_timeout_ns = 10;
+        let mut place = place_signal("slow-identity");
+        if let Signal::NewOrder(order) = &mut place {
+            order.instance_id = "owner-b".into();
+            order.order_slot = OrderSlot::with_generation(9, 23);
+        }
+        sim.submit_with_latency_split(&place, 100, 100, 100)
+            .unwrap();
+        assert_eq!(
+            sim.order_owner("slow-identity"),
+            Some(("owner-b", OrderSlot::with_generation(9, 23)))
+        );
+        let timeout = sim.step();
+        assert_eq!(timeout[0].status, OrderStatus::NewOrderTimeout);
+        assert_eq!(timeout[0].order_slot, OrderSlot::with_generation(9, 23));
+        while sim.peek_when().is_some() {
+            sim.step();
+        }
+        assert!(sim.core.order_symbol_side("slow-identity").is_some());
+    }
+
     #[test]
     fn lost_place_ack_forces_orphan_then_account_reconciliation() {
         let mut sim = sim_with_fixed_rtt(100);
@@ -2774,13 +4903,7 @@ mod tests {
 
         sim.submit(
             &Signal::ReconcilePolymarket {
-                pending_places: vec![(
-                    "lost-place".into(),
-                    "tok".into(),
-                    Side::Buy,
-                    0.6,
-                    None,
-                )],
+                pending_places: vec![("lost-place".into(), "tok".into(), Side::Buy, 0.6, None)],
                 pending_cancels: vec![],
                 pending_trade_ids: vec![],
                 instance_id: String::new(),
@@ -3003,6 +5126,775 @@ mod tests {
         sim.observe_dynamic_markout_spot_book(&book(102.0, 3_000_000_000), 3_000_000_000);
         let got = sim.spot_realised_vol_bps(3_000_000_000).unwrap();
         let expected = (102.0_f64 / 100.0).ln().abs() * 10_000.0;
-        assert!((got - expected).abs() < 1e-9, "got={got} expected={expected}");
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "got={got} expected={expected}"
+        );
+    }
+
+    fn owned_cancel_signal(coid: &str, timestamp_ns: u64) -> Signal {
+        Signal::CancelOrder {
+            exchange: Exchange::Polymarket,
+            client_order_id: coid.into(),
+            instance_id: "one".into(),
+            timestamp_ns,
+        }
+    }
+
+    fn staged_sim(rtt_ms: u64, processing_ms: u64) -> Simulator {
+        let mut sim = sim_with_fixed_rtt(rtt_ms);
+        sim.cancel_timing_mode = CancelTimingMode::StagedRttBudget;
+        sim.cancel_processing_ns = processing_ms * 1_000_000;
+        sim.separate_taker_private_fills = true;
+        sim.execution_timing = ExecutionTimingAudit::new(true);
+        sim
+    }
+
+    fn owned_front_order(sim: &mut Simulator, coid: &str, iid: &str, token: &str) {
+        sim.core.configure_replay_self_depth(1.0);
+        sim.core.on_orderbook(&OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: token.into(),
+            bids: vec![PriceLevel {
+                price: 0.6,
+                quantity: 10.0,
+            }],
+            asks: vec![PriceLevel {
+                price: 0.62,
+                quantity: 100.0,
+            }],
+            exchange_timestamp_ns: 1,
+            local_timestamp_ns: 1,
+        });
+        let Signal::NewOrder(mut request) = place_signal(coid) else {
+            unreachable!()
+        };
+        request.instance_id = iid.into();
+        request.symbol = token.into();
+        request.order_slot = OrderSlot::with_generation(1, 1);
+        assert_eq!(
+            sim.core.submit_order(&request, 2).status,
+            OrderStatus::Accepted
+        );
+    }
+
+    fn trade_front(sim: &mut Simulator, quantity: f64, when: u64) -> Vec<OrderUpdate> {
+        sim.core.on_trade_tick(&TradeTick {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            exchange_trade_id: None,
+            price: 0.6,
+            quantity,
+            side: Side::Sell,
+            exchange_timestamp_ns: when,
+            local_timestamp_ns: when,
+        })
+    }
+
+    #[test]
+    fn fraction_cancel_residual_stops_matching_but_late_private_fill_retains_match_time() {
+        let mut sim = staged_sim(100, 0);
+        sim.cancel_timing_mode = CancelTimingMode::StagedRttFraction;
+        sim.cancel_processing_fraction_bps = 2000;
+        sim.core.configure_durable_terminal_status(true);
+        sim.latency.set_fill_push_mult(10.0);
+        owned_front_order(&mut sim, "fraction", "one", "tok");
+        let emit = 1_000_000_000;
+        sim.submit(&owned_cancel_signal("fraction", emit), emit);
+        assert_eq!(sim.peek_when(), Some(emit + 40_000_000));
+        sim.step();
+        let at = emit + 50_000_000;
+        let fills = trade_front(&mut sim, 4.0, at);
+        assert_eq!(fills.len(), 1);
+        sim.schedule_private_fill(fills[0].clone(), at);
+        assert_eq!(sim.peek_when(), Some(emit + 60_000_000));
+        sim.step();
+        assert!(trade_front(&mut sim, 100.0, emit + 61_000_000).is_empty());
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].status, OrderStatus::Cancelled);
+        assert_eq!(updates[0].timestamp_ns, emit + 100_000_000);
+        assert_eq!(updates[1].timestamp_ns, at + 500_000_000);
+        assert_eq!(updates[1].exchange_event_timestamp_ns, Some(at));
+        let rows: Vec<_> = sim.drain_execution_timing_audit().collect();
+        for row in rows.iter().filter(|r| {
+            matches!(
+                r.stage,
+                ExecutionStage::PrivateMatched
+                    | ExecutionStage::PrivateScheduled
+                    | ExecutionStage::PrivateDelivered
+            )
+        }) {
+            assert_eq!(row.exchange_event_timestamp_ns, Some(at));
+        }
+        assert_eq!(sim.execution_timing_stats().queued, 0);
+    }
+
+    #[test]
+    fn staged_cancel_preserves_rtt_and_exposes_match_vs_private_receive() {
+        let mut sim = staged_sim(100, 40);
+        sim.cancel_finality_delay_frac = 12.0; // deliberately ignored in staged mode
+        sim.latency.set_fill_push_mult(10.0);
+        owned_front_order(&mut sim, "staged", "one", "tok");
+        let emit = 1_000_000_000;
+        sim.submit(&owned_cancel_signal("staged", emit), emit);
+        assert_eq!(sim.peek_when(), Some(emit + 30_000_000));
+        assert!(sim.step().is_empty());
+        assert!(sim.core.order_symbol_side("staged").is_some());
+        let matched = emit + 50_000_000;
+        let fills = trade_front(&mut sim, 4.0, matched);
+        assert_eq!(fills.len(), 1);
+        sim.schedule_private_fill(fills[0].clone(), matched);
+        assert_eq!(sim.peek_when(), Some(emit + 70_000_000));
+        assert!(sim.step().is_empty());
+        assert!(sim.core.order_symbol_side("staged").is_none());
+        assert!(trade_front(&mut sim, 6.0, emit + 80_000_000).is_empty());
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].status, OrderStatus::Cancelled);
+        assert_eq!(updates[0].timestamp_ns, emit + 100_000_000);
+        assert_eq!(updates[0].filled_quantity, 0.0);
+        assert_eq!(
+            updates[0]
+                .order_audit
+                .as_ref()
+                .unwrap()
+                .size_matched
+                .as_deref(),
+            Some("4")
+        );
+        assert_eq!(updates[1].filled_quantity, 4.0);
+        assert_eq!(updates[1].timestamp_ns, matched + 500_000_000);
+        let rows: Vec<_> = sim.drain_execution_timing_audit().collect();
+        let row = |stage| rows.iter().find(|r| r.stage == stage).unwrap();
+        assert_eq!(row(ExecutionStage::PrivateMatched).actual_ns, matched);
+        assert_eq!(
+            row(ExecutionStage::PrivateDelivered).actual_ns,
+            matched + 500_000_000
+        );
+        assert_eq!(
+            row(ExecutionStage::CancelEffective).actual_ns,
+            emit + 70_000_000
+        );
+        assert_eq!(
+            row(ExecutionStage::HttpDelivered).actual_ns,
+            emit + 100_000_000
+        );
+        assert!(rows
+            .iter()
+            .all(|r| r.iid.as_str() == "one" && r.coid.as_str() == "staged"));
+        assert_eq!(sim.execution_timing_stats().queued, 0);
+        assert_eq!(
+            sim.execution_timing_stats().emitted,
+            sim.execution_timing_stats().drained
+        );
+    }
+
+    #[test]
+    fn staged_cancel_full_match_never_claims_successful_cancel_or_double_economics() {
+        let mut sim = staged_sim(100, 80);
+        owned_front_order(&mut sim, "matched", "one", "tok");
+        let emit = 1_000_000_000;
+        sim.submit(&owned_cancel_signal("matched", emit), emit);
+        sim.step();
+        let fills = trade_front(&mut sim, 10.0, emit + 50_000_000);
+        assert_eq!(fills.len(), 1);
+        let tid = fills[0].trade_id.clone().unwrap();
+        sim.schedule_private_fill(fills[0].clone(), emit + 50_000_000);
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert!(!updates.iter().any(|u| u.status == OrderStatus::Cancelled));
+        let mut seen = std::collections::HashSet::new();
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|u| u.trade_id.as_deref() == Some(tid.as_str()))
+                .count(),
+            1,
+            "HTTP must not shortcut the independent private push"
+        );
+        let qty: f64 = updates
+            .iter()
+            .filter(|u| {
+                u.trade_id
+                    .as_ref()
+                    .is_some_and(|id| seen.insert(id.clone()))
+            })
+            .map(|u| u.filled_quantity)
+            .sum();
+        assert_eq!(qty, 10.0);
+        assert!(updates.iter().any(|u| u.status == OrderStatus::Filled
+            && u.trade_id.is_none()
+            && u.filled_quantity == 0.0));
+        let rows: Vec<_> = sim.drain_execution_timing_audit().collect();
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.stage == ExecutionStage::PrivateMatched
+                    && r.trade_id.as_str() == tid.as_str())
+                .count(),
+            1
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.stage == ExecutionStage::HttpDelivered
+                    && r.actual_ns == emit + 100_000_000)
+        );
+    }
+
+    #[test]
+    fn staged_cancel_timeout_does_not_cancel_scheduled_exchange_processing() {
+        let mut sim = staged_sim(1000, 200);
+        sim.cancel_timeout_ns = 100_000_000;
+        owned_front_order(&mut sim, "timeout", "one", "tok");
+        let emit = 1_000_000_000;
+        sim.submit(&owned_cancel_signal("timeout", emit), emit);
+        let timeout = sim.step();
+        assert_eq!(timeout[0].status, OrderStatus::CancelOrderTimeout);
+        assert_eq!(timeout[0].timestamp_ns, emit + 100_000_000);
+        assert!(sim.core.order_symbol_side("timeout").is_some());
+        assert_eq!(sim.peek_server_when(), Some(emit + 400_000_000));
+        sim.step();
+        assert!(sim.core.order_symbol_side("timeout").is_some());
+        sim.step();
+        assert!(sim.core.order_symbol_side("timeout").is_none());
+        while sim.peek_when().is_some() {
+            assert!(sim.step().is_empty());
+        }
+        let rows: Vec<_> = sim.drain_execution_timing_audit().collect();
+        assert!(rows.iter().any(
+            |r| r.stage == ExecutionStage::CancelEffective && r.actual_ns == emit + 600_000_000
+        ));
+        assert!(rows
+            .iter()
+            .any(|r| r.stage == ExecutionStage::HttpLateDiscarded
+                && r.actual_ns == emit + 1_000_000_000));
+        assert!(!rows
+            .iter()
+            .any(|r| r.stage == ExecutionStage::HttpDelivered));
+    }
+
+    #[test]
+    fn staged_cap_and_reply_deadline_tie_preserve_exact_total_rtt() {
+        let mut sim = staged_sim(100, 500);
+        sim.cancel_timeout_ns = 100_000_000;
+        owned_front_order(&mut sim, "cap", "one", "tok");
+        let emit = 1_000_000_000;
+        sim.submit(&owned_cancel_signal("cap", emit), emit);
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, OrderStatus::Cancelled);
+        assert_eq!(updates[0].timestamp_ns, emit + 100_000_000);
+        assert_eq!(sim.timeout_stats().0, 0);
+        assert_eq!(sim.cancel_timing_stats().processing_capped_requests, 1);
+        let rows: Vec<_> = sim.drain_execution_timing_audit().collect();
+        let t = rows.iter().find_map(|r| r.timing).unwrap();
+        assert_eq!(
+            (t.network_l1_ns, t.processing_ns, t.network_l2_ns),
+            (0, 100_000_000, 0)
+        );
+    }
+
+    #[test]
+    fn staged_duplicate_cancel_attempts_have_independent_http_identity() {
+        let mut sim = staged_sim(100, 40);
+        owned_front_order(&mut sim, "retry", "one", "tok");
+        let emit = 1_000_000_000;
+        sim.submit(&owned_cancel_signal("retry", emit), emit);
+        let first = sim.last_dispatched_request_id();
+        sim.submit(&owned_cancel_signal("retry", emit + 1), emit + 1);
+        assert_ne!(first, sim.last_dispatched_request_id());
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 2);
+        assert!(updates.iter().all(|u| u.filled_quantity == 0.0));
+        assert!(sim.core.order_symbol_side("retry").is_none());
+        let rows: Vec<_> = sim.drain_execution_timing_audit().collect();
+        let ids: std::collections::HashSet<_> = rows
+            .iter()
+            .filter(|r| r.stage == ExecutionStage::HttpDelivered)
+            .map(|r| r.request_id)
+            .collect();
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn staged_cancel_during_private_reconnect_recovers_fill_once() {
+        let mut sim = staged_sim(100, 40);
+        sim.private_fill_reconcile_rate = 1.0;
+        sim.private_fill_reconcile_delay_ns = 750_000_000;
+        owned_front_order(&mut sim, "recover", "one", "tok");
+        let emit = 1_000_000_000;
+        let fills = trade_front(&mut sim, 4.0, emit);
+        sim.schedule_private_fill(fills[0].clone(), emit);
+        sim.submit(&owned_cancel_signal("recover", emit + 1), emit + 1);
+        let tid = fills[0].trade_id.clone().unwrap();
+        sim.submit(
+            &Signal::ReconcilePolymarket {
+                pending_places: vec![],
+                pending_cancels: vec![],
+                pending_trade_ids: vec![tid.clone()],
+                instance_id: "one".into(),
+            },
+            emit + 200_000_000,
+        );
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|u| u.trade_id.as_deref() == Some(&tid))
+                .count(),
+            1
+        );
+        assert_eq!(sim.private_fill_recovery_stats().0, 0);
+        let rows: Vec<_> = sim.drain_execution_timing_audit().collect();
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.stage == ExecutionStage::PrivateDelivered
+                    && r.trade_id.as_str() == tid.as_str())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn staged_cancel_all_is_scoped_and_uses_effective_time_membership() {
+        let mut sim = staged_sim(100, 40);
+        owned_front_order(&mut sim, "target", "one", "tok");
+        owned_front_order(&mut sim, "sibling", "two", "tok");
+        owned_front_order(&mut sim, "other-market", "one", "other");
+        let emit = 1_000_000_000;
+        sim.submit(
+            &Signal::PolymarketCancelAllOrders {
+                reason: "test".into(),
+                market: Some("market".into()),
+                asset_ids: vec!["tok".into()],
+                instance_id: "one".into(),
+            },
+            emit,
+        );
+        assert_eq!(sim.peek_server_when(), Some(emit + 30_000_000));
+        sim.step();
+        assert!(sim.core.order_symbol_side("target").is_some());
+        owned_front_order(&mut sim, "arrived-during-processing", "one", "tok");
+        assert_eq!(sim.peek_server_when(), Some(emit + 70_000_000));
+        sim.step();
+        assert!(sim.core.order_symbol_side("target").is_none());
+        assert!(sim
+            .core
+            .order_symbol_side("arrived-during-processing")
+            .is_none());
+        assert!(sim.core.order_symbol_side("sibling").is_some());
+        assert!(sim.core.order_symbol_side("other-market").is_some());
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 2);
+        assert!(updates
+            .iter()
+            .all(|u| u.status == OrderStatus::Cancelled && u.timestamp_ns == emit + 100_000_000));
+        assert_eq!(sim.cancel_timing_stats().staged_requests, 1);
+    }
+
+    #[test]
+    fn staged_cancel_all_timeout_retains_exchange_effect_and_emits_no_false_ack() {
+        let mut sim = staged_sim(100, 40);
+        sim.cancel_timeout_ns = 20_000_000;
+        owned_front_order(&mut sim, "batch-timeout", "one", "tok");
+        let emit = 1_000_000_000;
+        sim.submit(
+            &Signal::CancelAll {
+                exchange: Exchange::Polymarket,
+                symbol: "tok".into(),
+                instance_id: "one".into(),
+                timestamp_ns: emit,
+            },
+            emit,
+        );
+        while sim.peek_when().is_some() {
+            assert!(sim.step().is_empty());
+        }
+        assert!(sim.core.order_symbol_side("batch-timeout").is_none());
+        let rows: Vec<_> = sim.drain_execution_timing_audit().collect();
+        assert!(rows.iter().any(|r| r.stage == ExecutionStage::HttpDeadline
+            && r.coid.is_empty()
+            && r.iid.as_str() == "one"));
+        assert!(rows
+            .iter()
+            .any(|r| r.stage == ExecutionStage::HttpLateDiscarded
+                && r.coid.as_str() == "batch-timeout"));
+        assert!(!rows
+            .iter()
+            .any(|r| r.stage == ExecutionStage::HttpDelivered));
+    }
+
+    #[test]
+    #[should_panic(expected = "explicit owner")]
+    fn staged_cancel_all_empty_owner_fails_closed() {
+        let mut sim = staged_sim(100, 40);
+        sim.submit(
+            &Signal::CancelAll {
+                exchange: Exchange::Polymarket,
+                symbol: "tok".into(),
+                instance_id: String::new(),
+                timestamp_ns: 1,
+            },
+            1,
+        );
+    }
+
+    #[test]
+    fn timing_audit_is_legacy_economics_and_rng_neutral() {
+        let run = |audit| {
+            let mut sim = sim_with_fixed_rtt(100);
+            sim.cancel_finality_delay_frac = 12.0;
+            sim.cancel_finality_counts_toward_timeout = true;
+            sim.separate_taker_private_fills = true;
+            sim.execution_timing = ExecutionTimingAudit::new(audit);
+            owned_front_order(&mut sim, "neutral", "one", "tok");
+            sim.submit(
+                &owned_cancel_signal("neutral", 1_000_000_000),
+                1_000_000_000,
+            );
+            let mut updates = Vec::new();
+            while sim.peek_when().is_some() {
+                updates.extend(sim.step());
+            }
+            (
+                serde_json::to_string(&updates).unwrap(),
+                sim.latency.sample_place_split(2_000_000_000),
+                sim.latency.sample_cancel_split(2_000_000_000),
+                sim.latency.sample_fill_push(2_000_000_000),
+            )
+        };
+        assert_eq!(run(false), run(true));
+    }
+
+    #[test]
+    fn staged_timing_audit_overflow_aborts_without_silent_evidence_loss() {
+        let mut sim = staged_sim(100, 40);
+        owned_front_order(&mut sim, "overflow", "one", "tok");
+        for _ in 0..super::super::timing::EXECUTION_TIMING_CAPACITY {
+            sim.audit_transition(
+                ExecutionStage::CancelDispatched,
+                "overflow",
+                None,
+                1,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sim.audit_transition(
+                ExecutionStage::CancelDispatched,
+                "overflow",
+                None,
+                2,
+                None,
+                None,
+                None,
+                None,
+            );
+        }));
+        assert!(result.is_err());
+        let stats = sim.execution_timing_stats();
+        assert_eq!(stats.queued, stats.capacity);
+        assert_eq!(stats.high_water, stats.capacity);
+        assert_eq!(stats.overflows, 1);
+        assert_eq!(sim.drain_execution_timing_audit().count(), stats.capacity);
+    }
+
+    #[test]
+    #[ignore = "100k offline cancel lifecycle component benchmark; run release --nocapture"]
+    fn staged_cancel_lifecycle_benchmark() {
+        const N: usize = 100_000;
+        for (mode, audit) in [
+            (CancelTimingMode::LegacyL2Multiplier, false),
+            (CancelTimingMode::StagedRttBudget, false),
+            (CancelTimingMode::StagedRttBudget, true),
+            (CancelTimingMode::StagedRttFraction, false),
+            (CancelTimingMode::StagedRttFraction, true),
+        ] {
+            let mut sim = staged_sim(100, 40);
+            sim.cancel_timing_mode = mode;
+            sim.cancel_finality_delay_frac = 1.0;
+            sim.execution_timing = ExecutionTimingAudit::new(audit);
+            owned_front_order(&mut sim, "benchmark", "one", "tok");
+            let signal = owned_cancel_signal("benchmark", 0);
+            let mut elapsed = Vec::with_capacity(N);
+            let mut server_hwm = 0;
+            let mut strategy_hwm = 0;
+            let mut steps = 0u64;
+            for index in 0..N {
+                let emit = 1_000_000_000 + (index as u64) * 1_000_000_000;
+                let started = std::time::Instant::now();
+                sim.submit(&signal, emit);
+                server_hwm = server_hwm.max(sim.server_sched.len());
+                strategy_hwm = strategy_hwm.max(sim.strategy_sched.len());
+                while sim.peek_when().is_some() {
+                    std::hint::black_box(sim.step());
+                    steps += 1;
+                    server_hwm = server_hwm.max(sim.server_sched.len());
+                    strategy_hwm = strategy_hwm.max(sim.strategy_sched.len());
+                }
+                elapsed.push(started.elapsed().as_nanos() as u64);
+                // Serialization and drain are outside the measured boundary.
+                for row in sim.drain_execution_timing_audit() {
+                    std::hint::black_box(row);
+                }
+            }
+            elapsed.sort_unstable();
+            let stats = sim.execution_timing_stats();
+            println!(
+                "{}",
+                serde_json::json!({"benchmark":"staged_cancel_lifecycle", "scope":"offline simulator submit through terminal HTTP/deadline; same terminal order retries; includes bounded audit enqueue, excludes serialization/drain and external market matching", "requests":N,"scheduler_steps":steps,
+                "mode":mode,"audit":audit,"median_ns":elapsed[N/2],"p99_ns":elapsed[N*99/100],"p999_ns":elapsed[N*999/1000],"max_ns":elapsed[N-1],
+                "server_queue_high_water":server_hwm,"strategy_queue_high_water":strategy_hwm,
+                "http_deadline_high_water":sim.http_deadline_high_water,"http_deadline_capacity":MAX_HTTP_DEADLINES,
+                "audit_stats":stats,"server_queue_pending":sim.server_sched.len(),"strategy_queue_pending":sim.strategy_sched.len(),
+                "queue_overflow":0,"scheduler_storage":"existing growable DES heap; observed reserved capacity", "server_queue_capacity":sim.server_sched.capacity(),"strategy_queue_capacity":sim.strategy_sched.capacity()})
+            );
+        }
+    }
+
+    #[test]
+    fn staged_wrong_owner_cannot_cancel_sibling_order() {
+        let mut sim = staged_sim(100, 40);
+        owned_front_order(&mut sim, "sibling", "two", "tok");
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sim.submit(
+                &owned_cancel_signal("sibling", 1_000_000_000),
+                1_000_000_000,
+            );
+        }));
+        assert!(attempt.is_err());
+        assert!(sim.core.order_symbol_side("sibling").is_some());
+        assert!(sim.peek_when().is_none());
+        assert_eq!(sim.execution_timing_stats().emitted, 0);
+    }
+
+    #[test]
+    fn staged_processing_does_not_advance_http_or_private_rng() {
+        let mut a = staged_sim(100, 0);
+        let mut b = staged_sim(100, 75);
+        for n in 0..1000 {
+            let emit = 1_000_000_000 + n;
+            std::hint::black_box(b.cancel_timing_preview(emit, 50_000_000, 50_000_000));
+            assert_eq!(
+                a.latency.sample_place_split(emit),
+                b.latency.sample_place_split(emit)
+            );
+            assert_eq!(
+                a.latency.sample_cancel_split(emit),
+                b.latency.sample_cancel_split(emit)
+            );
+            assert_eq!(
+                a.latency.sample_fill_push(emit),
+                b.latency.sample_fill_push(emit)
+            );
+        }
+    }
+
+    #[test]
+    fn staged_recorded_timeout_at_budget_boundary_cannot_fabricate_http_success() {
+        let mut sim = staged_sim(100, 40);
+        sim.cancel_timeout_ns = 100_000_000;
+        owned_front_order(&mut sim, "censored", "one", "tok");
+        let emit = 1_000_000_000;
+        sim.submit_with_latency_split_and_transport_observation(
+            &owned_cancel_signal("censored", emit),
+            emit,
+            50_000_000,
+            50_000_000,
+            ArrivalEvidence::modeled(emit + 50_000_000),
+            false,
+        )
+        .unwrap();
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, OrderStatus::CancelOrderTimeout);
+        assert_eq!(updates[0].timestamp_ns, emit + 100_000_000);
+        assert!(sim.core.order_symbol_side("censored").is_none());
+        let rows: Vec<_> = sim.drain_execution_timing_audit().collect();
+        assert!(rows
+            .iter()
+            .any(|r| r.stage == ExecutionStage::CancelEffective));
+        assert!(rows
+            .iter()
+            .any(|r| r.stage == ExecutionStage::HttpSuppressed));
+        assert!(!rows
+            .iter()
+            .any(|r| r.stage == ExecutionStage::HttpDelivered));
+    }
+
+    #[test]
+    fn staged_same_time_trade_uses_explicit_feed_before_cancel_ordering() {
+        let mut sim = staged_sim(100, 40);
+        owned_front_order(&mut sim, "tie", "one", "tok");
+        let emit = 1_000_000_000;
+        let when = emit + 70_000_000;
+        sim.feed.test_push_server_event(
+            when,
+            SimEvent::ServerTrade(
+                TradeTick {
+                    exchange: Exchange::Polymarket,
+                    symbol: "tok".into(),
+                    exchange_trade_id: None,
+                    price: 0.6,
+                    quantity: 10.0,
+                    side: Side::Sell,
+                    exchange_timestamp_ns: when,
+                    local_timestamp_ns: when,
+                },
+                super::super::event::ServerEventTime {
+                    raw_source_ns: when,
+                    recorded_receive_ns: when,
+                    reconstructed_source_ns: None,
+                    effective_apply_ns: when,
+                    stream_index: 0,
+                    stream_sequence: 1,
+                },
+            ),
+        );
+        sim.submit(&owned_cancel_signal("tie", emit), emit);
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert!(!updates.iter().any(|u| u.status == OrderStatus::Cancelled));
+        let rows: Vec<_> = sim.drain_execution_timing_audit().collect();
+        let matched = rows
+            .iter()
+            .position(|r| r.stage == ExecutionStage::PrivateMatched)
+            .unwrap();
+        let cancelled = rows
+            .iter()
+            .position(|r| r.stage == ExecutionStage::CancelEffective)
+            .unwrap();
+        assert!(matched < cancelled);
+        assert_eq!(rows[matched].actual_ns, rows[cancelled].actual_ns);
+        assert_eq!(rows[cancelled].status, Some(OrderStatus::Filled));
+    }
+
+    #[test]
+    fn staged_censored_cancel_http_cannot_shortcut_private_recovery() {
+        let mut sim = staged_sim(100, 80);
+        sim.cancel_timeout_ns = 100_000_000;
+        sim.private_fill_reconcile_rate = 1.0;
+        sim.private_fill_reconcile_delay_ns = 750_000_000;
+        owned_front_order(&mut sim, "no-echo", "one", "tok");
+        let emit = 1_000_000_000;
+        sim.submit_with_latency_split_and_transport_observation(
+            &owned_cancel_signal("no-echo", emit),
+            emit,
+            50_000_000,
+            50_000_000,
+            ArrivalEvidence::modeled(emit + 50_000_000),
+            false,
+        )
+        .unwrap();
+        sim.step();
+        let fills = trade_front(&mut sim, 10.0, emit + 50_000_000);
+        sim.schedule_private_fill(fills[0].clone(), emit + 50_000_000);
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].status, OrderStatus::CancelOrderTimeout);
+        assert_eq!(updates[0].timestamp_ns, emit + 100_000_000);
+        assert_eq!(updates[1].filled_quantity, 10.0);
+        assert_eq!(updates[1].timestamp_ns, emit + 875_000_000);
+        let rows: Vec<_> = sim.drain_execution_timing_audit().collect();
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.stage == ExecutionStage::PrivateMatched)
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.stage == ExecutionStage::PrivateDelivered)
+                .count(),
+            1
+        );
+        assert!(!rows
+            .iter()
+            .any(|r| r.stage == ExecutionStage::HttpDelivered));
+    }
+
+    #[test]
+    fn staged_single_and_batch_cancel_cannot_cross_venue_even_after_terminal() {
+        let exchange = Exchange::Binance;
+        let signals = [
+            Signal::CancelOrder {
+                exchange,
+                client_order_id: "venue".into(),
+                instance_id: "one".into(),
+                timestamp_ns: 10,
+            },
+            Signal::BatchCancelOrders {
+                exchange,
+                market_id: String::new(),
+                client_order_ids: ["venue".into()].into_iter().collect(),
+                instance_id: "one".into(),
+                timestamp_ns: 10,
+            },
+            Signal::BatchUpdateOrders {
+                exchange,
+                market_id: String::new(),
+                cancel_client_order_ids: ["venue".into()].into_iter().collect(),
+                place_orders: Default::default(),
+                instance_id: "one".into(),
+                timestamp_ns: 10,
+            },
+            Signal::ReplaceOrder {
+                exchange,
+                market_id: String::new(),
+                cancel_client_order_ids: ["venue".into()].into_iter().collect(),
+                place_orders: Default::default(),
+                instance_id: "one".into(),
+                timestamp_ns: 10,
+            },
+        ];
+        for signal in signals {
+            let mut sim = staged_sim(100, 40);
+            owned_front_order(&mut sim, "venue", "one", "tok");
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sim.submit(&signal, 10)));
+            assert!(result.is_err());
+            assert!(sim.core.order_symbol_side("venue").is_some());
+            assert!(sim.peek_when().is_none());
+            assert_eq!(sim.execution_timing_stats().emitted, 0);
+            sim.core.cancel_order(Exchange::Polymarket, "venue", 11);
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sim.submit(&signal, 12)));
+            assert!(
+                result.is_err(),
+                "original exchange survives terminal order removal"
+            );
+            assert!(sim.peek_when().is_none());
+        }
     }
 }

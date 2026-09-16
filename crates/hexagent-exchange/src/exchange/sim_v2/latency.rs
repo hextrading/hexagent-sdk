@@ -18,6 +18,10 @@ pub struct LatencyModel {
     /// advance the HTTP place sampler and thereby change a later order RTT.
     /// `None` preserves the historical half-place-RTT multiplier exactly.
     private_fill: Option<LatencySampler>,
+    /// Independent fallback for newly separated taker private pushes. Unlike
+    /// the legacy maker fallback this never advances the HTTP random stream.
+    taker_private_fallback: LatencySampler,
+    taker_overhead_enabled: bool,
     /// TAKER matching-engine overhead, added on top of the (time-varying) place
     /// RTT for taker fills (additive model: taker ≈ place(now) + overhead).
     overhead: LatencySampler,
@@ -27,10 +31,26 @@ pub struct LatencyModel {
     /// matches live (see `empirical_anchors_censored`). Defaults to 2000 ms;
     /// the simulator overrides it from `client_timeout_ns`.
     client_timeout_ms: f64,
+    cancel_timeout_ms: f64,
 }
 
 impl LatencyModel {
+    /// Split a total observed/sampled cancel RTT without consuming any RNG.
+    /// The processing component is estimated and capped inside that budget;
+    /// HTTP/private sampler streams retain their prior draw order.
+    pub fn partition_cancel_budget(
+        &self,
+        dispatch_ns: u64,
+        l1_ns: u64,
+        l2_ns: u64,
+        processing_ns: u64,
+    ) -> super::timing::CancelTiming {
+        super::timing::CancelTiming::partition(dispatch_ns, l1_ns, l2_ns, processing_ns)
+    }
+
     pub fn new(place: LatencyProfile, cancel: LatencyProfile, rho_cross: f64, seed: u64) -> Self {
+        let taker_private_fallback =
+            LatencySampler::new(place.clone(), seed.wrapping_add(0x7A4E_F111));
         let place_sampler = LatencySampler::new(place, seed.wrapping_add(0xC0FFEE));
         let cancel_sampler = LatencySampler::new(cancel, seed.wrapping_add(0xCAFE_BABE));
         let coupled = CoupledLatencySamplers::new(
@@ -50,9 +70,12 @@ impl LatencyModel {
             coupled,
             fill_push_mult: 1.5,
             private_fill: None,
+            taker_private_fallback,
+            taker_overhead_enabled: true,
             overhead,
             seed,
             client_timeout_ms: 2000.0,
+            cancel_timeout_ms: 2000.0,
         }
     }
 
@@ -92,7 +115,21 @@ impl LatencyModel {
     pub fn set_client_timeout_ms(&mut self, ms: f64) {
         if ms > 0.0 && ms.is_finite() {
             self.client_timeout_ms = ms;
+            self.cancel_timeout_ms = ms;
         }
+    }
+
+    /// Override cancel censoring independently after setting the legacy cap.
+    pub fn set_cancel_timeout_ms(&mut self, ms: f64) {
+        if ms > 0.0 && ms.is_finite() {
+            self.cancel_timeout_ms = ms;
+        }
+    }
+
+    /// Recorded whole-request RTTs already include exchange processing. Disable
+    /// additive overhead explicitly without drawing or advancing its RNG.
+    pub fn set_taker_overhead_enabled(&mut self, enabled: bool) {
+        self.taker_overhead_enabled = enabled;
     }
 
     /// Set the taker matching-overhead distribution (ms quantiles).
@@ -137,7 +174,11 @@ impl LatencyModel {
     /// delivery latency. The place RTT (already time-varying / per-event)
     /// supplies the shared network component, so taker co-moves with maker.
     pub fn sample_taker_overhead(&mut self, now_ns: u64) -> u64 {
-        self.overhead.sample_ns(now_ns)
+        if self.taker_overhead_enabled {
+            self.overhead.sample_ns(now_ns)
+        } else {
+            0
+        }
     }
 
     /// Apply a per-event RTT override (sim_rtt_mode="exact"), mirroring v1's
@@ -204,7 +245,7 @@ impl LatencyModel {
                 late,
                 SEGMENT_BOUNDARY_SECS,
                 cr,
-                cap,
+                self.cancel_timeout_ms,
             );
         } else if let Some((p50, p85, p95, p99)) = q(
             entry.cancel_p50_ms,
@@ -212,8 +253,14 @@ impl LatencyModel {
             entry.cancel_p95_ms,
             entry.cancel_p99_ms,
         ) {
-            self.coupled
-                .set_cancel_per_event_anchors(p50, p85, p95, p99, cr, cap);
+            self.coupled.set_cancel_per_event_anchors(
+                p50,
+                p85,
+                p95,
+                p99,
+                cr,
+                self.cancel_timeout_ms,
+            );
         } else {
             self.coupled.clear_cancel_per_event_anchors();
         }
@@ -249,6 +296,13 @@ impl LatencyModel {
     pub fn sample_cancel_split(&mut self, now_ns: u64) -> (u64, u64) {
         let rtt = self.coupled.sample_cancel(now_ns);
         (rtt / 2, rtt - rtt / 2)
+    }
+
+    pub fn sample_taker_fill_push(&mut self, now_ns: u64) -> u64 {
+        if let Some(private_fill) = self.private_fill.as_mut() {
+            return private_fill.sample_ns(now_ns);
+        }
+        (self.taker_private_fallback.sample_ns(now_ns) as f64 * 0.5 * self.fill_push_mult) as u64
     }
 
     /// WebSocket fill-push delay (ns) for a maker/taker fill landing back at
@@ -309,6 +363,28 @@ mod tests {
     }
 
     #[test]
+    fn taker_private_fallback_does_not_advance_http_or_overhead_streams() {
+        let p = LatencyModel::empirical_profile(50.0, 150.0, 300.0, 0.4);
+        let mut test = LatencyModel::new(p.clone(), p.clone(), 0.3, 17);
+        let mut control = LatencyModel::new(p.clone(), p, 0.3, 17);
+        for ts in 1..100 {
+            assert!(test.sample_taker_fill_push(ts) > 0);
+            assert_eq!(test.sample_place_split(ts), control.sample_place_split(ts));
+            assert_eq!(
+                test.sample_cancel_split(ts),
+                control.sample_cancel_split(ts)
+            );
+        }
+        test.set_taker_overhead_enabled(false);
+        assert_eq!(test.sample_taker_overhead(100), 0);
+        test.set_taker_overhead_enabled(true);
+        assert_eq!(
+            test.sample_taker_overhead(101),
+            control.sample_taker_overhead(101)
+        );
+    }
+
+    #[test]
     fn private_fill_anchor_quantiles_are_plausible() {
         let mut m = LatencyModel::new(
             LatencyProfile::Fixed(50),
@@ -322,7 +398,9 @@ mod tests {
             samples.push(m.sample_fill_push(1_000_000_000 + i * 1_000_000));
         }
         samples.sort_unstable();
-        let ms = |p: f64| samples[((p * samples.len() as f64) as usize).min(samples.len() - 1)] as f64 / 1e6;
+        let ms = |p: f64| {
+            samples[((p * samples.len() as f64) as usize).min(samples.len() - 1)] as f64 / 1e6
+        };
         let p50 = ms(0.50);
         let p95 = ms(0.95);
         let p99 = ms(0.99);

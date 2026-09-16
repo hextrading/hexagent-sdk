@@ -106,6 +106,85 @@ impl SimV2ReplayClocks {
     }
 }
 
+/// Replay-coordinator-owned routing metadata. Instance identities are frozen
+/// at startup; each sequence belongs to exactly one virtual strategy owner.
+/// No shared account or process-global routing authority is consulted. The
+/// existing deterministic replay runs virtual owners serially; live workers
+/// continue to use their dedicated bounded lanes without any change here.
+struct SimLifecycleRouter {
+    owners: HashMap<String, usize>,
+    sequences: Vec<u64>,
+}
+
+impl SimLifecycleRouter {
+    fn new(strategies: &[Box<dyn Strategy>]) -> Result<Self> {
+        anyhow::ensure!(
+            strategies.len() < usize::from(SYSTEM_STRATEGY_OWNER),
+            "too many simulated lifecycle owners"
+        );
+        let mut owners = HashMap::with_capacity(strategies.len());
+        for (index, strategy) in strategies.iter().enumerate() {
+            anyhow::ensure!(
+                owners
+                    .insert(strategy.instance_id().to_owned(), index)
+                    .is_none(),
+                "duplicate simulated strategy instance {:?}",
+                strategy.instance_id()
+            );
+        }
+        Ok(Self {
+            owners,
+            sequences: vec![0; strategies.len()],
+        })
+    }
+
+    /// Transfer an owned update through the same lifecycle hook as live.
+    /// The caller resolves immutable coid ownership from simulator evidence;
+    /// neither symbol nor a parsed coid prefix is an admission/routing fallback.
+    fn dispatch(
+        &mut self,
+        instance: &str,
+        strategies: &mut [Box<dyn Strategy>],
+        update: OrderUpdate,
+        out: &mut SignalBatch,
+    ) -> Result<()> {
+        out.clear();
+        let owner = *self
+            .owners
+            .get(instance)
+            .ok_or_else(|| anyhow::anyhow!("unknown simulated lifecycle owner {instance:?}"))?;
+        let sequence = self.sequences[owner].checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("simulated lifecycle sequence exhausted for {instance}")
+        })?;
+        self.sequences[owner] = sequence;
+        let source = if update.trade_id.is_some() && update.filled_quantity != 0.0 {
+            LifecycleSource::PrivateFeed
+        } else {
+            LifecycleSource::Execution
+        };
+        let envelope = LifecycleEnvelope {
+            owner: owner as u16,
+            order_slot: update.order_slot,
+            sequence,
+            source,
+            // Replay has logical delivery time but no process-local private
+            // producer timing; zero is the documented unavailable sentinel.
+            timing: LifecycleTiming::default(),
+            update,
+        };
+        if strategies[owner]
+            .on_lifecycle_update_owned_into(envelope, out)
+            .is_err()
+        {
+            // Do not submit a partially emitted replacement batch. Stopping
+            // the offline run is fail-closed and preserves the overflow error.
+            out.clear();
+            anyhow::bail!("simulated owner {instance} lifecycle signal batch overflow");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod sim_v2_replay_clock_tests {
     use super::SimV2ReplayClocks;
@@ -125,6 +204,198 @@ mod sim_v2_replay_clock_tests {
         assert_eq!(clocks.advance_strategy(1_100), 1_100);
         assert_eq!(clocks.server_ns, 900);
         assert_eq!(clocks.advance_strategy(1_050), 1_100);
+    }
+}
+
+#[cfg(test)]
+mod sim_lifecycle_router_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Observed {
+        callbacks: AtomicUsize,
+        sequence: AtomicU64,
+        generation: AtomicUsize,
+        owner: AtomicUsize,
+        private: AtomicUsize,
+    }
+
+    struct Spy {
+        id: &'static str,
+        observed: Arc<Observed>,
+        overflow: bool,
+    }
+
+    impl Strategy for Spy {
+        fn name(&self) -> &str {
+            "sim-owner-fixture"
+        }
+        fn instance_id(&self) -> &str {
+            self.id
+        }
+        fn on_order_update(
+            &mut self,
+            _: &OrderUpdate,
+        ) -> std::result::Result<SignalBatch, SignalBatchOverflow> {
+            self.observed.callbacks.fetch_add(1, Ordering::Relaxed);
+            Ok(SignalBatch::new())
+        }
+        fn on_lifecycle_update_owned_into(
+            &mut self,
+            e: LifecycleEnvelope,
+            out: &mut SignalBatch,
+        ) -> std::result::Result<(), SignalBatchOverflow> {
+            assert_eq!(e.order_slot, e.update.order_slot);
+            let previous = self.observed.sequence.swap(e.sequence, Ordering::Relaxed);
+            assert_eq!(e.sequence, previous + 1);
+            self.observed.callbacks.fetch_add(1, Ordering::Relaxed);
+            self.observed
+                .owner
+                .store(e.owner as usize, Ordering::Relaxed);
+            self.observed.generation.store(
+                e.order_slot.generation().unwrap_or(0) as usize,
+                Ordering::Relaxed,
+            );
+            if e.source == LifecycleSource::PrivateFeed {
+                self.observed.private.fetch_add(1, Ordering::Relaxed);
+            }
+            if self.overflow {
+                for _ in 0..=SIGNAL_BATCH_CAPACITY {
+                    extend_signal_batch(out, [Signal::Exit])?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn fixture(id: &'static str, overflow: bool) -> (Box<dyn Strategy>, Arc<Observed>) {
+        let observed = Arc::new(Observed::default());
+        (
+            Box::new(Spy {
+                id,
+                observed: observed.clone(),
+                overflow,
+            }),
+            observed,
+        )
+    }
+
+    fn update(generation: u16, fill: bool) -> OrderUpdate {
+        OrderUpdate {
+            order_slot: OrderSlot::with_generation(7, generation),
+            client_order_id: "opaque-coid".into(),
+            exchange: Exchange::Polymarket,
+            symbol: "same-token".into(),
+            side: Side::Buy,
+            exchange_order_id: None,
+            status: if fill {
+                OrderStatus::Filled
+            } else {
+                OrderStatus::Accepted
+            },
+            liquidity: fill.then_some(Liquidity::Maker),
+            filled_quantity: if fill { 2.0 } else { 0.0 },
+            remaining_quantity: 0.0,
+            avg_fill_price: 0.5,
+            timestamp_ns: 100,
+            exchange_event_timestamp_ns: None,
+            trade_id: fill.then(|| "stable-trade-id".into()),
+            order_audit: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn unique_owner_receives_envelope_with_independent_sequence_and_original_generation() {
+        let (a, a_seen) = fixture("a", false);
+        let (b, b_seen) = fixture("b", false);
+        let mut strategies = vec![a, b];
+        let mut router = SimLifecycleRouter::new(&strategies).unwrap();
+        let mut signals = SignalBatch::new();
+        router
+            .dispatch("b", &mut strategies, update(4, true), &mut signals)
+            .unwrap();
+        router
+            .dispatch("a", &mut strategies, update(4, false), &mut signals)
+            .unwrap();
+        // The routing layer must preserve the old generation, so the owner's
+        // real lifecycle handler can reject it instead of rewriting it to 5.
+        router
+            .dispatch("b", &mut strategies, update(5, false), &mut signals)
+            .unwrap();
+        router
+            .dispatch("b", &mut strategies, update(4, false), &mut signals)
+            .unwrap();
+        assert_eq!(a_seen.callbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(b_seen.callbacks.load(Ordering::Relaxed), 3);
+        assert_eq!(a_seen.sequence.load(Ordering::Relaxed), 1);
+        assert_eq!(b_seen.sequence.load(Ordering::Relaxed), 3);
+        assert_eq!(b_seen.generation.load(Ordering::Relaxed), 4);
+        assert_eq!(b_seen.owner.load(Ordering::Relaxed), 1);
+        assert_eq!(b_seen.private.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn duplicate_or_unknown_owner_fails_closed_without_fallback() {
+        let (a, _) = fixture("duplicate", false);
+        let (b, _) = fixture("duplicate", false);
+        assert!(SimLifecycleRouter::new(&[a, b]).is_err());
+        let (a, seen) = fixture("a", false);
+        let mut strategies = vec![a];
+        let mut router = SimLifecycleRouter::new(&strategies).unwrap();
+        let mut signals = SignalBatch::new();
+        assert!(router
+            .dispatch("unknown", &mut strategies, update(1, false), &mut signals)
+            .is_err());
+        assert_eq!(seen.callbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(router.sequences, vec![0]);
+    }
+
+    #[test]
+    fn overflowing_callback_never_leaks_partial_order_batch() {
+        let (a, _) = fixture("a", true);
+        let mut strategies = vec![a];
+        let mut router = SimLifecycleRouter::new(&strategies).unwrap();
+        let mut signals = SignalBatch::new();
+        assert!(router
+            .dispatch("a", &mut strategies, update(1, false), &mut signals)
+            .is_err());
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    #[ignore = "focused offline lifecycle routing benchmark; run --release --ignored --nocapture"]
+    fn lifecycle_dispatch_latency_benchmark() {
+        const N: usize = 100_000;
+        fn measure(mut values: Vec<u64>) -> [u64; 4] {
+            values.sort_unstable();
+            [
+                values[(N - 1) / 2],
+                values[(N - 1) * 99 / 100],
+                values[(N - 1) * 999 / 1000],
+                values[N - 1],
+            ]
+        }
+        let (a, _) = fixture("a", false);
+        let mut strategies = vec![a];
+        let mut router = SimLifecycleRouter::new(&strategies).unwrap();
+        let mut signals = SignalBatch::new();
+        let mut old = Vec::with_capacity(N);
+        let mut new = Vec::with_capacity(N);
+        for _ in 0..N {
+            let legacy_update = update(1, false);
+            let started = Instant::now();
+            std::hint::black_box(strategies[0].on_order_update(&legacy_update).unwrap());
+            old.push(elapsed_nanos(started));
+            let owned_update = update(1, false); // construction outside boundary
+            let started = Instant::now();
+            router
+                .dispatch("a", &mut strategies, owned_update, &mut signals)
+                .unwrap();
+            new.push(elapsed_nanos(started));
+        }
+        println!("sim_lifecycle_dispatch n={N} boundary=prepared_update_to_callback_return unit=ns legacy_p50_p99_p999_max={:?} owned_p50_p99_p999_max={:?} transport_queue_depth=0 transport_overflow=0 signal_batch_capacity={} callback=atomic_counter_fixture excludes=matching_real_strategy_and_os_scheduling",
+            measure(old), measure(new), SIGNAL_BATCH_CAPACITY);
     }
 }
 
@@ -593,6 +864,7 @@ fn spawn_polymarket_feed_worker(
     feed_readiness: Arc<RwLock<HashMap<String, FeedReadiness>>>,
     worker_slot: Arc<PolymarketWorkerSlot>,
     epoch: PolymarketWorkerEpoch,
+    protocol_sink: Option<crate::recorder::BookProtocolSink>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name(format!("feed-polymarket-{}", epoch.generation))
@@ -610,6 +882,7 @@ fn spawn_polymarket_feed_worker(
 
             let make_feed = || {
                 let mut feed = PolymarketMarket::with_liveness(liveness.clone());
+                if let Some(sink) = protocol_sink.as_ref() { feed.set_book_protocol_sink(sink.clone()); }
                 if force_clob_runtime_fallback {
                     feed.force_clob_runtime_fallback();
                 }
@@ -924,6 +1197,7 @@ fn spawn_polymarket_feed_manager(
     sim_tx: Option<Sender<MarketEvent>>,
     shutdown: Arc<AtomicBool>,
     feed_readiness: Arc<RwLock<HashMap<String, FeedReadiness>>>,
+    protocol_sink: Option<crate::recorder::BookProtocolSink>,
 ) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
     let worker_slot = Arc::new(PolymarketWorkerSlot::new());
     let (rebuild_tx, rebuild_rx) = bounded::<PolymarketWorkerRebuild>(1);
@@ -949,6 +1223,7 @@ fn spawn_polymarket_feed_manager(
                 feed_readiness.clone(),
                 worker_slot.clone(),
                 initial,
+                protocol_sink.clone(),
             ) {
                 Ok(worker) => workers.push(worker),
                 Err(error) => {
@@ -1035,6 +1310,7 @@ fn spawn_polymarket_feed_manager(
                             feed_readiness.clone(),
                             worker_slot.clone(),
                             replacement,
+                            protocol_sink.clone(),
                         ) {
                             Ok(worker) => workers.push(worker),
                             Err(error) => {
@@ -3172,6 +3448,8 @@ mod public_subscription_coalesce_tests {
 }
 
 pub struct Engine {
+    /// Startup-allocated public evidence lane; no strategy/account authority.
+    book_protocol_lane: Option<crate::recorder::BookProtocolLane>,
     config: Config,
     /// Strategy factories the application registered (the engine never names a
     /// concrete strategy type — see `build_strategies`).
@@ -3216,6 +3494,9 @@ impl Engine {
             .map(|cfg| (cfg.name.clone(), FeedReadiness::Starting))
             .collect();
         Self {
+            book_protocol_lane: (config.recording.book_protocol_evidence
+                && config.general.mode != RunMode::Backtest)
+                .then(|| crate::recorder::BookProtocolLane::new(now_ns())),
             config,
             registry,
             feed_readiness: Arc::new(RwLock::new(feed_readiness)),
@@ -3308,6 +3589,11 @@ impl Engine {
             })
             .to_string_lossy()
             .to_string();
+        let mut protocol = self
+            .book_protocol_lane
+            .as_ref()
+            .map(|lane| lane.consumer(std::path::Path::new(&output_dir)))
+            .transpose()?;
         let (recorder_tx, recorder_rx) = bounded::<Arc<MarketEvent>>(CHANNEL_CAPACITY);
         let handle = thread::Builder::new()
             .name("recorder".into())
@@ -3334,7 +3620,18 @@ impl Engine {
                 let mut next_checkpoint_unix_secs =
                     ((now_secs / CHECKPOINT_INTERVAL_SECS) + 1) * CHECKPOINT_INTERVAL_SECS;
                 loop {
-                    match recorder_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                    if let Some(protocol) = protocol.as_mut() {
+                        if let Err(error) = protocol.drain(&mut recorder, 256) {
+                            error!("[Recorder] Protocol evidence incomplete: {}", error);
+                        }
+                    }
+                    let incoming = match protocol.as_ref() {
+                        Some(protocol) => {
+                            protocol.recv_market(&recorder_rx, std::time::Duration::from_secs(5))
+                        }
+                        None => recorder_rx.recv_timeout(std::time::Duration::from_secs(5)),
+                    };
+                    match incoming {
                         Ok(event) => {
                             if matches!(event.as_ref(), MarketEvent::Exit) {
                                 break;
@@ -3348,6 +3645,11 @@ impl Engine {
                     }
                     if last_flush.elapsed() >= flush_interval {
                         recorder.flush_buffers();
+                        if let Some(protocol) = protocol.as_mut() {
+                            if let Err(error) = protocol.checkpoint(&mut recorder) {
+                                error!("[Recorder] Protocol flush incomplete: {}", error);
+                            }
+                        }
                         last_flush = std::time::Instant::now();
                     }
                     // Clock-aligned checkpoint at every :00 / :05 / :10 /…
@@ -3362,6 +3664,11 @@ impl Engine {
                         // backlog to avoid a checkpoint flood.
                         next_checkpoint_unix_secs =
                             ((cur / CHECKPOINT_INTERVAL_SECS) + 1) * CHECKPOINT_INTERVAL_SECS;
+                    }
+                }
+                if let Some(protocol) = protocol.as_mut() {
+                    if let Err(error) = protocol.finish(&mut recorder) {
+                        error!("[Recorder] Protocol shutdown incomplete: {}", error);
                     }
                 }
                 info!("[Recorder] Flushing {} events...", recorder.event_count());
@@ -3953,6 +4260,10 @@ impl Engine {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_tx = market_tx.clone();
 
+        // Spawn recorder for market data persistence (paper data goes to separate dir)
+        let (recorder_tx, recorder_handle) =
+            self.spawn_recorder_thread_to(&self.config.recording.paper_data_dir)?;
+
         // Live exchange feeds — Polymarket events also sent to sim_feed_tx for the sim_v2 core
         let feed_handles =
             self.spawn_exchange_feeds_paper(market_tx, Some(sim_feed_tx), shutdown.clone())?;
@@ -3967,10 +4278,6 @@ impl Engine {
             self.config.backtest.clone(),
             shutdown_done_tx,
         );
-
-        // Spawn recorder for market data persistence (paper data goes to separate dir)
-        let (recorder_tx, recorder_handle) =
-            self.spawn_recorder_thread_to(&self.config.recording.paper_data_dir)?;
 
         // Strategy thread: same as live, data_dir = backtest.data_dir with paper_data_dir fallback
         // Paper mode: no RTT-probe (no real CLOB to probe). No stale-
@@ -4037,8 +4344,6 @@ impl Engine {
         // RECORD mode, so there's nothing else to set it).
         let probe_active_token =
             crate::exchange::polymarket::rtt_probe::ActiveTokenHandle::new(None);
-
-        let feed_handles = self.spawn_exchange_feeds(market_tx, shutdown.clone())?;
 
         // Spawn one RTT-probe per configured polymaker instance (all
         // sharing `probe_active_token`). all_probe=true ⇒ fires
@@ -4168,6 +4473,11 @@ impl Engine {
             .to_string_lossy()
             .to_string();
 
+        let mut protocol = self
+            .book_protocol_lane
+            .as_ref()
+            .map(|lane| lane.consumer(std::path::Path::new(&output_dir)))
+            .transpose()?;
         let recorder_handle = thread::Builder::new()
             .name("recorder".into())
             .spawn(move || {
@@ -4204,7 +4514,14 @@ impl Engine {
                 // to gate the probe target onto `first_poly_series` only.
                 let mut current_event_series: Option<String> = None;
                 loop {
-                    match market_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                    if let Some(protocol) = protocol.as_mut() {
+                        if let Err(error) = protocol.drain(&mut recorder, 256) { error!("[Recorder] Protocol evidence incomplete: {}", error); }
+                    }
+                    let incoming = match protocol.as_ref() {
+                        Some(protocol) => protocol.recv_public_market(&market_rx, std::time::Duration::from_secs(5)),
+                        None => market_rx.recv_timeout(std::time::Duration::from_secs(5)),
+                    };
+                    match incoming {
                         Ok(event) => {
                             if matches!(event, MarketEvent::Exit) { break; }
                             // all_probe: keep the probe's target fresh — the
@@ -4277,6 +4594,9 @@ impl Engine {
                     // Periodic flush: write row groups every 60s to free memory
                     if last_flush.elapsed() >= flush_interval {
                         recorder.flush_buffers();
+                        if let Some(protocol) = protocol.as_mut() {
+                            if let Err(error) = protocol.checkpoint(&mut recorder) { error!("[Recorder] Protocol flush incomplete: {}", error); }
+                        }
                         last_flush = std::time::Instant::now();
                     }
                     let cur = std::time::SystemTime::now()
@@ -4290,12 +4610,17 @@ impl Engine {
                         ) * CHECKPOINT_INTERVAL_SECS;
                     }
                 }
+                if let Some(protocol) = protocol.as_mut() {
+                    if let Err(error) = protocol.finish(&mut recorder) { error!("[Recorder] Protocol shutdown incomplete: {}", error); }
+                }
                 info!("[Recorder] Flushing {} events...", recorder.event_count());
                 if let Err(e) = recorder.flush() {
                     error!("[Recorder] Flush error: {}", e);
                 }
                 info!("[Recorder] Finished: {} events written", recorder.event_count());
             })?;
+
+        let feed_handles = self.spawn_exchange_feeds(market_tx, shutdown.clone())?;
 
         Self::wait_for_shutdown(&shutdown, &shutdown_tx);
         // Drop our copy of market_tx so channel closes when feeds exit
@@ -4392,6 +4717,11 @@ impl Engine {
 
         // ── Strat-lane replayers (local_ts order) — verbatim from v1 ──
         let replay_options = crate::recorder::ReplayOptions {
+            time_policy: if bt.sim_replay_arrival_time_strict {
+                crate::recorder::ReplayTimePolicy::ArrivalTimeStrict
+            } else {
+                crate::recorder::ReplayTimePolicy::LegacySourceTime
+            },
             bootstrap_binary_open: bt.sim_v2_bootstrap_binary_open,
             binary_open_delay_ns: bt.sim_v2_binary_open_delay_ms.saturating_mul(1_000_000),
             binary_open_max_backfill_ns: bt
@@ -4407,7 +4737,7 @@ impl Engine {
             {
                 continue;
             }
-            if let Ok(r) = MarketReplayer::new_with_options(
+            match MarketReplayer::new_with_options(
                 &data_path,
                 exchange,
                 symbol,
@@ -4415,7 +4745,13 @@ impl Engine {
                 end_dt,
                 replay_options,
             ) {
-                strat_replayers.push(r);
+                Ok(r) => strat_replayers.push(r),
+                Err(error) if bt.sim_replay_arrival_time_strict => {
+                    return Err(anyhow::anyhow!(
+                        "strict strategy replay {exchange}/{symbol}: {error}"
+                    ));
+                }
+                Err(_) => {}
             }
         }
         if !bt.market_data_health_replay_path.trim().is_empty() {
@@ -4448,10 +4784,19 @@ impl Engine {
                 let sym_lower = filter.to_lowercase().replace('/', "-");
                 let rtds_path = format!("{}/{}", source, sym_lower);
                 let rtds_end_dt = end_dt + chrono::TimeDelta::seconds(10);
-                if let Ok(r) =
-                    MarketReplayer::new(&data_path, "rtds", &rtds_path, start_dt, rtds_end_dt)
-                {
-                    strat_replayers.push(r);
+                match MarketReplayer::new_with_options(
+                    &data_path,
+                    "rtds",
+                    &rtds_path,
+                    start_dt,
+                    rtds_end_dt,
+                    replay_options,
+                ) {
+                    Ok(r) => strat_replayers.push(r),
+                    Err(error) if bt.sim_replay_arrival_time_strict => {
+                        return Err(anyhow::anyhow!("strict RTDS replay {rtds_path}: {error}"));
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -4460,11 +4805,30 @@ impl Engine {
                 continue;
             }
             let sym_lower = symbol.to_lowercase().replace('/', "-");
-            let early = if exchange == "chainlink" { 10 } else { 0 };
+            // Strict warm-up owns every receive before start. Replaying an
+            // extra ten seconds would duplicate those initial-state updates.
+            let early = if exchange == "chainlink" && !bt.sim_replay_arrival_time_strict {
+                10
+            } else {
+                0
+            };
             let start = start_dt - chrono::TimeDelta::seconds(early);
             let end = end_dt + chrono::TimeDelta::seconds(10);
-            if let Ok(r) = MarketReplayer::new(&data_path, exchange, &sym_lower, start, end) {
-                strat_replayers.push(r);
+            match MarketReplayer::new_with_options(
+                &data_path,
+                exchange,
+                &sym_lower,
+                start,
+                end,
+                replay_options,
+            ) {
+                Ok(r) => strat_replayers.push(r),
+                Err(error) if bt.sim_replay_arrival_time_strict => {
+                    return Err(anyhow::anyhow!(
+                        "strict oracle replay {exchange}/{sym_lower}: {error}"
+                    ));
+                }
+                Err(_) => {}
             }
         }
         for (exchange, symbol) in &replay_sources {
@@ -4480,10 +4844,21 @@ impl Engine {
                 base_symbol.to_lowercase()
             };
             let end = end_dt + chrono::TimeDelta::seconds(10);
-            if let Ok(r) =
-                MarketReplayer::new(&data_path, "binance_futures", &sym_lower, start_dt, end)
-            {
-                strat_replayers.push(r);
+            match MarketReplayer::new_with_options(
+                &data_path,
+                "binance_futures",
+                &sym_lower,
+                start_dt,
+                end,
+                replay_options,
+            ) {
+                Ok(r) => strat_replayers.push(r),
+                Err(error) if bt.sim_replay_arrival_time_strict => {
+                    return Err(anyhow::anyhow!(
+                        "strict futures replay {sym_lower}: {error}"
+                    ));
+                }
+                Err(_) => {}
             }
         }
 
@@ -4786,13 +5161,14 @@ impl Engine {
                     s.on_prediction_warmup_start();
                 }
                 for (exchange, symbol) in &warmup_sources {
-                    match crate::recorder::MarketReplayer::new(
+                    match crate::recorder::MarketReplayer::new_with_options(
                         &data_path,
                         exchange,
                         symbol,
                         warmup_start_dt,
                         warmup_end_dt,
-                        ) {
+                        replay_options,
+                    ) {
                         Ok(mut replayer) => {
                             while let Some((_ts, event)) = replayer.next_event()? {
                                 for strategy in &mut strategies {
@@ -4803,6 +5179,11 @@ impl Engine {
                                     }
                                 }
                             }
+                        }
+                        Err(e) if bt.sim_replay_arrival_time_strict => {
+                            return Err(anyhow::anyhow!(
+                                "strict prediction warm-up {exchange}/{symbol}: {e}"
+                            ));
                         }
                         Err(e) => warn!(
                             "[Backtest v2] Warm-up: no data for {}/{}: {}",
@@ -4854,14 +5235,20 @@ impl Engine {
                 );
                 let mut replayers: Vec<crate::recorder::MarketReplayer> = Vec::new();
                 for (exchange, symbol) in &spot_sources {
-                    match crate::recorder::MarketReplayer::new(
+                    match crate::recorder::MarketReplayer::new_with_options(
                         &data_path,
                         exchange,
                         symbol,
                         replay_start_dt,
                         aw_end_dt,
+                        replay_options,
                     ) {
                         Ok(r) => replayers.push(r),
+                        Err(e) if bt.sim_replay_arrival_time_strict => {
+                            return Err(anyhow::anyhow!(
+                                "strict APV2 warm-up {exchange}/{symbol}: {e}"
+                            ));
+                        }
                         Err(e) => warn!(
                             "[Backtest v2] apv2 warm-up: no data for {}/{}: {}",
                             exchange, symbol, e
@@ -5348,8 +5735,25 @@ impl Engine {
         };
 
         // ── Build the v2 Simulator (owns server-axis feed + DES + RTT) ──
+        let continuity_owner =
+            if bt.sim_v2_book_continuity_evidence_path.trim().is_empty() {
+                None
+            } else {
+                anyhow::ensure!(sim_wallet_usdc_by_iid.len() == 1,
+                "book continuity journal currently requires exactly one explicit simulator owner");
+                Some(sim_wallet_usdc_by_iid.keys().next().unwrap().clone())
+            };
         let mut sim = Simulator::new(SimV2Config {
             data_dir: data_dir.clone(),
+            replay_arrival_time_strict: bt.sim_replay_arrival_time_strict,
+            raw_server_clock: bt.sim_v2_raw_server_clock,
+            strict_admission: bt.sim_v2_strict_admission,
+            admission_unknown_reject: bt.sim_v2_admission_unknown_reject,
+            admission_audit: bt.sim_v2_admission_audit,
+            book_continuity_mode: bt
+                .sim_v2_book_continuity_mode
+                .parse()
+                .map_err(|error: String| anyhow::anyhow!(error))?,
             start: start_dt,
             end: end_dt,
             sources: replay_sources.clone(),
@@ -5368,6 +5772,9 @@ impl Engine {
             rho_cross: lat_cross,
             seed: bt.sim_latency_seed,
             client_timeout_ns: client_timeout_ms.saturating_mul(1_000_000),
+            cancel_timeout_ns: bt.sim_cancel_timeout_ms.saturating_mul(1_000_000),
+            reconcile_timeout_ns: bt.sim_reconcile_timeout_ms.saturating_mul(1_000_000),
+            separate_taker_private_fills: bt.sim_v2_separate_taker_private_fills,
             wallet_usdc_by_iid: sim_wallet_usdc_by_iid,
             split_by_iid: sim_split_by_iid,
             ahead_frac,
@@ -5386,6 +5793,16 @@ impl Engine {
             replay_self_depth_fifo_replacement: bt.sim_v2_replay_self_depth_fifo_replacement,
             replay_self_taker_depth_rate: bt.sim_v2_replay_self_taker_depth_rate,
             cancel_finality_delay_frac: bt.sim_v2_cancel_finality_delay_frac,
+            cancel_timing_mode: bt
+                .sim_v2_cancel_timing_mode
+                .parse()
+                .map_err(|error: String| anyhow::anyhow!(error))?,
+            cancel_processing_ns: bt
+                .sim_v2_cancel_processing_ms
+                .checked_mul(1_000_000)
+                .ok_or_else(|| anyhow::anyhow!("cancel processing ms overflow"))?,
+            cancel_processing_fraction_bps: bt.sim_v2_cancel_processing_fraction_bps,
+            execution_timing_audit: bt.sim_v2_execution_timing_audit,
             cancel_finality_counts_toward_timeout: bt.sim_v2_cancel_finality_counts_toward_timeout,
             place_ack_uncertainty_rate: bt.sim_v2_place_ack_uncertainty_rate,
             cancel_ack_uncertainty_rate: bt.sim_v2_cancel_ack_uncertainty_rate,
@@ -5458,6 +5875,24 @@ impl Engine {
             cancel_profile,
         })?;
         sim.configure_maker_order_audit(bt.sim_v2_fill_audit);
+        sim.set_taker_overhead_enabled(bt.sim_v2_taker_overhead_enabled);
+        if let Some(iid) = continuity_owner {
+            let replay = crate::exchange::sim_v2::BookContinuityReplay::from_path(
+                &bt.sim_v2_book_continuity_evidence_path,
+                &iid,
+            )?;
+            sim.set_book_continuity_replay(replay);
+        }
+        if !bt.sim_v2_observed_admission_path.trim().is_empty() {
+            let admission = crate::exchange::sim_v2::admission::ObservedAdmissionReplay::from_path(
+                &bt.sim_v2_observed_admission_path,
+            )?;
+            info!(
+                "[Backtest v2] observed admission replay: {} merged intervals, {} ns; new-place only, observed lower bound",
+                admission.interval_count(), admission.total_blocked_ns()
+            );
+            sim.set_observed_admission_replay(admission);
+        }
 
         info!(
             "[Backtest v2] {} strat replayers, {} bar events",
@@ -5490,6 +5925,28 @@ impl Engine {
 
         let mut replay_clocks = SimV2ReplayClocks::default();
 
+        let mut lifecycle_router = SimLifecycleRouter::new(&strategies)?;
+        let mut lifecycle_signals = SignalBatch::new();
+        // Offline simulator evidence is serialized outside strategy callbacks.
+        // The live execution/quote lanes never enter this backtest loop.
+        let mut admission_writer = if bt.sim_v2_admission_audit {
+            Some(std::io::BufWriter::with_capacity(
+                256 * 1024,
+                std::fs::File::create("sim_admission_audit.jsonl")?,
+            ))
+        } else {
+            None
+        };
+
+        let mut execution_timing_writer = if bt.sim_v2_execution_timing_audit {
+            Some(std::io::BufWriter::with_capacity(
+                256 * 1024,
+                std::fs::File::create("sim_execution_timing_audit.jsonl")?,
+            ))
+        } else {
+            None
+        };
+
         let perf_sim_setup_ns = elapsed_nanos(perf_sim_setup_started);
         let perf_event_loop_started = Instant::now();
         loop {
@@ -5514,27 +5971,37 @@ impl Engine {
                     replay_clocks.advance_server(server_ts);
                 }
                 let updates = sim.step();
+                if let Some(writer) = admission_writer.as_mut() {
+                    for row in sim.drain_admission_audit() {
+                        serde_json::to_writer(&mut *writer, &row)?;
+                        std::io::Write::write_all(writer, b"\n")?;
+                    }
+                }
                 for mut update in updates {
                     let strategy_now = replay_clocks.advance_strategy(update.timestamp_ns);
                     update.timestamp_ns = strategy_now;
                     sim.observe_strategy_clock(strategy_now);
                     set_sim_clock(strategy_now);
-                    for strategy in strategies.iter_mut() {
-                        match strategy.on_order_update(&update) {
-                            Ok(signals) => {
-                                for sig in signals {
-                                    sim.submit(&sig, strategy_now);
-                                }
-                            }
-                            Err(overflow) => {
-                                let emergency = emergency_cancel_for_signal(
-                                    &overflow.signal,
-                                    strategy.instance_id(),
-                                    "fixed lifecycle signal batch overflow",
-                                );
-                                sim.submit(&emergency, strategy_now);
-                            }
-                        }
+                    let (instance, order_slot) =
+                        sim.order_owner(&update.client_order_id).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "missing simulated lifecycle ownership for {}",
+                                update.client_order_id,
+                            )
+                        })?;
+                    anyhow::ensure!(
+                        order_slot == update.order_slot,
+                        "simulated lifecycle slot mismatch for {}",
+                        update.client_order_id
+                    );
+                    lifecycle_router.dispatch(
+                        instance,
+                        &mut strategies,
+                        update,
+                        &mut lifecycle_signals,
+                    )?;
+                    for signal in lifecycle_signals.drain(..) {
+                        sim.submit(&signal, strategy_now);
                     }
                 }
             } else {
@@ -5699,6 +6166,13 @@ impl Engine {
                 }
             }
 
+            if let Some(writer) = execution_timing_writer.as_mut() {
+                for row in sim.drain_execution_timing_audit() {
+                    serde_json::to_writer(&mut *writer, &row)?;
+                    std::io::Write::write_all(writer, b"\n")?;
+                }
+            }
+
             // Synthetic RTT-probe emit (PROBE recovery), carried over from the removed v1 sim engine.
             let now_for_probe = replay_clocks.strategy_ns;
             if bt_probe_enable.load(std::sync::atomic::Ordering::Relaxed)
@@ -5710,6 +6184,34 @@ impl Engine {
             }
         }
         let perf_event_loop_ns = elapsed_nanos(perf_event_loop_started);
+        if let Some(writer) = admission_writer.as_mut() {
+            std::io::Write::flush(writer)?;
+        }
+        if let Some(writer) = execution_timing_writer.as_mut() {
+            std::io::Write::flush(writer)?;
+            let stats = sim.execution_timing_stats();
+            let summary = serde_json::json!({
+                "execution_timing_audit": stats, "cancel_timing_stats": sim.cancel_timing_stats(),
+                "replay_complete": sim.peek_when().is_none() && stats.queued == 0,
+                "scheduler_pending_at_end": sim.peek_when().is_some(),
+            });
+            std::fs::write(
+                "sim_execution_timing_summary.json",
+                serde_json::to_vec_pretty(&summary)?,
+            )?;
+            info!("  Sim v2:   execution_timing {}", summary);
+        }
+        if bt.sim_v2_admission_audit || bt.sim_v2_strict_admission {
+            let stats = sim.admission_audit_stats();
+            std::fs::write(
+                "sim_admission_summary.json",
+                serde_json::to_vec_pretty(&stats)?,
+            )?;
+            info!(
+                "  Sim v2:   admission_audit {}",
+                serde_json::to_string(&stats)?
+            );
+        }
         let perf_reporting_started = Instant::now();
 
         for s in &mut strategies {
@@ -5724,6 +6226,12 @@ impl Engine {
         );
         let (server_ts_regressions, max_server_ts_regression_ns) =
             sim.server_time_regression_stats();
+        info!(
+            "  Sim v2:   clock_profile receive_strict={} raw_server={} older_books_dropped={}",
+            bt.sim_replay_arrival_time_strict,
+            bt.sim_v2_raw_server_clock,
+            sim.raw_older_books_dropped(),
+        );
         if server_ts_regressions > 0 {
             warn!(
                 "  Sim v2:   server timestamp regressions normalized: count={} max_ms={:.3}",
@@ -6154,6 +6662,26 @@ impl Engine {
             }
         }
         let replay_perf = crate::recorder::replayer_stats();
+        let (deadline_pending, deadline_high_water, deadline_capacity) = sim.http_deadline_stats();
+        let (recovery_pending, recovery_high_water, recovery_capacity) =
+            sim.private_fill_recovery_stats();
+        let (gate_rejected, gate_pending, gate_high_water, gate_capacity) =
+            sim.observed_admission_stats();
+        let (query_pending, query_high_water, query_capacity) = sim.query_timeout_feedback_stats();
+        info!(
+            "[BacktestQuery] timed_out_requests={} pending_feedback={} high_water={} capacity={} overflow=0 policy=abort_on_overflow",
+            sim.reconcile_timeout_stats(), query_pending, query_high_water, query_capacity
+        );
+        info!(
+            "[BacktestAdmission] rejected_places={} pending_feedback={} high_water={} capacity={} overflow=0 policy=abort_on_overflow feedback_delay_ms=1",
+            gate_rejected, gate_pending, gate_high_water, gate_capacity
+        );
+        info!(
+            "[BacktestLifecycle] delivered={} owners={} transport_queue_depth=0 signal_batch_capacity={} deadline_pending={} deadline_high_water={} deadline_capacity={} private_recovery_pending={} private_recovery_high_water={} private_recovery_capacity={} overflow=0 policy=abort_on_overflow",
+            lifecycle_router.sequences.iter().sum::<u64>(), lifecycle_router.sequences.len(),
+            SIGNAL_BATCH_CAPACITY, deadline_pending, deadline_high_water, deadline_capacity,
+            recovery_pending, recovery_high_water, recovery_capacity
+        );
         let perf_reporting_ns = elapsed_nanos(perf_reporting_started);
         let perf_total_ns = elapsed_nanos(perf_total_started);
         info!(
@@ -8825,6 +9353,7 @@ impl Engine {
                     sim_tx,
                     shutdown,
                     feed_readiness,
+                    self.book_protocol_lane.as_ref().map(|lane| lane.sink()),
                 )?);
                 continue;
             }

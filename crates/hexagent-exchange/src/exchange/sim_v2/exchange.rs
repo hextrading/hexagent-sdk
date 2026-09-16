@@ -14,11 +14,16 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::types::{
-    AuthoritativeOrderAudit, Exchange, Instrument, Liquidity, OrderBookSnapshot, OrderRequest, OrderStatus, OrderType,
-    OrderUpdate, PriceLevel, Side, TickSizeChange, TradeTick,
+    AuthoritativeOrderAudit, Exchange, Instrument, Liquidity, OrderBookSnapshot, OrderRequest,
+    OrderSlot, OrderStatus, OrderType, OrderUpdate, PriceLevel, Side, TickSizeChange, TradeTick,
 };
 
 use super::book::{price_to_ticks, BookSet};
+use super::event::ServerEventTime;
+use super::evidence::{
+    ArchiveCoverage, ArrivalEvidence, BookContinuityMode, BookContinuityRecord,
+    BookContinuityState, ContinuityStatus,
+};
 use super::wallet::WalletBook;
 
 const EPS: f64 = 1e-9;
@@ -36,6 +41,124 @@ const RETAIN_EVENTS: usize = 16;
 // fabricates a zero-fill terminal and never changes matching/RNG/latency.
 const MAX_ORDER_EVIDENCE: usize = 65_536;
 const MAX_ORDER_TRADE_IDS: usize = 256;
+const ADMISSION_AUDIT_CAPACITY: usize = 8_192;
+const ADMISSION_BOOK_CAPACITY: usize = 128;
+
+/// Offline arrival-book evidence. Token identifies the actual recorded book
+/// selected into the canonical frame; BBO here is in that recorded token frame.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AdmissionBookEvidence {
+    pub token: String,
+    pub version: u64,
+    pub clock: ServerEventTime,
+    pub best_bid: Option<f64>,
+    pub best_ask: Option<f64>,
+}
+
+#[derive(Clone, Copy)]
+struct AdmissionBookSnapshot {
+    version: u64,
+    clock: ServerEventTime,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+}
+
+impl AdmissionBookEvidence {
+    fn from_snapshot(token: &str, snapshot: AdmissionBookSnapshot) -> Self {
+        Self {
+            token: token.to_owned(),
+            version: snapshot.version,
+            clock: snapshot.clock,
+            best_bid: snapshot.best_bid,
+            best_ask: snapshot.best_ask,
+        }
+    }
+
+    fn update(&mut self, token: &str, snapshot: AdmissionBookSnapshot) {
+        if self.token != token {
+            self.token.clear();
+            self.token.push_str(token);
+        }
+        self.version = snapshot.version;
+        self.clock = snapshot.clock;
+        self.best_bid = snapshot.best_bid;
+        self.best_ask = snapshot.best_ask;
+    }
+}
+
+/// Every core placement decision, including idempotent retries and unknown
+/// data coverage. These are replay-local attempt identities, not HTTP slots.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AdmissionAuditRow {
+    pub attempt_sequence: u64,
+    pub coid: String,
+    pub iid: String,
+    pub event_slug: Option<String>,
+    pub strategy_order_slot: OrderSlot,
+    pub token: String,
+    pub side: Side,
+    pub order_type: OrderType,
+    pub price: Option<f64>,
+    pub quantity: f64,
+    pub post_only: bool,
+    pub request_timestamp_ns: u64,
+    pub request_arrival_ns: u64,
+    pub decision_ns: u64,
+    pub arrival_evidence: ArrivalEvidence,
+    pub canonical_token: String,
+    pub canonical_side: Side,
+    pub canonical_price: Option<f64>,
+    pub tick: f64,
+    pub original_book: Option<AdmissionBookEvidence>,
+    pub selected_book: Option<AdmissionBookEvidence>,
+    pub canonical_best_bid: Option<f64>,
+    pub canonical_best_ask: Option<f64>,
+    pub opposing_price_after_self_depth: Option<f64>,
+    pub source_age_ns: Option<u64>,
+    pub gate_source_age_ns: Option<u64>,
+    pub local_visible_at_ns: Option<u64>,
+    pub local_age_ns: Option<u64>,
+    pub exchange_stale: bool,
+    pub local_stale: bool,
+    pub strict_admission: bool,
+    pub book_continuity_mode: BookContinuityMode,
+    pub continuity: Option<BookContinuityState>,
+    /// Whether explicit protocol evidence covers the decision time.
+    pub covered: bool,
+    /// Whether this configured scenario permits using the selected book.
+    pub eligible: bool,
+    pub evidence_confidence: &'static str,
+    pub coverage_scope: &'static str,
+    /// Age remains diagnostic even when it no longer controls eligibility.
+    pub source_age_stale: bool,
+    pub crossing: Option<bool>,
+    pub coverage: &'static str,
+    pub decision: &'static str,
+    pub status: OrderStatus,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct AdmissionAuditStats {
+    pub queued: usize,
+    pub high_water: usize,
+    pub capacity: usize,
+    pub total_rows: u64,
+    pub unknown_decisions: u64,
+    pub unknown_rejected: u64,
+    pub estimated_decisions: u64,
+    pub verified_decisions: u64,
+    pub overflows: u64,
+}
+
+#[derive(Clone, Copy)]
+struct BookEligibility {
+    covered: bool,
+    eligible: bool,
+    confidence: &'static str,
+    coverage: &'static str,
+    continuity: Option<BookContinuityState>,
+}
 
 /// End-of-replay counters for bounded, simulator-owned order evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +173,16 @@ pub struct OrderEvidenceStats {
 
 struct SimOrderEvidence {
     instance_id: String,
+    /// Immutable original venue, retained after the resting order is gone.
+    exchange: Exchange,
+    order_slot: OrderSlot,
+    owner_valid: bool,
+    exchange_seen: bool,
+    pending_messages: usize,
+    retired: bool,
+    price: Option<f64>,
+    order_type: OrderType,
+    post_only: bool,
     symbol: String,
     side: Side,
     original_quantity: f64,
@@ -60,14 +193,13 @@ struct SimOrderEvidence {
 
 impl SimOrderEvidence {
     fn audit(&self) -> Option<AuthoritativeOrderAudit> {
-        self.complete.then(|| AuthoritativeOrderAudit {
+        (self.complete && self.exchange_seen).then(|| AuthoritativeOrderAudit {
             original_size: Some(self.original_quantity.to_string()),
             size_matched: Some(self.matched_quantity.to_string()),
             associate_trades: self.trade_ids.clone(),
         })
     }
 }
-
 
 struct RestingOrder {
     request: OrderRequest,
@@ -445,6 +577,27 @@ pub struct SimExchangeV2 {
     /// both the folded out-of-order guard and one clock of the matching stale
     /// gate.
     last_book_ts: HashMap<String, u64>,
+    /// Strict server-clock profile only: snapshots dropped before changing
+    /// depth, queue evidence, freshness, or maker fills. Equal times are legal.
+    pub raw_older_books_dropped: u64,
+    strict_admission: bool,
+    admission_unknown_reject: bool,
+    admission_audit_enabled: bool,
+    admission_audit: VecDeque<AdmissionAuditRow>,
+    admission_audit_high_water: usize,
+    admission_audit_total: u64,
+    admission_unknown_decisions: u64,
+    admission_unknown_rejected: u64,
+    admission_estimated_decisions: u64,
+    admission_verified_decisions: u64,
+    admission_audit_overflows: u64,
+    admission_book_version: u64,
+    admission_original_books: HashMap<String, AdmissionBookEvidence>,
+    admission_selected_books: HashMap<String, AdmissionBookEvidence>,
+    book_continuity_mode: BookContinuityMode,
+    book_continuity: HashMap<String, BookContinuityState>,
+    continuity_owner_iid: Option<String>,
+    archive_coverage: ArchiveCoverage,
     /// Local receive timestamp carried by the last accepted full book. Together
     /// with `last_book_ts` this detects both a silent recorder/client feed and a
     /// server snapshot whose own timestamp stopped advancing.
@@ -608,6 +761,7 @@ pub struct SimExchangeV2 {
     /// retired from every token-keyed map to bound memory over long runs.
     event_fifo: VecDeque<(String, [String; 2])>,
     matched_cant_cancel_window_ns: u64,
+    durable_terminal_status: bool,
     #[allow(dead_code)]
     client_timeout_ns: u64,
     pub taker_fills: u64,
@@ -626,15 +780,6 @@ pub struct SimExchangeV2 {
     /// post-only orders seen at reach (denominator for the cross rate).
     pub post_only_seen: u64,
     pub matched_cant_cancel: u64,
-    /// Cancel-on-arrival ledger. A cancel whose coid is neither resting nor
-    /// recently-filled is most likely a cancel that RACED AHEAD of its own
-    /// place ack — the placement is still in flight and will rest in a moment.
-    /// Recording the coid here lets `submit_order` honour the cancel when the
-    /// place finally arrives, instead of resting an order the strategy has
-    /// already removed (it acts on the `Cancelled` we return for the race),
-    /// which otherwise becomes a forgotten orphan that rests to settlement and
-    /// locks the wallet. coid → cancel-arrival ts (for stale pruning).
-    pending_cancels: std::collections::HashMap<String, u64>,
     // ── Phase-A diagnostics (maker fill timing) ──
     /// Σ (fill_ts − placed_ts) over maker fills, + count, + #fills on orders
     /// older than 1s. Mean fill-age = sum/n. High age ⇒ orders linger before
@@ -723,6 +868,25 @@ impl SimExchangeV2 {
             audit_clock_ns: 0,
             fold_sibling: HashMap::new(),
             last_book_ts: HashMap::new(),
+            raw_older_books_dropped: 0,
+            strict_admission: false,
+            admission_unknown_reject: false,
+            admission_audit_enabled: false,
+            admission_audit: VecDeque::new(),
+            admission_audit_high_water: 0,
+            admission_audit_total: 0,
+            admission_unknown_decisions: 0,
+            admission_unknown_rejected: 0,
+            admission_estimated_decisions: 0,
+            admission_verified_decisions: 0,
+            admission_audit_overflows: 0,
+            admission_book_version: 0,
+            admission_original_books: HashMap::new(),
+            admission_selected_books: HashMap::new(),
+            book_continuity_mode: BookContinuityMode::LegacyAge,
+            book_continuity: HashMap::new(),
+            continuity_owner_iid: None,
+            archive_coverage: ArchiveCoverage::default(),
             last_book_local_ts: HashMap::new(),
             book_stale_after_ns: 0,
             stale_resting_exchange_only: false,
@@ -784,6 +948,7 @@ impl SimExchangeV2 {
             recent_fills: HashMap::new(),
             event_fifo: VecDeque::new(),
             matched_cant_cancel_window_ns: 2_000_000_000,
+            durable_terminal_status: false,
             client_timeout_ns,
             taker_fills: 0,
             maker_fills: 0,
@@ -796,7 +961,6 @@ impl SimExchangeV2 {
             post_only_rejects: 0,
             post_only_seen: 0,
             matched_cant_cancel: 0,
-            pending_cancels: std::collections::HashMap::new(),
             maker_fill_age_sum_ns: 0,
             maker_fill_n: 0,
             maker_fill_age_over1s: 0,
@@ -829,27 +993,114 @@ impl SimExchangeV2 {
 
     fn register_order_evidence(&mut self, order: &OrderRequest) {
         if let Some(existing) = self.order_evidence.get_mut(&order.client_order_id) {
-            if existing.instance_id != order.instance_id || existing.symbol != order.symbol
-                || existing.side != order.side || existing.original_quantity != order.quantity
+            if existing.instance_id != order.instance_id
+                || existing.order_slot != order.order_slot
+                || existing.symbol != order.symbol
+                || existing.side != order.side
+                || existing.original_quantity != order.quantity
+                || existing.price != order.price
+                || existing.order_type != order.order_type
+                || existing.post_only != order.post_only
             {
                 existing.complete = false;
+                existing.owner_valid = false;
             }
+            existing.exchange_seen = true;
             return;
         }
         if self.order_evidence.len() >= MAX_ORDER_EVIDENCE {
             self.order_evidence_overflows += 1;
             return;
         }
-        self.order_evidence.insert(order.client_order_id.clone(), SimOrderEvidence {
-            instance_id: order.instance_id.clone(),
-            symbol: order.symbol.clone(),
-            side: order.side,
-            original_quantity: order.quantity,
-            matched_quantity: 0.0,
-            trade_ids: Vec::new(),
-            complete: order.quantity.is_finite() && order.quantity > 0.0,
-        });
-        self.order_evidence_high_water = self.order_evidence_high_water.max(self.order_evidence.len());
+        self.order_evidence.insert(
+            order.client_order_id.clone(),
+            SimOrderEvidence {
+                instance_id: order.instance_id.clone(),
+                exchange: order.exchange,
+                order_slot: order.order_slot,
+                owner_valid: true,
+                exchange_seen: true,
+                pending_messages: 0,
+                retired: false,
+                price: order.price,
+                order_type: order.order_type,
+                post_only: order.post_only,
+                symbol: order.symbol.clone(),
+                side: order.side,
+                original_quantity: order.quantity,
+                matched_quantity: 0.0,
+                trade_ids: Vec::new(),
+                complete: order.quantity.is_finite() && order.quantity > 0.0,
+            },
+        );
+        self.order_evidence_high_water = self
+            .order_evidence_high_water
+            .max(self.order_evidence.len());
+    }
+
+    /// Register immutable routing identity before a request leaves the local
+    /// simulator. Reuses the existing bounded evidence store: no shared owner
+    /// map, new worker, or live-path allocation is introduced. An overflow or
+    /// coid collision has no owner and must fail closed at delivery.
+    pub fn register_dispatched_order(&mut self, order: &OrderRequest) {
+        let was_known = self.order_evidence.contains_key(&order.client_order_id);
+        let was_seen = self
+            .order_evidence
+            .get(&order.client_order_id)
+            .is_some_and(|e| e.exchange_seen);
+        self.register_order_evidence(order);
+        if !was_known || !was_seen {
+            if let Some(evidence) = self.order_evidence.get_mut(&order.client_order_id) {
+                evidence.exchange_seen = false;
+            }
+        }
+    }
+
+    /// Scheduler references keep identity alive across event retirement until
+    /// the final queued callback has been handed to the engine. Release never
+    /// deletes immediately: the engine may borrow owner metadata after step().
+    pub fn retain_order_message(&mut self, coid: &str) {
+        if let Some(e) = self.order_evidence.get_mut(coid) {
+            e.pending_messages += 1;
+        }
+    }
+
+    pub fn release_order_message(&mut self, coid: &str) {
+        if let Some(e) = self.order_evidence.get_mut(coid) {
+            e.pending_messages = e.pending_messages.saturating_sub(1);
+        }
+    }
+
+    /// Immutable single-writer simulator metadata; never a strategy/account borrow.
+    pub fn order_owner(&self, coid: &str) -> Option<(&str, OrderSlot)> {
+        self.order_evidence
+            .get(coid)
+            .filter(|e| e.owner_valid)
+            .map(|e| (e.instance_id.as_str(), e.order_slot))
+    }
+
+    pub fn order_matches_owner_and_exchange(
+        &self,
+        coid: &str,
+        iid: &str,
+        exchange: Exchange,
+    ) -> bool {
+        self.order_evidence
+            .get(coid)
+            .is_some_and(|e| e.owner_valid && e.instance_id == iid && e.exchange == exchange)
+    }
+
+    /// Borrowed immutable routing evidence for the offline timing audit.
+    pub fn order_timing_identity(&self, coid: &str) -> Option<(&str, &str, OrderSlot)> {
+        self.order_evidence
+            .get(coid)
+            .filter(|e| e.owner_valid)
+            .map(|e| (e.instance_id.as_str(), e.symbol.as_str(), e.order_slot))
+    }
+
+    fn order_slot(&self, coid: &str) -> OrderSlot {
+        self.order_owner(coid)
+            .map_or(OrderSlot::UNASSIGNED, |(_, slot)| slot)
     }
 
     /// Read once for end-of-replay reporting; this is not a queue or live
@@ -866,10 +1117,15 @@ impl SimExchangeV2 {
     }
 
     fn record_order_execution(&mut self, coid: &str, trade_id: &str, quantity: f64) {
-        let Some(evidence) = self.order_evidence.get_mut(coid) else { return; };
-        if evidence.trade_ids.iter().any(|known| known == trade_id) { return; }
+        let Some(evidence) = self.order_evidence.get_mut(coid) else {
+            return;
+        };
+        if evidence.trade_ids.iter().any(|known| known == trade_id) {
+            return;
+        }
         evidence.matched_quantity += quantity;
-        if !quantity.is_finite() || quantity <= 0.0
+        if !quantity.is_finite()
+            || quantity <= 0.0
             || !evidence.matched_quantity.is_finite()
             || evidence.matched_quantity > evidence.original_quantity + EPS
             || evidence.trade_ids.len() == MAX_ORDER_TRADE_IDS
@@ -879,14 +1135,42 @@ impl SimExchangeV2 {
             return;
         }
         evidence.trade_ids.push(trade_id.to_string());
-        self.order_trade_ids_high_water = self.order_trade_ids_high_water.max(evidence.trade_ids.len());
+        self.order_trade_ids_high_water = self
+            .order_trade_ids_high_water
+            .max(evidence.trade_ids.len());
+    }
+
+    pub fn configure_durable_terminal_status(&mut self, enabled: bool) {
+        self.durable_terminal_status = enabled;
+    }
+
+    /// A recent-fill cache is a delivery aid, never the authority for whether
+    /// the residual was cancelled. Keep total match status across cache expiry
+    /// and partial-fill/cancel retries; economic fills stay on the private lane.
+    fn terminal_status(&self, coid: &str) -> OrderStatus {
+        if self.durable_terminal_status
+            && self.order_evidence.get(coid).is_some_and(|e| {
+                e.complete
+                    && e.exchange_seen
+                    && e.original_quantity > EPS
+                    && e.matched_quantity + EPS >= e.original_quantity
+            })
+        {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::Cancelled
+        }
     }
 
     fn terminal_order_audit(&self, coid: &str) -> Option<AuthoritativeOrderAudit> {
         // A recovery probe must not label an order with live residual as a
         // completed quantity audit, even if an older cancel result was lost.
-        if self.orders.contains_key(coid) { return None; }
-        self.order_evidence.get(coid).and_then(SimOrderEvidence::audit)
+        if self.orders.contains_key(coid) {
+            return None;
+        }
+        self.order_evidence
+            .get(coid)
+            .and_then(SimOrderEvidence::audit)
     }
 
     /// Record a fill so a cancel arriving within the window returns Filled.
@@ -905,15 +1189,18 @@ impl SimExchangeV2 {
         // order's matched amount. Wallet economics and private fill payloads
         // remain unchanged; the consumer accounts fees exactly once.
         self.record_order_execution(coid, &trade_id, add_qty);
-        let e = self.recent_fills.entry(coid.to_string()).or_insert(RecentFill {
-            ts,
-            trade_id: trade_id.clone(),
-            filled_quantity: add_qty,
-            price,
-            side,
-            symbol: symbol.to_string(),
-            liquidity,
-        });
+        let e = self
+            .recent_fills
+            .entry(coid.to_string())
+            .or_insert(RecentFill {
+                ts,
+                trade_id: trade_id.clone(),
+                filled_quantity: add_qty,
+                price,
+                side,
+                symbol: symbol.to_string(),
+                liquidity,
+            });
         e.ts = ts;
         e.trade_id = trade_id;
         // `trade_id` identifies one immutable execution.  If an order fills in
@@ -931,12 +1218,22 @@ impl SimExchangeV2 {
         // by a later cancel → result-neutral. Keeps `recent_fills` to ≈one
         // window of fills instead of growing once per fill forever.
         let window = self.matched_cant_cancel_window_ns;
-        self.recent_fills.retain(|_, f| ts.saturating_sub(f.ts) <= window);
+        self.recent_fills
+            .retain(|_, f| ts.saturating_sub(f.ts) <= window);
     }
 
     /// Symbol/side of a resting order (for building timeout updates).
     pub fn order_symbol_side(&self, coid: &str) -> Option<(String, Side)> {
-        self.orders.get(coid).map(|o| (o.request.symbol.clone(), o.request.side))
+        self.orders
+            .get(coid)
+            .map(|o| (o.request.symbol.clone(), o.request.side))
+    }
+
+    pub fn order_identity_symbol_side(&self, coid: &str) -> Option<(String, Side)> {
+        self.order_evidence
+            .get(coid)
+            .filter(|e| e.owner_valid)
+            .map(|e| (e.symbol.clone(), e.side))
     }
 
     fn tick_of(&self, token: &str) -> f64 {
@@ -1003,11 +1300,15 @@ impl SimExchangeV2 {
 
     fn audit_row_mut(&mut self, token: &str, iid: &str) -> Option<&mut FillAuditRow> {
         let key = self.audit_key(token, iid)?;
-        Some(self.fill_audit.entry(key.clone()).or_insert_with(|| FillAuditRow {
-            slug: key.0,
-            iid: key.1,
-            ..FillAuditRow::default()
-        }))
+        Some(
+            self.fill_audit
+                .entry(key.clone())
+                .or_insert_with(|| FillAuditRow {
+                    slug: key.0,
+                    iid: key.1,
+                    ..FillAuditRow::default()
+                }),
+        )
     }
 
     pub fn fill_audit_rows(&self) -> Vec<FillAuditRow> {
@@ -1097,16 +1398,377 @@ impl SimExchangeV2 {
         self.book_stale_after_ns = stale_after_ns;
     }
 
+    /// Startup-only offline profile. Unknown venue-book coverage aborts by
+    /// default. `unknown_reject` is an explicit conservative scenario, never a
+    /// claim that the exchange actually rejected these orders.
+    pub fn configure_admission(&mut self, strict: bool, unknown_reject: bool, audit: bool) {
+        self.strict_admission = strict;
+        self.admission_unknown_reject = unknown_reject;
+        self.admission_audit_enabled = audit;
+        if audit {
+            self.admission_audit = VecDeque::with_capacity(ADMISSION_AUDIT_CAPACITY);
+            self.admission_original_books = HashMap::with_capacity(ADMISSION_BOOK_CAPACITY);
+            self.admission_selected_books = HashMap::with_capacity(ADMISSION_BOOK_CAPACITY);
+        }
+    }
+
+    /// Startup-only experimental policy. Normalized snapshots can support an
+    /// explicitly estimated hold, but never manufacture sequence continuity.
+    pub fn configure_book_continuity(&mut self, mode: BookContinuityMode) {
+        assert!(
+            mode == BookContinuityMode::LegacyAge || self.strict_admission,
+            "experimental book continuity requires strict admission"
+        );
+        self.book_continuity_mode = mode;
+        if mode != BookContinuityMode::LegacyAge {
+            self.book_continuity = HashMap::with_capacity(ADMISSION_BOOK_CAPACITY);
+            if self.admission_original_books.capacity() < ADMISSION_BOOK_CAPACITY {
+                self.admission_original_books = HashMap::with_capacity(ADMISSION_BOOK_CAPACITY);
+                self.admission_selected_books = HashMap::with_capacity(ADMISSION_BOOK_CAPACITY);
+            }
+        }
+    }
+
+    pub fn bind_continuity_owner(&mut self, iid: String) {
+        assert!(
+            !iid.is_empty(),
+            "continuity journal requires an explicit owner"
+        );
+        assert!(
+            self.continuity_owner_iid
+                .as_ref()
+                .is_none_or(|old| old == &iid),
+            "cannot replace continuity journal owner"
+        );
+        self.continuity_owner_iid = Some(iid);
+    }
+
+    pub(crate) fn install_archive_coverage(&mut self, archive: ArchiveCoverage) {
+        assert!(
+            self.book_continuity.is_empty(),
+            "archive must be installed before market replay"
+        );
+        self.archive_coverage = archive;
+    }
+
+    pub fn observe_book_continuity(&mut self, record: &BookContinuityRecord, now_ns: u64) {
+        assert_eq!(
+            self.continuity_owner_iid.as_deref(),
+            Some(record.iid.as_str()),
+            "foreign continuity owner"
+        );
+        assert!(
+            record.validate(&record.iid).is_ok(),
+            "malformed continuity evidence"
+        );
+        assert!(
+            record.apply_ns <= now_ns,
+            "future continuity evidence applied early"
+        );
+        let epoch = self
+            .event_slug_by_token
+            .get(&record.token)
+            .and_then(|slug| slug.rsplit('-').next())
+            .and_then(|part| part.parse::<u64>().ok());
+        assert_eq!(
+            epoch,
+            Some(record.event_epoch),
+            "continuity token/event routing mismatch"
+        );
+        if !self.book_continuity.contains_key(&record.token) {
+            assert!(
+                self.book_continuity.len() < ADMISSION_BOOK_CAPACITY,
+                "continuity token capacity exhausted"
+            );
+            self.book_continuity
+                .insert(record.token.clone(), BookContinuityState::default());
+        }
+        self.book_continuity
+            .get_mut(&record.token)
+            .unwrap()
+            .observe(record);
+        if self.book_continuity_mode != BookContinuityMode::LegacyAge
+            && matches!(
+                self.book_continuity[&record.token].status,
+                ContinuityStatus::Gap | ContinuityStatus::Reconnect
+            )
+        {
+            let canon = self
+                .fold_to
+                .get(&record.token)
+                .map(String::as_str)
+                .unwrap_or(&record.token);
+            // A sibling observation must not invalidate a separately selected
+            // canonical book. Only the actually selected source owns this gap.
+            if self
+                .admission_selected_books
+                .get(canon)
+                .is_some_and(|book| book.token == record.token)
+            {
+                for order in self.orders.values_mut() {
+                    if order.match_symbol == canon {
+                        order.await_fresh_book = true;
+                    }
+                }
+                self.pend_cross.remove(canon);
+                self.pending_level_trade_evidence.remove(canon);
+            }
+        }
+    }
+
+    /// Transfer audit rows to an offline loop outside strategy callbacks.
+    /// Draining retains the preallocated capacity. Failure to drain is fatal,
+    /// not a dropped audit record or an unbounded buffer.
+    pub fn drain_admission_audit(
+        &mut self,
+    ) -> std::collections::vec_deque::Drain<'_, AdmissionAuditRow> {
+        self.admission_audit.drain(..)
+    }
+
+    pub fn admission_audit_stats(&self) -> AdmissionAuditStats {
+        AdmissionAuditStats {
+            queued: self.admission_audit.len(),
+            high_water: self.admission_audit_high_water,
+            capacity: ADMISSION_AUDIT_CAPACITY,
+            total_rows: self.admission_audit_total,
+            unknown_decisions: self.admission_unknown_decisions,
+            unknown_rejected: self.admission_unknown_rejected,
+            estimated_decisions: self.admission_estimated_decisions,
+            verified_decisions: self.admission_verified_decisions,
+            overflows: self.admission_audit_overflows,
+        }
+    }
+
+    fn capture_admission_book(
+        &mut self,
+        ob: &OrderBookSnapshot,
+        timing: Option<&ServerEventTime>,
+        now_ns: u64,
+    ) -> Option<AdmissionBookSnapshot> {
+        if !self.admission_audit_enabled
+            && self.book_continuity_mode == BookContinuityMode::LegacyAge
+        {
+            return None;
+        }
+        if self.book_continuity_mode != BookContinuityMode::LegacyAge {
+            if !self.book_continuity.contains_key(&ob.symbol) {
+                assert!(
+                    self.book_continuity.len() < ADMISSION_BOOK_CAPACITY,
+                    "continuity token capacity exhausted"
+                );
+                self.book_continuity
+                    .insert(ob.symbol.clone(), BookContinuityState::default());
+            }
+            let epoch = self
+                .event_slug_by_token
+                .get(&ob.symbol)
+                .and_then(|slug| slug.rsplit('-').next())
+                .and_then(|part| part.parse::<u64>().ok());
+            let certificate = epoch.and_then(|epoch| {
+                self.archive_coverage.certificate(
+                    &ob.symbol,
+                    ob.exchange_timestamp_ns,
+                    ob.local_timestamp_ns,
+                    epoch,
+                )
+            });
+            let state = self.book_continuity.get_mut(&ob.symbol).unwrap();
+            state.observe_book(ob.exchange_timestamp_ns, ob.local_timestamp_ns);
+            if !state.book_identity_ambiguous
+                && state.book_source_ns == Some(ob.exchange_timestamp_ns)
+                && state.book_receive_ns == Some(ob.local_timestamp_ns)
+            {
+                state.archive_certificate = certificate;
+            }
+        }
+        self.admission_book_version = self
+            .admission_book_version
+            .checked_add(1)
+            .expect("admission book sequence exhausted");
+        let valid =
+            |level: &&PriceLevel| level.quantity > EPS && level.price > 0.0 && level.price < 1.0;
+        let observation = AdmissionBookSnapshot {
+            version: self.admission_book_version,
+            clock: timing.copied().unwrap_or(ServerEventTime {
+                raw_source_ns: ob.exchange_timestamp_ns,
+                recorded_receive_ns: ob.local_timestamp_ns,
+                reconstructed_source_ns: None,
+                effective_apply_ns: now_ns,
+                stream_index: u32::MAX,
+                stream_sequence: 0,
+            }),
+            best_bid: ob
+                .bids
+                .iter()
+                .filter(valid)
+                .map(|l| l.price)
+                .reduce(f64::max),
+            best_ask: ob
+                .asks
+                .iter()
+                .filter(valid)
+                .map(|l| l.price)
+                .reduce(f64::min),
+        };
+        let replace = self
+            .admission_original_books
+            .get(&ob.symbol)
+            .is_none_or(|old| observation.clock.raw_source_ns >= old.clock.raw_source_ns);
+        if replace {
+            if let Some(existing) = self.admission_original_books.get_mut(&ob.symbol) {
+                existing.update(&ob.symbol, observation);
+            } else {
+                assert!(
+                    self.admission_original_books.len() < ADMISSION_BOOK_CAPACITY,
+                    "admission original book evidence capacity exhausted"
+                );
+                self.admission_original_books.insert(
+                    ob.symbol.clone(),
+                    AdmissionBookEvidence::from_snapshot(&ob.symbol, observation),
+                );
+            }
+        }
+        Some(observation)
+    }
+
+    fn select_admission_book(
+        &mut self,
+        canonical: &str,
+        source_token: &str,
+        observation: Option<AdmissionBookSnapshot>,
+    ) {
+        if let Some(observation) = observation {
+            if let Some(existing) = self.admission_selected_books.get_mut(canonical) {
+                existing.update(source_token, observation);
+            } else {
+                assert!(
+                    self.admission_selected_books.len() < ADMISSION_BOOK_CAPACITY,
+                    "admission canonical book evidence capacity exhausted"
+                );
+                self.admission_selected_books.insert(
+                    canonical.to_owned(),
+                    AdmissionBookEvidence::from_snapshot(source_token, observation),
+                );
+            }
+        }
+    }
+
     pub fn configure_stale_resting_exchange_only(&mut self, enabled: bool) {
         self.stale_resting_exchange_only = enabled;
     }
 
     fn resting_trade_is_stale(&self, exchange_stale: bool, local_stale: bool) -> bool {
-        exchange_stale || (!self.stale_resting_exchange_only && local_stale)
+        exchange_stale
+            || (self.book_continuity_mode == BookContinuityMode::LegacyAge
+                && !self.stale_resting_exchange_only
+                && local_stale)
+    }
+
+    fn age_stale(&self, token: &str, now_ns: u64) -> bool {
+        self.book_stale_after_ns > 0
+            && self
+                .last_book_ts
+                .get(self.canonical_of(token))
+                .is_none_or(|source| now_ns.saturating_sub(*source) > self.book_stale_after_ns)
+    }
+
+    fn book_eligibility(&self, token: &str, now_ns: u64) -> BookEligibility {
+        let canon = self.canonical_of(token);
+        let exists = self.last_book_ts.contains_key(canon);
+        let selected = self.admission_selected_books.get(canon);
+        let state = selected
+            .and_then(|book| self.book_continuity.get(&book.token))
+            .copied();
+        let unknown = |coverage, continuity| BookEligibility {
+            covered: false,
+            eligible: false,
+            confidence: "unknown",
+            coverage,
+            continuity,
+        };
+        if !exists {
+            return unknown("missing_server_book", state);
+        }
+        if self.book_continuity_mode == BookContinuityMode::LegacyAge {
+            let stale = self.age_stale(token, now_ns);
+            return BookEligibility {
+                covered: false,
+                eligible: !stale,
+                confidence: "legacy_age",
+                coverage: if stale { "stale_server_book" } else { "known" },
+                continuity: state,
+            };
+        }
+        let Some(state) = state else {
+            return unknown("continuity_unproven", None);
+        };
+        if state.status == ContinuityStatus::Gap {
+            return unknown("continuity_gap", Some(state));
+        }
+        if state.status == ContinuityStatus::Reconnect {
+            return unknown("continuity_reconnect", Some(state));
+        }
+        // The evidence must describe the selected book, not a sibling stream's
+        // newer observation or a book dropped by the canonical raw-time guard.
+        let bound = selected.is_some_and(|book| {
+            Some(book.clock.raw_source_ns) == state.book_source_ns
+                && Some(book.clock.recorded_receive_ns) == state.book_receive_ns
+        });
+        if bound
+            && !state.book_identity_ambiguous
+            && state
+                .archive_certificate
+                .is_some_and(|certificate| certificate.covers(now_ns))
+        {
+            return BookEligibility {
+                covered: true,
+                eligible: true,
+                confidence: "verified",
+                coverage: "known",
+                continuity: Some(state),
+            };
+        }
+        if bound
+            && self.book_continuity_mode == BookContinuityMode::SnapshotHoldEstimated
+            && state.hold_eligible()
+        {
+            return BookEligibility {
+                covered: false,
+                eligible: true,
+                confidence: "estimated",
+                coverage: "estimated_snapshot_hold",
+                continuity: Some(state),
+            };
+        }
+        unknown("continuity_unproven", Some(state))
+    }
+
+    fn admission_eligibility(&self, o: &OrderRequest, now_ns: u64) -> BookEligibility {
+        let mut eligibility = self.book_eligibility(&o.symbol, now_ns);
+        if self.book_continuity_mode != BookContinuityMode::LegacyAge
+            && self
+                .continuity_owner_iid
+                .as_ref()
+                .is_some_and(|iid| iid != &o.instance_id)
+        {
+            eligibility.covered = false;
+            eligibility.eligible = false;
+            eligibility.confidence = "unknown";
+            eligibility.coverage = "continuity_owner_mismatch";
+        }
+        eligibility
     }
 
     fn book_stale_reasons(&self, token: &str, now_ns: u64) -> (bool, bool) {
         let max_age = self.book_stale_after_ns;
+        if self.book_continuity_mode != BookContinuityMode::LegacyAge {
+            let local = max_age > 0
+                && self
+                    .last_book_local_ts
+                    .get(self.canonical_of(token))
+                    .is_none_or(|timestamp| now_ns.saturating_sub(*timestamp) > max_age);
+            return (!self.book_eligibility(token, now_ns).eligible, local);
+        }
         if max_age == 0 {
             return (false, false);
         }
@@ -1185,10 +1847,7 @@ impl SimExchangeV2 {
                 continue;
             }
             let depth = books.level_depth(&o.match_symbol, o.match_side, o.match_price, o.tick);
-            o.replay_self_depth_credit = o
-                .replay_self_depth_credit
-                .min(depth)
-                .min(o.remaining);
+            o.replay_self_depth_credit = o.replay_self_depth_credit.min(depth).min(o.remaining);
             o.q_ahead = (depth - o.replay_self_depth_credit).max(0.0) + o.own_q_ahead;
             o.level_qty_at_sync = depth;
             let mid = books.eff_mid(&o.match_symbol);
@@ -1205,7 +1864,9 @@ impl SimExchangeV2 {
 
     fn maybe_rebase_stale_orders(&mut self, canon: &str, now_ns: u64) {
         let (exchange_stale, local_stale) = self.book_stale_reasons(canon, now_ns);
-        if !exchange_stale && !local_stale {
+        if !exchange_stale
+            && (self.book_continuity_mode != BookContinuityMode::LegacyAge || !local_stale)
+        {
             self.rebase_stale_orders(canon);
         }
     }
@@ -1390,7 +2051,12 @@ impl SimExchangeV2 {
     }
     /// Stash the next book for the canonical frame from a sibling (down) stream
     /// snapshot, mirroring it (p→1−p, bid↔ask).
-    pub fn set_next_book_mirrored(&mut self, canon: &str, bids: &[PriceLevel], asks: &[PriceLevel]) {
+    pub fn set_next_book_mirrored(
+        &mut self,
+        canon: &str,
+        bids: &[PriceLevel],
+        asks: &[PriceLevel],
+    ) {
         let (b, a) = Self::mirror_levels(bids, asks);
         self.books.set_next(canon, b, a);
     }
@@ -1400,7 +2066,12 @@ impl SimExchangeV2 {
     }
     /// Append a window snapshot from a sibling (down) stream, mirrored to the
     /// canonical frame (taker windowed race).
-    pub fn push_next_window_mirrored(&mut self, canon: &str, bids: &[PriceLevel], asks: &[PriceLevel]) {
+    pub fn push_next_window_mirrored(
+        &mut self,
+        canon: &str,
+        bids: &[PriceLevel],
+        asks: &[PriceLevel],
+    ) {
         let (b, a) = Self::mirror_levels(bids, asks);
         self.books.push_next_window(canon, b, a);
     }
@@ -1413,7 +2084,7 @@ impl SimExchangeV2 {
     /// Apply a book snapshot. Returns any maker fills caused by causally
     /// available book depletion or a trade-confirmed book-through sweep.
     pub fn on_orderbook(&mut self, ob: &OrderBookSnapshot) -> Vec<OrderUpdate> {
-        self.on_orderbook_inner(ob, None)
+        self.on_orderbook_inner(ob, None, ob.exchange_timestamp_ns, false, None)
     }
 
     /// Apply a book snapshot with the canonical forward mid at `t+h`. The
@@ -1424,16 +2095,42 @@ impl SimExchangeV2 {
         ob: &OrderBookSnapshot,
         fwd_mid: Option<f64>,
     ) -> Vec<OrderUpdate> {
-        self.on_orderbook_inner(ob, fwd_mid)
+        self.on_orderbook_inner(ob, fwd_mid, ob.exchange_timestamp_ns, false, None)
+    }
+
+    /// Preserve raw envelope evidence while retaining legacy matching clocks.
+    pub fn on_orderbook_observed(
+        &mut self,
+        ob: &OrderBookSnapshot,
+        timing: &ServerEventTime,
+        fwd_mid: Option<f64>,
+    ) -> Vec<OrderUpdate> {
+        self.on_orderbook_inner(ob, fwd_mid, ob.exchange_timestamp_ns, false, Some(timing))
+    }
+
+    /// Strict replay clock boundary. Book source time determines stale/drop;
+    /// fills, exposure, and queue processing use the monotonic application
+    /// time. The independently delivered local book clock is untouched.
+    pub fn on_orderbook_at(
+        &mut self,
+        ob: &OrderBookSnapshot,
+        timing: &ServerEventTime,
+        fwd_mid: Option<f64>,
+    ) -> Vec<OrderUpdate> {
+        debug_assert_eq!(ob.exchange_timestamp_ns, timing.raw_source_ns);
+        self.on_orderbook_inner(ob, fwd_mid, timing.effective_apply_ns, true, Some(timing))
     }
 
     fn on_orderbook_inner(
         &mut self,
         ob: &OrderBookSnapshot,
         fwd_mid: Option<f64>,
+        now_ns: u64,
+        strict_source_clock: bool,
+        timing: Option<&ServerEventTime>,
     ) -> Vec<OrderUpdate> {
-        let now_ns = ob.exchange_timestamp_ns;
         self.audit_clock_ns = self.audit_clock_ns.max(now_ns);
+        let observation = self.capture_admission_book(ob, timing, now_ns);
         if self.fold_outcomes {
             // Fold onto the canonical frame: the non-canonical token's snapshot
             // is mirrored (p→1−p, bid↔ask); the canonical token is applied as-is.
@@ -1453,10 +2150,13 @@ impl SimExchangeV2 {
             }
             if let Some(&last) = self.last_book_ts.get(&canon) {
                 if ob.exchange_timestamp_ns < last {
+                    self.raw_older_books_dropped += strict_source_clock as u64;
                     return Vec::new();
                 }
             }
-            self.last_book_ts.insert(canon.clone(), ob.exchange_timestamp_ns);
+            self.last_book_ts
+                .insert(canon.clone(), ob.exchange_timestamp_ns);
+            self.select_admission_book(&canon, &ob.symbol, observation);
             if ob.symbol == canon {
                 self.canonical_book_seen.insert(canon.clone());
                 self.books.update(&canon, ob.bids.clone(), ob.asks.clone());
@@ -1466,23 +2166,35 @@ impl SimExchangeV2 {
             }
             self.maybe_rebase_stale_orders(&canon, now_ns);
             let mut depletion_fills = self.resync_queues(now_ns, &canon, fwd_mid);
-            let book_through_fills =
-                self.run_book_through_if_fresh(&canon, now_ns, fwd_mid);
+            let book_through_fills = self.run_book_through_if_fresh(&canon, now_ns, fwd_mid);
             if depletion_fills.is_empty() {
                 return book_through_fills;
             }
             depletion_fills.extend(book_through_fills);
             return depletion_fills;
         }
-        self.books.update(&ob.symbol, ob.bids.clone(), ob.asks.clone());
+        // Legacy unfolded mode historically overwrote old depth. Keep that
+        // opt-out behavior, but the strict profile applies the same raw-source
+        // guard to both folded and ordinary token books.
+        if strict_source_clock
+            && self
+                .last_book_ts
+                .get(&ob.symbol)
+                .is_some_and(|last| ob.exchange_timestamp_ns < *last)
+        {
+            self.raw_older_books_dropped += 1;
+            return Vec::new();
+        }
+        self.books
+            .update(&ob.symbol, ob.bids.clone(), ob.asks.clone());
+        self.select_admission_book(&ob.symbol, &ob.symbol, observation);
         self.last_book_ts
             .entry(ob.symbol.clone())
             .and_modify(|ts| *ts = (*ts).max(ob.exchange_timestamp_ns))
             .or_insert(ob.exchange_timestamp_ns);
         self.maybe_rebase_stale_orders(&ob.symbol, now_ns);
         let mut depletion_fills = self.resync_queues(now_ns, &ob.symbol, fwd_mid);
-        let book_through_fills =
-            self.run_book_through_if_fresh(&ob.symbol, now_ns, fwd_mid);
+        let book_through_fills = self.run_book_through_if_fresh(&ob.symbol, now_ns, fwd_mid);
         if depletion_fills.is_empty() {
             return book_through_fills;
         }
@@ -1497,7 +2209,9 @@ impl SimExchangeV2 {
         fwd_mid: Option<f64>,
     ) -> Vec<OrderUpdate> {
         let (exchange_stale, local_stale) = self.book_stale_reasons(token, now_ns);
-        if exchange_stale || local_stale {
+        if exchange_stale
+            || (self.book_continuity_mode == BookContinuityMode::LegacyAge && local_stale)
+        {
             // A trade-confirmation belongs only to the immediately following
             // book interval. Do not let a confirmation suppressed by the stale
             // gate leak forward and fill on a later fresh book.
@@ -1542,8 +2256,12 @@ impl SimExchangeV2 {
                 let is_buy = o.match_side == Side::Buy;
                 // Contra TOUCHED or crossed our price (option C: touch-inclusive)…
                 let touched = match o.match_side {
-                    Side::Buy => books.eff_best_ask(&o.match_symbol).is_some_and(|a| a <= p + EPS),
-                    Side::Sell => books.eff_best_bid(&o.match_symbol).is_some_and(|b| b >= p - EPS),
+                    Side::Buy => books
+                        .eff_best_ask(&o.match_symbol)
+                        .is_some_and(|a| a <= p + EPS),
+                    Side::Sell => books
+                        .eff_best_bid(&o.match_symbol)
+                        .is_some_and(|b| b >= p - EPS),
                 };
                 if !touched {
                     continue;
@@ -1551,10 +2269,12 @@ impl SimExchangeV2 {
                 // …AND a trade since the last book update CONFIRMS a real match at
                 // our price (sell ≤ p for a bid / buy ≥ p for an ask) — filters the
                 // ~56 % of locks that are flicker (no trade). Verified physical.
-                let trade_confirmed = pend.get(&o.match_symbol).is_some_and(|&(min_sell, max_buy)| match o.match_side {
-                    Side::Buy => min_sell <= p + EPS,
-                    Side::Sell => max_buy >= p - EPS,
-                });
+                let trade_confirmed =
+                    pend.get(&o.match_symbol)
+                        .is_some_and(|&(min_sell, max_buy)| match o.match_side {
+                            Side::Buy => min_sell <= p + EPS,
+                            Side::Sell => max_buy >= p - EPS,
+                        });
                 if !trade_confirmed {
                     continue;
                 }
@@ -1562,8 +2282,7 @@ impl SimExchangeV2 {
                 let through = books.available_volume(&o.match_symbol, is_buy, Some(p));
                 let fillable = (through - o.q_ahead).max(0.0) * rate;
                 let uncapped_fill = fillable.min(o.remaining);
-                let inferred_capacity =
-                    (o.remaining - o.inferred_residual_floor).max(0.0);
+                let inferred_capacity = (o.remaining - o.inferred_residual_floor).max(0.0);
                 let fill = uncapped_fill.min(inferred_capacity);
                 let residual_suppressed = (uncapped_fill - fill).max(0.0);
                 if fill <= EPS {
@@ -1657,6 +2376,16 @@ impl SimExchangeV2 {
         changed_token: &str,
         fwd_mid: Option<f64>,
     ) -> Vec<OrderUpdate> {
+        let continuity_enabled = self.book_continuity_mode != BookContinuityMode::LegacyAge;
+        if continuity_enabled && !self.book_eligibility(changed_token, now_ns).eligible {
+            for order in self.orders.values_mut() {
+                if order.match_symbol == changed_token {
+                    order.await_fresh_book = true;
+                }
+            }
+            self.pending_level_trade_evidence.remove(changed_token);
+            return Vec::new();
+        }
         let books = &self.books;
         let af_override = self.ahead_frac_override;
         let dynamic_af_strength = self.dynamic_ahead_frac_strength;
@@ -1687,6 +2416,9 @@ impl SimExchangeV2 {
         let mut evidence_capped_n = 0u64;
         let mut evidence_capped_qty = 0.0;
         for (coid, o) in self.orders.iter_mut() {
+            if continuity_enabled && o.await_fresh_book {
+                continue;
+            }
             // Queue depth tracked in the canonical matching frame.
             let l_now = books.level_depth(&o.match_symbol, o.match_side, o.match_price, o.tick);
             let l_prev = o.level_qty_at_sync;
@@ -1727,15 +2459,17 @@ impl SimExchangeV2 {
             // exactly the prior model. The fill's adverse cost is realised later
             // at settlement (down move ⇒ a filled `up` bid loses).
             let mid_now = books.eff_mid(&o.match_symbol);
-            let adverse = if (adv_rate > 0.0 || depletion_rate > 0.0)
-                && mid_now > 0.0
-                && o.mid_at_sync > 0.0
-            {
-                let raw = mid_now - o.mid_at_sync; // + = canonical(up) mid rose
-                match o.match_side { Side::Buy => -raw, Side::Sell => raw }
-            } else {
-                0.0
-            };
+            let adverse =
+                if (adv_rate > 0.0 || depletion_rate > 0.0) && mid_now > 0.0 && o.mid_at_sync > 0.0
+                {
+                    let raw = mid_now - o.mid_at_sync; // + = canonical(up) mid rose
+                    match o.match_side {
+                        Side::Buy => -raw,
+                        Side::Sell => raw,
+                    }
+                } else {
+                    0.0
+                };
             let ahead_frac = if adv_rate > 0.0 {
                 let s = (adv_rate * adverse / (adv_scale * o.tick)).clamp(-1.0, 1.0);
                 if s > 0.0 {
@@ -1855,10 +2589,7 @@ impl SimExchangeV2 {
             // Own depth cannot survive after it disappears from the replayed
             // level. Capping here prevents a later, unrelated level re-entry
             // from receiving the same leave-one-out credit a second time.
-            o.replay_self_depth_credit = o
-                .replay_self_depth_credit
-                .min(l_now)
-                .min(o.remaining);
+            o.replay_self_depth_credit = o.replay_self_depth_credit.min(l_now).min(o.remaining);
             o.level_qty_at_sync = l_now;
             if mid_now > 0.0 {
                 o.mid_at_sync = mid_now;
@@ -1919,8 +2650,7 @@ impl SimExchangeV2 {
                     continue;
                 };
                 let uncapped_fill = actual.min(o.remaining);
-                let inferred_capacity =
-                    (o.remaining - o.inferred_residual_floor).max(0.0);
+                let inferred_capacity = (o.remaining - o.inferred_residual_floor).max(0.0);
                 let fill = uncapped_fill.min(inferred_capacity);
                 let residual_suppressed = (uncapped_fill - fill).max(0.0);
                 if fill <= EPS {
@@ -2009,19 +2739,35 @@ impl SimExchangeV2 {
     /// Maker fills: a trade print drains the resting queue at the matched level
     /// (direct) and at the mirrored complement level (cross-outcome).
     pub fn on_trade_tick(&mut self, t: &TradeTick) -> Vec<OrderUpdate> {
-        self.on_trade_tick_inner(t, None)
+        self.on_trade_tick_inner(t, None, t.exchange_timestamp_ns)
     }
 
     /// Like `on_trade_tick` but with the canonical forward mid at `t+h` (peeked
     /// by the simulator) for the forward-markout adverse reprice. `None` ⇒ no
     /// reprice (also a no-op when `fill_markout_vn == 0`).
     pub fn on_trade_tick_fwd(&mut self, t: &TradeTick, fwd_mid: Option<f64>) -> Vec<OrderUpdate> {
-        self.on_trade_tick_inner(t, fwd_mid)
+        self.on_trade_tick_inner(t, fwd_mid, t.exchange_timestamp_ns)
     }
 
-    fn on_trade_tick_inner(&mut self, t: &TradeTick, fwd_mid: Option<f64>) -> Vec<OrderUpdate> {
+    /// The public trade payload retains its recorder timestamp; matching and
+    /// causal trade windows run on the monotonic application clock. The feed's
+    /// separate source estimate is diagnostic, never reinserted into payload.
+    pub fn on_trade_tick_at(
+        &mut self,
+        t: &TradeTick,
+        timing: &ServerEventTime,
+        fwd_mid: Option<f64>,
+    ) -> Vec<OrderUpdate> {
+        self.on_trade_tick_inner(t, fwd_mid, timing.effective_apply_ns)
+    }
+
+    fn on_trade_tick_inner(
+        &mut self,
+        t: &TradeTick,
+        fwd_mid: Option<f64>,
+        ts: u64,
+    ) -> Vec<OrderUpdate> {
         let mut fills: Vec<MakerFill> = Vec::new();
-        let ts = t.exchange_timestamp_ns;
         self.audit_clock_ns = self.audit_clock_ns.max(ts);
         if self.fold_outcomes {
             // Fold the trade onto the canonical frame and drain the single
@@ -2061,7 +2807,9 @@ impl SimExchangeV2 {
                 self.audit_stale_trade(&t.symbol, t.side, t.price, t.quantity);
                 self.count_book_stale_block(exchange_stale, local_stale, false);
             } else {
-                self.match_trade(&t.symbol, t.side, t.price, t.quantity, ts, fwd_mid, &mut fills);
+                self.match_trade(
+                    &t.symbol, t.side, t.price, t.quantity, ts, fwd_mid, &mut fills,
+                );
             }
             // Cross-outcome mirror: flip side, 1 − price on the complement token.
             if let Some(comp) = self.books.complement(&t.symbol).cloned() {
@@ -2108,8 +2856,16 @@ impl SimExchangeV2 {
     /// `(now_ns − taker_comp_window, now_ns]` at prices that cross our limit —
     /// takers who beat us to the touch. For a BUY (lifting asks) competitors are
     /// BUY-aggressor trades at price ≤ limit; for a SELL, SELL-aggressor at ≥ limit.
-    fn taker_competition_volume(&self, msym: &str, mside: Side, lim: Option<f64>, now_ns: u64) -> f64 {
-        let Some(buf) = self.recent_trades.get(msym) else { return 0.0 };
+    fn taker_competition_volume(
+        &self,
+        msym: &str,
+        mside: Side,
+        lim: Option<f64>,
+        now_ns: u64,
+    ) -> f64 {
+        let Some(buf) = self.recent_trades.get(msym) else {
+            return 0.0;
+        };
         let from = now_ns.saturating_sub(self.taker_comp_window_ns);
         let mut comp = 0.0;
         for &(ts, side, price, qty) in buf.iter() {
@@ -2144,7 +2900,10 @@ impl SimExchangeV2 {
         // extent for the next book update — a SELL at `price` can confirm a
         // bid-fill at ≥ price, a BUY confirms an ask-fill at ≤ price.
         if self.book_through_rate > 0.0 {
-            let e = self.pend_cross.entry(symbol.to_string()).or_insert((f64::INFINITY, f64::NEG_INFINITY));
+            let e = self
+                .pend_cross
+                .entry(symbol.to_string())
+                .or_insert((f64::INFINITY, f64::NEG_INFINITY));
             match aggressor_side {
                 Side::Sell => e.0 = e.0.min(price),
                 Side::Buy => e.1 = e.1.max(price),
@@ -2261,19 +3020,16 @@ impl SimExchangeV2 {
             // Suppress a bounded fraction and turn it into latent queue ahead;
             // adverse/no movement remains fully fillable. Only current book
             // state is used — no future markout and no execution repricing.
-            let favorable_ticks = if toxicity_strength > 0.0
-                && mid_now > 0.0
-                && o.entry_mid > 0.0
-                && o.tick > 0.0
-            {
-                let favorable_move = match o.match_side {
-                    Side::Buy => mid_now - o.entry_mid,
-                    Side::Sell => o.entry_mid - mid_now,
+            let favorable_ticks =
+                if toxicity_strength > 0.0 && mid_now > 0.0 && o.entry_mid > 0.0 && o.tick > 0.0 {
+                    let favorable_move = match o.match_side {
+                        Side::Buy => mid_now - o.entry_mid,
+                        Side::Sell => o.entry_mid - mid_now,
+                    };
+                    (favorable_move / o.tick).max(0.0)
+                } else {
+                    0.0
                 };
-                (favorable_move / o.tick).max(0.0)
-            } else {
-                0.0
-            };
             let suppress_frac = if favorable_ticks > 0.0 {
                 toxicity_strength * (favorable_ticks / toxicity_scale_ticks).clamp(0.0, 1.0)
             } else {
@@ -2281,8 +3037,7 @@ impl SimExchangeV2 {
             };
             let suppressed = candidate * suppress_frac;
             let uncapped_fill = (candidate - suppressed).max(0.0);
-            let inferred_capacity =
-                (o.remaining - o.inferred_residual_floor).max(0.0);
+            let inferred_capacity = (o.remaining - o.inferred_residual_floor).max(0.0);
             let fill = uncapped_fill.min(inferred_capacity);
             let residual_suppressed = (uncapped_fill - fill).max(0.0);
             if residual_suppressed > EPS && !o.inferred_residual_realized {
@@ -2374,8 +3129,12 @@ impl SimExchangeV2 {
             }
             // Maker fills settle at our limit; Polymarket maker fee = 0.
             match f.side {
-                Side::Buy => self.wallets.settle_buy(&f.iid, &f.token, f.fill, f.price * f.fill),
-                Side::Sell => self.wallets.settle_sell(&f.iid, &f.token, f.fill, f.price * f.fill),
+                Side::Buy => self
+                    .wallets
+                    .settle_buy(&f.iid, &f.token, f.fill, f.price * f.fill),
+                Side::Sell => self
+                    .wallets
+                    .settle_sell(&f.iid, &f.token, f.fill, f.price * f.fill),
             }
             self.maker_fills += 1;
             if let Some(a) = self.audit_row_mut(&f.token, &f.iid) {
@@ -2417,7 +3176,11 @@ impl SimExchangeV2 {
                 Liquidity::Maker,
                 now_ns,
             );
-            let status = if f.fully { OrderStatus::Filled } else { OrderStatus::PartiallyFilled };
+            let status = if f.fully {
+                OrderStatus::Filled
+            } else {
+                OrderStatus::PartiallyFilled
+            };
             out.push(OrderUpdate {
                 client_order_id: f.coid.clone(),
                 exchange: Exchange::Polymarket,
@@ -2434,7 +3197,7 @@ impl SimExchangeV2 {
                 trade_id: Some(trade_id),
                 order_audit: None,
                 error: None,
-                order_slot: Default::default(),
+                order_slot: self.order_slot(&f.coid),
             });
             if f.fully {
                 self.orders.remove(&f.coid);
@@ -2466,11 +3229,17 @@ impl SimExchangeV2 {
     /// Mirror a single outcome's L2 levels into the complement frame:
     /// `price → 1 − price`, `bids ↔ asks`. `BUY tok @ p ≡ SELL comp @ (1−p)`,
     /// so the complement's bids become this frame's asks and vice-versa.
-    fn mirror_levels(bids: &[PriceLevel], asks: &[PriceLevel]) -> (Vec<PriceLevel>, Vec<PriceLevel>) {
+    fn mirror_levels(
+        bids: &[PriceLevel],
+        asks: &[PriceLevel],
+    ) -> (Vec<PriceLevel>, Vec<PriceLevel>) {
         let map = |ls: &[PriceLevel]| -> Vec<PriceLevel> {
             ls.iter()
                 .filter(|l| l.quantity > 0.0 && l.price > 0.0 && l.price < 1.0)
-                .map(|l| PriceLevel { price: 1.0 - l.price, quantity: l.quantity })
+                .map(|l| PriceLevel {
+                    price: 1.0 - l.price,
+                    quantity: l.quantity,
+                })
                 .collect()
         };
         // canonical bids ← complement asks(1−p); canonical asks ← complement bids(1−p)
@@ -2486,11 +3255,13 @@ impl SimExchangeV2 {
                 self.event_slug_by_token.insert(b.clone(), bo.slug.clone());
                 for iid in self.split_by_iid.keys() {
                     let key = (bo.slug.clone(), iid.clone());
-                    self.fill_audit.entry(key.clone()).or_insert_with(|| FillAuditRow {
-                        slug: key.0,
-                        iid: key.1,
-                        ..FillAuditRow::default()
-                    });
+                    self.fill_audit
+                        .entry(key.clone())
+                        .or_insert_with(|| FillAuditRow {
+                            slug: key.0,
+                            iid: key.1,
+                            ..FillAuditRow::default()
+                        });
                 }
                 if self.fold_outcomes {
                     // Single canonical frame: canonical = clob_token_ids[0],
@@ -2504,7 +3275,10 @@ impl SimExchangeV2 {
                 } else {
                     self.books.set_pair(a, b);
                 }
-                let fp = FeeParams { rate: bo.fee_rate, exponent: bo.fee_exponent };
+                let fp = FeeParams {
+                    rate: bo.fee_rate,
+                    exponent: bo.fee_exponent,
+                };
                 self.fees.insert(a.clone(), fp);
                 self.fees.insert(b.clone(), fp);
                 if bo.tick_size > 0.0 {
@@ -2535,7 +3309,8 @@ impl SimExchangeV2 {
                     // `self.orders` — otherwise the per-book-event `resync_queues`
                     // / `run_book_through` loops grow O(n_orders) and the backtest
                     // slows quadratically over a long run.
-                    self.event_fifo.push_back((bo.condition_id.clone(), [a.clone(), b.clone()]));
+                    self.event_fifo
+                        .push_back((bo.condition_id.clone(), [a.clone(), b.clone()]));
                     while self.event_fifo.len() > RETAIN_EVENTS {
                         let (cond, toks) = self.event_fifo.pop_front().unwrap();
                         self.retire_event(&cond, &toks);
@@ -2601,12 +3376,18 @@ impl SimExchangeV2 {
             self.event_slug_by_token.remove(t);
             self.last_book_ts.remove(t);
             self.last_book_local_ts.remove(t);
+            self.admission_original_books.remove(t);
+            self.admission_selected_books.remove(t);
+            self.book_continuity.remove(t);
             self.recent_trades.remove(t);
             self.pending_level_trade_evidence.remove(t);
             self.books.retire_token(t);
             self.wallets.retire_token(t);
         }
-        self.order_evidence.retain(|_, evidence| !tokens.contains(&evidence.symbol));
+        self.order_evidence.retain(|_, evidence| {
+            evidence.retired |= tokens.contains(&evidence.symbol);
+            !evidence.retired || evidence.pending_messages > 0
+        });
         self.seeded_conditions.remove(condition);
     }
 
@@ -2635,14 +3416,14 @@ impl SimExchangeV2 {
                 continue;
             }
             o.tick = t.new_tick_size;
-            let d = books.level_depth(&o.match_symbol, o.match_side, o.match_price, t.new_tick_size);
-            o.replay_self_depth_credit = o
-                .replay_self_depth_credit
-                .min(d)
-                .min(o.remaining);
-            o.q_ahead = o
-                .q_ahead
-                .min((d - o.replay_self_depth_credit).max(0.0));
+            let d = books.level_depth(
+                &o.match_symbol,
+                o.match_side,
+                o.match_price,
+                t.new_tick_size,
+            );
+            o.replay_self_depth_credit = o.replay_self_depth_credit.min(d).min(o.remaining);
+            o.q_ahead = o.q_ahead.min((d - o.replay_self_depth_credit).max(0.0));
             o.level_qty_at_sync = d;
             o.traded_since_sync = 0.0;
         }
@@ -2650,7 +3431,11 @@ impl SimExchangeV2 {
 
     // ── balance helpers (gate only when USDC seeded) ─────────────
     fn locked_usdc_for(&self, iid: &str) -> f64 {
-        self.orders.values().filter(|o| o.request.instance_id == iid).map(|o| o.locked_usdc).sum()
+        self.orders
+            .values()
+            .filter(|o| o.request.instance_id == iid)
+            .map(|o| o.locked_usdc)
+            .sum()
     }
 
     /// Raw gating-wallet USDC (no locked-order subtraction). Diagnostic.
@@ -2660,12 +3445,18 @@ impl SimExchangeV2 {
     fn locked_sell_shares_for(&self, iid: &str, token: &str) -> f64 {
         self.orders
             .values()
-            .filter(|o| o.request.instance_id == iid && o.request.symbol == token && o.request.side == Side::Sell)
+            .filter(|o| {
+                o.request.instance_id == iid
+                    && o.request.symbol == token
+                    && o.request.side == Side::Sell
+            })
             .map(|o| o.remaining)
             .sum()
     }
     fn available_usdc(&self, iid: &str) -> Option<f64> {
-        self.wallets.usdc(iid).map(|b| b - self.locked_usdc_for(iid))
+        self.wallets
+            .usdc(iid)
+            .map(|b| b - self.locked_usdc_for(iid))
     }
     fn available_shares(&self, iid: &str, token: &str) -> f64 {
         (self.wallets.shares(iid, token) - self.locked_sell_shares_for(iid, token)).max(0.0)
@@ -2772,8 +3563,17 @@ impl SimExchangeV2 {
         if o.post_only {
             return false;
         }
+        if self.book_continuity_mode != BookContinuityMode::LegacyAge
+            && !self.admission_eligibility(o, now_ns).eligible
+        {
+            return false;
+        }
         let (exchange_stale, local_stale) = self.book_stale_reasons(&o.symbol, now_ns);
-        if exchange_stale || local_stale {
+        if exchange_stale
+            || (!self.strict_admission && local_stale)
+            || (self.strict_admission
+                && !self.last_book_ts.contains_key(self.canonical_of(&o.symbol)))
+        {
             return false;
         }
         // Cross-check in the canonical matching frame (folded down → up mirror).
@@ -2828,8 +3628,200 @@ impl SimExchangeV2 {
         now_ns: u64,
         causal_race_cap: Option<f64>,
     ) -> OrderUpdate {
+        self.submit_order_with_arrival(o, now_ns, causal_race_cap, now_ns)
+    }
+
+    /// For deferred takers, `arrival_ns` is the original L1 arrival and
+    /// `now_ns` is the later matching decision. Post-only always decides at
+    /// arrival. The audit labels both clocks and the book used at decision.
+    pub fn submit_order_with_arrival(
+        &mut self,
+        o: &OrderRequest,
+        now_ns: u64,
+        causal_race_cap: Option<f64>,
+        arrival_ns: u64,
+    ) -> OrderUpdate {
+        self.submit_order_with_arrival_evidence(
+            o,
+            now_ns,
+            causal_race_cap,
+            arrival_ns,
+            ArrivalEvidence::modeled(arrival_ns),
+        )
+    }
+
+    pub fn submit_order_with_arrival_evidence(
+        &mut self,
+        o: &OrderRequest,
+        now_ns: u64,
+        causal_race_cap: Option<f64>,
+        arrival_ns: u64,
+        arrival_evidence: ArrivalEvidence,
+    ) -> OrderUpdate {
+        if self.admission_audit_enabled && self.admission_audit.len() == ADMISSION_AUDIT_CAPACITY {
+            self.admission_audit_overflows += 1;
+            panic!("admission audit capacity {ADMISSION_AUDIT_CAPACITY} exhausted before order {}; drain the offline audit lane", o.client_order_id);
+        }
+        let already_seen = self.admission_audit_enabled
+            && self
+                .order_evidence
+                .get(&o.client_order_id)
+                .is_some_and(|e| e.exchange_seen);
+        let audit = self
+            .admission_audit_enabled
+            .then(|| self.prepare_admission_audit(o, now_ns, arrival_ns, arrival_evidence));
+        let update = self.submit_order_inner(o, now_ns, causal_race_cap);
+        if let Some(mut row) = audit {
+            row.decision = if update
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("simulator-data-unknown:"))
+            {
+                "data_unknown_rejected"
+            } else if update.error.as_deref()
+                == Some("ambiguous or unavailable simulator order identity")
+            {
+                "identity_rejected"
+            } else if already_seen {
+                "idempotent_lookup"
+            } else if !self.strict_admission && (row.exchange_stale || row.local_stale) {
+                if update.status == OrderStatus::Accepted {
+                    "legacy_stale_rest"
+                } else {
+                    "legacy_stale_cancel"
+                }
+            } else if update.error.as_deref() == Some("invalid post-only order: order crosses book")
+            {
+                "post_only_cross_rejected"
+            } else if update.status == OrderStatus::Rejected {
+                "other_rejected"
+            } else if row.crossing == Some(true) {
+                "taker_match"
+            } else if update.status == OrderStatus::Cancelled {
+                "nonmarketable_cancelled"
+            } else {
+                "rest"
+            };
+            row.status = update.status;
+            row.error = update.error.clone();
+            self.admission_audit_total += 1;
+            self.admission_audit.push_back(row);
+            self.admission_audit_high_water = self
+                .admission_audit_high_water
+                .max(self.admission_audit.len());
+        }
+        update
+    }
+
+    fn prepare_admission_audit(
+        &self,
+        o: &OrderRequest,
+        now_ns: u64,
+        arrival_ns: u64,
+        arrival_evidence: ArrivalEvidence,
+    ) -> AdmissionAuditRow {
+        let (canonical, side, price) = self.match_view(o);
+        let (exchange_stale, local_stale) = self.book_stale_reasons(&o.symbol, now_ns);
+        let source = self.last_book_ts.get(&canonical).copied();
+        let local = self.last_book_local_ts.get(&canonical).copied();
+        let selected = self.admission_selected_books.get(&canonical).cloned();
+        let eligibility = self.admission_eligibility(o, now_ns);
+        let ladder = if side == Side::Buy {
+            self.books.buy_ladder(&canonical)
+        } else {
+            self.books.sell_ladder(&canonical)
+        };
+        let opposing =
+            self.replay_clean_best_taker_price(&o.instance_id, &canonical, side, &ladder);
+        let is_market = matches!(o.order_type, OrderType::Market) || o.price.is_none();
+        let crossing = source.map(|_| match (opposing, side, price, is_market) {
+            (Some(_), _, _, true) => true,
+            (Some(best), Side::Buy, Some(limit), false) => best <= limit + EPS,
+            (Some(best), Side::Sell, Some(limit), false) => best >= limit - EPS,
+            _ => false,
+        });
+        AdmissionAuditRow {
+            attempt_sequence: self.admission_audit_total + 1,
+            coid: o.client_order_id.clone(),
+            iid: o.instance_id.clone(),
+            event_slug: self.event_slug_by_token.get(&o.symbol).cloned(),
+            strategy_order_slot: o.order_slot,
+            token: o.symbol.clone(),
+            side: o.side,
+            order_type: o.order_type,
+            price: o.price,
+            quantity: o.quantity,
+            post_only: o.post_only,
+            request_timestamp_ns: o.timestamp_ns,
+            request_arrival_ns: arrival_ns,
+            decision_ns: now_ns,
+            arrival_evidence,
+            canonical_side: side,
+            canonical_price: price,
+            tick: self.tick_of(&canonical),
+            canonical_best_bid: self.books.eff_best_bid(&canonical),
+            canonical_best_ask: self.books.eff_best_ask(&canonical),
+            original_book: self.admission_original_books.get(&o.symbol).cloned(),
+            source_age_ns: selected
+                .as_ref()
+                .map(|s| now_ns.saturating_sub(s.clock.raw_source_ns)),
+            gate_source_age_ns: source.map(|s| now_ns.saturating_sub(s)),
+            selected_book: selected,
+            opposing_price_after_self_depth: opposing,
+            local_visible_at_ns: local,
+            local_age_ns: local.map(|s| now_ns.saturating_sub(s)),
+            exchange_stale,
+            local_stale,
+            strict_admission: self.strict_admission,
+            crossing,
+            book_continuity_mode: self.book_continuity_mode,
+            continuity: eligibility.continuity,
+            covered: eligibility.covered,
+            eligible: eligibility.eligible,
+            evidence_confidence: eligibility.confidence,
+            coverage_scope: if eligibility.covered {
+                "retrospective_archive_coverage"
+            } else if eligibility.confidence == "estimated" {
+                "recorded_snapshot_assumption"
+            } else if self.book_continuity_mode == BookContinuityMode::LegacyAge {
+                "source_age_heuristic"
+            } else {
+                "unproven"
+            },
+            source_age_stale: self.age_stale(&o.symbol, now_ns),
+            coverage: eligibility.coverage,
+            canonical_token: canonical,
+            decision: "pending",
+            status: OrderStatus::Rejected,
+            error: None,
+        }
+    }
+
+    fn submit_order_inner(
+        &mut self,
+        o: &OrderRequest,
+        now_ns: u64,
+        causal_race_cap: Option<f64>,
+    ) -> OrderUpdate {
         self.audit_clock_ns = self.audit_clock_ns.max(now_ns);
+        let already_seen = self
+            .order_evidence
+            .get(&o.client_order_id)
+            .is_some_and(|e| e.exchange_seen);
         self.register_order_evidence(o);
+        if self.order_owner(&o.client_order_id).is_none() {
+            return self.rejected(
+                o,
+                now_ns,
+                "ambiguous or unavailable simulator order identity",
+            );
+        }
+        if already_seen {
+            // A repeated request identity is an idempotent lookup, never a new
+            // match or queue insertion. In particular a replay cannot reopen a
+            // terminal order or assign an old coid to a new slot generation.
+            return self.reconcile_one(&o.client_order_id, &o.symbol, o.side, false, now_ns);
+        }
         if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
             a.place_orders += 1;
             a.place_qty += o.quantity;
@@ -2838,30 +3830,36 @@ impl SimExchangeV2 {
                 a.passive_place_qty += o.quantity;
             }
         }
-        // Cancel-on-arrival: a cancel for this coid already arrived (it raced
-        // ahead of this place ack). Honour the strategy's cancel intent now —
-        // return Cancelled WITHOUT booking the order (no rest, no fill), so it
-        // never becomes a forgotten orphan resting to settlement. See
-        // `pending_cancels`.
-        if self.pending_cancels.remove(&o.client_order_id).is_some() {
-            if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
-                a.cancel_before_place_orders += 1;
-                a.cancel_before_place_qty += o.quantity;
-            }
-            return self.cancelled(o, now_ns, o.quantity);
-        }
         if o.post_only {
             self.post_only_seen += 1;
         }
         let (exchange_stale, local_stale) = self.book_stale_reasons(&o.symbol, now_ns);
-        if exchange_stale || local_stale {
+        let eligibility = self.admission_eligibility(o, now_ns);
+        if self.strict_admission && !eligibility.eligible {
+            self.admission_unknown_decisions += 1;
+            let reason = match eligibility.coverage {
+                "missing_server_book" => "missing server book",
+                "stale_server_book" => "stale server book",
+                other => other,
+            };
+            if !self.admission_unknown_reject {
+                panic!("simulator-data-unknown: {reason} at arrival decision {now_ns} for {} (owner {}); strict admission cannot infer venue acceptance", o.client_order_id, o.instance_id);
+            }
+            self.admission_unknown_rejected += 1;
+            return self.rejected(o, now_ns, &format!("simulator-data-unknown: {reason}"));
+        }
+        self.admission_estimated_decisions += (eligibility.confidence == "estimated") as u64;
+        self.admission_verified_decisions += eligibility.covered as u64;
+        if !self.strict_admission && (exchange_stale || local_stale) {
             self.count_book_stale_block(exchange_stale, local_stale, true);
             if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
                 a.stale_order_blocks += 1;
                 a.stale_order_qty += o.quantity;
             }
-            if matches!(o.order_type, OrderType::Market | OrderType::Fak | OrderType::Fok)
-                || o.price.is_none()
+            if matches!(
+                o.order_type,
+                OrderType::Market | OrderType::Fak | OrderType::Fok
+            ) || o.price.is_none()
             {
                 return self.cancelled(o, now_ns, o.quantity);
             }
@@ -2922,13 +3920,8 @@ impl SimExchangeV2 {
     ) -> OrderUpdate {
         let folded = msym != o.symbol;
         let raw_available = self.books.available_volume(msym, mside == Side::Buy, lim);
-        let now_available = self.replay_clean_taker_available(
-            &o.instance_id,
-            msym,
-            mside,
-            ladder,
-            lim,
-        );
+        let now_available =
+            self.replay_clean_taker_available(&o.instance_id, msym, mside, ladder, lim);
         let replay_self_depth = (raw_available - now_available).max(0.0);
         if replay_self_depth > EPS {
             self.taker_replay_self_sweeps_n += 1;
@@ -2947,10 +3940,7 @@ impl SimExchangeV2 {
         let mut notional = 0.0; // canonical-frame notional
         let mut fee = 0.0;
         let mut rem = o.quantity;
-        if self.taker_overlap_dedup
-            && self.taker_race_rate > 0.0
-            && self.taker_comp_rate > 0.0
-        {
+        if self.taker_overlap_dedup && self.taker_race_rate > 0.0 && self.taker_comp_rate > 0.0 {
             // Race and competition can observe the same touch consumption via
             // different feeds. Compute both against the ORIGINAL request. If
             // both independently suppress this order, assume full overlap and
@@ -2988,9 +3978,7 @@ impl SimExchangeV2 {
             let comp = self.taker_competition_volume(msym, mside, lim, now_ns);
             self.taker_comp_vol_sum += comp;
             self.taker_comp_n += 1;
-            let comp_cap = requested.min(
-                (now_available - self.taker_comp_rate * comp).max(0.0),
-            );
+            let comp_cap = requested.min((now_available - self.taker_comp_rate * comp).max(0.0));
             if comp_cap + EPS < requested {
                 self.taker_comp_capped += 1;
                 if comp_cap <= EPS {
@@ -3008,11 +3996,7 @@ impl SimExchangeV2 {
                         (comp_cap, 0.0, comp_suppressed)
                     }
                 } else {
-                    (
-                        race_cap.min(comp_cap),
-                        race_suppressed,
-                        comp_suppressed,
-                    )
+                    (race_cap.min(comp_cap), race_suppressed, comp_suppressed)
                 };
             rem = final_cap;
             if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
@@ -3114,7 +4098,11 @@ impl SimExchangeV2 {
 
         // Translate canonical notional → original frame (down: Σ qty·(1−p) =
         // filled − Σ qty·p). For an unfolded order they're equal.
-        let notional_orig = if folded { (filled - notional).max(0.0) } else { notional };
+        let notional_orig = if folded {
+            (filled - notional).max(0.0)
+        } else {
+            notional
+        };
 
         let iid = &o.instance_id;
         if self.wallets.lockup_enabled(iid) {
@@ -3155,8 +4143,12 @@ impl SimExchangeV2 {
 
         let avg = notional_orig / filled; // original-frame avg fill price
         match o.side {
-            Side::Buy => self.wallets.settle_buy(iid, &o.symbol, filled, notional_orig + fee),
-            Side::Sell => self.wallets.settle_sell(iid, &o.symbol, filled, notional_orig - fee),
+            Side::Buy => self
+                .wallets
+                .settle_buy(iid, &o.symbol, filled, notional_orig + fee),
+            Side::Sell => self
+                .wallets
+                .settle_sell(iid, &o.symbol, filled, notional_orig - fee),
         }
         self.taker_fills += 1;
         if let Some(a) = self.audit_row_mut(&o.symbol, &o.instance_id) {
@@ -3178,7 +4170,11 @@ impl SimExchangeV2 {
             Liquidity::Taker,
             now_ns,
         );
-        let status = if remainder > EPS { OrderStatus::PartiallyFilled } else { OrderStatus::Filled };
+        let status = if remainder > EPS {
+            OrderStatus::PartiallyFilled
+        } else {
+            OrderStatus::Filled
+        };
         OrderUpdate {
             client_order_id: o.client_order_id.clone(),
             exchange: o.exchange,
@@ -3195,7 +4191,7 @@ impl SimExchangeV2 {
             trade_id: Some(format!("simv2-taker-{}", o.client_order_id)),
             order_audit: None,
             error: None,
-            order_slot: Default::default(),
+            order_slot: o.order_slot,
         }
     }
 
@@ -3258,9 +4254,8 @@ impl SimExchangeV2 {
                     && (next_depth - replay_self_depth_credit).max(0.0) > queue_now_depth =>
             {
                 let queue_next_depth = (next_depth - replay_self_depth_credit).max(0.0);
-                let blended =
-                    self.maker_race_rate * queue_next_depth
-                        + (1.0 - self.maker_race_rate) * queue_now_depth;
+                let blended = self.maker_race_rate * queue_next_depth
+                    + (1.0 - self.maker_race_rate) * queue_now_depth;
                 self.maker_race_inflated += 1;
                 self.maker_race_ratio_sum += if queue_now_depth > EPS {
                     blended / queue_now_depth
@@ -3286,9 +4281,9 @@ impl SimExchangeV2 {
             // invoke the missing-level extrapolation fallback.
             0.0
         } else if race_q_ahead < EPS {
-            if let Some((extra, effective_decay)) = self
-                .books
-                .extrapolate_level_depth_with_decay(&msym, mside, match_price, tick)
+            if let Some((extra, effective_decay)) =
+                self.books
+                    .extrapolate_level_depth_with_decay(&msym, mside, match_price, tick)
             {
                 self.q0_extrapolated += 1;
                 if effective_decay > 0.0 {
@@ -3312,7 +4307,11 @@ impl SimExchangeV2 {
                         self.books.best_bid_qty(&msym, tick),
                     ),
                 };
-                if same > EPS { same } else { opp }
+                if same > EPS {
+                    same
+                } else {
+                    opp
+                }
             }
         } else {
             race_q_ahead
@@ -3370,7 +4369,11 @@ impl SimExchangeV2 {
             bucket[0] += 1;
             bucket[1] += q0 as u64;
         }
-        let locked = if o.side == Side::Buy { price * remaining } else { 0.0 };
+        let locked = if o.side == Side::Buy {
+            price * remaining
+        } else {
+            0.0
+        };
         let mid0 = self.books.eff_mid(&msym);
         let inferred_residual_floor = if self.inferred_maker_residual_rate > 0.0
             && self.inferred_maker_residual_fraction > 0.0
@@ -3534,7 +4537,7 @@ impl SimExchangeV2 {
             trade_id: None,
             order_audit: None,
             error: None,
-            order_slot: Default::default(),
+            order_slot: o.order_slot,
         }
     }
 
@@ -3558,7 +4561,7 @@ impl SimExchangeV2 {
             trade_id: None,
             order_audit: None,
             error: Some(err.to_string()),
-            order_slot: Default::default(),
+            order_slot: o.order_slot,
         }
     }
 
@@ -3579,7 +4582,7 @@ impl SimExchangeV2 {
             trade_id: None,
             order_audit: self.terminal_order_audit(&o.client_order_id),
             error: None,
-            order_slot: Default::default(),
+            order_slot: o.order_slot,
         }
     }
 
@@ -3609,9 +4612,7 @@ impl SimExchangeV2 {
                     {
                         continue;
                     }
-                    let advance = max_advance
-                        .min(later.own_q_ahead)
-                        .min(later.q_ahead);
+                    let advance = max_advance.min(later.own_q_ahead).min(later.q_ahead);
                     if advance <= EPS {
                         continue;
                     }
@@ -3664,8 +4665,14 @@ impl SimExchangeV2 {
                 trade_id: None,
                 order_audit,
                 error: None,
-                order_slot: Default::default(),
+                order_slot: self.order_slot(coid),
             };
+        }
+        if self.durable_terminal_status && self.terminal_order_audit(coid).is_some() {
+            let (symbol, side) = self
+                .order_identity_symbol_side(coid)
+                .expect("complete terminal evidence requires immutable identity");
+            return self.reconcile_one(coid, &symbol, side, true, now_ns);
         }
         // Not resting — matched-can't-cancel if it just filled. Re-emit the
         // original fill's trade_id so the PositionManager dedupes (no double
@@ -3707,30 +4714,35 @@ impl SimExchangeV2 {
                 trade_id: Some(trade_id),
                 order_audit: None,
                 error: None,
-                order_slot: Default::default(),
+                order_slot: self.order_slot(coid),
             };
         }
-        // Unknown / stale: not resting and didn't just fill. Almost always a
-        // cancel that RACED AHEAD of its own place ack — the placement is still
-        // in flight and will rest momentarily. Record the cancel intent so
-        // `submit_order` cancels it ON ARRIVAL instead of letting it rest as an
-        // orphan the strategy has already forgotten (it removes the order on the
-        // `Cancelled` we return here). Without this, the order rests to
-        // settlement and locks the wallet → the rest-sell-reject cascade.
-        // Bound the map: drop entries whose place never arrived (e.g. a
-        // timed-out placement) past a generous window.
-        if self.pending_cancels.len() > 1024 {
-            let cutoff = now_ns.saturating_sub(10_000_000_000);
-            self.pending_cancels.retain(|_, ts| *ts >= cutoff);
-        }
-        self.pending_cancels.insert(coid.to_string(), now_ns);
+        // A not-found reply is not a durable cancel intent. The placement
+        // may still arrive later. Preserve uncertainty/reservation until a
+        // later query observes a resting order or a proven terminal audit.
+        let terminal = self.terminal_order_audit(coid).is_some();
         OrderUpdate {
             client_order_id: coid.to_string(),
             exchange,
-            symbol: self.order_evidence.get(coid).map(|e| e.symbol.clone()).unwrap_or_default(),
-            side: self.order_evidence.get(coid).map(|e| e.side).unwrap_or(Side::Buy),
-            exchange_order_id: self.order_evidence.contains_key(coid).then(|| format!("simv2-{}", coid)),
-            status: OrderStatus::Cancelled,
+            symbol: self
+                .order_evidence
+                .get(coid)
+                .map(|e| e.symbol.clone())
+                .unwrap_or_default(),
+            side: self
+                .order_evidence
+                .get(coid)
+                .map(|e| e.side)
+                .unwrap_or(Side::Buy),
+            exchange_order_id: self
+                .order_evidence
+                .contains_key(coid)
+                .then(|| format!("simv2-{}", coid)),
+            status: if terminal {
+                OrderStatus::Cancelled
+            } else {
+                OrderStatus::CancelUncertain
+            },
             liquidity: None,
             filled_quantity: 0.0,
             remaining_quantity: 0.0,
@@ -3740,77 +4752,136 @@ impl SimExchangeV2 {
             trade_id: None,
             order_audit: self.terminal_order_audit(coid),
             error: None,
-            order_slot: Default::default(),
+            order_slot: self.order_slot(coid),
         }
     }
 
-    /// Resolve timed-out orphans (Signal::ReconcilePolymarket). By the time this
-    /// fires the order's real state is in the core: still resting → Accepted;
-    /// gone → Cancelled (a fill would have been delivered independently via the
-    /// fill path, which also clears the orphan). Cancels always resolve to
-    /// Cancelled. No engine-side stash needed (unlike v1).
+    /// Query state at SERVER ARRIVAL, never at local request emission. A
+    /// disappeared order is terminal only with complete exchange evidence;
+    /// dispatched-but-unseen, retired, overflowed and unknown orders stay
+    /// uncertain. Terminal quantity/trade-id audits preserve late-fill recovery.
     pub fn reconcile(
         &mut self,
         pending_places: &[(String, String, Side, f64, Option<String>)],
         pending_cancels: &[(String, String)],
         now_ns: u64,
     ) -> Vec<OrderUpdate> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(pending_places.len() + pending_cancels.len());
         for (coid, symbol, side, _price, _hash) in pending_places {
-            let (status, remaining) = match self.orders.get(coid) {
-                Some(o) => (OrderStatus::Accepted, o.remaining),
-                None => (OrderStatus::Cancelled, 0.0),
-            };
-            out.push(OrderUpdate {
-                client_order_id: coid.clone(),
-                exchange: Exchange::Polymarket,
-                symbol: symbol.clone(),
-                side: *side,
-                exchange_order_id: Some(format!("simv2-{}", coid)),
-                status,
-                liquidity: None,
-                filled_quantity: 0.0,
-                remaining_quantity: remaining,
-                avg_fill_price: 0.0,
-                timestamp_ns: now_ns,
-                exchange_event_timestamp_ns: None,
-                trade_id: None,
-                order_audit: if status == OrderStatus::Cancelled { self.terminal_order_audit(coid) } else { None },
-                error: None,
-                order_slot: Default::default(),
-            });
+            out.push(self.reconcile_one(coid, symbol, *side, false, now_ns));
         }
         for (coid, _oid) in pending_cancels {
-            out.push(OrderUpdate {
-                client_order_id: coid.clone(),
-                exchange: Exchange::Polymarket,
-                symbol: self.order_evidence.get(coid).map(|e| e.symbol.clone()).unwrap_or_default(),
-                side: self.order_evidence.get(coid).map(|e| e.side).unwrap_or(Side::Buy),
-                exchange_order_id: self.order_evidence.contains_key(coid).then(|| format!("simv2-{}", coid)),
-                status: OrderStatus::Cancelled,
-                liquidity: None,
-                filled_quantity: 0.0,
-                remaining_quantity: 0.0,
-                avg_fill_price: 0.0,
-                timestamp_ns: now_ns,
-                exchange_event_timestamp_ns: None,
-                trade_id: None,
-                order_audit: self.terminal_order_audit(coid),
-                error: None,
-                order_slot: Default::default(),
-            });
+            let (symbol, side) = self
+                .order_identity_symbol_side(coid)
+                .unwrap_or_else(|| (String::new(), Side::Buy));
+            out.push(self.reconcile_one(coid, &symbol, side, true, now_ns));
         }
         out
     }
 
-    pub fn cancel_all(&mut self, exchange: Exchange, symbol: &str, now_ns: u64) -> Vec<OrderUpdate> {
+    fn reconcile_one(
+        &self,
+        coid: &str,
+        symbol: &str,
+        side: Side,
+        cancel: bool,
+        now_ns: u64,
+    ) -> OrderUpdate {
+        let audit = self.terminal_order_audit(coid);
+        let (status, remaining) = if let Some(order) = self.orders.get(coid) {
+            (OrderStatus::Accepted, order.remaining)
+        } else if audit.is_some() {
+            (self.terminal_status(coid), 0.0)
+        } else {
+            (
+                if cancel {
+                    OrderStatus::CancelUncertain
+                } else {
+                    OrderStatus::NewOrderTimeout
+                },
+                0.0,
+            )
+        };
+        OrderUpdate {
+            client_order_id: coid.to_string(),
+            exchange: Exchange::Polymarket,
+            symbol: symbol.to_string(),
+            side,
+            exchange_order_id: self
+                .order_evidence
+                .contains_key(coid)
+                .then(|| format!("simv2-{coid}")),
+            status,
+            liquidity: None,
+            filled_quantity: 0.0,
+            remaining_quantity: remaining,
+            avg_fill_price: 0.0,
+            timestamp_ns: now_ns,
+            exchange_event_timestamp_ns: Some(now_ns),
+            trade_id: None,
+            order_audit: audit,
+            error: None,
+            order_slot: self.order_slot(coid),
+        }
+    }
+
+    pub fn cancel_all(
+        &mut self,
+        exchange: Exchange,
+        symbol: &str,
+        now_ns: u64,
+    ) -> Vec<OrderUpdate> {
         let coids: Vec<String> = self
             .orders
             .iter()
             .filter(|(_, o)| symbol.is_empty() || o.request.symbol == symbol)
             .map(|(c, _)| c.clone())
             .collect();
-        coids.into_iter().map(|c| self.cancel_order(exchange, &c, now_ns)).collect()
+        coids
+            .into_iter()
+            .map(|c| self.cancel_order(exchange, &c, now_ns))
+            .collect()
+    }
+
+    /// Staged-mode emergency endpoint. The scope is evaluated at the actual
+    /// processing time. New orders admitted before that time are included;
+    /// other accounts and tokens are never included. Empty owner fails closed.
+    /// Temporary response storage is confined to this offline emergency path.
+    pub fn cancel_all_owned(
+        &mut self,
+        exchange: Exchange,
+        iid: &str,
+        symbols: &[String],
+        now_ns: u64,
+    ) -> Vec<OrderUpdate> {
+        assert!(
+            !iid.is_empty(),
+            "sim_v2 scoped cancel-all requires an explicit owner"
+        );
+        let mut coids = arrayvec::ArrayVec::<arrayvec::ArrayString<128>, 1024>::new();
+        for (coid, order) in &self.orders {
+            if order.request.exchange == exchange
+                && order.request.instance_id == iid
+                && (symbols.is_empty()
+                    || symbols.iter().any(|symbol| *symbol == order.request.symbol))
+            {
+                assert!(
+                    self.order_owner(coid)
+                        .is_some_and(|(owner, _)| owner == iid),
+                    "sim_v2 scoped cancel-all has ambiguous order ownership"
+                );
+                let identity = arrayvec::ArrayString::from(coid.as_str())
+                    .expect("sim_v2 scoped cancel-all identity exceeds capacity");
+                coids.try_push(identity).expect(
+                    "sim_v2 scoped cancel-all exceeds 1024 orders; no cancellation applied",
+                );
+            }
+        }
+        coids.sort_unstable();
+        coids
+            .iter()
+            .map(|coid| self.cancel_order(exchange, coid, now_ns))
+            .collect()
     }
 }
 
@@ -3856,7 +4927,12 @@ mod tests {
         book_ts(symbol, bids, asks, 0)
     }
 
-    fn book_ts(symbol: &str, bids: Vec<(f64, f64)>, asks: Vec<(f64, f64)>, ts: u64) -> OrderBookSnapshot {
+    fn book_ts(
+        symbol: &str,
+        bids: Vec<(f64, f64)>,
+        asks: Vec<(f64, f64)>,
+        ts: u64,
+    ) -> OrderBookSnapshot {
         book_dual_ts(symbol, bids, asks, ts, ts)
     }
 
@@ -3870,14 +4946,34 @@ mod tests {
         OrderBookSnapshot {
             exchange: Exchange::Polymarket,
             symbol: symbol.into(),
-            bids: bids.into_iter().map(|(p, q)| PriceLevel { price: p, quantity: q }).collect(),
-            asks: asks.into_iter().map(|(p, q)| PriceLevel { price: p, quantity: q }).collect(),
+            bids: bids
+                .into_iter()
+                .map(|(p, q)| PriceLevel {
+                    price: p,
+                    quantity: q,
+                })
+                .collect(),
+            asks: asks
+                .into_iter()
+                .map(|(p, q)| PriceLevel {
+                    price: p,
+                    quantity: q,
+                })
+                .collect(),
             exchange_timestamp_ns: exchange_ts,
             local_timestamp_ns: local_ts,
         }
     }
 
-    fn order(coid: &str, symbol: &str, side: Side, price: f64, qty: f64, post_only: bool, ot: OrderType) -> OrderRequest {
+    fn order(
+        coid: &str,
+        symbol: &str,
+        side: Side,
+        price: f64,
+        qty: f64,
+        post_only: bool,
+        ot: OrderType,
+    ) -> OrderRequest {
         OrderRequest {
             client_order_id: coid.into(),
             exchange: Exchange::Polymarket,
@@ -3923,11 +5019,814 @@ mod tests {
         c
     }
 
+    fn continuity_core(mode: BookContinuityMode) -> SimExchangeV2 {
+        let mut core = core();
+        core.configure_admission(true, true, true);
+        core.configure_book_continuity(mode);
+        core.configure_book_stale_gate(15);
+        core.event_slug_by_token
+            .insert("up".into(), "btc-updown-5m-300".into());
+        core.event_slug_by_token
+            .insert("down".into(), "btc-updown-5m-300".into());
+        core
+    }
+
+    fn continuity_gap(token: &str, now: u64) -> BookContinuityRecord {
+        BookContinuityRecord {
+            iid: "iid".into(),
+            token: token.into(),
+            event_epoch: 300,
+            evidence_id: 1,
+            kind: super::super::evidence::ContinuityKind::Gap,
+            session_id: 1,
+            sequence: None,
+            previous_sequence: None,
+            source_ns: None,
+            receive_ns: now,
+            apply_ns: now,
+            book_source_ns: None,
+            book_receive_ns: None,
+            provenance: "fixture:explicit_disconnect".into(),
+        }
+    }
+
+    #[test]
+    fn continuity_hold_is_estimated_and_legacy_age_is_unchanged() {
+        for mode in [
+            BookContinuityMode::LegacyAge,
+            BookContinuityMode::SnapshotHoldEstimated,
+            BookContinuityMode::RequireVerified,
+        ] {
+            let mut c = continuity_core(mode);
+            c.on_orderbook(&book_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 100));
+            let update = c.submit_order(
+                &order("a", "up", Side::Buy, 0.63, 12.0, true, OrderType::Limit),
+                200,
+            );
+            let row = c.drain_admission_audit().next().unwrap();
+            assert!(!row.covered && row.source_age_stale && row.local_stale);
+            if mode == BookContinuityMode::SnapshotHoldEstimated {
+                assert_eq!(
+                    update.error.as_deref(),
+                    Some("invalid post-only order: order crosses book")
+                );
+                assert_eq!(row.coverage, "estimated_snapshot_hold");
+                assert!(row.eligible);
+                assert_eq!(c.admission_audit_stats().estimated_decisions, 1);
+                assert_eq!(c.admission_audit_stats().unknown_decisions, 0);
+            } else {
+                assert!(update
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("simulator-data-unknown:"));
+                assert!(!row.eligible);
+                assert_eq!(
+                    row.coverage,
+                    if mode == BookContinuityMode::LegacyAge {
+                        "stale_server_book"
+                    } else {
+                        "continuity_unproven"
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn continuity_legacy_nonempty_journal_never_rebases_existing_orders() {
+        let mut c = continuity_core(BookContinuityMode::LegacyAge);
+        c.bind_continuity_owner("iid".into());
+        c.on_orderbook(&book_ts("up", vec![(0.55, 10.0)], vec![(0.57, 100.0)], 100));
+        assert_eq!(
+            c.submit_order(
+                &order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+                110
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        c.observe_book_continuity(&continuity_gap("up", 115), 115);
+        assert_eq!(
+            c.book_continuity["up"].status,
+            ContinuityStatus::Gap,
+            "evidence remains diagnostic"
+        );
+        assert!(!c.orders["a"].await_fresh_book);
+        assert_eq!(c.orders["a"].q_ahead, 10.0);
+        c.on_orderbook(&book_ts("up", vec![(0.55, 30.0)], vec![(0.57, 100.0)], 116));
+        assert!(!c.orders["a"].await_fresh_book);
+        assert_eq!(c.orders["a"].q_ahead, 10.0);
+    }
+
+    #[test]
+    fn continuity_archive_binds_before_book_matching_and_never_installs_future_bbo() {
+        use super::super::evidence::{BookContinuityReplay, ContinuityKind};
+        let mut rows = Vec::new();
+        for (id, kind, source, seq, prev) in [
+            (1, ContinuityKind::Snapshot, 100, 1, None),
+            (2, ContinuityKind::SequencedUpdate, 200, 2, Some(1)),
+            (3, ContinuityKind::SequenceHeartbeat, 300, 2, None),
+        ] {
+            let mut row = continuity_gap("up", source);
+            row.evidence_id = id;
+            row.kind = kind;
+            row.source_ns = Some(source);
+            row.sequence = Some(seq);
+            row.previous_sequence = prev;
+            row.book_source_ns = Some(source);
+            row.book_receive_ns = Some(source);
+            serde_json::to_writer(&mut rows, &row).unwrap();
+            rows.push(b'\n');
+        }
+        let replay = BookContinuityReplay::from_reader(std::io::Cursor::new(rows), "iid").unwrap();
+        let mut c = continuity_core(BookContinuityMode::RequireVerified);
+        c.bind_continuity_owner(replay.owner_iid);
+        c.install_archive_coverage(replay.archive);
+        c.configure_book_through(1.0);
+        c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.55, 100.0)],
+            vec![(0.57, 100.0)],
+            100,
+        ));
+        assert_eq!(c.books.eff_best_ask("up"), Some(0.57));
+        assert_eq!(
+            c.submit_order(
+                &order("a", "up", Side::Buy, 0.55, 10.0, true, OrderType::Limit),
+                150
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        let audit = c.drain_admission_audit().next().unwrap();
+        assert!(audit.covered && audit.eligible);
+        assert_eq!(audit.coverage_scope, "retrospective_archive_coverage");
+        assert_eq!(
+            audit
+                .continuity
+                .unwrap()
+                .archive_certificate
+                .unwrap()
+                .end_exclusive_ns,
+            200
+        );
+        assert!(c
+            .on_trade_tick(&trade_ts("up", Side::Sell, 0.55, 10.0, 180))
+            .is_empty());
+        // No positive protocol event has been consumed, yet the source/receive
+        // bound certificate is installed atomically before this book matches.
+        let fills = c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.55, 100.0)],
+            vec![(0.54, 200.0)],
+            200,
+        ));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].filled_quantity, 10.0);
+        assert!(
+            !c.book_eligibility("up", 300).eligible,
+            "half-open terminal boundary must not extrapolate"
+        );
+    }
+
+    #[test]
+    fn continuity_gap_blocks_depletion_and_requires_queue_rebase() {
+        let mut c = continuity_core(BookContinuityMode::SnapshotHoldEstimated);
+        c.bind_continuity_owner("iid".into());
+        c.configure(Some(1.0), 2_000_000_000);
+        c.configure_unexplained_depletion_execution(1.0);
+        c.on_orderbook(&book_ts("up", vec![(0.55, 10.0)], vec![(0.57, 100.0)], 100));
+        assert_eq!(
+            c.submit_order(
+                &order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+                110
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        c.observe_book_continuity(&continuity_gap("up", 150), 150);
+        assert!(c
+            .on_orderbook(&book_ts("up", vec![(0.54, 10.0)], vec![(0.56, 100.0)], 150))
+            .is_empty());
+        assert!(c.orders["a"].await_fresh_book);
+        assert_eq!(c.orders["a"].q_ahead, 10.0);
+        assert!(c
+            .on_orderbook(&book_ts(
+                "down",
+                vec![(0.4, 100.0)],
+                vec![(0.5, 100.0)],
+                160
+            ))
+            .is_empty());
+        assert_eq!(
+            c.orders["a"].q_ahead, 10.0,
+            "other token cannot infer through unobserved gap"
+        );
+        c.on_orderbook(&book_ts("up", vec![(0.55, 30.0)], vec![(0.57, 100.0)], 170));
+        assert!(!c.orders["a"].await_fresh_book);
+        assert_eq!(c.orders["a"].q_ahead, 30.0);
+    }
+
+    #[test]
+    fn continuity_hold_applies_to_resting_trade_and_taker_matching() {
+        let mut c = continuity_core(BookContinuityMode::SnapshotHoldEstimated);
+        c.on_orderbook(&book_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 100));
+        let maker = order("maker", "up", Side::Buy, 0.59, 12.0, true, OrderType::Limit);
+        assert_eq!(c.submit_order(&maker, 200).status, OrderStatus::Accepted);
+        let fills = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.59, 100.0, 201));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].filled_quantity, 12.0);
+        let taker = order(
+            "taker",
+            "up",
+            Side::Buy,
+            0.63,
+            12.0,
+            false,
+            OrderType::Limit,
+        );
+        assert!(c.would_cross(&taker, 202));
+        assert_eq!(c.submit_order(&taker, 202).status, OrderStatus::Filled);
+        assert!(
+            c.last_book_local_ts.is_empty(),
+            "server matching must not advance the client visibility clock"
+        );
+    }
+
+    #[test]
+    fn continuity_hold_applies_to_trade_confirmed_book_through() {
+        let mut c = continuity_core(BookContinuityMode::SnapshotHoldEstimated);
+        c.configure_book_through(1.0);
+        c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.55, 100.0)],
+            vec![(0.57, 100.0)],
+            100,
+        ));
+        assert_eq!(
+            c.submit_order(
+                &order("a", "up", Side::Buy, 0.55, 10.0, true, OrderType::Limit),
+                200
+            )
+            .status,
+            OrderStatus::Accepted
+        );
+        assert!(c
+            .on_trade_tick(&trade_ts("up", Side::Sell, 0.55, 10.0, 201))
+            .is_empty());
+        let fills = c.on_orderbook(&book_ts(
+            "up",
+            vec![(0.55, 100.0)],
+            vec![(0.54, 200.0)],
+            202,
+        ));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].liquidity, Some(Liquidity::Maker));
+    }
+
+    #[test]
+    fn continuity_gap_cannot_be_healed_by_sibling_trade_or_old_receive() {
+        let mut c = continuity_core(BookContinuityMode::SnapshotHoldEstimated);
+        c.bind_continuity_owner("iid".into());
+        c.on_orderbook(&book_dual_ts(
+            "up",
+            vec![(0.60, 10.0)],
+            vec![(0.62, 80.0)],
+            100,
+            110,
+        ));
+        c.observe_book_continuity(&continuity_gap("up", 150), 150);
+        c.on_orderbook(&book_ts(
+            "down",
+            vec![(0.38, 10.0)],
+            vec![(0.40, 80.0)],
+            160,
+        ));
+        c.on_trade_tick(&trade_ts("up", Side::Sell, 0.59, 100.0, 160));
+        c.on_orderbook(&book_dual_ts(
+            "up",
+            vec![(0.60, 10.0)],
+            vec![(0.62, 80.0)],
+            120,
+            140,
+        ));
+        assert!(!c.book_eligibility("up", 160).eligible);
+        assert!(c.book_eligibility("down", 160).eligible);
+        c.on_orderbook(&book_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 170));
+        assert!(c.book_eligibility("up", 200).eligible);
+        assert!(!c.book_eligibility("up", 200).covered);
+        let mut foreign = order(
+            "foreign",
+            "up",
+            Side::Buy,
+            0.59,
+            12.0,
+            true,
+            OrderType::Limit,
+        );
+        foreign.instance_id = "other".into();
+        assert!(c
+            .submit_order(&foreign, 200)
+            .error
+            .unwrap()
+            .contains("continuity_owner_mismatch"));
+    }
+
+    #[test]
+    fn continuity_token_capacity_retirement_and_bad_routing_fail_closed() {
+        let mut c = continuity_core(BookContinuityMode::SnapshotHoldEstimated);
+        c.on_orderbook(&book_ts("up", vec![], vec![], 100));
+        c.retire_event("cond1", &["up".into(), "down".into()]);
+        assert!(c.book_continuity.is_empty());
+        c.bind_continuity_owner("iid".into());
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.observe_book_continuity(&continuity_gap("up", 120), 120)
+        }));
+        assert!(
+            failure.is_err(),
+            "retired token cannot consume a new event's journal"
+        );
+        for n in 0..ADMISSION_BOOK_CAPACITY {
+            c.on_orderbook(&book_ts(&format!("token-{n}"), vec![], vec![], 100));
+        }
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.on_orderbook(&book_ts("overflow", vec![], vec![], 100))
+        }));
+        assert!(failure.is_err());
+        assert_eq!(c.book_continuity.len(), ADMISSION_BOOK_CAPACITY);
+        assert!(!c.last_book_ts.contains_key("overflow"));
+    }
+
+    /// Boundary: core book application (including evidence) through returned
+    /// fills. Reuses input storage; the audit writer is outside this benchmark.
+    #[test]
+    #[ignore = "focused offline benchmark; release --ignored --nocapture"]
+    fn continuity_book_capture_benchmark() {
+        const N: usize = 100_000;
+        for mode in [
+            BookContinuityMode::LegacyAge,
+            BookContinuityMode::SnapshotHoldEstimated,
+            BookContinuityMode::RequireVerified,
+        ] {
+            let mut c = continuity_core(mode);
+            let mut ob = book_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 1);
+            let mut times = Vec::with_capacity(N);
+            for n in 0..N {
+                ob.exchange_timestamp_ns = n as u64 + 1;
+                ob.local_timestamp_ns = n as u64 + 1;
+                let before = std::time::Instant::now();
+                std::hint::black_box(c.on_orderbook(&ob));
+                times.push(before.elapsed().as_nanos());
+            }
+            times.sort_unstable();
+            let stats = c.admission_audit_stats();
+            println!("continuity_book_capture_benchmark mode={mode:?} events={N} median_ns={} p99_ns={} p999_ns={} max_ns={} queue_capacity={} queue_high_water={} overflow={} token_capacity={} tokens={}",
+                times[N/2], times[N*99/100], times[N*999/1000], times[N-1], stats.capacity, stats.high_water, stats.overflows, ADMISSION_BOOK_CAPACITY, c.book_continuity.len());
+        }
+    }
+
+    #[test]
+    fn strict_admission_checks_post_only_against_server_book_despite_missing_local_book() {
+        let mut c = core();
+        c.configure_admission(true, false, true);
+        c.configure_book_stale_gate(15);
+        c.on_orderbook(&book_dual_ts(
+            "up",
+            vec![(0.60, 10.0)],
+            vec![(0.62, 80.0)],
+            100,
+            1000,
+        ));
+        let request = order(
+            "cross-without-local",
+            "up",
+            Side::Buy,
+            0.63,
+            12.0,
+            true,
+            OrderType::Limit,
+        );
+        let update = c.submit_order(&request, 101);
+        assert_eq!(update.status, OrderStatus::Rejected);
+        assert_eq!(c.post_only_rejects, 1);
+        assert!(c.orders.is_empty());
+        let rows: Vec<_> = c.drain_admission_audit().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].coverage, "known");
+        assert_eq!(rows[0].decision, "post_only_cross_rejected");
+        assert_eq!(rows[0].crossing, Some(true));
+        assert!(!rows[0].exchange_stale && rows[0].local_stale);
+        assert_eq!(rows[0].local_visible_at_ns, None);
+        assert_eq!(rows[0].source_age_ns, Some(1));
+    }
+
+    #[test]
+    fn strict_admission_taker_deferral_uses_server_freshness_only() {
+        let mut c = core();
+        c.configure_admission(true, false, true);
+        c.configure_book_stale_gate(15);
+        c.on_orderbook(&book_dual_ts(
+            "up",
+            vec![(0.60, 10.0)],
+            vec![(0.62, 80.0)],
+            100,
+            1000,
+        ));
+        let request = order(
+            "taker-without-local",
+            "up",
+            Side::Buy,
+            0.63,
+            12.0,
+            false,
+            OrderType::Limit,
+        );
+        assert!(c.would_cross(&request, 101));
+        let update = c.submit_order_with_arrival(&request, 105, None, 101);
+        assert_eq!(update.filled_quantity, 12.0);
+        let row = c.drain_admission_audit().next().unwrap();
+        assert_eq!((row.request_arrival_ns, row.decision_ns), (101, 105));
+        assert_eq!(row.decision, "taker_match");
+    }
+
+    #[test]
+    fn strict_admission_unknown_coverage_aborts_by_default_without_resting_order() {
+        for stale in [false, true] {
+            let mut c = core();
+            c.configure_admission(true, false, true);
+            c.configure_book_stale_gate(15);
+            if stale {
+                c.on_orderbook(&book_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 100));
+            }
+            let request = order(
+                "unknown-abort",
+                "up",
+                Side::Buy,
+                0.55,
+                12.0,
+                true,
+                OrderType::Limit,
+            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                c.submit_order(&request, 200)
+            }));
+            assert!(result.is_err());
+            assert!(
+                c.orders.is_empty(),
+                "unknown book cannot create Accepted resting state"
+            );
+            assert_eq!(c.admission_audit_stats().unknown_decisions, 1);
+            assert_eq!(c.post_only_rejects, 0);
+        }
+    }
+
+    #[test]
+    fn strict_admission_explicit_unknown_reject_is_distinct_from_venue_cross_reject() {
+        let mut c = core();
+        c.configure_admission(true, true, true);
+        // A disabled age threshold does not turn an absent book into known data.
+        let request = order(
+            "unknown-reject",
+            "up",
+            Side::Buy,
+            0.55,
+            12.0,
+            true,
+            OrderType::Limit,
+        );
+        let update = c.submit_order(&request, 200);
+        assert_eq!(update.status, OrderStatus::Rejected);
+        assert_eq!(
+            update.error.as_deref(),
+            Some("simulator-data-unknown: missing server book")
+        );
+        assert!(c.orders.is_empty());
+        assert_eq!((c.post_only_rejects, c.rejects), (0, 0));
+        let stats = c.admission_audit_stats();
+        assert_eq!((stats.unknown_decisions, stats.unknown_rejected), (1, 1));
+        let row = c.drain_admission_audit().next().unwrap();
+        assert_eq!(row.coverage, "missing_server_book");
+        assert_eq!(row.crossing, None);
+        assert_eq!(row.decision, "data_unknown_rejected");
+        assert!(row.original_book.is_none() && row.selected_book.is_none());
+    }
+
+    #[test]
+    fn admission_audit_retains_original_and_selected_canonical_raw_book_identity() {
+        let mut c = core();
+        c.set_fold_outcomes(true);
+        // Pair mappings are installed when instruments are processed.
+        c.on_instrument(&binary_instrument());
+        c.configure_fold_canonical_book_only(true);
+        c.configure_admission(true, false, true);
+        let up = book_dual_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 200, 1000);
+        let timing = ServerEventTime {
+            raw_source_ns: 200,
+            recorded_receive_ns: 1000,
+            reconstructed_source_ns: None,
+            effective_apply_ns: 250,
+            stream_index: 7,
+            stream_sequence: 12,
+        };
+        c.on_orderbook_at(&up, &timing, None);
+        // This sibling is observed but canonical-only mode does not select it.
+        c.on_orderbook_at(
+            &book_dual_ts("down", vec![(0.50, 30.0)], vec![(0.55, 20.0)], 260, 1010),
+            &ServerEventTime {
+                raw_source_ns: 260,
+                recorded_receive_ns: 1010,
+                effective_apply_ns: 260,
+                stream_index: 8,
+                stream_sequence: 9,
+                ..timing
+            },
+            None,
+        );
+        let request = order(
+            "down-original",
+            "down",
+            Side::Sell,
+            0.40,
+            12.0,
+            true,
+            OrderType::Limit,
+        );
+        assert_eq!(c.submit_order(&request, 280).status, OrderStatus::Accepted);
+        let row = c.drain_admission_audit().next().unwrap();
+        assert_eq!(row.canonical_token, "up");
+        assert_eq!((row.side, row.canonical_side), (Side::Sell, Side::Buy));
+        assert_eq!(row.original_book.as_ref().unwrap().token, "down");
+        assert_eq!(row.original_book.as_ref().unwrap().best_bid, Some(0.50));
+        let selected = row.selected_book.unwrap();
+        assert_eq!(selected.token, "up");
+        assert_eq!(selected.clock, timing);
+        assert_eq!(row.canonical_best_ask, Some(0.62));
+        assert_eq!(row.crossing, Some(false));
+        assert_eq!(
+            (row.source_age_ns, row.gate_source_age_ns),
+            (Some(80), Some(80))
+        );
+    }
+
+    #[test]
+    fn admission_audit_older_raw_book_cannot_replace_selected_identity() {
+        let mut c = core();
+        c.configure_admission(true, false, true);
+        let timing = ServerEventTime {
+            raw_source_ns: 200,
+            recorded_receive_ns: 1000,
+            reconstructed_source_ns: None,
+            effective_apply_ns: 250,
+            stream_index: 0,
+            stream_sequence: 1,
+        };
+        c.on_orderbook_at(
+            &book_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 200),
+            &timing,
+            None,
+        );
+        c.on_orderbook_at(
+            &book_ts("up", vec![(0.60, 1.0)], vec![(0.59, 80.0)], 190),
+            &ServerEventTime {
+                raw_source_ns: 190,
+                stream_sequence: 2,
+                ..timing
+            },
+            None,
+        );
+        let request = order(
+            "selected-old-drop",
+            "up",
+            Side::Buy,
+            0.61,
+            12.0,
+            true,
+            OrderType::Limit,
+        );
+        assert_eq!(c.submit_order(&request, 260).status, OrderStatus::Accepted);
+        let row = c.drain_admission_audit().next().unwrap();
+        assert_eq!(row.selected_book.as_ref().unwrap().clock.stream_sequence, 1);
+        assert_eq!(row.original_book.as_ref().unwrap().clock.stream_sequence, 1);
+        assert_eq!(row.selected_book.as_ref().unwrap().version, 1);
+        assert_eq!(c.raw_older_books_dropped, 1);
+    }
+
+    #[test]
+    fn admission_audit_capacity_is_lossless_bounded_and_draining_reuses_storage() {
+        let mut c = core();
+        c.configure_admission(false, false, true);
+        c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
+        let request = order(
+            "replayed",
+            "up",
+            Side::Buy,
+            0.55,
+            12.0,
+            true,
+            OrderType::Limit,
+        );
+        for now in 0..ADMISSION_AUDIT_CAPACITY {
+            c.submit_order(&request, now as u64);
+        }
+        let capacity = c.admission_audit.capacity();
+        let overflow = order(
+            "overflow",
+            "up",
+            Side::Buy,
+            0.55,
+            12.0,
+            true,
+            OrderType::Limit,
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.submit_order(&overflow, 9999)
+        }));
+        assert!(result.is_err());
+        assert!(
+            c.order_owner("overflow").is_none(),
+            "overflow aborts before matching/identity mutation"
+        );
+        assert_eq!(c.admission_audit_stats().overflows, 1);
+        let rows: Vec<_> = c.drain_admission_audit().collect();
+        assert_eq!(rows.len(), ADMISSION_AUDIT_CAPACITY);
+        assert_eq!(rows[1].decision, "idempotent_lookup");
+        assert_eq!(
+            rows.last().unwrap().attempt_sequence,
+            ADMISSION_AUDIT_CAPACITY as u64
+        );
+        assert_eq!(c.admission_audit.capacity(), capacity);
+        c.submit_order(&overflow, 10_000);
+        assert_eq!(c.admission_audit_stats().queued, 1);
+        assert_eq!(
+            c.admission_audit_stats().high_water,
+            ADMISSION_AUDIT_CAPACITY
+        );
+    }
+
+    #[test]
+    fn admission_audit_owner_routing_and_reused_identity_fail_closed() {
+        let mut c = core();
+        c.configure_admission(true, false, true);
+        c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
+        let mut a = order(
+            "owner-a",
+            "up",
+            Side::Buy,
+            0.55,
+            12.0,
+            true,
+            OrderType::Limit,
+        );
+        a.instance_id = "a".into();
+        a.order_slot = OrderSlot::with_generation(1, 1);
+        let mut b = a.clone();
+        b.client_order_id = "owner-b".into();
+        b.instance_id = "b".into();
+        b.order_slot = OrderSlot::with_generation(1, 2);
+        c.submit_order(&a, 1);
+        c.submit_order(&b, 2);
+        let mut collision = a.clone();
+        collision.instance_id = "b".into();
+        assert_eq!(c.submit_order(&collision, 3).status, OrderStatus::Rejected);
+        let rows: Vec<_> = c.drain_admission_audit().collect();
+        assert_eq!((rows[0].iid.as_str(), rows[1].iid.as_str()), ("a", "b"));
+        assert_ne!(rows[0].strategy_order_slot, rows[1].strategy_order_slot);
+        assert_eq!(rows[2].decision, "identity_rejected");
+        assert_eq!(
+            c.orders.len(),
+            2,
+            "collision cannot create another resting order"
+        );
+    }
+
+    /// The request and cancel object are built before the measured section.
+    /// Measure admission entry through returned update, including optional
+    /// in-memory audit capture, excluding drain/serialization and cancellation.
+    #[test]
+    #[ignore = "focused offline benchmark; release --ignored --nocapture"]
+    fn admission_capture_benchmark() {
+        const N: usize = 100_000;
+        for audit in [false, true] {
+            let mut c = core();
+            c.configure_admission(true, false, audit);
+            c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
+            let mut timings = Vec::with_capacity(N);
+            for n in 0..N {
+                let request = order(
+                    &format!("bench-{n}"),
+                    "up",
+                    Side::Buy,
+                    0.55,
+                    12.0,
+                    true,
+                    OrderType::Limit,
+                );
+                let start = std::time::Instant::now();
+                std::hint::black_box(c.submit_order(&request, n as u64));
+                timings.push(start.elapsed().as_nanos() as u64);
+                c.cancel_order(Exchange::Polymarket, &request.client_order_id, n as u64);
+                // Only the local benchmark's terminal evidence is retired;
+                // actual replay uses normal event retirement and delayed refs.
+                c.order_evidence.remove(&request.client_order_id);
+                c.recent_fills.remove(&request.client_order_id);
+                c.drain_admission_audit().for_each(drop);
+            }
+            timings.sort_unstable();
+            let stats = c.admission_audit_stats();
+            println!("admission_capture_benchmark audit={} events={} median_ns={} p99_ns={} p999_ns={} max_ns={} queue_high_water={} queue_capacity={} overflow={}",
+                audit, N, timings[N/2], timings[N*99/100], timings[N*999/1000], timings[N-1],
+                stats.high_water, stats.capacity, stats.overflows);
+        }
+    }
+
+    #[test]
+    fn admission_book_evidence_capacity_and_event_retirement_are_explicit() {
+        let mut c = core();
+        c.configure_admission(false, false, true);
+        c.on_orderbook(&book("up", vec![], vec![]));
+        c.on_orderbook(&book("down", vec![], vec![]));
+        c.retire_event("cond1", &["up".into(), "down".into()]);
+        assert!(c.admission_original_books.is_empty() && c.admission_selected_books.is_empty());
+        for n in 0..ADMISSION_BOOK_CAPACITY {
+            c.on_orderbook(&book(&format!("book-{n}"), vec![], vec![]));
+        }
+        let overflow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.on_orderbook(&book("overflow", vec![], vec![]))
+        }));
+        assert!(overflow.is_err());
+        assert_eq!(c.admission_original_books.len(), ADMISSION_BOOK_CAPACITY);
+        assert_eq!(c.admission_selected_books.len(), ADMISSION_BOOK_CAPACITY);
+        assert!(!c.last_book_ts.contains_key("overflow"));
+    }
+
+    /// Book entry -> core return, including BBO/clock evidence updates. Input
+    /// storage is reused and prepared before the measured boundary. This is a
+    /// synchronous offline lane; no network or live strategy latency claim.
+    #[test]
+    #[ignore = "focused offline benchmark; release --ignored --nocapture"]
+    fn admission_book_capture_benchmark() {
+        const N: usize = 100_000;
+        for audit in [false, true] {
+            let mut c = core();
+            c.configure_admission(true, false, audit);
+            let mut ob = book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]);
+            let mut timings = Vec::with_capacity(N);
+            for n in 0..(N + 1000) {
+                ob.exchange_timestamp_ns = n as u64;
+                ob.local_timestamp_ns = n as u64 + 1000;
+                let timing = ServerEventTime {
+                    raw_source_ns: n as u64,
+                    recorded_receive_ns: n as u64 + 1000,
+                    reconstructed_source_ns: None,
+                    effective_apply_ns: n as u64,
+                    stream_index: 0,
+                    stream_sequence: n as u64 + 1,
+                };
+                let start = std::time::Instant::now();
+                std::hint::black_box(c.on_orderbook_at(&ob, &timing, None));
+                if n >= 1000 {
+                    timings.push(start.elapsed().as_nanos() as u64);
+                }
+            }
+            timings.sort_unstable();
+            let stats = c.admission_audit_stats();
+            println!("admission_book_capture_benchmark audit={} events={} median_ns={} p99_ns={} p999_ns={} max_ns={} queue_high_water={} queue_capacity={} overflow={} book_evidence_count={} book_evidence_capacity={}",
+                audit, N, timings[N/2], timings[N*99/100], timings[N*999/1000], timings[N-1],
+                stats.high_water, stats.capacity, stats.overflows,
+                c.admission_original_books.len(), ADMISSION_BOOK_CAPACITY);
+        }
+    }
+
     fn assert_terminal_audit(update: &OrderUpdate, original: f64, matched: f64, ids: &[String]) {
-        let audit = update.order_audit.as_ref().expect("complete terminal evidence");
-        assert_eq!(update.exchange_order_id.as_deref(), Some(format!("simv2-{}", update.client_order_id).as_str()));
-        assert_eq!(audit.original_size.as_deref().unwrap().parse::<f64>().unwrap(), original);
-        assert!((audit.size_matched.as_deref().unwrap().parse::<f64>().unwrap() - matched).abs() < EPS);
+        let audit = update
+            .order_audit
+            .as_ref()
+            .expect("complete terminal evidence");
+        assert_eq!(
+            update.exchange_order_id.as_deref(),
+            Some(format!("simv2-{}", update.client_order_id).as_str())
+        );
+        assert_eq!(
+            audit
+                .original_size
+                .as_deref()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap(),
+            original
+        );
+        assert!(
+            (audit
+                .size_matched
+                .as_deref()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap()
+                - matched)
+                .abs()
+                < EPS
+        );
         assert_eq!(audit.associate_trades, ids);
     }
 
@@ -3936,46 +5835,98 @@ mod tests {
         let mut c = core();
         c.configure_replay_self_depth(1.0);
         c.on_orderbook(&book("up", vec![(0.55, 12.0)], vec![(0.57, 100.0)]));
-        c.submit_order(&order("audit", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit), 1);
+        c.submit_order(
+            &order("audit", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit),
+            1,
+        );
         let first = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.55, 5.0, 100));
         let second = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.55, 6.9928, 110));
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
-        let ids = vec![first[0].trade_id.clone().unwrap(), second[0].trade_id.clone().unwrap()];
+        let ids = vec![
+            first[0].trade_id.clone().unwrap(),
+            second[0].trade_id.clone().unwrap(),
+        ];
         let cancelled = c.cancel_order(Exchange::Polymarket, "audit", 120);
         assert_eq!(cancelled.status, OrderStatus::Cancelled);
-        assert_eq!(cancelled.filled_quantity, 0.0, "audit never creates a private fill");
+        assert_eq!(
+            cancelled.filled_quantity, 0.0,
+            "audit never creates a private fill"
+        );
         assert_terminal_audit(&cancelled, 12.0, 11.9928, &ids);
         let replay = c.cancel_order(Exchange::Polymarket, "audit", 3_000_000_000);
         assert_terminal_audit(&replay, 12.0, 11.9928, &ids);
-        let recovered = c.reconcile(&[], &[("audit".into(), "simv2-audit".into())], 4_000_000_000);
+        let recovered = c.reconcile(
+            &[],
+            &[("audit".into(), "simv2-audit".into())],
+            4_000_000_000,
+        );
         assert_terminal_audit(&recovered[0], 12.0, 11.9928, &ids);
         assert!((c.order_evidence["audit"].matched_quantity - 11.9928).abs() < EPS);
     }
 
     #[test]
-    fn terminal_audit_zero_fill_cancel_and_cancel_before_place_are_explicit() {
+    fn unknown_cancel_does_not_cancel_a_future_placement() {
         let mut c = core();
         c.on_orderbook(&book("up", vec![(0.55, 12.0)], vec![(0.57, 100.0)]));
-        c.submit_order(&order("zero", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit), 1);
-        assert_terminal_audit(&c.cancel_order(Exchange::Polymarket, "zero", 2), 12.0, 0.0, &[]);
+        c.submit_order(
+            &order("zero", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit),
+            1,
+        );
+        assert_terminal_audit(
+            &c.cancel_order(Exchange::Polymarket, "zero", 2),
+            12.0,
+            0.0,
+            &[],
+        );
         let unknown = c.cancel_order(Exchange::Polymarket, "race", 3);
-        assert!(unknown.order_audit.is_none(), "unknown original quantity is not zero-fill proof");
-        let arrival = c.submit_order(&order("race", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit), 4);
-        assert_eq!(arrival.status, OrderStatus::Cancelled);
-        assert_terminal_audit(&arrival, 12.0, 0.0, &[]);
+        assert!(
+            unknown.order_audit.is_none(),
+            "unknown original quantity is not zero-fill proof"
+        );
+        let arrival = c.submit_order(
+            &order("race", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit),
+            4,
+        );
+        assert_eq!(unknown.status, OrderStatus::CancelUncertain);
+        assert_eq!(arrival.status, OrderStatus::Accepted);
+        assert!(arrival.order_audit.is_none());
+        assert_terminal_audit(
+            &c.cancel_order(Exchange::Polymarket, "race", 5),
+            12.0,
+            0.0,
+            &[],
+        );
     }
 
     #[test]
     fn terminal_audit_partial_taker_uses_gross_quantity_and_original_identity() {
         let mut c = core();
         c.on_orderbook(&book("up", vec![(0.55, 100.0)], vec![(0.57, 5.0)]));
-        let fill = c.submit_order(&order("taker-audit", "up", Side::Buy, 0.57, 12.0, false, OrderType::Fak), 1);
+        let fill = c.submit_order(
+            &order(
+                "taker-audit",
+                "up",
+                Side::Buy,
+                0.57,
+                12.0,
+                false,
+                OrderType::Fak,
+            ),
+            1,
+        );
         assert_eq!(fill.filled_quantity, 5.0);
         assert_eq!(fill.status, OrderStatus::PartiallyFilled);
-        assert!(fill.order_audit.is_none(), "private trade payload remains unchanged");
+        assert!(
+            fill.order_audit.is_none(),
+            "private trade payload remains unchanged"
+        );
         let ids = vec![fill.trade_id.clone().unwrap()];
-        let recovered = c.reconcile(&[("taker-audit".into(), "up".into(), Side::Buy, 0.57, None)], &[], 2_000_000_000);
+        let recovered = c.reconcile(
+            &[("taker-audit".into(), "up".into(), Side::Buy, 0.57, None)],
+            &[],
+            2_000_000_000,
+        );
         assert_terminal_audit(&recovered[0], 12.0, 5.0, &ids);
         assert_eq!(recovered[0].symbol, "up");
         assert_eq!(recovered[0].side, Side::Buy);
@@ -3985,15 +5936,29 @@ mod tests {
     fn terminal_audit_live_residual_and_trade_id_overflow_fail_closed() {
         let mut c = core();
         c.on_orderbook(&book("up", vec![(0.55, 100.0)], vec![(0.57, 100.0)]));
-        let request = order("full", "up", Side::Buy, 0.55, 1000.0, true, OrderType::Limit);
+        let request = order(
+            "full",
+            "up",
+            Side::Buy,
+            0.55,
+            1000.0,
+            true,
+            OrderType::Limit,
+        );
         c.submit_order(&request, 1);
-        assert!(c.terminal_order_audit("full").is_none(), "live residual cannot be terminal evidence");
+        assert!(
+            c.terminal_order_audit("full").is_none(),
+            "live residual cannot be terminal evidence"
+        );
         for index in 0..=MAX_ORDER_TRADE_IDS {
             c.record_order_execution("full", &format!("fragment-{index}"), 1.0);
         }
         let cancelled = c.cancel_order(Exchange::Polymarket, "full", 2);
         assert!(cancelled.order_audit.is_none());
-        assert_eq!(c.order_evidence["full"].trade_ids.len(), MAX_ORDER_TRADE_IDS);
+        assert_eq!(
+            c.order_evidence["full"].trade_ids.len(),
+            MAX_ORDER_TRADE_IDS
+        );
         assert_eq!(c.order_evidence_overflows, 1);
         let stats = c.order_evidence_stats();
         assert_eq!(stats.high_water_trade_ids, MAX_ORDER_TRADE_IDS);
@@ -4028,7 +5993,15 @@ mod tests {
     #[test]
     fn terminal_audit_instances_keep_distinct_original_orders_and_trades() {
         let mut c = core();
-        let mut a = order("instance-a", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit);
+        let mut a = order(
+            "instance-a",
+            "up",
+            Side::Buy,
+            0.55,
+            12.0,
+            true,
+            OrderType::Limit,
+        );
         let mut b = a.clone();
         a.instance_id = "a".into();
         b.client_order_id = "instance-b".into();
@@ -4049,19 +6022,32 @@ mod tests {
         let mut collision = a.clone();
         collision.instance_id = "b".into();
         c.register_order_evidence(&collision);
-        assert!(c.terminal_order_audit(&a.client_order_id).is_none(), "ambiguous owner fails closed");
+        assert!(
+            c.terminal_order_audit(&a.client_order_id).is_none(),
+            "ambiguous owner fails closed"
+        );
     }
 
     #[test]
     fn terminal_audit_cancel_all_preserves_each_order_and_unknown_reconcile_stays_unknown() {
         let mut c = core();
         c.on_orderbook(&book("up", vec![(0.55, 12.0)], vec![(0.57, 100.0)]));
-        c.submit_order(&order("all-a", "up", Side::Buy, 0.54, 12.0, true, OrderType::Limit), 1);
-        c.submit_order(&order("all-b", "up", Side::Sell, 0.58, 7.0, true, OrderType::Limit), 2);
+        c.submit_order(
+            &order("all-a", "up", Side::Buy, 0.54, 12.0, true, OrderType::Limit),
+            1,
+        );
+        c.submit_order(
+            &order("all-b", "up", Side::Sell, 0.58, 7.0, true, OrderType::Limit),
+            2,
+        );
         let updates = c.cancel_all(Exchange::Polymarket, "up", 3);
         assert_eq!(updates.len(), 2);
         for update in &updates {
-            let original = if update.client_order_id == "all-a" { 12.0 } else { 7.0 };
+            let original = if update.client_order_id == "all-a" {
+                12.0
+            } else {
+                7.0
+            };
             assert_terminal_audit(update, original, 0.0, &[]);
         }
         let unknown = c.reconcile(
@@ -4078,12 +6064,129 @@ mod tests {
         assert_eq!(stats.overflows, 0);
     }
 
+    #[test]
+    fn slot_identity_survives_lifecycle_and_slot_reuse() {
+        let mut c = core();
+        c.on_orderbook(&book("up", vec![(0.55, 12.0)], vec![(0.57, 100.0)]));
+        let mut old = order("old", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit);
+        old.order_slot = OrderSlot::with_generation(7, 1);
+        c.register_dispatched_order(&old);
+        assert_eq!(
+            c.order_owner("old"),
+            Some((old.instance_id.as_str(), old.order_slot))
+        );
+        let unseen = c.reconcile(
+            &[("old".into(), "up".into(), Side::Buy, 0.55, None)],
+            &[],
+            0,
+        );
+        assert_eq!(unseen[0].status, OrderStatus::NewOrderTimeout);
+        assert!(unseen[0].order_audit.is_none());
+        assert_eq!(c.submit_order(&old, 1).order_slot, old.order_slot);
+        let live = c.reconcile(&[], &[("old".into(), "simv2-old".into())], 2);
+        assert_eq!(live[0].status, OrderStatus::Accepted);
+        assert_eq!(live[0].remaining_quantity, 12.0);
+        assert_eq!(live[0].order_slot, old.order_slot);
+        let cancel = c.cancel_order(Exchange::Polymarket, "old", 3);
+        assert_eq!(cancel.order_slot, old.order_slot);
+        let mut new = old.clone();
+        new.client_order_id = "new".into();
+        new.order_slot = OrderSlot::with_generation(7, 2);
+        c.submit_order(&new, 4);
+        let late = c.cancel_order(Exchange::Polymarket, "old", 5);
+        assert_eq!(late.order_slot, old.order_slot);
+        assert_eq!(
+            c.order_owner("new"),
+            Some((new.instance_id.as_str(), new.order_slot))
+        );
+        assert_eq!(c.orders["new"].remaining, 12.0);
+    }
+
+    #[test]
+    fn event_retirement_keeps_owner_until_queued_delivery_is_consumed() {
+        let mut c = core();
+        let mut request = order("late", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit);
+        request.order_slot = OrderSlot::with_generation(8, 4);
+        c.register_dispatched_order(&request);
+        c.retain_order_message("late");
+        c.retire_event("cond1", &["up".into(), "down".into()]);
+        assert_eq!(c.order_owner("late").unwrap().1, request.order_slot);
+        c.release_order_message("late");
+        assert!(
+            c.order_owner("late").is_some(),
+            "engine can route the returned update"
+        );
+        c.retire_event("cond2", &["up2".into(), "down2".into()]);
+        assert!(c.order_owner("late").is_none());
+    }
+
+    #[test]
+    fn execution_and_rejection_updates_preserve_original_slot() {
+        let mut c = core();
+        c.configure_replay_self_depth(1.0);
+        c.on_orderbook(&book("up", vec![(0.55, 12.0)], vec![(0.57, 100.0)]));
+        let mut request = order(
+            "maker-slot",
+            "up",
+            Side::Buy,
+            0.55,
+            12.0,
+            true,
+            OrderType::Limit,
+        );
+        request.order_slot = OrderSlot::with_generation(12, 31);
+        c.submit_order(&request, 1);
+        let fills = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.55, 12.0, 100));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].order_slot, request.order_slot);
+        assert_eq!(
+            c.cancel_order(Exchange::Polymarket, "maker-slot", 101)
+                .order_slot,
+            request.order_slot
+        );
+        request.client_order_id = "rejected-slot".into();
+        request.price = Some(0.57);
+        request.order_slot = OrderSlot::with_generation(12, 32);
+        let rejected = c.submit_order(&request, 102);
+        assert_eq!(rejected.status, OrderStatus::Rejected);
+        assert_eq!(rejected.order_slot, request.order_slot);
+        request.client_order_id = "taker-slot".into();
+        request.post_only = false;
+        request.order_type = OrderType::Fak;
+        request.order_slot = OrderSlot::with_generation(12, 33);
+        let fill = c.submit_order(&request, 103);
+        assert!(fill.filled_quantity > 0.0);
+        assert_eq!(fill.order_slot, request.order_slot);
+    }
+
+    #[test]
+    fn repeated_place_cannot_reopen_terminal_or_overwrite_generation() {
+        let mut c = core();
+        c.on_orderbook(&book("up", vec![(0.55, 12.0)], vec![(0.57, 100.0)]));
+        let mut request = order("same", "up", Side::Buy, 0.55, 12.0, true, OrderType::Limit);
+        request.order_slot = OrderSlot::with_generation(3, 1);
+        c.submit_order(&request, 1);
+        let seq = c.orders["same"].queue_seq;
+        c.submit_order(&request, 2);
+        assert_eq!(c.orders["same"].queue_seq, seq);
+        c.cancel_order(Exchange::Polymarket, "same", 3);
+        assert_eq!(c.submit_order(&request, 4).status, OrderStatus::Cancelled);
+        assert!(!c.orders.contains_key("same"));
+        request.order_slot = OrderSlot::with_generation(3, 2);
+        assert_eq!(c.submit_order(&request, 5).status, OrderStatus::Rejected);
+        assert!(c.order_owner("same").is_none());
+        assert!(c.terminal_order_audit("same").is_none());
+    }
+
     // ── P2 taker tests (unchanged behaviour) ──
     #[test]
     fn post_only_crossing_is_rejected() {
         let mut c = core();
         c.on_orderbook(&book("up", vec![(0.58, 100.0)], vec![(0.62, 80.0)]));
-        let u = c.submit_order(&order("a", "up", Side::Buy, 0.63, 10.0, true, OrderType::Limit), 1);
+        let u = c.submit_order(
+            &order("a", "up", Side::Buy, 0.63, 10.0, true, OrderType::Limit),
+            1,
+        );
         assert_eq!(u.status, OrderStatus::Rejected);
     }
 
@@ -4092,7 +6195,10 @@ mod tests {
         let mut c = core();
         c.on_orderbook(&book("up", vec![(0.58, 100.0)], vec![(0.62, 80.0)]));
         c.on_orderbook(&book("down", vec![(0.40, 70.0)], vec![(0.43, 50.0)]));
-        let u = c.submit_order(&order("a", "up", Side::Buy, 0.61, 10.0, false, OrderType::Limit), 1);
+        let u = c.submit_order(
+            &order("a", "up", Side::Buy, 0.61, 10.0, false, OrderType::Limit),
+            1,
+        );
         assert_eq!(u.status, OrderStatus::Filled);
         assert!((u.avg_fill_price - 0.60).abs() < 1e-9);
     }
@@ -4106,26 +6212,10 @@ mod tests {
             vec![(0.58, 100.0)],
             vec![(0.62, 5.0), (0.63, 10.0)],
         ));
-        let maker = order(
-            "maker",
-            "up",
-            Side::Sell,
-            0.62,
-            5.0,
-            true,
-            OrderType::Limit,
-        );
+        let maker = order("maker", "up", Side::Sell, 0.62, 5.0, true, OrderType::Limit);
         assert_eq!(c.submit_order(&maker, 1).status, OrderStatus::Accepted);
 
-        let taker = order(
-            "taker",
-            "up",
-            Side::Buy,
-            0.63,
-            5.0,
-            false,
-            OrderType::Fak,
-        );
+        let taker = order("taker", "up", Side::Buy, 0.63, 5.0, false, OrderType::Fak);
         assert!(c.would_cross(&taker, 2));
         let fill = c.submit_order(&taker, 2);
         assert_eq!(fill.status, OrderStatus::Filled);
@@ -4148,25 +6238,9 @@ mod tests {
                 vec![(0.58, 100.0)],
                 vec![(0.62, 5.0), (0.63, 10.0)],
             ));
-            let maker = order(
-                "maker",
-                "up",
-                Side::Sell,
-                0.62,
-                5.0,
-                true,
-                OrderType::Limit,
-            );
+            let maker = order("maker", "up", Side::Sell, 0.62, 5.0, true, OrderType::Limit);
             assert_eq!(c.submit_order(&maker, 1).status, OrderStatus::Accepted);
-            let mut taker = order(
-                "taker",
-                "up",
-                Side::Buy,
-                0.63,
-                5.0,
-                false,
-                OrderType::Fak,
-            );
+            let mut taker = order("taker", "up", Side::Buy, 0.63, 5.0, false, OrderType::Fak);
             taker.instance_id = taker_iid.to_string();
             c.submit_order(&taker, 2)
         }
@@ -4249,12 +6323,7 @@ mod tests {
     fn passive_exposure_snapshots_still_open_orders_at_latest_exchange_time() {
         let mut c = core();
         c.configure_maker_order_audit(true);
-        c.on_orderbook(&book_ts(
-            "up",
-            vec![(0.60, 10.0)],
-            vec![(0.62, 80.0)],
-            1,
-        ));
+        c.on_orderbook(&book_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 1));
         assert_eq!(
             c.submit_order(
                 &order("open", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
@@ -4263,12 +6332,7 @@ mod tests {
             .status,
             OrderStatus::Accepted
         );
-        c.on_orderbook(&book_ts(
-            "up",
-            vec![(0.60, 10.0)],
-            vec![(0.62, 80.0)],
-            102,
-        ));
+        c.on_orderbook(&book_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 102));
 
         let order = &c.maker_order_audit_rows()[0];
         assert_eq!(order.rest_time_ns, 100);
@@ -4284,26 +6348,24 @@ mod tests {
     fn passive_exposure_stops_when_event_is_retired() {
         let mut c = core();
         c.configure_maker_order_audit(true);
-        c.on_orderbook(&book_ts(
-            "up",
-            vec![(0.60, 10.0)],
-            vec![(0.62, 80.0)],
-            1,
-        ));
+        c.on_orderbook(&book_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 1));
         assert_eq!(
             c.submit_order(
-                &order("retired", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                &order(
+                    "retired",
+                    "up",
+                    Side::Buy,
+                    0.60,
+                    5.0,
+                    true,
+                    OrderType::Limit
+                ),
                 2,
             )
             .status,
             OrderStatus::Accepted
         );
-        c.on_orderbook(&book_ts(
-            "up",
-            vec![(0.60, 10.0)],
-            vec![(0.62, 80.0)],
-            102,
-        ));
+        c.on_orderbook(&book_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 102));
         c.retire_event("cond1", &["up".to_string(), "down".to_string()]);
         // Later exchange activity must not extend the retired quote's lifetime.
         c.audit_clock_ns = 1_000;
@@ -4323,12 +6385,7 @@ mod tests {
     fn passive_exposure_is_capped_at_market_end() {
         let mut c = core();
         c.configure_maker_order_audit(true);
-        c.on_orderbook(&book_ts(
-            "up",
-            vec![(0.60, 10.0)],
-            vec![(0.62, 80.0)],
-            1,
-        ));
+        c.on_orderbook(&book_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 1));
         assert_eq!(
             c.submit_order(
                 &order("capped", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
@@ -4337,13 +6394,11 @@ mod tests {
             .status,
             OrderStatus::Accepted
         );
-        c.maker_order_audit.get_mut("capped").unwrap().exposure_end_ns = 52;
-        c.on_orderbook(&book_ts(
-            "up",
-            vec![(0.60, 10.0)],
-            vec![(0.62, 80.0)],
-            102,
-        ));
+        c.maker_order_audit
+            .get_mut("capped")
+            .unwrap()
+            .exposure_end_ns = 52;
+        c.on_orderbook(&book_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 102));
 
         let order = &c.maker_order_audit_rows()[0];
         assert_eq!(order.rest_time_ns, 50);
@@ -4361,7 +6416,15 @@ mod tests {
         // exchange arrival, not BTreeMap/client-id order.
         assert_eq!(
             c.submit_order(
-                &order("z-older", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                &order(
+                    "z-older",
+                    "up",
+                    Side::Buy,
+                    0.60,
+                    5.0,
+                    true,
+                    OrderType::Limit
+                ),
                 1,
             )
             .status,
@@ -4369,7 +6432,15 @@ mod tests {
         );
         assert_eq!(
             c.submit_order(
-                &order("a-newer", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                &order(
+                    "a-newer",
+                    "up",
+                    Side::Buy,
+                    0.60,
+                    5.0,
+                    true,
+                    OrderType::Limit
+                ),
                 2,
             )
             .status,
@@ -4412,7 +6483,15 @@ mod tests {
         );
         assert_eq!(
             c.submit_order(
-                &order("printed", "up", Side::Buy, 0.59, 5.0, true, OrderType::Limit),
+                &order(
+                    "printed",
+                    "up",
+                    Side::Buy,
+                    0.59,
+                    5.0,
+                    true,
+                    OrderType::Limit
+                ),
                 2,
             )
             .status,
@@ -4693,12 +6772,7 @@ mod tests {
         let mut c = core();
         c.set_fold_outcomes(true);
         c.configure_book_stale_gate(2_000_000_000);
-        let ob = book_ts(
-            "up",
-            vec![(0.60, 10.0)],
-            vec![(0.62, 80.0)],
-            1_000_000_000,
-        );
+        let ob = book_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 1_000_000_000);
         c.on_orderbook(&ob);
         c.on_local_orderbook(&ob, 1_000_000_000);
         let u = c.submit_order(
@@ -4706,13 +6780,7 @@ mod tests {
             1_100_000_000,
         );
         assert_eq!(u.status, OrderStatus::Accepted);
-        let stale = c.on_trade_tick(&trade_ts(
-            "up",
-            Side::Sell,
-            0.60,
-            20.0,
-            4_000_000_000,
-        ));
+        let stale = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.60, 20.0, 4_000_000_000));
         assert!(stale.is_empty());
         assert_eq!(c.book_stale_trade_blocks, 1);
         assert!(c.orders.contains_key("m"));
@@ -4741,13 +6809,7 @@ mod tests {
             1_100_000_000,
         );
         assert_eq!(u.status, OrderStatus::Accepted);
-        let fills = c.on_trade_tick(&trade_ts(
-            "up",
-            Side::Sell,
-            0.60,
-            20.0,
-            4_000_000_000,
-        ));
+        let fills = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.60, 20.0, 4_000_000_000));
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].status, OrderStatus::Filled);
         assert_eq!(c.book_stale_trade_blocks, 0);
@@ -4759,12 +6821,7 @@ mod tests {
         c.set_fold_outcomes(true);
         c.configure_book_stale_gate(2_000_000_000);
         c.configure_book_through(1.0);
-        let initial = book_ts(
-            "up",
-            vec![(0.60, 10.0)],
-            vec![(0.62, 80.0)],
-            1_000_000_000,
-        );
+        let initial = book_ts("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)], 1_000_000_000);
         c.on_orderbook(&initial);
         c.on_local_orderbook(&initial, 1_000_000_000);
         let u = c.submit_order(
@@ -4774,32 +6831,16 @@ mod tests {
         assert_eq!(u.status, OrderStatus::Accepted);
         // A small fresh trade confirms the price but does not drain q_ahead.
         assert!(c
-            .on_trade_tick(&trade_ts(
-                "up",
-                Side::Sell,
-                0.60,
-                5.0,
-                1_200_000_000,
-            ))
+            .on_trade_tick(&trade_ts("up", Side::Sell, 0.60, 5.0, 1_200_000_000,))
             .is_empty());
         // Exchange book is fresh, but the strategy has received no full book
         // for three seconds: book-through must not fill and its confirmation
         // must not carry into the next fresh interval.
-        let through = book_ts(
-            "up",
-            vec![(0.58, 10.0)],
-            vec![(0.59, 100.0)],
-            4_000_000_000,
-        );
+        let through = book_ts("up", vec![(0.58, 10.0)], vec![(0.59, 100.0)], 4_000_000_000);
         assert!(c.on_orderbook(&through).is_empty());
         assert!(c.orders.contains_key("m"));
         c.on_local_orderbook(&through, 4_000_000_000);
-        let next = book_ts(
-            "up",
-            vec![(0.58, 10.0)],
-            vec![(0.59, 100.0)],
-            4_100_000_000,
-        );
+        let next = book_ts("up", vec![(0.58, 10.0)], vec![(0.59, 100.0)], 4_100_000_000);
         assert!(c.on_orderbook(&next).is_empty());
         assert!(c.orders.contains_key("m"));
     }
@@ -4808,12 +6849,7 @@ mod tests {
     fn stale_entry_rebases_behind_next_fresh_visible_queue() {
         let mut c = core();
         c.configure_book_stale_gate(2_000_000_000);
-        let initial = book_ts(
-            "up",
-            vec![(0.60, 50.0)],
-            vec![(0.62, 80.0)],
-            1_000_000_000,
-        );
+        let initial = book_ts("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)], 1_000_000_000);
         c.on_orderbook(&initial);
         c.on_local_orderbook(&initial, 1_000_000_000);
         let u = c.submit_order(
@@ -4823,12 +6859,7 @@ mod tests {
         assert_eq!(u.status, OrderStatus::Accepted);
         assert!(c.orders.get("m").unwrap().await_fresh_book);
 
-        let fresh = book_ts(
-            "up",
-            vec![(0.60, 100.0)],
-            vec![(0.62, 80.0)],
-            5_000_000_000,
-        );
+        let fresh = book_ts("up", vec![(0.60, 100.0)], vec![(0.62, 80.0)], 5_000_000_000);
         c.on_orderbook(&fresh);
         assert!(c.orders.get("m").unwrap().await_fresh_book);
         c.on_local_orderbook(&fresh, 5_000_000_000);
@@ -4838,21 +6869,9 @@ mod tests {
         assert_eq!(c.book_stale_rebases, 1);
 
         assert!(c
-            .on_trade_tick(&trade_ts(
-                "up",
-                Side::Sell,
-                0.60,
-                90.0,
-                5_100_000_000,
-            ))
+            .on_trade_tick(&trade_ts("up", Side::Sell, 0.60, 90.0, 5_100_000_000,))
             .is_empty());
-        let fills = c.on_trade_tick(&trade_ts(
-            "up",
-            Side::Sell,
-            0.60,
-            20.0,
-            5_200_000_000,
-        ));
+        let fills = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.60, 20.0, 5_200_000_000));
         assert_eq!(fills.len(), 1);
         assert!((fills[0].filled_quantity - 5.0).abs() < 1e-9);
     }
@@ -4883,7 +6902,10 @@ mod tests {
     fn fok_partial_is_cancelled() {
         let mut c = core();
         c.on_orderbook(&book("up", vec![(0.58, 100.0)], vec![(0.62, 5.0)]));
-        let u = c.submit_order(&order("a", "up", Side::Buy, 0.62, 10.0, false, OrderType::Fok), 1);
+        let u = c.submit_order(
+            &order("a", "up", Side::Buy, 0.62, 10.0, false, OrderType::Fok),
+            1,
+        );
         assert_eq!(u.status, OrderStatus::Cancelled);
     }
 
@@ -4893,7 +6915,10 @@ mod tests {
         let mut c = core();
         // Our BUY up @ 0.60 rests behind 50 visible at that level.
         c.on_orderbook(&book("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)]));
-        let u = c.submit_order(&order("a", "up", Side::Buy, 0.60, 10.0, true, OrderType::Limit), 1);
+        let u = c.submit_order(
+            &order("a", "up", Side::Buy, 0.60, 10.0, true, OrderType::Limit),
+            1,
+        );
         assert_eq!(u.status, OrderStatus::Accepted);
         // A SELL trade @ 0.60 of 45 → q_ahead 50→5, no fill yet.
         let f0 = c.on_trade_tick(&trade("up", Side::Sell, 0.60, 45.0));
@@ -4914,13 +6939,29 @@ mod tests {
         c.configure_race(1.0, 0.0); // full weight on the next snapshot
         c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
         // Next book: same level grows 10 → 100.
-        c.set_next_book("up", vec![PriceLevel { price: 0.60, quantity: 100.0 }], vec![PriceLevel { price: 0.62, quantity: 80.0 }]);
-        let u = c.submit_order(&order("a", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit), 1);
+        c.set_next_book(
+            "up",
+            vec![PriceLevel {
+                price: 0.60,
+                quantity: 100.0,
+            }],
+            vec![PriceLevel {
+                price: 0.62,
+                quantity: 80.0,
+            }],
+        );
+        let u = c.submit_order(
+            &order("a", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+            1,
+        );
         assert_eq!(u.status, OrderStatus::Accepted);
         // q_ahead ≈ 100 (race). A SELL @ 0.60 of 50 drains to 50 — still no fill.
         c.clear_next_books();
         let f = c.on_trade_tick(&trade("up", Side::Sell, 0.60, 50.0));
-        assert!(f.is_empty(), "race-inflated queue (≈100) must not fill on 50");
+        assert!(
+            f.is_empty(),
+            "race-inflated queue (≈100) must not fill on 50"
+        );
     }
 
     #[test]
@@ -4930,8 +6971,21 @@ mod tests {
         let mut c = core();
         c.configure_race(1.0, 0.0);
         c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
-        c.set_next_book("up", vec![PriceLevel { price: 0.60, quantity: 2.0 }], vec![PriceLevel { price: 0.62, quantity: 80.0 }]);
-        let u = c.submit_order(&order("a", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit), 1);
+        c.set_next_book(
+            "up",
+            vec![PriceLevel {
+                price: 0.60,
+                quantity: 2.0,
+            }],
+            vec![PriceLevel {
+                price: 0.62,
+                quantity: 80.0,
+            }],
+        );
+        let u = c.submit_order(
+            &order("a", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+            1,
+        );
         assert_eq!(u.status, OrderStatus::Accepted);
         // q_ahead = now (10). SELL @ 0.60 of 12 → 2 overflow → fill 2.
         c.clear_next_books();
@@ -4947,11 +7001,28 @@ mod tests {
         c.configure_race(0.0, 1.0); // full weight on the next snapshot
         c.on_orderbook(&book("up", vec![(0.58, 10.0)], vec![(0.62, 100.0)]));
         // Next book: the ask we wanted recedes 100 → 3.
-        c.set_next_book("up", vec![PriceLevel { price: 0.58, quantity: 10.0 }], vec![PriceLevel { price: 0.62, quantity: 3.0 }]);
-        let u = c.submit_order(&order("t", "up", Side::Buy, 0.62, 20.0, false, OrderType::Limit), 1);
+        c.set_next_book(
+            "up",
+            vec![PriceLevel {
+                price: 0.58,
+                quantity: 10.0,
+            }],
+            vec![PriceLevel {
+                price: 0.62,
+                quantity: 3.0,
+            }],
+        );
+        let u = c.submit_order(
+            &order("t", "up", Side::Buy, 0.62, 20.0, false, OrderType::Limit),
+            1,
+        );
         // now_avail=100, next_avail=3 → cap=3 → fills 3, remainder 17 rests.
         assert_eq!(u.status, OrderStatus::PartiallyFilled);
-        assert!((u.filled_quantity - 3.0).abs() < 1e-6, "fill {} != 3", u.filled_quantity);
+        assert!(
+            (u.filled_quantity - 3.0).abs() < 1e-6,
+            "fill {} != 3",
+            u.filled_quantity
+        );
         assert_eq!(u.liquidity, Some(Liquidity::Taker));
     }
 
@@ -4980,12 +7051,39 @@ mod tests {
         c.configure_race(0.0, 1.0); // full weight on the windowed next leg
         c.on_orderbook(&book("up", vec![(0.58, 10.0)], vec![(0.62, 100.0)]));
         // Two window frames: ask 2 (recedes), then ask 50 (recovers).
-        c.push_next_window("up", vec![PriceLevel { price: 0.58, quantity: 10.0 }], vec![PriceLevel { price: 0.62, quantity: 2.0 }]);
-        c.push_next_window("up", vec![PriceLevel { price: 0.58, quantity: 10.0 }], vec![PriceLevel { price: 0.62, quantity: 50.0 }]);
-        let u = c.submit_order(&order("t", "up", Side::Buy, 0.62, 20.0, false, OrderType::Limit), 1);
+        c.push_next_window(
+            "up",
+            vec![PriceLevel {
+                price: 0.58,
+                quantity: 10.0,
+            }],
+            vec![PriceLevel {
+                price: 0.62,
+                quantity: 2.0,
+            }],
+        );
+        c.push_next_window(
+            "up",
+            vec![PriceLevel {
+                price: 0.58,
+                quantity: 10.0,
+            }],
+            vec![PriceLevel {
+                price: 0.62,
+                quantity: 50.0,
+            }],
+        );
+        let u = c.submit_order(
+            &order("t", "up", Side::Buy, 0.62, 20.0, false, OrderType::Limit),
+            1,
+        );
         // min(2, 50) = 2 → fill capped at 2, remainder 18 rests.
         assert_eq!(u.status, OrderStatus::PartiallyFilled);
-        assert!((u.filled_quantity - 2.0).abs() < 1e-6, "fill {} != 2", u.filled_quantity);
+        assert!(
+            (u.filled_quantity - 2.0).abs() < 1e-6,
+            "fill {} != 2",
+            u.filled_quantity
+        );
         assert_eq!(u.liquidity, Some(Liquidity::Taker));
     }
 
@@ -5010,10 +7108,17 @@ mod tests {
             local_timestamp_ns: 1_000,
         };
         c.on_trade_tick(&comp);
-        let u = c.submit_order(&order("t", "up", Side::Buy, 0.62, 20.0, false, OrderType::Limit), 200_000);
+        let u = c.submit_order(
+            &order("t", "up", Side::Buy, 0.62, 20.0, false, OrderType::Limit),
+            200_000,
+        );
         // now_avail=25, comp=20 → eff=5 → fill 5, remainder 15 rests.
         assert_eq!(u.status, OrderStatus::PartiallyFilled);
-        assert!((u.filled_quantity - 5.0).abs() < 1e-6, "fill {} != 5", u.filled_quantity);
+        assert!(
+            (u.filled_quantity - 5.0).abs() < 1e-6,
+            "fill {} != 5",
+            u.filled_quantity
+        );
         assert_eq!(u.liquidity, Some(Liquidity::Taker));
         assert_eq!(c.taker_comp_capped, 1);
     }
@@ -5133,13 +7238,26 @@ mod tests {
         let mut c = core();
         c.on_orderbook(&book("up", vec![], vec![(0.62, 25.0)]));
         let comp = TradeTick {
-            exchange: Exchange::Polymarket, symbol: "up".into(), exchange_trade_id: None, price: 0.62,
-            quantity: 20.0, side: Side::Buy, exchange_timestamp_ns: 1_000, local_timestamp_ns: 1_000,
+            exchange: Exchange::Polymarket,
+            symbol: "up".into(),
+            exchange_trade_id: None,
+            price: 0.62,
+            quantity: 20.0,
+            side: Side::Buy,
+            exchange_timestamp_ns: 1_000,
+            local_timestamp_ns: 1_000,
         };
         c.on_trade_tick(&comp);
-        let u = c.submit_order(&order("t", "up", Side::Buy, 0.62, 20.0, false, OrderType::Limit), 200_000);
+        let u = c.submit_order(
+            &order("t", "up", Side::Buy, 0.62, 20.0, false, OrderType::Limit),
+            200_000,
+        );
         assert_eq!(u.status, OrderStatus::Filled);
-        assert!((u.filled_quantity - 20.0).abs() < 1e-6, "fill {} != 20", u.filled_quantity);
+        assert!(
+            (u.filled_quantity - 20.0).abs() < 1e-6,
+            "fill {} != 20",
+            u.filled_quantity
+        );
     }
 
     #[test]
@@ -5150,7 +7268,10 @@ mod tests {
         // cancel/grow (which would corrupt q_ahead via the bucketing discontinuity).
         let mut c = core();
         c.on_orderbook(&book("up", vec![(0.95, 100.0)], vec![]));
-        let u = c.submit_order(&order("m", "up", Side::Buy, 0.95, 10.0, true, OrderType::Limit), 1);
+        let u = c.submit_order(
+            &order("m", "up", Side::Buy, 0.95, 10.0, true, OrderType::Limit),
+            1,
+        );
         assert_eq!(u.status, OrderStatus::Accepted);
         assert!((c.orders["m"].tick - 0.01).abs() < 1e-12);
         assert!((c.orders["m"].q_ahead - 100.0).abs() < 1e-6);
@@ -5164,11 +7285,18 @@ mod tests {
         };
         c.on_tick_size_change(&tsc);
         assert!((c.tick_of("up") - 0.001).abs() < 1e-12);
-        assert!((c.orders["m"].tick - 0.001).abs() < 1e-12, "o.tick stale: {}", c.orders["m"].tick);
+        assert!(
+            (c.orders["m"].tick - 0.001).abs() < 1e-12,
+            "o.tick stale: {}",
+            c.orders["m"].tick
+        );
         // Identical book → re-baselined → no spurious q_ahead change.
         c.on_orderbook(&book("up", vec![(0.95, 100.0)], vec![]));
-        assert!((c.orders["m"].q_ahead - 100.0).abs() < 1e-6,
-            "q_ahead spuriously changed to {}", c.orders["m"].q_ahead);
+        assert!(
+            (c.orders["m"].q_ahead - 100.0).abs() < 1e-6,
+            "q_ahead spuriously changed to {}",
+            c.orders["m"].q_ahead
+        );
     }
 
     #[test]
@@ -5192,7 +7320,11 @@ mod tests {
             local_timestamp_ns: 1,
         };
         c.on_tick_size_change(&tsc);
-        assert!((c.tick_of("up") - 0.001).abs() < 1e-12, "canonical tick not updated: {}", c.tick_of("up"));
+        assert!(
+            (c.tick_of("up") - 0.001).abs() < 1e-12,
+            "canonical tick not updated: {}",
+            c.tick_of("up")
+        );
         assert!((c.tick_of("down") - 0.001).abs() < 1e-12);
     }
 
@@ -5204,10 +7336,13 @@ mod tests {
             HashMap::from([("iid".to_string(), 100.0)]),
         );
         c.on_instrument(&binary_instrument()); // seeds 100 down shares
-        // Empty book both sides so our SELL-down rests at the front with q_ahead=0
-        // (the q_init data-truncation fallback only fires when a best level exists).
+                                               // Empty book both sides so our SELL-down rests at the front with q_ahead=0
+                                               // (the q_init data-truncation fallback only fires when a best level exists).
         c.on_orderbook(&book("down", vec![], vec![]));
-        let u = c.submit_order(&order("s", "down", Side::Sell, 0.40, 10.0, true, OrderType::Limit), 1);
+        let u = c.submit_order(
+            &order("s", "down", Side::Sell, 0.40, 10.0, true, OrderType::Limit),
+            1,
+        );
         assert_eq!(u.status, OrderStatus::Accepted);
         // A SELL-up @ 0.60 trade mirrors to down: flip→BUY, price 1−0.60=0.40.
         // BUY aggressor @ 0.40 ≥ our sell 0.40 → fills our resting SELL-down.
@@ -5232,22 +7367,44 @@ mod tests {
         c.on_orderbook(&book(
             "up",
             vec![(0.50, 50.0)],
-            vec![(0.60, 40.0), (0.61, 100.0), (0.62, 130.0), (0.63, 130.0), (0.64, 80.0)],
+            vec![
+                (0.60, 40.0),
+                (0.61, 100.0),
+                (0.62, 130.0),
+                (0.63, 130.0),
+                (0.64, 80.0),
+            ],
         ));
         // SELL @ 0.70 is beyond the deepest recorded ask (0.64) → extrapolated.
-        let beyond = c.books.extrapolate_level_depth("up", Side::Sell, 0.70, 0.01);
+        let beyond = c
+            .books
+            .extrapolate_level_depth("up", Side::Sell, 0.70, 0.01);
         assert!(beyond.is_some(), "beyond-window must extrapolate");
         let q = beyond.unwrap();
-        assert!(q >= 40.0 - 1e-6 && q <= 130.0 + 1e-6, "extrapolated {} out of recorded band", q);
+        assert!(
+            q >= 40.0 - 1e-6 && q <= 130.0 + 1e-6,
+            "extrapolated {} out of recorded band",
+            q
+        );
         // SELL @ 0.615 is INSIDE the window (between 0.61 and 0.62) → None.
-        assert!(c.books.extrapolate_level_depth("up", Side::Sell, 0.615, 0.01).is_none(),
-            "in-window gap must not extrapolate");
+        assert!(
+            c.books
+                .extrapolate_level_depth("up", Side::Sell, 0.615, 0.01)
+                .is_none(),
+            "in-window gap must not extrapolate"
+        );
         // End-to-end: resting SELL @ 0.70 gets the extrapolated q_ahead, so a
         // small SELL-aggressor trade at 0.70 does NOT immediately fill us.
-        let u = c.submit_order(&order("a", "up", Side::Sell, 0.70, 5.0, true, OrderType::Limit), 1);
+        let u = c.submit_order(
+            &order("a", "up", Side::Sell, 0.70, 5.0, true, OrderType::Limit),
+            1,
+        );
         assert_eq!(u.status, OrderStatus::Accepted);
         let f = c.on_trade_tick(&trade("up", Side::Buy, 0.70, 3.0)); // 3 < extrapolated queue
-        assert!(f.is_empty(), "extrapolated queue must protect against tiny fill");
+        assert!(
+            f.is_empty(),
+            "extrapolated queue must protect against tiny fill"
+        );
     }
 
     // ── outcome-folding tests ──
@@ -5261,9 +7418,18 @@ mod tests {
         c.on_instrument(&binary_instrument());
         c.on_orderbook(&book_ts("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)], 100));
         // Newer down ask 0.40 ×30 mirrors to up bid 0.60 and REPLACES the book.
-        c.on_orderbook(&book_ts("down", vec![(0.38, 20.0)], vec![(0.40, 30.0)], 200));
+        c.on_orderbook(&book_ts(
+            "down",
+            vec![(0.38, 20.0)],
+            vec![(0.40, 30.0)],
+            200,
+        ));
         let d = c.books.level_depth("up", Side::Buy, 0.60, 0.01);
-        assert!((d - 30.0).abs() < 1e-9, "expected single-count 30, got {}", d);
+        assert!(
+            (d - 30.0).abs() < 1e-9,
+            "expected single-count 30, got {}",
+            d
+        );
     }
 
     #[test]
@@ -5285,27 +7451,12 @@ mod tests {
 
         // Canonical Up becomes authoritative. A newer but slightly different
         // sibling mirror must not replace it and manufacture a queue depletion.
-        c.on_orderbook(&book_ts(
-            "up",
-            vec![(0.60, 50.0)],
-            vec![(0.62, 80.0)],
-            200,
-        ));
-        c.on_orderbook(&book_ts(
-            "down",
-            vec![(0.38, 20.0)],
-            vec![(0.40, 5.0)],
-            300,
-        ));
+        c.on_orderbook(&book_ts("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)], 200));
+        c.on_orderbook(&book_ts("down", vec![(0.38, 20.0)], vec![(0.40, 5.0)], 300));
         assert_eq!(c.books.level_depth("up", Side::Buy, 0.60, 0.01), 50.0);
         assert_eq!(c.folded_sibling_books_ignored, 1);
 
-        c.on_orderbook(&book_ts(
-            "up",
-            vec![(0.60, 40.0)],
-            vec![(0.62, 80.0)],
-            400,
-        ));
+        c.on_orderbook(&book_ts("up", vec![(0.60, 40.0)], vec![(0.62, 80.0)], 400));
         assert_eq!(c.books.level_depth("up", Side::Buy, 0.60, 0.01), 40.0);
     }
 
@@ -5317,7 +7468,11 @@ mod tests {
         c.on_orderbook(&book_ts("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)], 200));
         c.on_orderbook(&book_ts("up", vec![(0.60, 5.0)], vec![(0.62, 80.0)], 100)); // older → dropped
         let d = c.books.level_depth("up", Side::Buy, 0.60, 0.01);
-        assert!((d - 50.0).abs() < 1e-9, "stale snapshot must be dropped, got {}", d);
+        assert!(
+            (d - 50.0).abs() < 1e-9,
+            "stale snapshot must be dropped, got {}",
+            d
+        );
     }
 
     #[test]
@@ -5332,7 +7487,10 @@ mod tests {
         c.set_fold_outcomes(true);
         c.on_instrument(&binary_instrument());
         c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
-        let u = c.submit_order(&order("s", "down", Side::Sell, 0.40, 10.0, true, OrderType::Limit), 1);
+        let u = c.submit_order(
+            &order("s", "down", Side::Sell, 0.40, 10.0, true, OrderType::Limit),
+            1,
+        );
         assert_eq!(u.status, OrderStatus::Accepted);
         assert_eq!(u.symbol, "down");
         // Folded trade: down BUY @ 0.40 of 15 → canonical SELL up @ 0.60 of 15.
@@ -5341,7 +7499,11 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].symbol, "down");
         assert_eq!(f[0].side, Side::Sell);
-        assert!((f[0].filled_quantity - 5.0).abs() < 1e-9, "fill {}", f[0].filled_quantity);
+        assert!(
+            (f[0].filled_quantity - 5.0).abs() < 1e-9,
+            "fill {}",
+            f[0].filled_quantity
+        );
         assert!((f[0].avg_fill_price - 0.40).abs() < 1e-9);
     }
 
@@ -5358,19 +7520,103 @@ mod tests {
         c.set_fold_outcomes(true);
         c.on_instrument(&binary_instrument());
         c.on_orderbook(&book("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)]));
-        let u = c.submit_order(&order("t", "down", Side::Buy, 0.45, 10.0, false, OrderType::Limit), 1);
-        assert_eq!(u.status, OrderStatus::Filled, "down taker must fill, not rest");
+        let u = c.submit_order(
+            &order("t", "down", Side::Buy, 0.45, 10.0, false, OrderType::Limit),
+            1,
+        );
+        assert_eq!(
+            u.status,
+            OrderStatus::Filled,
+            "down taker must fill, not rest"
+        );
         assert_eq!(u.liquidity, Some(Liquidity::Taker));
         assert_eq!(u.symbol, "down");
         // Canonical fill @ up bid 0.60 → original down price 1−0.60 = 0.40.
-        assert!((u.avg_fill_price - 0.40).abs() < 1e-9, "down avg {} != 0.40", u.avg_fill_price);
+        assert!(
+            (u.avg_fill_price - 0.40).abs() < 1e-9,
+            "down avg {} != 0.40",
+            u.avg_fill_price
+        );
+    }
+
+    #[test]
+    fn durable_terminal_full_fill_survives_recent_fill_cache_expiry() {
+        let mut c = core();
+        c.configure_durable_terminal_status(true);
+        c.on_orderbook(&book("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)]));
+        c.submit_order(
+            &order(
+                "durable",
+                "up",
+                Side::Buy,
+                0.60,
+                10.0,
+                true,
+                OrderType::Limit,
+            ),
+            1,
+        );
+        let fills = c.on_trade_tick(&trade("up", Side::Sell, 0.60, 100.0));
+        assert_eq!(fills.len(), 1);
+        c.recent_fills.clear();
+        for now in [3_000_000_000, 4_000_000_000] {
+            let u = c.cancel_order(Exchange::Polymarket, "durable", now);
+            assert_eq!(u.status, OrderStatus::Filled);
+            assert_eq!(u.filled_quantity, 0.0);
+            assert!(u.trade_id.is_none());
+            assert_eq!(
+                u.order_audit.as_ref().unwrap().size_matched.as_deref(),
+                Some("10")
+            );
+            let q = c.reconcile_one("durable", "up", Side::Buy, false, now);
+            assert_eq!(q.status, OrderStatus::Filled);
+            assert_eq!(q.filled_quantity, 0.0);
+        }
+    }
+
+    #[test]
+    fn durable_terminal_partial_cancel_retry_never_becomes_full_fill() {
+        let mut c = core();
+        c.configure_durable_terminal_status(true);
+        c.on_orderbook(&book("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)]));
+        c.submit_order(
+            &order(
+                "partial",
+                "up",
+                Side::Buy,
+                0.60,
+                10.0,
+                true,
+                OrderType::Limit,
+            ),
+            1,
+        );
+        let fills = c.on_trade_tick(&trade("up", Side::Sell, 0.60, 54.0));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].filled_quantity, 4.0);
+        for now in [200, 300, 3_000_000_000] {
+            let u = c.cancel_order(Exchange::Polymarket, "partial", now);
+            assert_eq!(u.status, OrderStatus::Cancelled);
+            assert_eq!(u.filled_quantity, 0.0);
+            assert!(u.trade_id.is_none());
+            assert_eq!(
+                u.order_audit.as_ref().unwrap().size_matched.as_deref(),
+                Some("4")
+            );
+        }
+        assert!(c
+            .on_trade_tick(&trade("up", Side::Sell, 0.60, 100.0))
+            .is_empty());
     }
 
     #[test]
     fn matched_cant_cancel_replays_exact_maker_fill_idempotently() {
         let mut c = core();
         c.on_orderbook(&book("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)]));
-        let _ = c.submit_order(&order("a", "up", Side::Buy, 0.60, 10.0, true, OrderType::Limit), 1);
+        let _ = c.submit_order(
+            &order("a", "up", Side::Buy, 0.60, 10.0, true, OrderType::Limit),
+            1,
+        );
         // Big SELL @ 0.60 drains 50 ahead + fills our 10.
         let fills = c.on_trade_tick(&trade("up", Side::Sell, 0.60, 100.0));
         assert_eq!(fills.len(), 1);
@@ -5403,7 +7649,10 @@ mod tests {
     fn matched_cant_cancel_replays_latest_fragment_not_order_cumulative() {
         let mut c = core();
         c.on_orderbook(&book("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)]));
-        let _ = c.submit_order(&order("a", "up", Side::Buy, 0.60, 10.0, true, OrderType::Limit), 1);
+        let _ = c.submit_order(
+            &order("a", "up", Side::Buy, 0.60, 10.0, true, OrderType::Limit),
+            1,
+        );
 
         // The first trade drains the 50 shares ahead and fills four; the next
         // trade fills the remaining six under a distinct trade id.
@@ -5443,24 +7692,38 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_resting_accepted_gone_cancelled() {
+    fn reconcile_resting_accepted_unknown_uncertain() {
         let mut c = core();
         c.on_orderbook(&book("up", vec![(0.60, 50.0)], vec![(0.62, 80.0)]));
-        let _ = c.submit_order(&order("a", "up", Side::Buy, 0.60, 10.0, true, OrderType::Limit), 1);
-        let out = c.reconcile(&[("a".into(), "up".into(), Side::Buy, 0.60, None)], &[], 100);
+        let _ = c.submit_order(
+            &order("a", "up", Side::Buy, 0.60, 10.0, true, OrderType::Limit),
+            1,
+        );
+        let out = c.reconcile(
+            &[("a".into(), "up".into(), Side::Buy, 0.60, None)],
+            &[],
+            100,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].status, OrderStatus::Accepted);
-        let out2 = c.reconcile(&[("ghost".into(), "up".into(), Side::Buy, 0.60, None)], &[], 100);
-        assert_eq!(out2[0].status, OrderStatus::Cancelled);
+        let out2 = c.reconcile(
+            &[("ghost".into(), "up".into(), Side::Buy, 0.60, None)],
+            &[],
+            100,
+        );
+        assert_eq!(out2[0].status, OrderStatus::NewOrderTimeout);
         let out3 = c.reconcile(&[], &[("c".into(), "oid".into())], 100);
-        assert_eq!(out3[0].status, OrderStatus::Cancelled);
+        assert_eq!(out3[0].status, OrderStatus::CancelUncertain);
     }
 
     #[test]
     fn cancel_attribution_advances_queue() {
         let mut c = core();
         c.on_orderbook(&book("up", vec![(0.60, 100.0)], vec![(0.62, 80.0)]));
-        let _ = c.submit_order(&order("a", "up", Side::Buy, 0.60, 10.0, true, OrderType::Limit), 1);
+        let _ = c.submit_order(
+            &order("a", "up", Side::Buy, 0.60, 10.0, true, OrderType::Limit),
+            1,
+        );
         // Level shrinks 100→40 with no trades → 60 cancels; proportional
         // ahead_frac = q_ahead/level = 100/100 = 1 → q_ahead 100→40.
         c.on_orderbook(&book("up", vec![(0.60, 40.0)], vec![(0.62, 80.0)]));
@@ -5539,10 +7802,15 @@ mod tests {
             let mut c = core();
             c.configure_adverse_sel(4.0, 1.0); // strong tilt (|s|→1 either way)
             c.on_orderbook(&book("up", vec![(0.60, 100.0)], vec![(0.62, 100.0)]));
-            let u = c.submit_order(&order("a", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit), 1);
+            let u = c.submit_order(
+                &order("a", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit),
+                1,
+            );
             assert_eq!(u.status, OrderStatus::Accepted); // q_ahead=100, mid_at_sync=0.61
-            // Drain q_ahead 100→50 (no fill); records traded_since_sync=50.
-            assert!(c.on_trade_tick(&trade("up", Side::Sell, 0.60, 50.0)).is_empty());
+                                                         // Drain q_ahead 100→50 (no fill); records traded_since_sync=50.
+            assert!(c
+                .on_trade_tick(&trade("up", Side::Sell, 0.60, 50.0))
+                .is_empty());
             // Book: level cancels 100→30 (cancels = 100−50−30 = 20); the ask moves
             // to `ask_after` → the mid signal. base = q_ahead/l_prev = 50/100 = 0.5.
             c.on_orderbook(&book("up", vec![(0.60, 30.0)], vec![(ask_after, 100.0)]));
@@ -5551,10 +7819,16 @@ mod tests {
         };
         // ask 0.61 → mid fell 0.61→0.605 = ADVERSE for a bid: ahead_frac→1 →
         // q_ahead 50→30 (<40) → the toxic flow fills us.
-        assert!(!probe(0.61).is_empty(), "adverse move must advance queue → fill");
+        assert!(
+            !probe(0.61).is_empty(),
+            "adverse move must advance queue → fill"
+        );
         // ask 0.63 → mid rose 0.61→0.615 = FAVORABLE: ahead_frac→0 → q_ahead
         // holds at 50 (>40) → we miss (the move we'd have wanted).
-        assert!(probe(0.63).is_empty(), "favorable move must hold queue → no fill");
+        assert!(
+            probe(0.63).is_empty(),
+            "favorable move must hold queue → no fill"
+        );
     }
 
     #[test]
@@ -5566,12 +7840,17 @@ mod tests {
             let mut c = core();
             c.configure_book_through(1.0);
             c.on_orderbook(&book("up", vec![(0.55, 100.0)], vec![(0.57, 100.0)]));
-            let u = c.submit_order(&order("a", "up", Side::Buy, 0.55, 10.0, true, OrderType::Limit), 1);
+            let u = c.submit_order(
+                &order("a", "up", Side::Buy, 0.55, 10.0, true, OrderType::Limit),
+                1,
+            );
             assert_eq!(u.status, OrderStatus::Accepted); // q_ahead=100
             if with_trade {
                 // Small sell @ 0.55 — too small to fill via the trade path
                 // (over = 10−100 < 0) but it RECORDS the trade-cross gate.
-                assert!(c.on_trade_tick(&trade("up", Side::Sell, 0.55, 10.0)).is_empty());
+                assert!(c
+                    .on_trade_tick(&trade("up", Side::Sell, 0.55, 10.0))
+                    .is_empty());
             }
             c.on_orderbook(&book("up", vec![(0.55, 100.0)], vec![(0.54, 200.0)]))
         };
@@ -5579,8 +7858,14 @@ mod tests {
         assert_eq!(fills.len(), 1, "trade-confirmed cross → book-through fill");
         assert_eq!(fills[0].status, OrderStatus::Filled);
         assert_eq!(fills[0].liquidity, Some(Liquidity::Maker));
-        assert!((fills[0].avg_fill_price - 0.55).abs() < 1e-9, "fills at the limit (adverse)");
-        assert!(probe(false).is_empty(), "cross with NO trade is flicker → no fill");
+        assert!(
+            (fills[0].avg_fill_price - 0.55).abs() < 1e-9,
+            "fills at the limit (adverse)"
+        );
+        assert!(
+            probe(false).is_empty(),
+            "cross with NO trade is flicker → no fill"
+        );
     }
 
     #[test]
@@ -5594,7 +7879,9 @@ mod tests {
             1,
         );
         assert_eq!(accepted.status, OrderStatus::Accepted);
-        assert!(c.on_trade_tick(&trade("up", Side::Sell, 0.55, 10.0)).is_empty());
+        assert!(c
+            .on_trade_tick(&trade("up", Side::Sell, 0.55, 10.0))
+            .is_empty());
         let fills = c.on_orderbook(&book("up", vec![(0.55, 100.0)], vec![(0.54, 200.0)]));
         assert_eq!(fills.len(), 1);
 
@@ -5623,11 +7910,7 @@ mod tests {
 
         // The ten-share depletion only consumes the ten-share public queue.
         // With no leave-one-out credit there is no causal overflow to fill us.
-        let fills = c.on_orderbook(&book(
-            "up",
-            vec![(0.54, 10.0)],
-            vec![(0.56, 100.0)],
-        ));
+        let fills = c.on_orderbook(&book("up", vec![(0.54, 10.0)], vec![(0.56, 100.0)]));
         assert!(fills.is_empty());
         assert_eq!(c.orders["a"].q_ahead, 0.0);
         assert_eq!(c.orders["a"].remaining, 5.0);
@@ -5652,11 +7935,7 @@ mod tests {
         // raw ten-share depletion therefore contains 2.5 hidden-execution
         // shares and 7.5 cancels. At ahead_frac=1 the total reaches past q by
         // five, but the fill remains capped by the 2.5 execution shares.
-        let fills = c.on_orderbook(&book(
-            "up",
-            vec![(0.54, 10.0)],
-            vec![(0.56, 100.0)],
-        ));
+        let fills = c.on_orderbook(&book("up", vec![(0.54, 10.0)], vec![(0.56, 100.0)]));
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].status, OrderStatus::PartiallyFilled);
         assert_eq!(fills[0].filled_quantity, 2.5);
@@ -5696,11 +7975,7 @@ mod tests {
         assert!(c
             .on_trade_tick(&trade("up", Side::Sell, 0.55, 2.0))
             .is_empty());
-        let fills = c.on_orderbook(&book(
-            "up",
-            vec![(0.54, 10.0)],
-            vec![(0.56, 100.0)],
-        ));
+        let fills = c.on_orderbook(&book("up", vec![(0.54, 10.0)], vec![(0.56, 100.0)]));
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].status, OrderStatus::PartiallyFilled);
         assert!((fills[0].filled_quantity - 1.0).abs() < EPS);
@@ -5731,11 +8006,7 @@ mod tests {
         assert!(c
             .on_trade_tick(&trade("up", Side::Sell, 0.54, 20.0))
             .is_empty());
-        let fills = c.on_orderbook(&book(
-            "up",
-            vec![(0.54, 10.0)],
-            vec![(0.56, 100.0)],
-        ));
+        let fills = c.on_orderbook(&book("up", vec![(0.54, 10.0)], vec![(0.56, 100.0)]));
         assert!(fills.is_empty());
         assert_eq!(c.orders["a"].remaining, 5.0);
         assert_eq!(c.orders["a"].q_ahead, 0.0);
@@ -5759,11 +8030,7 @@ mod tests {
             OrderStatus::Accepted
         );
 
-        let fills = c.on_orderbook(&book(
-            "up",
-            vec![(0.54, 10.0)],
-            vec![(0.56, 100.0)],
-        ));
+        let fills = c.on_orderbook(&book("up", vec![(0.54, 10.0)], vec![(0.56, 100.0)]));
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].status, OrderStatus::PartiallyFilled);
         assert!((fills[0].filled_quantity - 2.5).abs() < EPS);
@@ -5793,11 +8060,7 @@ mod tests {
         // Only 40% of the level disappears. The high-confidence evidence gate
         // stays off, so the calibrated hidden-execution path supplies four
         // shares, two drain q_ahead and two partially fill the order.
-        let fills = c.on_orderbook(&book(
-            "up",
-            vec![(0.55, 6.0)],
-            vec![(0.55, 100.0)],
-        ));
+        let fills = c.on_orderbook(&book("up", vec![(0.55, 6.0)], vec![(0.55, 100.0)]));
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].status, OrderStatus::PartiallyFilled);
         assert!((fills[0].filled_quantity - 2.0).abs() < EPS);
@@ -5839,11 +8102,7 @@ mod tests {
         // The old bid level disappears while the mid moves up, in our favor.
         // This is consistent with cancellation/repricing, not an adverse maker
         // execution, so it may advance q but must not fill.
-        let fills = c.on_orderbook(&book(
-            "up",
-            vec![(0.56, 10.0)],
-            vec![(0.57, 100.0)],
-        ));
+        let fills = c.on_orderbook(&book("up", vec![(0.56, 10.0)], vec![(0.57, 100.0)]));
         assert!(fills.is_empty());
         assert_eq!(c.orders["a"].q_ahead, 0.0);
         assert_eq!(c.orders["a"].remaining, 5.0);
@@ -5857,24 +8116,14 @@ mod tests {
         c.configure_maker_order_audit(true);
         c.configure_replay_self_depth(1.0);
         c.configure_unexplained_depletion_execution(1.0);
-        c.on_orderbook(&book_ts(
-            "up",
-            vec![(0.55, 5.0)],
-            vec![(0.57, 100.0)],
-            10,
-        ));
+        c.on_orderbook(&book_ts("up", vec![(0.55, 5.0)], vec![(0.57, 100.0)], 10));
         let accepted = c.submit_order(
             &order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
             11,
         );
         assert_eq!(accepted.status, OrderStatus::Accepted);
 
-        let fills = c.on_orderbook(&book_ts(
-            "up",
-            vec![(0.54, 10.0)],
-            vec![(0.56, 100.0)],
-            100,
-        ));
+        let fills = c.on_orderbook(&book_ts("up", vec![(0.54, 10.0)], vec![(0.56, 100.0)], 100));
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].status, OrderStatus::Filled);
         let trade_id = fills[0].trade_id.clone();
@@ -5884,7 +8133,10 @@ mod tests {
         assert_eq!(cancel.trade_id, trade_id);
         assert_eq!(cancel.filled_quantity, 5.0);
         assert_eq!(c.matched_cant_cancel, 1);
-        assert_eq!(c.maker_order_audit_rows()[0].cancel_result, "matched_before_cancel");
+        assert_eq!(
+            c.maker_order_audit_rows()[0].cancel_result,
+            "matched_before_cancel"
+        );
     }
 
     #[test]
@@ -5895,12 +8147,7 @@ mod tests {
         c.configure_replay_self_depth(1.0);
         c.configure_unexplained_depletion_execution(1.0);
         c.configure_inferred_maker_residual(1.0, 0.001);
-        c.on_orderbook(&book_ts(
-            "up",
-            vec![(0.55, 5.0)],
-            vec![(0.57, 100.0)],
-            10,
-        ));
+        c.on_orderbook(&book_ts("up", vec![(0.55, 5.0)], vec![(0.57, 100.0)], 10));
         assert_eq!(
             c.submit_order(
                 &order("dust", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
@@ -5910,12 +8157,7 @@ mod tests {
             OrderStatus::Accepted
         );
 
-        let inferred = c.on_orderbook(&book_ts(
-            "up",
-            vec![(0.54, 10.0)],
-            vec![(0.56, 100.0)],
-            100,
-        ));
+        let inferred = c.on_orderbook(&book_ts("up", vec![(0.54, 10.0)], vec![(0.56, 100.0)], 100));
         assert_eq!(inferred.len(), 1);
         assert_eq!(inferred[0].status, OrderStatus::PartiallyFilled);
         assert!((inferred[0].filled_quantity - 4.995).abs() < EPS);
@@ -5926,13 +8168,7 @@ mod tests {
 
         // An aggregate public print cannot prove that this individual dust
         // allocation completed, so it remains physically resting.
-        let explicit = c.on_trade_tick(&trade_ts(
-            "up",
-            Side::Sell,
-            0.55,
-            1.0,
-            150,
-        ));
+        let explicit = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.55, 1.0, 150));
         assert!(explicit.is_empty());
         assert!((c.orders["dust"].remaining - 0.005).abs() < EPS);
         assert_eq!(c.inferred_maker_residual_orders_n, 1);
@@ -5971,11 +8207,7 @@ mod tests {
         assert_eq!(c.submit_order(&a, 1).status, OrderStatus::Accepted);
         assert_eq!(c.submit_order(&b, 1).status, OrderStatus::Accepted);
 
-        let fills = c.on_orderbook(&book(
-            "up",
-            vec![(0.54, 5.0)],
-            vec![(0.56, 100.0)],
-        ));
+        let fills = c.on_orderbook(&book("up", vec![(0.54, 5.0)], vec![(0.56, 100.0)]));
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].client_order_id, "a");
         assert_eq!(c.wallet_usdc_raw("iid-a"), Some(97.25));
@@ -5992,18 +8224,22 @@ mod tests {
         c.configure_maker_order_audit(true);
         c.configure_replay_self_depth(1.0);
         c.configure_unexplained_depletion_execution(1.0);
-        c.on_orderbook(&book(
-            "up",
-            vec![(0.55, 5.0)],
-            vec![(0.57, 100.0)],
-        ));
+        c.on_orderbook(&book("up", vec![(0.55, 5.0)], vec![(0.57, 100.0)]));
 
         // Reverse lexical coids prove allocation follows exchange arrival,
         // not BTreeMap/coid order. Both approximate leave-one-out queues reach
         // zero, but the public level supplied only five execution shares.
         assert_eq!(
             c.submit_order(
-                &order("z-older", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+                &order(
+                    "z-older",
+                    "up",
+                    Side::Buy,
+                    0.55,
+                    5.0,
+                    true,
+                    OrderType::Limit
+                ),
                 1,
             )
             .status,
@@ -6011,18 +8247,22 @@ mod tests {
         );
         assert_eq!(
             c.submit_order(
-                &order("a-newer", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
+                &order(
+                    "a-newer",
+                    "up",
+                    Side::Buy,
+                    0.55,
+                    5.0,
+                    true,
+                    OrderType::Limit
+                ),
                 2,
             )
             .status,
             OrderStatus::Accepted
         );
 
-        let fills = c.on_orderbook(&book(
-            "up",
-            vec![(0.54, 10.0)],
-            vec![(0.56, 100.0)],
-        ));
+        let fills = c.on_orderbook(&book("up", vec![(0.54, 10.0)], vec![(0.56, 100.0)]));
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].client_order_id, "z-older");
         assert_eq!(fills[0].filled_quantity, 5.0);
@@ -6049,12 +8289,7 @@ mod tests {
             let mut c = core();
             c.configure(Some(1.0), 2_000_000_000);
             c.configure_unexplained_depletion_execution(rate);
-            c.on_orderbook(&book_ts(
-                "up",
-                vec![(0.55, 10.0)],
-                vec![(0.57, 100.0)],
-                1,
-            ));
+            c.on_orderbook(&book_ts("up", vec![(0.55, 10.0)], vec![(0.57, 100.0)], 1));
             assert_eq!(
                 c.submit_order(
                     &order("a", "up", Side::Buy, 0.55, 5.0, true, OrderType::Limit),
@@ -6071,19 +8306,12 @@ mod tests {
                 // timed section; no fill is possible because q_before equals the
                 // entire causal depletion.
                 let base_ts = 3 + (i as u64) * 2;
-                let down = book_ts(
-                    "up",
-                    vec![(0.54, 10.0)],
-                    vec![(0.56, 100.0)],
-                    base_ts,
-                );
-                let restored = book_ts(
-                    "up",
-                    vec![(0.55, 10.0)],
-                    vec![(0.57, 100.0)],
-                    base_ts + 1,
-                );
-                let resting = c.orders.get_mut("a").expect("benchmark order remains resting");
+                let down = book_ts("up", vec![(0.54, 10.0)], vec![(0.56, 100.0)], base_ts);
+                let restored = book_ts("up", vec![(0.55, 10.0)], vec![(0.57, 100.0)], base_ts + 1);
+                let resting = c
+                    .orders
+                    .get_mut("a")
+                    .expect("benchmark order remains resting");
                 resting.q_ahead = 10.0;
                 resting.level_qty_at_sync = 10.0;
                 resting.mid_at_sync = 0.56;
@@ -6103,9 +8331,7 @@ mod tests {
 
         fn describe(label: &str, mut samples: Vec<u64>) {
             samples.sort_unstable();
-            let at = |fraction: f64| {
-                samples[((samples.len() - 1) as f64 * fraction) as usize]
-            };
+            let at = |fraction: f64| samples[((samples.len() - 1) as f64 * fraction) as usize];
             println!(
                 "SIMV2_RESYNC_BENCH profile={label} n={} median_ns={} p99_ns={} p999_ns={} max_ns={}",
                 samples.len(),
@@ -6134,9 +8360,7 @@ mod tests {
     fn benchmark_causal_maker_models_latency() {
         fn describe(label: &str, mut samples: Vec<u64>, max_depth: usize) {
             samples.sort_unstable();
-            let at = |fraction: f64| {
-                samples[((samples.len() - 1) as f64 * fraction) as usize]
-            };
+            let at = |fraction: f64| samples[((samples.len() - 1) as f64 * fraction) as usize];
             println!(
                 "SIMV2_CAUSAL_BENCH profile={label} n={} median_ns={} p99_ns={} p999_ns={} max_ns={} max_order_depth={} overflow=0 boundary={}",
                 samples.len(),
@@ -6251,8 +8475,14 @@ mod tests {
                 // active because each synthetic depletion fills only half.
                 c.books.update(
                     "up",
-                    vec![PriceLevel { price: 0.55, quantity: 5.0 }],
-                    vec![PriceLevel { price: 0.57, quantity: 100.0 }],
+                    vec![PriceLevel {
+                        price: 0.55,
+                        quantity: 5.0,
+                    }],
+                    vec![PriceLevel {
+                        price: 0.57,
+                        quantity: 100.0,
+                    }],
                 );
                 let resting = c.orders.get_mut("maker").unwrap();
                 resting.remaining = 10.0;
@@ -6273,7 +8503,15 @@ mod tests {
             c.on_orderbook(&book("up", vec![(0.60, 80.0)], vec![(0.62, 80.0)]));
             assert_eq!(
                 c.submit_order(
-                    &order("maker", "up", Side::Sell, 0.62, 10.0, true, OrderType::Limit),
+                    &order(
+                        "maker",
+                        "up",
+                        Side::Sell,
+                        0.62,
+                        10.0,
+                        true,
+                        OrderType::Limit
+                    ),
                     1,
                 )
                 .status,
@@ -6297,16 +8535,8 @@ mod tests {
         describe("trade_disabled", sample_trade(0.0, false, N), 1);
         describe("trade_toxicity_0p5", sample_trade(0.5, false, N), 1);
         describe("trade_exact_level", sample_trade(0.0, true, N), 1);
-        describe(
-            "queue_disabled",
-            sample_queue_lifecycle(0.0, false, N),
-            2,
-        );
-        describe(
-            "queue_fifo_1p0",
-            sample_queue_lifecycle(1.0, false, N),
-            2,
-        );
+        describe("queue_disabled", sample_queue_lifecycle(0.0, false, N), 2);
+        describe("queue_fifo_1p0", sample_queue_lifecycle(1.0, false, N), 2);
         describe(
             "queue_self_depth_replacement",
             sample_queue_lifecycle(1.0, true, N),
@@ -6314,7 +8544,11 @@ mod tests {
         );
         describe("book_markout_disabled", sample_book_markout(0.0, N), 1);
         describe("book_markout_0p78", sample_book_markout(0.78, N), 1);
-        describe("taker_self_clean_disabled", sample_taker_self_clean(0.0, N), 1);
+        describe(
+            "taker_self_clean_disabled",
+            sample_taker_self_clean(0.0, N),
+            1,
+        );
         describe("taker_self_clean_1p0", sample_taker_self_clean(1.0, N), 1);
     }
 
@@ -6327,23 +8561,44 @@ mod tests {
             let mut c = core();
             c.configure_fill_markout_vn(1.0);
             c.on_orderbook(&book("up", vec![(0.55, 10.0)], vec![(0.57, 100.0)]));
-            let u = c.submit_order(&order("a", "up", Side::Buy, 0.55, 10.0, true, OrderType::Limit), 1);
+            let u = c.submit_order(
+                &order("a", "up", Side::Buy, 0.55, 10.0, true, OrderType::Limit),
+                1,
+            );
             assert_eq!(u.status, OrderStatus::Accepted); // q_ahead=10
-            // SELL 20 @ 0.55 → over = 20−10 = 10 → fully fills (vn keeps quantity).
+                                                         // SELL 20 @ 0.55 → over = 20−10 = 10 → fully fills (vn keeps quantity).
             c.on_trade_tick_fwd(&trade("up", Side::Sell, 0.55, 20.0), fwd)
         };
         // Favorable: fwd mid 0.56 → markout +0.01 → BUY repriced to 0.56, FULL fill.
         let f = probe(Some(0.56));
         assert_eq!(f.len(), 1);
-        assert!((f[0].filled_quantity - 10.0).abs() < 1e-9, "vn keeps full fill {}", f[0].filled_quantity);
-        assert!((f[0].avg_fill_price - 0.56).abs() < 1e-9, "repriced adverse {}", f[0].avg_fill_price);
+        assert!(
+            (f[0].filled_quantity - 10.0).abs() < 1e-9,
+            "vn keeps full fill {}",
+            f[0].filled_quantity
+        );
+        assert!(
+            (f[0].avg_fill_price - 0.56).abs() < 1e-9,
+            "repriced adverse {}",
+            f[0].avg_fill_price
+        );
         assert_eq!(f[0].status, OrderStatus::Filled);
         // Adverse: fwd mid 0.54 → markout −0.01 → no reprice → fill at the limit.
         let fa = probe(Some(0.54));
-        assert!((fa[0].avg_fill_price - 0.55).abs() < 1e-9, "adverse at limit {}", fa[0].avg_fill_price);
-        assert!((fa[0].filled_quantity - 10.0).abs() < 1e-9, "adverse full fill");
+        assert!(
+            (fa[0].avg_fill_price - 0.55).abs() < 1e-9,
+            "adverse at limit {}",
+            fa[0].avg_fill_price
+        );
+        assert!(
+            (fa[0].filled_quantity - 10.0).abs() < 1e-9,
+            "adverse full fill"
+        );
         // No forward signal → no reprice → fill at the limit.
-        assert!((probe(None)[0].avg_fill_price - 0.55).abs() < 1e-9, "no-signal at limit");
+        assert!(
+            (probe(None)[0].avg_fill_price - 0.55).abs() < 1e-9,
+            "no-signal at limit"
+        );
     }
 
     #[test]
@@ -6401,7 +8656,9 @@ mod tests {
                 .status,
                 OrderStatus::Accepted
             );
-            assert!(c.on_trade_tick(&trade("up", Side::Sell, 0.55, 10.0)).is_empty());
+            assert!(c
+                .on_trade_tick(&trade("up", Side::Sell, 0.55, 10.0))
+                .is_empty());
             let fills = c.on_orderbook_fwd(
                 &book("up", vec![(0.55, 100.0)], vec![(0.54, 200.0)]),
                 fwd_mid,
@@ -6429,15 +8686,74 @@ mod tests {
     fn maker_markout_reprice_preserves_folded_penalty_direction() {
         // Original DOWN sell @0.40 is canonical UP buy @0.60. A favorable UP
         // move to 0.61 must reduce the original sell settlement to 0.39.
-        let (price, penalty) = maker_markout_reprice(
-            0.40,
-            Side::Sell,
-            Side::Buy,
-            0.60,
-            Some(0.61),
-            1.0,
-        );
+        let (price, penalty) =
+            maker_markout_reprice(0.40, Side::Sell, Side::Buy, 0.60, Some(0.61), 1.0);
         assert!((price - 0.39).abs() < 1e-9);
         assert!((penalty - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn staged_cancel_all_filters_exchange_and_has_stable_response_order() {
+        let mut c = core();
+        c.on_orderbook(&book("up", vec![(0.55, 100.0)], vec![(0.57, 100.0)]));
+        for coid in ["z", "a", "m"] {
+            assert_eq!(
+                c.submit_order(
+                    &order(coid, "up", Side::Buy, 0.54, 5.0, true, OrderType::Limit),
+                    1
+                )
+                .status,
+                OrderStatus::Accepted
+            );
+        }
+        let mut foreign = order(
+            "foreign",
+            "up",
+            Side::Buy,
+            0.54,
+            5.0,
+            true,
+            OrderType::Limit,
+        );
+        foreign.exchange = Exchange::Binance;
+        assert_eq!(c.submit_order(&foreign, 1).status, OrderStatus::Accepted);
+        let updates = c.cancel_all_owned(Exchange::Polymarket, "iid", &["up".into()], 2);
+        assert_eq!(
+            updates
+                .iter()
+                .map(|u| u.client_order_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "m", "z"]
+        );
+        assert!(c.orders.contains_key("foreign"));
+    }
+
+    #[test]
+    fn staged_cancel_all_overflow_applies_no_partial_batch() {
+        let mut c = core();
+        c.on_orderbook(&book("up", vec![(0.55, 100.0)], vec![(0.57, 100.0)]));
+        for n in 0..1025 {
+            assert_eq!(
+                c.submit_order(
+                    &order(
+                        &format!("batch-{n}"),
+                        "up",
+                        Side::Buy,
+                        0.54,
+                        5.0,
+                        true,
+                        OrderType::Limit
+                    ),
+                    1
+                )
+                .status,
+                OrderStatus::Accepted
+            );
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.cancel_all_owned(Exchange::Polymarket, "iid", &["up".into()], 2);
+        }));
+        assert!(result.is_err());
+        assert_eq!(c.orders.len(), 1025);
     }
 }
