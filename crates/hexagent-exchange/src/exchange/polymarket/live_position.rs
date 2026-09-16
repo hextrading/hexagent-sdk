@@ -309,8 +309,7 @@ impl Drop for RecoveryUpdateAck {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             if let Some(key) = self.key.take() {
-                self.health
-                    .enqueue_recovery_ack(self.generation, key);
+                self.health.enqueue_recovery_ack(self.generation, key);
             }
         }
     }
@@ -503,9 +502,9 @@ impl UserFeedHealth {
     pub fn begin_recovery_delivery(&self) -> u64 {
         self.set_recovering(true);
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        if let Err(error) = self.send_recovery_command(RecoveryDeliveryCommand::Begin {
-            reply: reply_tx,
-        }) {
+        if let Err(error) =
+            self.send_recovery_command(RecoveryDeliveryCommand::Begin { reply: reply_tx })
+        {
             log::error!("[user_feed_health] {error}");
             return 0;
         }
@@ -516,6 +515,20 @@ impl UserFeedHealth {
                 0
             }
         }
+    }
+
+    /// Background terminal REST replay joins the current recovery epoch.
+    /// This is a hint, not enrollment authority: the delivery owner rejects
+    /// stale or closed generations when the event is actually registered.
+    pub(crate) fn current_recovery_delivery_generation(&self) -> Result<Option<u64>, String> {
+        if !self.is_recovering() {
+            return Ok(None);
+        }
+        let generation = self.recovery_generation_fast.load(Ordering::Acquire);
+        if generation == 0 {
+            return Err("recovery delivery generation is not established".into());
+        }
+        Ok(Some(generation))
     }
 
     pub fn register_recovery_update(
@@ -593,10 +606,7 @@ impl UserFeedHealth {
     /// Broadcast siblings cannot consume the acknowledgement because the
     /// instance id is part of the key.
     pub fn acknowledge_recovery_update(&self, instance_id: &str, update: &OrderUpdate) -> bool {
-        self.acknowledge_recovery_update_key(
-            None,
-            RecoveryUpdateKey::new(instance_id, update),
-        )
+        self.acknowledge_recovery_update_key(None, RecoveryUpdateKey::new(instance_id, update))
     }
 
     fn acknowledge_recovery_update_key(
@@ -605,14 +615,13 @@ impl UserFeedHealth {
         key: RecoveryUpdateKey,
     ) -> bool {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        self
-            .send_recovery_command(RecoveryDeliveryCommand::Acknowledge {
-                generation,
-                key,
-                reply: reply_tx,
-            })
-            .and_then(|()| self.receive_recovery_reply(reply_rx))
-            .unwrap_or(false)
+        self.send_recovery_command(RecoveryDeliveryCommand::Acknowledge {
+            generation,
+            key,
+            reply: reply_tx,
+        })
+        .and_then(|()| self.receive_recovery_reply(reply_rx))
+        .unwrap_or(false)
     }
 
     pub fn recovery_update_ack(
@@ -945,6 +954,19 @@ impl LivePositionManager {
 
 #[cfg(test)]
 mod user_feed_health_tests {
+    #[test]
+    fn terminal_replay_generation_context_distinguishes_unready_healthy_and_new_epoch() {
+        let health = super::UserFeedHealth::new();
+        assert!(health.current_recovery_delivery_generation().is_err());
+        let first = health.begin_recovery_delivery();
+        assert_eq!(health.current_recovery_delivery_generation(), Ok(Some(first)));
+        assert!(health.finish_recovery_delivery_enrollment(first));
+        assert!(health.try_finish_recovery(health.recovery_certificate()));
+        assert_eq!(health.current_recovery_delivery_generation(), Ok(None));
+        let second = health.begin_recovery_delivery();
+        assert_ne!(first, second);
+        assert_eq!(health.current_recovery_delivery_generation(), Ok(Some(second)));
+    }
     use super::{UserFeedHealth, RECOVERY_DELIVERY_OWNER_CAPACITY};
     use crate::types::{now_ns, Exchange, OrderStatus, OrderUpdate, Side};
 
@@ -1420,8 +1442,8 @@ mod update_trade_dedup_tests {
             .unwrap()
             .as_secs();
         let restored = RestoredTrade {
-                fee_attributed: true,
-                fee_settlement: Default::default(),
+            fee_attributed: true,
+            fee_settlement: Default::default(),
             ownership: hexagent_account::account::shared_account::TradeOwnership {
                 account_id: "account".to_string(),
                 instance_id: "instance".to_string(),

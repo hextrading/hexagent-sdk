@@ -17,6 +17,7 @@ pub mod new_orders;
 pub mod probe;
 pub mod signer;
 pub mod signer_v2;
+pub mod taker_execution;
 pub mod market_info;
 mod network_incident;
 pub mod trade;

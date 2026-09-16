@@ -20,6 +20,7 @@ use anyhow::{anyhow, Result};
 use crossbeam_channel::Sender;
 use futures_util::{SinkExt, StreamExt};
 use hexagent_account::account::shared_account::normalize_order_id;
+use hexagent_account::account::shared_account::FrozenTradeExecution;
 use log::{debug, info, warn};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
@@ -29,11 +30,19 @@ use super::trade::{PolymarketTrade, SharedState};
 use crate::async_rt;
 use crate::types::*;
 
+#[path = "private_execution_cache.rs"]
+mod private_execution_cache;
+use private_execution_cache::{ExecutionAckLane, ExecutionAckTicket, PrivateExecutionCache};
+
 /// Current BTC crypto live default, matching the app's event fallback. Existing
 /// token curves take precedence; the selected amounts travel with the update.
 /// Non-crypto adapters must supply their own explicit basis instead of this policy.
 fn private_crypto_fee_fallback(settlement: FeeSettlement) -> FeeBasis {
-    FeeBasis { settlement, rate: 0.07, exponent: 1.0 }
+    FeeBasis {
+        settlement,
+        rate: 0.07,
+        exponent: 1.0,
+    }
 }
 
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
@@ -1343,6 +1352,7 @@ fn parse_user_event_checked(
     shared: &SharedState,
     live_position: &mut LivePositionManager,
     replay: &mut PrivateReplayOwner,
+    execution: Option<FrozenTradeExecution>,
 ) -> std::result::Result<Vec<OrderUpdate>, String> {
     let event_type = data
         .get("event_type")
@@ -1353,7 +1363,8 @@ fn parse_user_event_checked(
         "order" => parse_order_event(data, shared),
         "trade" => {
             validate_trade_event(data, shared)?;
-            let updates = parse_user_event_validated(data, shared, live_position, replay);
+            let updates =
+                parse_user_event_validated(data, shared, live_position, replay, execution);
             Ok(updates)
         }
         _ => Ok(Vec::new()),
@@ -1382,6 +1393,11 @@ struct PrivateEventDelta {
     kind: PrivateEventKind,
     payload: serde_json::Value,
     timing: LifecycleTiming,
+    /// Taker economics frozen before fast strategy delivery. The cold worker
+    /// receives exactly this scalar certificate through the existing lane.
+    execution: Option<FrozenTradeExecution>,
+    execution_ack: Option<ExecutionAckTicket>,
+    needs_execution_repair: bool,
 }
 
 impl PrivateEventDelta {
@@ -1403,6 +1419,9 @@ impl PrivateEventDelta {
             kind,
             payload,
             timing,
+            execution: None,
+            execution_ack: None,
+            needs_execution_repair: false,
         })
     }
 
@@ -1578,9 +1597,9 @@ fn trade_lifecycle_is_durably_covered(payload: &serde_json::Value, shared: &Shar
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct ReplayApplySummary {
-    applied: usize,
-    durable_skips: usize,
+pub(crate) struct ReplayApplySummary {
+    pub(crate) applied: usize,
+    pub(crate) durable_skips: usize,
 }
 
 enum PrivateApplyCommand {
@@ -1598,6 +1617,7 @@ enum PrivateApplyCommand {
     Replay {
         events: Vec<PrivateEventDelta>,
         recovery_generation: Option<u64>,
+        expected_recovery_certificate: Option<u64>,
         completion: tokio::sync::oneshot::Sender<std::result::Result<ReplayApplySummary, String>>,
     },
 }
@@ -1615,21 +1635,37 @@ pub(crate) struct PrivateColdCommand {
     identities: Vec<PrivateRouteIdentity>,
     durable_skips: usize,
     recovery_generation: Option<u64>,
+    expected_recovery_certificate: Option<u64>,
     completion:
         Option<tokio::sync::oneshot::Sender<std::result::Result<ReplayApplySummary, String>>>,
     routed_at: crate::latency::Instant,
     feedback: PrivateColdFeedback,
 }
 
-#[derive(Clone)]
-struct PrivateColdFeedback {
-    ack_tx: crossbeam_channel::Sender<Vec<PrivateRouteIdentity>>,
-    reconnect_generation: Arc<AtomicU64>,
-    reconnect_notify: Arc<tokio::sync::Notify>,
+/// One batch credit is owned by `PrivateRouteDedupe::repair_inflight`.
+/// The capacity-one reply cannot be overwritten; the original replay completion
+/// crosses back with the exact historical events and is released after delivery.
+struct PrivateExecutionRepairReply {
+    events: Vec<PrivateEventDelta>,
+    seeds: Vec<hexagent_account::account::shared_account::PrivateExecutionSeed>,
+    recovery_generation: Option<u64>,
+    expected_recovery_certificate: Option<u64>,
+    result: std::result::Result<ReplayApplySummary, String>,
+    completion:
+        Option<tokio::sync::oneshot::Sender<std::result::Result<ReplayApplySummary, String>>>,
 }
 
 #[derive(Clone)]
-struct PrivateApplyLane {
+struct PrivateColdFeedback {
+    ack_tx: crossbeam_channel::Sender<Vec<PrivateRouteIdentity>>,
+    repair_tx: crossbeam_channel::Sender<PrivateExecutionRepairReply>,
+    reconnect_generation: Arc<AtomicU64>,
+    reconnect_notify: Arc<tokio::sync::Notify>,
+    execution_ack: Option<ExecutionAckLane>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PrivateApplyLane {
     live_tx: crossbeam_channel::Sender<PrivateApplyCommand>,
     replay_tx: crossbeam_channel::Sender<PrivateApplyCommand>,
     reconnect_generation: Arc<AtomicU64>,
@@ -1647,6 +1683,7 @@ struct FastPrivateUpdate {
     update: OrderUpdate,
     identity: PrivateRouteIdentity,
     timing: LifecycleTiming,
+    execution: Option<FrozenTradeExecution>,
 }
 
 #[derive(Debug)]
@@ -1654,6 +1691,8 @@ struct PrivateRouteDedupe {
     capacity: usize,
     ranks: HashMap<u128, u8>,
     order: VecDeque<(u128, u8)>,
+    execution_cache: Option<PrivateExecutionCache>,
+    repair_inflight: bool,
 }
 
 struct RoutedPrivateBatch {
@@ -1668,6 +1707,8 @@ impl PrivateRouteDedupe {
             capacity: TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY,
             ranks: HashMap::with_capacity(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY),
             order: VecDeque::with_capacity(TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY),
+            execution_cache: None,
+            repair_inflight: false,
         }
     }
 
@@ -1676,7 +1717,7 @@ impl PrivateRouteDedupe {
             PrivateRouteIdentity::TradeLifecycle { fingerprint, rank } => self
                 .ranks
                 .get(fingerprint)
-                .is_some_and(|existing| *existing >= *rank),
+                .is_some_and(|existing| *existing >= 3 || *existing >= *rank),
         }
     }
 
@@ -1686,7 +1727,7 @@ impl PrivateRouteDedupe {
                 if self
                     .ranks
                     .get(&fingerprint)
-                    .is_some_and(|existing| *existing >= rank)
+                    .is_some_and(|existing| *existing >= 3 || *existing >= rank)
                 {
                     return;
                 }
@@ -1707,7 +1748,15 @@ impl PrivateRouteDedupe {
 fn private_route_fingerprint(kind: u8, parts: &[&str]) -> u128 {
     let mut left = 0xcbf29ce484222325_u64 ^ u64::from(kind);
     let mut right = 0x9e3779b97f4a7c15_u64 ^ u64::from(kind);
-    for part in parts {
+    for (index, part) in parts.iter().enumerate() {
+        let part = part.trim();
+        let part = if kind == b'o' || (kind == b'm' && index == 1) {
+            part.strip_prefix("0x")
+                .or_else(|| part.strip_prefix("0X"))
+                .unwrap_or(part)
+        } else {
+            part
+        };
         for byte in part.bytes().map(|byte| byte.to_ascii_lowercase()) {
             left ^= u64::from(byte);
             left = left.wrapping_mul(0x100000001b3);
@@ -1765,9 +1814,10 @@ fn private_failure_reason(data: &serde_json::Value) -> Option<String> {
 /// mirror only. No shared account transition, audit, logging, or persistence
 /// occurs here; the account actor can deliver these updates to StrategyAccount
 /// before beginning cold bookkeeping.
-fn route_private_event_fast(
+fn route_private_event_fast_owned(
     event: &PrivateEventDelta,
     shared: &SharedState,
+    cache: &mut PrivateExecutionCache,
 ) -> std::result::Result<Vec<FastPrivateUpdate>, String> {
     let data = event.payload();
     match event.kind {
@@ -1868,6 +1918,7 @@ fn route_private_event_fast(
             let mut timing = event.timing;
             timing.private_producer_ns = crate::types::monotonic_now_ns();
             Ok(vec![FastPrivateUpdate {
+                execution: None,
                 owner: shared
                     .strategy_owner(&ownership.instance_id)
                     .ok_or_else(|| {
@@ -1904,6 +1955,80 @@ fn route_private_event_fast(
             }])
         }
         PrivateEventKind::Trade => {
+            // A historical repair carries complete owner identity. Order/oid
+            // indexes may retire after the cold commit; this one-shot proof
+            // survives until the exact strategy delivery succeeds.
+            let repair_trade = data
+                .get("id")
+                .or_else(|| data.get("trade_id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let repair_order = taker_order_id(data).unwrap_or("");
+            if let Some(proof) = cache.repair_ownership(repair_trade, repair_order) {
+                let symbol = required_string(data, &["asset_id", "token_id"], "asset_id")?;
+                let side = strict_side(required_string(data, &["side"], "side")?, "side")?;
+                let quantity = strict_number(
+                    data.get("size").or_else(|| data.get("matched_amount")),
+                    "size",
+                )?;
+                let raw_price = strict_number(data.get("price"), "price")?;
+                let execution = cache
+                    .lookup(
+                        repair_trade,
+                        repair_order,
+                        symbol,
+                        side,
+                        quantity,
+                        raw_price,
+                        false,
+                    )?
+                    .ok_or_else(|| "historical repaired execution is missing".to_string())?;
+                let (status, rank) = match proof.status.as_str() {
+                    "CONFIRMED" => (OrderStatus::Filled, 3),
+                    "FAILED" => (OrderStatus::Failed, 4),
+                    "MINED" => (OrderStatus::PartiallyFilled, 2),
+                    _ => (OrderStatus::PartiallyFilled, 1),
+                };
+                let (_, incoming_status, incoming_rank) = private_status(data);
+                let (status, rank) = if rank < 3 && incoming_rank > rank {
+                    (incoming_status, incoming_rank)
+                } else {
+                    (status, rank)
+                };
+                let owner = shared.strategy_owner(&proof.instance_id).ok_or_else(|| {
+                    "historical repaired trade has no numeric strategy owner".to_string()
+                })?;
+                let mut timing = event.timing;
+                timing.private_producer_ns = crate::types::monotonic_now_ns();
+                return Ok(vec![FastPrivateUpdate {
+                    owner,
+                    identity: PrivateRouteIdentity::TradeLifecycle {
+                        fingerprint: private_route_fingerprint(b't', &[repair_trade]),
+                        rank,
+                    },
+                    execution: Some(execution),
+                    timing,
+                    update: OrderUpdate {
+                        order_slot: proof.order_slot,
+                        client_order_id: proof.client_order_id.clone(),
+                        exchange: Exchange::Polymarket,
+                        symbol: proof.token_id.clone(),
+                        side: proof.side,
+                        exchange_order_id: Some(proof.order_id.clone()),
+                        status,
+                        liquidity: Some(Liquidity::Taker),
+                        filled_quantity: proof.quantity,
+                        remaining_quantity: 0.0,
+                        avg_fill_price: execution.price,
+                        timestamp_ns: now_ns(),
+                        exchange_event_timestamp_ns: exchange_event_timestamp_ns(data),
+                        trade_id: Some(proof.trade_key.clone()),
+                        trade_fee: Some(execution.fee),
+                        order_audit: None,
+                        error: private_failure_reason(data),
+                    },
+                }]);
+            }
             let (status_name, status, rank) = private_status(data);
             // REST history commonly returns MATCHED even after the durable
             // ledger has advanced the same trade to MINED/CONFIRMED. Treat a
@@ -1980,10 +2105,19 @@ fn route_private_event_fast(
                             ));
                         }
                         let key = format!("{}:{}", trade_id, normalize_order_id(order_id));
+                        let maker_fee = cache
+                            .lookup(trade_id, order_id, symbol, side, quantity, price, true)?
+                            .map(|execution| execution.fee)
+                            .unwrap_or(TradeFee {
+                                settlement: shared.clob_version.fee_settlement(),
+                                usdc_fee: 0.0,
+                                shares_fee: 0.0,
+                            });
                         let produced_ns = now_ns();
                         let mut timing = event.timing;
                         timing.private_producer_ns = crate::types::monotonic_now_ns();
                         routed.push(FastPrivateUpdate {
+                            execution: None,
                             owner: shared.strategy_owner(&ownership.instance_id).ok_or_else(
                                 || {
                                     format!(
@@ -2007,7 +2141,7 @@ fn route_private_event_fast(
                                 timestamp_ns: produced_ns,
                                 exchange_event_timestamp_ns: exchange_timestamp_ns,
                                 trade_id: Some(key.clone()),
-                                trade_fee: None,
+                                trade_fee: Some(maker_fee),
                                 order_audit: None,
                                 error: failure_reason.clone(),
                             },
@@ -2048,10 +2182,86 @@ fn route_private_event_fast(
                             "taker trade ownership mismatch trade={trade_id} order_id={order_id}"
                         ));
                     }
+                    let cached =
+                        cache.lookup(trade_id, order_id, symbol, side, quantity, price, false)?;
+                    // Only terminal+durably acknowledged entries can be
+                    // reclaimed. Such a miss is historical, never a new fill
+                    // eligible for repricing or another strategy delivery.
+                    if cached.is_none() && shared.account_state.has_private_trade_identity(trade_id)
+                    {
+                        return Ok(Vec::new());
+                    }
+                    let execution = if let Some(execution) = cached {
+                        if execution.gross_notional.is_some() {
+                            if data
+                                .get("maker_orders")
+                                .and_then(serde_json::Value::as_array)
+                                .is_some_and(|legs| !legs.is_empty())
+                            {
+                                let normalized = super::taker_execution::normalize_taker_execution(
+                                    data,
+                                    |condition, left, right| {
+                                        shared
+                                            .account_state
+                                            .private_execution_binary_pair(condition, left, right)
+                                    },
+                                )
+                                .map_err(|error| error.to_string())?;
+                                if (normalized.gross_notional - execution.gross_notional.unwrap())
+                                    .abs()
+                                    > 1e-6
+                                {
+                                    return Err(
+                                        "private frozen actual execution notional changed".into()
+                                    );
+                                }
+                            } else if (price - execution.raw_price).abs() > 1e-7
+                                && (price - execution.price).abs() > 1e-7
+                            {
+                                return Err("private replay is missing execution evidence".into());
+                            }
+                        }
+                        execution
+                    } else {
+                        let fallback =
+                            private_crypto_fee_fallback(shared.clob_version.fee_settlement());
+                        let basis = shared
+                            .account_state
+                            .private_execution_fee_basis(symbol, fallback);
+                        let gross = if basis.settlement == FeeSettlement::CollateralV2 {
+                            super::taker_execution::normalize_taker_execution(
+                                data,
+                                |condition, left, right| {
+                                    shared
+                                        .account_state
+                                        .private_execution_binary_pair(condition, left, right)
+                                },
+                            )
+                            .map_err(|error| error.to_string())?
+                            .gross_notional
+                        } else {
+                            quantity * price
+                        };
+                        let execution =
+                            FrozenTradeExecution::new(price, quantity, gross, side, false, basis)
+                                .map_err(str::to_string)?;
+                        cache
+                            .insert(trade_id, order_id, symbol, side, quantity, false, execution)?;
+                        execution
+                    };
+                    if (side == Side::Buy && execution.price > ownership.price + 1e-6)
+                        || (side == Side::Sell && execution.price + 1e-6 < ownership.price)
+                        || quantity > ownership.quantity + 1e-6
+                    {
+                        return Err(
+                            "private actual execution violates owned order limit/quantity".into(),
+                        );
+                    }
                     let produced_ns = now_ns();
                     let mut timing = event.timing;
                     timing.private_producer_ns = crate::types::monotonic_now_ns();
                     routed.push(FastPrivateUpdate {
+                        execution: Some(execution),
                         owner: shared
                             .strategy_owner(&ownership.instance_id)
                             .ok_or_else(|| {
@@ -2071,11 +2281,11 @@ fn route_private_event_fast(
                             liquidity: Some(Liquidity::Taker),
                             filled_quantity: quantity,
                             remaining_quantity: 0.0,
-                            avg_fill_price: price,
+                            avg_fill_price: execution.price,
                             timestamp_ns: produced_ns,
                             exchange_event_timestamp_ns: exchange_timestamp_ns,
                             trade_id: Some(trade_id.to_string()),
-                            trade_fee: None,
+                            trade_fee: Some(execution.fee),
                             order_audit: None,
                             error: failure_reason,
                         },
@@ -2092,7 +2302,28 @@ fn route_private_event_fast(
     }
 }
 
+#[cfg(test)]
+fn route_private_event_fast(
+    event: &PrivateEventDelta,
+    shared: &SharedState,
+) -> std::result::Result<Vec<FastPrivateUpdate>, String> {
+    let mut cache = PrivateExecutionCache::new(shared.account_state.private_execution_seed())?;
+    route_private_event_fast_owned(event, shared, &mut cache)
+}
+
 impl PrivateApplyLane {
+    pub(crate) async fn replay_terminal_record(
+        &self,
+        record: serde_json::Value,
+        recovery_generation: Option<u64>,
+        recovery_certificate: u64,
+    ) -> std::result::Result<ReplayApplySummary, String> {
+        let event = PrivateEventDelta::classify(record)
+            .ok_or_else(|| "terminal audit record is not a private lifecycle event".to_string())?;
+        self.apply_replay_batch_scoped(vec![event], recovery_generation, Some(recovery_certificate))
+            .await
+    }
+
     fn dispatch_live(
         &self,
         events: Vec<PrivateEventDelta>,
@@ -2115,6 +2346,16 @@ impl PrivateApplyLane {
         events: Vec<PrivateEventDelta>,
         recovery_generation: Option<u64>,
     ) -> std::result::Result<ReplayApplySummary, String> {
+        self.apply_replay_batch_scoped(events, recovery_generation, None)
+            .await
+    }
+
+    async fn apply_replay_batch_scoped(
+        &self,
+        events: Vec<PrivateEventDelta>,
+        recovery_generation: Option<u64>,
+        expected_recovery_certificate: Option<u64>,
+    ) -> std::result::Result<ReplayApplySummary, String> {
         if events.is_empty() {
             return Ok(ReplayApplySummary::default());
         }
@@ -2122,6 +2363,7 @@ impl PrivateApplyLane {
         let mut command = PrivateApplyCommand::Replay {
             events,
             recovery_generation,
+            expected_recovery_certificate,
             completion,
         };
         loop {
@@ -2233,6 +2475,32 @@ fn dispatch_private_update(
     result
 }
 
+fn dispatch_repaired_private_update(
+    shared: &SharedState,
+    update_tx: &Sender<RoutedOrderUpdate>,
+    generation: Option<u64>,
+    instance: &str,
+    routed: RoutedOrderUpdate,
+) -> std::result::Result<(), String> {
+    if let Some(generation) = generation {
+        if shared.strategy_owner(instance) != Some(routed.owner) {
+            return Err("historical repaired owner route changed".into());
+        }
+        let buffered = shared
+            .user_feed_health
+            .register_recovery_update(generation, instance, &routed.update)
+            .map_err(|error| error.to_string())?;
+        if buffered {
+            return Ok(());
+        }
+        update_tx
+            .try_send(routed)
+            .map_err(|error| format!("historical repair strategy delivery unavailable: {error}"))
+    } else {
+        dispatch_private_update(shared, update_tx, None, routed)
+    }
+}
+
 fn route_private_batch(
     shared: &SharedState,
     update_tx: &Sender<RoutedOrderUpdate>,
@@ -2241,6 +2509,13 @@ fn route_private_batch(
     route_dedupe: &mut PrivateRouteDedupe,
     cold_committed: Option<&PrivateRouteDedupe>,
 ) -> std::result::Result<RoutedPrivateBatch, String> {
+    // Production installs the startup seed before spawning this owner. Test
+    // harnesses without a worker retain the same initialization boundary.
+    if route_dedupe.execution_cache.is_none() {
+        route_dedupe.execution_cache = Some(PrivateExecutionCache::new(
+            shared.account_state.private_execution_seed(),
+        )?);
+    }
     let mut cold_events = Vec::with_capacity(events.len());
     let mut cold_identities = Vec::with_capacity(events.len());
     let mut durable_skips = 0usize;
@@ -2249,12 +2524,49 @@ fn route_private_batch(
         let payload = event.payload();
         let route_started = crate::latency::Instant::now();
         let validate_started = crate::latency::Instant::now();
+        let needs_repair = event.kind == PrivateEventKind::Trade
+            && payload
+                .get("id")
+                .or_else(|| payload.get("trade_id"))
+                .and_then(serde_json::Value::as_str)
+                .zip(taker_order_id(payload))
+                .is_some_and(|(trade, order)| {
+                    route_dedupe
+                        .execution_cache
+                        .as_ref()
+                        .unwrap()
+                        .needs_repair(trade, order, false)
+                });
+        if needs_repair && route_dedupe.repair_inflight {
+            return Err(
+                "historical private execution repair is already in flight; replay required".into(),
+            );
+        }
+        let needs_delivery = event.kind == PrivateEventKind::Trade
+            && payload
+                .get("id")
+                .or_else(|| payload.get("trade_id"))
+                .and_then(serde_json::Value::as_str)
+                .zip(taker_order_id(payload))
+                .is_some_and(|(trade, order)| {
+                    route_dedupe
+                        .execution_cache
+                        .as_ref()
+                        .unwrap()
+                        .needs_delivery(trade, order, false)
+                });
         let durably_covered = event.kind == PrivateEventKind::Trade
+            && !needs_repair
+            && !needs_delivery
             && trade_lifecycle_is_durably_covered(payload, shared);
-        let routed = match if durably_covered {
+        let routed = match if durably_covered || needs_repair {
             Ok(Vec::new())
         } else {
-            route_private_event_fast(&event, shared)
+            route_private_event_fast_owned(
+                &event,
+                shared,
+                route_dedupe.execution_cache.as_mut().unwrap(),
+            )
         } {
             Ok(routed) => routed,
             Err(error) => {
@@ -2262,29 +2574,55 @@ fn route_private_batch(
                 return Err(error);
             }
         };
+        event.needs_execution_repair = needs_repair;
         crate::latency::record("polymarket.user.validate_route", validate_started);
         let cold_already_committed = !routed.is_empty()
             && cold_committed
                 .is_some_and(|dedupe| routed.iter().all(|routed| dedupe.seen(&routed.identity)));
         for routed in routed {
+            if let Some(execution) = routed.execution {
+                event.execution = Some(execution);
+                event.execution_ack = route_dedupe
+                    .execution_cache
+                    .as_ref()
+                    .unwrap()
+                    .ticket(routed.identity);
+            }
             if !cold_already_committed {
                 cold_identities.push(routed.identity);
             }
             if route_dedupe.seen(&routed.identity) {
                 continue;
             }
-            dispatch_private_update(
-                shared,
-                update_tx,
-                recovery_generation,
-                RoutedOrderUpdate {
-                    owner: routed.owner,
-                    update: routed.update,
-                    timing: routed.timing,
-                },
-            )?;
+            let update = RoutedOrderUpdate {
+                owner: routed.owner,
+                update: routed.update,
+                timing: routed.timing,
+            };
+            if needs_delivery {
+                let instance = route_dedupe
+                    .execution_cache
+                    .as_ref()
+                    .unwrap()
+                    .repair_instance(routed.identity)
+                    .ok_or_else(|| "historical repair owner certificate missing".to_string())?;
+                dispatch_repaired_private_update(
+                    shared,
+                    update_tx,
+                    recovery_generation,
+                    instance,
+                    update,
+                )?;
+            } else {
+                dispatch_private_update(shared, update_tx, recovery_generation, update)?;
+            }
             // Delivery is the commit edge for actor-local replay suppression.
             route_dedupe.remember(routed.identity);
+            route_dedupe
+                .execution_cache
+                .as_mut()
+                .unwrap()
+                .mark_delivered(routed.identity);
         }
         // Fast validation succeeded, so duplicate lifecycle traffic remains a
         // valid private-feed heartbeat even when an acknowledged cold commit
@@ -2305,6 +2643,9 @@ fn route_private_batch(
         }
         crate::latency::record("polymarket.user.validate_route_dispatch", route_started);
     }
+    if cold_events.iter().any(|event| event.needs_execution_repair) {
+        route_dedupe.repair_inflight = true;
+    }
     Ok(RoutedPrivateBatch {
         events: cold_events,
         identities: cold_identities,
@@ -2323,16 +2664,23 @@ fn apply_private_cold_batch_owned(
     for event in events {
         let payload = event.payload();
         let is_trade = event.kind == PrivateEventKind::Trade;
-        if (is_trade && replay.lifecycle_seen(payload))
-            || event
-                .terminal_trade_key()
-                .is_some_and(|key| replay.terminal_seen(&key))
+        if !event.needs_execution_repair
+            && ((is_trade && replay.lifecycle_seen(payload))
+                || event
+                    .terminal_trade_key()
+                    .is_some_and(|key| replay.terminal_seen(&key)))
         {
             crate::latency::record_ns("polymarket.user.owner_replay_skip", 1);
             continue;
         }
         let account_apply_started = crate::latency::Instant::now();
-        let parsed = parse_user_event_with_health_owned(payload, shared, live_position, replay);
+        let parsed = parse_user_event_with_health_owned(
+            payload,
+            shared,
+            live_position,
+            replay,
+            event.execution,
+        );
         crate::latency::record(
             if is_trade {
                 "polymarket.user.account_apply.trade"
@@ -2431,6 +2779,7 @@ pub(crate) fn apply_private_cold_command(
         identities,
         durable_skips,
         recovery_generation,
+        expected_recovery_certificate,
         completion,
         routed_at,
         feedback,
@@ -2448,12 +2797,174 @@ pub(crate) fn apply_private_cold_command(
     if result.is_ok() && !identities.is_empty() && feedback.ack_tx.try_send(identities).is_err() {
         crate::latency::record_ns("polymarket.user.cold_commit_ack_overflow", 1);
     }
-    if let Some(completion) = completion {
-        let _ = completion.send(result.map(|applied| ReplayApplySummary {
-            applied,
-            durable_skips,
-        }));
+    if result.is_ok() {
+        if let Some(ack) = feedback.execution_ack.as_ref() {
+            for event in &events {
+                if private_status(event.payload()).2 >= 3 {
+                    if let Some(ticket) = event.execution_ack {
+                        ack.acknowledge(ticket);
+                    }
+                }
+            }
+        }
     }
+    let mut result = result.map(|applied| ReplayApplySummary {
+        applied,
+        durable_skips,
+    });
+    if events.iter().any(|event| event.needs_execution_repair) {
+        let mut seeds = Vec::new();
+        let mut repair_events = Vec::new();
+        if result.is_ok() {
+            for mut event in events
+                .into_iter()
+                .filter(|event| event.needs_execution_repair)
+            {
+                let trade_id = event
+                    .payload()
+                    .get("id")
+                    .or_else(|| event.payload().get("trade_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let seed = shared
+                    .account_state
+                    .private_execution_seed_for_trade(trade_id);
+                match seed {
+                    Some(seed) if seed.execution.is_some() => {
+                        // Cold owner is authoritative if another lifecycle edge
+                        // overtook this historical request. Never replay FAILED
+                        // over a frozen CONFIRMED terminal certificate.
+                        event.payload["status"] =
+                            serde_json::Value::String(seed.ownership.status.clone());
+                        event.needs_execution_repair = false;
+                        seeds.push(seed);
+                        repair_events.push(event);
+                    }
+                    _ => {
+                        result = Err("historical trade fee attribution remains pending".into());
+                        break;
+                    }
+                }
+            }
+        }
+        let reply = PrivateExecutionRepairReply {
+            events: repair_events,
+            seeds,
+            recovery_generation,
+            expected_recovery_certificate,
+            result,
+            completion,
+        };
+        if let Err(error) = feedback.repair_tx.try_send(reply) {
+            // Full is a violated single-credit invariant; disconnected means
+            // the owner exited. Either case keeps the recovery certificate shut
+            // and returns a replay error, never a successful delivery barrier.
+            shared.user_feed_health.set_recovering(true);
+            feedback.reconnect_generation.fetch_add(1, Ordering::AcqRel);
+            feedback.reconnect_notify.notify_one();
+            if let Some(completion) = error.into_inner().completion {
+                let _ =
+                    completion.send(Err("historical execution repair reply unavailable".into()));
+            }
+        }
+    } else if let Some(completion) = completion {
+        let _ = completion.send(result);
+    }
+}
+
+fn finish_private_execution_repair(
+    shared: &SharedState,
+    update_tx: &Sender<RoutedOrderUpdate>,
+    route_dedupe: &mut PrivateRouteDedupe,
+    reply: PrivateExecutionRepairReply,
+) -> std::result::Result<(), String> {
+    route_dedupe.repair_inflight = false;
+    let PrivateExecutionRepairReply {
+        events,
+        seeds,
+        recovery_generation,
+        expected_recovery_certificate,
+        result,
+        completion,
+    } = reply;
+    let result = result.and_then(|summary| {
+        for seed in seeds {
+            route_dedupe
+                .execution_cache
+                .as_mut()
+                .unwrap()
+                .repair(seed)?;
+        }
+        validate_terminal_replay_scope(
+            &shared.user_feed_health,
+            expected_recovery_certificate,
+            recovery_generation,
+        )?;
+        for event in events {
+            let routed = route_private_event_fast_owned(
+                &event,
+                shared,
+                route_dedupe.execution_cache.as_mut().unwrap(),
+            )?;
+            if routed.is_empty() {
+                return Err("historical repaired trade has no strategy owner delivery".into());
+            }
+            for routed in routed {
+                if !route_dedupe.seen(&routed.identity) {
+                    let instance = route_dedupe
+                        .execution_cache
+                        .as_ref()
+                        .unwrap()
+                        .repair_instance(routed.identity)
+                        .ok_or_else(|| "historical repair owner certificate missing".to_string())?;
+                    dispatch_repaired_private_update(
+                        shared,
+                        update_tx,
+                        recovery_generation,
+                        instance,
+                        RoutedOrderUpdate {
+                            owner: routed.owner,
+                            update: routed.update,
+                            timing: routed.timing,
+                        },
+                    )?;
+                    route_dedupe.remember(routed.identity);
+                    route_dedupe
+                        .execution_cache
+                        .as_mut()
+                        .unwrap()
+                        .mark_delivered(routed.identity);
+                }
+                route_dedupe
+                    .execution_cache
+                    .as_mut()
+                    .unwrap()
+                    .acknowledge(routed.identity);
+            }
+        }
+        Ok(summary)
+    });
+    let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
+    if let Some(completion) = completion {
+        let _ = completion.send(result);
+    }
+    outcome
+}
+
+fn validate_terminal_replay_scope(
+    health: &super::live_position::UserFeedHealth,
+    expected_certificate: Option<u64>,
+    generation: Option<u64>,
+) -> std::result::Result<(), String> {
+    let Some(certificate) = expected_certificate else {
+        return Ok(());
+    };
+    if certificate != health.recovery_certificate()
+        || health.current_recovery_delivery_generation()? != generation
+    {
+        return Err("terminal audit recovery scope changed before private-owner delivery".into());
+    }
+    Ok(())
 }
 
 fn spawn_private_apply_worker(
@@ -2468,6 +2979,7 @@ fn spawn_private_apply_worker(
     // event, so no private lifecycle or recovery edge can be lost.
     let (cold_ack_tx, cold_ack_rx) =
         crossbeam_channel::bounded::<Vec<PrivateRouteIdentity>>(PRIVATE_APPLY_QUEUE_CAPACITY);
+    let (repair_tx, repair_rx) = crossbeam_channel::bounded::<PrivateExecutionRepairReply>(1);
     let reconnect_generation = Arc::new(AtomicU64::new(0));
     let reconnect_notify = Arc::new(tokio::sync::Notify::new());
     let lane = PrivateApplyLane {
@@ -2477,23 +2989,48 @@ fn spawn_private_apply_worker(
         reconnect_notify: Arc::clone(&reconnect_notify),
     };
     let account_id = shared.account_state.account_id().to_string();
+    let initial_execution_cache = PrivateExecutionCache::new(
+        shared
+            .account_state
+            .private_execution_seed_checked()
+            .map_err(|error| anyhow!(error))?,
+    )
+    .map_err(|error| anyhow!(error))?;
     let cold_feedback = PrivateColdFeedback {
+        execution_ack: Some(initial_execution_cache.ack_lane()),
         ack_tx: cold_ack_tx,
+        repair_tx,
         reconnect_generation: Arc::clone(&reconnect_generation),
         reconnect_notify: Arc::clone(&reconnect_notify),
     };
+    shared
+        .install_private_apply_lane(lane.clone())
+        .map_err(|error| anyhow!(error))?;
     let worker = std::thread::Builder::new()
         .name(format!("poly-private-owner-{}", account_id))
         .spawn(move || {
             crate::os_tune::pin_private_route("polymarket-private-owner", &account_id);
             crate::latency::prepare_polymarket_private_stages();
             let mut route_dedupe = PrivateRouteDedupe::new();
+            route_dedupe.execution_cache = Some(initial_execution_cache);
             let mut cold_committed = PrivateRouteDedupe::new();
             while !shutdown.load(Ordering::Relaxed) {
                 crossbeam_channel::select_biased! {
+                    recv(repair_rx) -> reply => match reply {
+                        Ok(reply) => {
+                            if let Err(error) = finish_private_execution_repair(&shared, &update_tx, &mut route_dedupe, reply) {
+                                shared.user_feed_health.set_recovering(true);
+                                shared.enqueue_private_apply_failure_diagnostic(&error);
+                                reconnect_generation.fetch_add(1, Ordering::AcqRel);
+                                reconnect_notify.notify_one();
+                            }
+                        }
+                        Err(_) => break,
+                    },
                     recv(cold_ack_rx) -> ack => match ack {
                         Ok(identities) => {
                             for identity in identities {
+                                if let Some(cache) = route_dedupe.execution_cache.as_mut() { cache.acknowledge(identity); }
                                 cold_committed.remember(identity);
                             }
                         }
@@ -2533,11 +3070,14 @@ fn spawn_private_apply_worker(
                                 identities: routed.identities,
                                 durable_skips: routed.durable_skips,
                                 recovery_generation,
+                                expected_recovery_certificate: None,
                                 completion: None,
                                 routed_at: crate::latency::Instant::now(),
                                 feedback: cold_feedback.clone(),
                             };
+                            let owns_repair_credit = cold.events.iter().any(|event| event.needs_execution_repair);
                             if shared.enqueue_private_cold(cold).is_err() {
+                                if owns_repair_credit { route_dedupe.repair_inflight = false; }
                                 shared.user_feed_health.set_recovering(true);
                                 warn!(
                                     "[PolyUserFeed] cold private-account queue saturated; forcing reconnect/replay"
@@ -2547,7 +3087,7 @@ fn spawn_private_apply_worker(
                             }
                         }
                         Ok(PrivateApplyCommand::RecoveryFence { generation, completion }) => {
-                            let finished = shared.user_feed_health
+                            let finished = !route_dedupe.repair_inflight && shared.user_feed_health
                                 .finish_recovery_delivery_enrollment(generation);
                             let _ = completion.send(finished);
                         }
@@ -2562,8 +3102,13 @@ fn spawn_private_apply_worker(
                         Ok(PrivateApplyCommand::Replay {
                             events,
                             recovery_generation,
+                            expected_recovery_certificate,
                             completion,
                         }) => {
+                            if let Err(error) = validate_terminal_replay_scope(&shared.user_feed_health, expected_recovery_certificate, recovery_generation) {
+                                let _ = completion.send(Err(error));
+                                continue;
+                            }
                             let routed = route_private_batch(
                                 &shared,
                                 &update_tx,
@@ -2589,11 +3134,14 @@ fn spawn_private_apply_worker(
                                         identities: routed.identities,
                                         durable_skips: routed.durable_skips,
                                         recovery_generation,
+                                        expected_recovery_certificate,
                                         completion: Some(completion),
                                         routed_at: crate::latency::Instant::now(),
                                         feedback: cold_feedback.clone(),
                                     };
+                                    let owns_repair_credit = cold.events.iter().any(|event| event.needs_execution_repair);
                                     if let Err(error) = shared.enqueue_private_cold(cold) {
+                                        if owns_repair_credit { route_dedupe.repair_inflight = false; }
                                         if let PrivateColdCommand {
                                             completion: Some(completion),
                                             ..
@@ -2627,6 +3175,7 @@ fn parse_user_event_with_health_owned(
     shared: &SharedState,
     live_position: &mut LivePositionManager,
     replay: &mut PrivateReplayOwner,
+    execution: Option<FrozenTradeExecution>,
 ) -> ParsedPrivateEvent {
     let recognized = data
         .get("event_type")
@@ -2641,7 +3190,7 @@ fn parse_user_event_with_health_owned(
             rejection_reason: None,
         };
     }
-    match parse_user_event_checked(data, shared, live_position, replay) {
+    match parse_user_event_checked(data, shared, live_position, replay, execution) {
         Ok(updates) => {
             let anomaly_started = crate::latency::Instant::now();
             resolve_valid_private_event_anomaly(data, shared);
@@ -2672,7 +3221,8 @@ fn parse_user_event_with_health(
 ) -> ParsedPrivateEvent {
     shared.with_test_live_position(|live_position| {
         let mut replay = PrivateReplayOwner::new();
-        let parsed = parse_user_event_with_health_owned(data, shared, live_position, &mut replay);
+        let parsed =
+            parse_user_event_with_health_owned(data, shared, live_position, &mut replay, None);
         shared.publish_live_position_watermark(live_position.last_match_time_secs());
         parsed
     })
@@ -2727,13 +3277,14 @@ pub(crate) fn parse_user_event(data: &serde_json::Value, shared: &SharedState) -
 /// Checked parser outcome for terminal order-audit backfill. Callers must not
 /// infer "parser rejected" from an empty update vector: valid lifecycle
 /// duplicates and already-applied records intentionally produce no update.
+#[cfg(test)]
 pub(crate) fn parse_user_event_diagnosed_owned(
     data: &serde_json::Value,
     shared: &SharedState,
     live_position: &mut LivePositionManager,
     replay: &mut PrivateReplayOwner,
 ) -> ParsedPrivateEvent {
-    parse_user_event_with_health_owned(data, shared, live_position, replay)
+    parse_user_event_with_health_owned(data, shared, live_position, replay, None)
 }
 
 #[cfg(test)]
@@ -2749,6 +3300,7 @@ fn parse_user_event_validated(
     shared: &SharedState,
     live_position: &mut LivePositionManager,
     replay: &mut PrivateReplayOwner,
+    execution: Option<FrozenTradeExecution>,
 ) -> Vec<OrderUpdate> {
     // Determine event type from the payload structure
     let event_type = match data
@@ -2958,19 +3510,21 @@ fn parse_user_event_validated(
 
                     let runtime_coid = shared.lookup_coid(mo_order_id).unwrap_or_default();
                     let transition_started = crate::latency::Instant::now();
-                    let transition = shared.account_state.apply_trade_transition_with_context_and_fee_basis(
-                        &leg_id,
-                        status_str,
-                        &runtime_coid,
-                        mo_order_id,
-                        &mo_asset_id,
-                        mo_side,
-                        mo_size,
-                        mo_price,
-                        true,
-                        match_time.business_secs,
+                    let transition = shared
+                        .account_state
+                        .apply_trade_transition_with_context_and_fee_basis(
+                            &leg_id,
+                            status_str,
+                            &runtime_coid,
+                            mo_order_id,
+                            &mo_asset_id,
+                            mo_side,
+                            mo_size,
+                            mo_price,
+                            true,
+                            match_time.business_secs,
                             private_crypto_fee_fallback(shared.clob_version.fee_settlement()),
-                );
+                        );
                     crate::latency::record(
                         "polymarket.user.account_trade_transition",
                         transition_started,
@@ -3102,19 +3656,38 @@ fn parse_user_event_validated(
 
                 let runtime_coid = shared.lookup_coid(taker_order_id).unwrap_or_default();
                 let transition_started = crate::latency::Instant::now();
-                let transition = shared.account_state.apply_trade_transition_with_context_and_fee_basis(
-                    trade_id,
-                    status_str,
-                    &runtime_coid,
-                    taker_order_id,
-                    &asset_id,
-                    side,
-                    matched_amount,
-                    price,
-                    false,
-                    match_time.business_secs,
-                    private_crypto_fee_fallback(shared.clob_version.fee_settlement()),
-                );
+                let transition = if let Some(execution) = execution {
+                    shared
+                        .account_state
+                        .apply_trade_transition_with_frozen_execution(
+                            trade_id,
+                            status_str,
+                            &runtime_coid,
+                            taker_order_id,
+                            &asset_id,
+                            side,
+                            matched_amount,
+                            false,
+                            match_time.business_secs,
+                            execution,
+                        )
+                } else {
+                    shared
+                        .account_state
+                        .apply_trade_transition_with_context_and_fee_basis(
+                            trade_id,
+                            status_str,
+                            &runtime_coid,
+                            taker_order_id,
+                            &asset_id,
+                            side,
+                            matched_amount,
+                            price,
+                            false,
+                            match_time.business_secs,
+                            private_crypto_fee_fallback(shared.clob_version.fee_settlement()),
+                        )
+                };
                 crate::latency::record(
                     "polymarket.user.account_trade_transition",
                     transition_started,
@@ -3165,6 +3738,7 @@ fn parse_user_event_validated(
                 if transition.owned_noop() {
                     return Vec::new();
                 }
+                let price = ownership.price;
                 let coid = ownership.client_order_id;
                 let live_position_started = crate::latency::Instant::now();
                 let lifecycle_advanced = record_trade_transition(
@@ -3807,6 +4381,13 @@ fn deliver_open_order_recovery(
         Err(pass.errors.join("; "))
     }
 }
+
+#[cfg(test)]
+#[path = "private_execution_repair_tests.rs"]
+mod execution_repair_tests;
+#[cfg(test)]
+#[path = "private_execution_route_tests.rs"]
+mod execution_route_tests;
 
 #[cfg(test)]
 #[path = "user_feed_recovery_bench.rs"]
@@ -4532,7 +5113,7 @@ mod tests {
         );
     }
 
-    fn test_shared() -> Arc<SharedState> {
+    pub(super) fn test_shared() -> Arc<SharedState> {
         let shared = super::super::trade::PolymarketTrade::new(
             "api-key",
             "c2VjcmV0",
@@ -4875,7 +5456,11 @@ mod tests {
         let (owner1_tx, owner1_rx) = crossbeam_channel::bounded(4);
         shared.install_strategy_private_routes(HashMap::from([(0, owner0_tx), (1, owner1_tx)]));
         let (root_tx, root_rx) = crossbeam_channel::bounded(4);
-        let frozen_fee = Some(TradeFee { settlement: FeeSettlement::CollateralV2, usdc_fee: 0.0175, shares_fee: 0.0 });
+        let frozen_fee = Some(TradeFee {
+            settlement: FeeSettlement::CollateralV2,
+            usdc_fee: 0.0175,
+            shares_fee: 0.0,
+        });
         let make = |coid: &str| RoutedOrderUpdate {
             owner: 0,
             update: OrderUpdate {
@@ -4938,8 +5523,23 @@ mod tests {
     fn private_v2_missing_metadata_routes_explicit_default_fee_without_gate() {
         let shared = test_shared();
         shared.account_state.register_instance("owner", 1.0);
-        shared.account_state.apply_physical_snapshot(100.0, HashMap::new()).unwrap();
-        shared.account_state.reserve_order("owner", "owner-1", "0xabc1", "TOKEN", Side::Buy, 14.0, 0.85, 700).unwrap();
+        shared
+            .account_state
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        shared
+            .account_state
+            .reserve_order(
+                "owner",
+                "owner-1",
+                "0xabc1",
+                "TOKEN",
+                Side::Buy,
+                14.0,
+                0.85,
+                700,
+            )
+            .unwrap();
         shared.register_order_id("owner-1", "0xabc1", "TOKEN");
         let mut event = serde_json::json!({
             "event_type": "trade", "id": "fallback-trade", "status": "MATCHED",
@@ -4953,26 +5553,64 @@ mod tests {
         assert!((fee.usdc_fee - 0.12495).abs() < 1e-9);
         assert_eq!(fee.shares_fee, 0.0);
         assert!(!shared.account_state.is_uncertain());
-        shared.account_state.register_token_fee_config_with_settlement(&["TOKEN".into()], 0.12, 2.0, FeeSettlement::CollateralV2).unwrap();
+        shared
+            .account_state
+            .register_token_fee_config_with_settlement(
+                &["TOKEN".into()],
+                0.12,
+                2.0,
+                FeeSettlement::CollateralV2,
+            )
+            .unwrap();
         event["status"] = serde_json::json!("FAILED");
         let failed = parse_user_event_with_health(&event, &shared);
         assert_eq!(failed.updates[0].trade_fee, Some(fee));
-        assert!((shared.account_state.instance_snapshot("owner").unwrap().cash - 100.0).abs() < 1e-9);
+        assert!(
+            (shared
+                .account_state
+                .instance_snapshot("owner")
+                .unwrap()
+                .cash
+                - 100.0)
+                .abs()
+                < 1e-9
+        );
         let encoded = serde_json::to_value(&first.updates[0]).unwrap();
         let decoded: OrderUpdate = serde_json::from_value(encoded.clone()).unwrap();
         assert_eq!(decoded.trade_fee, Some(fee));
         let mut old = encoded;
         old.as_object_mut().unwrap().remove("trade_fee");
-        assert!(serde_json::from_value::<OrderUpdate>(old).unwrap().trade_fee.is_none());
+        assert!(serde_json::from_value::<OrderUpdate>(old)
+            .unwrap()
+            .trade_fee
+            .is_none());
     }
 
     #[test]
     fn private_v2_trade_binds_protocol_before_legacy_registry_is_refreshed() {
         let shared = test_shared();
         shared.account_state.register_instance("owner", 1.0);
-        shared.account_state.apply_physical_snapshot(100.0, HashMap::new()).unwrap();
-        shared.account_state.register_token_fee_config(&["TOKEN".into()], 0.07, 1.0).unwrap();
-        shared.account_state.reserve_order("owner", "owner-1", "0xabc1", "TOKEN", Side::Buy, 14.0, 0.85, 700).unwrap();
+        shared
+            .account_state
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        shared
+            .account_state
+            .register_token_fee_config(&["TOKEN".into()], 0.07, 1.0)
+            .unwrap();
+        shared
+            .account_state
+            .reserve_order(
+                "owner",
+                "owner-1",
+                "0xabc1",
+                "TOKEN",
+                Side::Buy,
+                14.0,
+                0.85,
+                700,
+            )
+            .unwrap();
         shared.register_order_id("owner-1", "0xabc1", "TOKEN");
         let mut event = serde_json::json!({
             "event_type": "trade", "id": "v2-fee-trade", "status": "MATCHED",
@@ -4981,11 +5619,24 @@ mod tests {
         });
         let first = parse_user_event_with_health(&event, &shared);
         assert!(first.valid_business_event);
-        assert!(!shared.account_state.is_uncertain(), "previous event curve must avoid a metadata gate");
-        let fee = first.updates[0].trade_fee.expect("owner-selected fee travels with private update");
+        assert!(
+            !shared.account_state.is_uncertain(),
+            "previous event curve must avoid a metadata gate"
+        );
+        let fee = first.updates[0]
+            .trade_fee
+            .expect("owner-selected fee travels with private update");
         assert!((fee.usdc_fee - 0.12495).abs() < 1e-9);
         assert_eq!(fee.settlement, FeeSettlement::CollateralV2);
-        shared.account_state.register_token_fee_config_with_settlement(&["TOKEN".into()], 0.12, 2.0, crate::types::FeeSettlement::CollateralV2).unwrap();
+        shared
+            .account_state
+            .register_token_fee_config_with_settlement(
+                &["TOKEN".into()],
+                0.12,
+                2.0,
+                crate::types::FeeSettlement::CollateralV2,
+            )
+            .unwrap();
         for status in ["MINED", "CONFIRMED", "CONFIRMED"] {
             event["status"] = serde_json::json!(status);
             parse_user_event_with_health(&event, &shared);
@@ -4994,7 +5645,10 @@ mod tests {
             assert!((owner.positions["TOKEN"] - 14.0).abs() < 1e-9);
         }
         let row = shared.account_state.restored_trades().pop().unwrap();
-        assert_eq!(row.fee_settlement, crate::types::FeeSettlement::CollateralV2);
+        assert_eq!(
+            row.fee_settlement,
+            crate::types::FeeSettlement::CollateralV2
+        );
         assert!((row.usdc_fee - 0.12495).abs() < 1e-9);
         assert_eq!(row.shares_fee, 0.0);
     }
@@ -5009,7 +5663,12 @@ mod tests {
             .unwrap();
         shared
             .account_state
-            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
+            .register_token_fee_config_with_settlement(
+                &["TOKEN".to_string()],
+                0.0,
+                1.0,
+                crate::types::FeeSettlement::CollateralV2,
+            )
             .unwrap();
         shared
             .account_state
@@ -5029,13 +5688,14 @@ mod tests {
             serde_json::json!({
                 "event_type": "trade",
                 "id": "fast-route-trade",
+                "market": "test-condition",
                 "status": "MATCHED",
                 "asset_id": "TOKEN",
                 "side": "BUY",
                 "size": "2",
                 "price": "0.5",
                 "taker_order_id": "0xabc1",
-                "maker_orders": []
+                "maker_orders": [{"order_id":"other", "asset_id":"TOKEN", "side":"SELL", "matched_amount":"2", "price":"0.5"}]
             }),
             LifecycleTiming {
                 private_ws_received_ns: 10,
@@ -5084,7 +5744,12 @@ mod tests {
             .unwrap();
         shared
             .account_state
-            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
+            .register_token_fee_config_with_settlement(
+                &["TOKEN".to_string()],
+                0.0,
+                1.0,
+                crate::types::FeeSettlement::CollateralV2,
+            )
             .unwrap();
         shared
             .account_state
@@ -5104,13 +5769,14 @@ mod tests {
             PrivateEventDelta::classify(serde_json::json!({
                 "event_type": "trade",
                 "id": "cold-ack-trade",
+                "market": "test-condition",
                 "status": "MATCHED",
                 "asset_id": "TOKEN",
                 "side": "BUY",
                 "size": "2",
                 "price": "0.5",
                 "taker_order_id": "0xabc1",
-                "maker_orders": []
+                "maker_orders": [{"order_id":"other", "asset_id":"TOKEN", "side":"SELL", "matched_amount":"2", "price":"0.5"}]
             }))
             .unwrap()
         };
@@ -5158,7 +5824,12 @@ mod tests {
             .unwrap();
         shared
             .account_state
-            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
+            .register_token_fee_config_with_settlement(
+                &["TOKEN".to_string()],
+                0.0,
+                1.0,
+                crate::types::FeeSettlement::CollateralV2,
+            )
             .unwrap();
         shared
             .account_state
@@ -5348,7 +6019,12 @@ mod tests {
             .apply_physical_snapshot(100.0, HashMap::new());
         shared
             .account_state
-            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
+            .register_token_fee_config_with_settlement(
+                &["TOKEN".to_string()],
+                0.0,
+                1.0,
+                crate::types::FeeSettlement::CollateralV2,
+            )
             .unwrap();
         shared
             .account_state
@@ -5423,7 +6099,12 @@ mod tests {
             .apply_physical_snapshot(200.0, HashMap::new());
         shared
             .account_state
-            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
+            .register_token_fee_config_with_settlement(
+                &["TOKEN".to_string()],
+                0.0,
+                1.0,
+                crate::types::FeeSettlement::CollateralV2,
+            )
             .unwrap();
         shared
             .account_state
@@ -5650,7 +6331,12 @@ mod tests {
             .apply_physical_snapshot(200.0, HashMap::new());
         shared
             .account_state
-            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
+            .register_token_fee_config_with_settlement(
+                &["TOKEN".to_string()],
+                0.0,
+                1.0,
+                crate::types::FeeSettlement::CollateralV2,
+            )
             .unwrap();
         for (instance, coid, oid) in [
             ("maker-owner", "maker-coid", "0xB001"),
@@ -5733,7 +6419,12 @@ mod tests {
             .apply_physical_snapshot(100.0, HashMap::new());
         shared
             .account_state
-            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
+            .register_token_fee_config_with_settlement(
+                &["TOKEN".to_string()],
+                0.0,
+                1.0,
+                crate::types::FeeSettlement::CollateralV2,
+            )
             .unwrap();
         shared
             .account_state
@@ -5953,7 +6644,12 @@ mod tests {
             .unwrap();
         shared
             .account_state
-            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
+            .register_token_fee_config_with_settlement(
+                &["TOKEN".to_string()],
+                0.0,
+                1.0,
+                crate::types::FeeSettlement::CollateralV2,
+            )
             .unwrap();
         shared
             .account_state
