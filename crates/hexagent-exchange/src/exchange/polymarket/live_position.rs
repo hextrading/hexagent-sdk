@@ -50,7 +50,10 @@ const RECOVERY_PENDING_CAPACITY: usize = 16_384;
 ///   it does not by itself make inventory unknown or require quote pauses.
 #[derive(Debug)]
 pub struct UserFeedHealth {
-    recovering: AtomicBool,
+    /// Low bit is the gate; upper bits advance on every recovery assertion.
+    /// A recovery completion must CAS the certificate captured before its work,
+    /// so it cannot overwrite a concurrent private-owner failure.
+    recovering_state: AtomicU64,
     /// Wall-clock edge timestamp for the current recovery interval. Strategies
     /// use it to pause new orders immediately while retaining resting maker
     /// orders across short reconnects.
@@ -324,7 +327,7 @@ impl UserFeedHealth {
             Arc::clone(&recovery_generation_fast),
         );
         Self {
-            recovering: AtomicBool::new(true),
+            recovering_state: AtomicU64::new(1),
             recovering_since_ns: AtomicU64::new(now_ns()),
             inventory_uncertain: AtomicBool::new(false),
             gap_replay_degraded: AtomicBool::new(false),
@@ -405,18 +408,55 @@ impl UserFeedHealth {
         }
     }
     pub fn is_recovering(&self) -> bool {
-        self.recovering.load(Ordering::Acquire)
+        self.recovering_state.load(Ordering::Acquire) & 1 != 0
     }
+
+    /// Capture before the gap/audit/delivery proof begins. Every subsequent
+    /// recovery assertion invalidates it, even if the gate was already closed.
+    pub fn recovery_certificate(&self) -> u64 {
+        self.recovering_state.load(Ordering::Acquire)
+    }
+
+    /// Clear only the recovery assertion for which the caller obtained proof.
+    /// The same atomic word carries the gate and revision: checking a separate
+    /// epoch followed by an unconditional boolean store would lose a failure.
+    pub fn try_finish_recovery(&self, certificate: u64) -> bool {
+        if certificate & 1 == 0 || certificate == u64::MAX {
+            return false;
+        }
+        self.recovering_state
+            .compare_exchange(
+                certificate,
+                certificate & !1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        // Keep the edge timestamp while healthy. It is ignored by readers and
+        // replaced on the next false→true edge; clearing it here could erase a
+        // concurrently published new recovery timestamp after the CAS.
+    }
+
     pub fn set_recovering(&self, v: bool) {
         if v {
-            if !self.recovering.swap(true, Ordering::AcqRel) {
-                self.recovering_since_ns.store(now_ns(), Ordering::Release);
-            } else if self.recovering_since_ns.load(Ordering::Acquire) == 0 {
-                self.recovering_since_ns.store(now_ns(), Ordering::Release);
-            }
+            self.recovering_state
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    if state & 1 == 0 {
+                        // Publish the edge clock before the new paused bit.
+                        // An acquiring strategy must not use the previous
+                        // interval's clock and cancel before this grace ends.
+                        self.recovering_since_ns
+                            .fetch_max(now_ns(), Ordering::Release);
+                    }
+                    // Exhaustion stays permanently closed instead of wrapping
+                    // and making an ancient certificate valid again.
+                    Some(state.saturating_add(2) | 1)
+                })
+                .expect("recovery assertion always supplies a state");
         } else {
-            self.recovering.store(false, Ordering::Release);
-            self.recovering_since_ns.store(0, Ordering::Release);
+            // Compatibility for callers that already hold current proof.
+            // Asynchronous recovery uses its earlier captured certificate.
+            let _ = self.try_finish_recovery(self.recovery_certificate());
         }
     }
     /// Elapsed wall-clock recovery time. Returns zero while healthy and also
@@ -960,6 +1000,74 @@ mod user_feed_health_tests {
         assert!(h.recovering_for_ns(now_ns().saturating_add(1)) > 0);
         h.set_recovering(false);
         assert_eq!(h.recovering_for_ns(now_ns()), 0);
+    }
+
+    #[test]
+    fn recovery_completion_cannot_clear_a_new_failure_while_already_paused() {
+        let h = UserFeedHealth::new();
+        let certificate = h.recovery_certificate();
+        h.set_recovering(true);
+        assert!(!h.try_finish_recovery(certificate));
+        assert!(h.is_recovering());
+        assert!(h.try_finish_recovery(h.recovery_certificate()));
+        assert!(!h.is_recovering());
+        assert!(!h.try_finish_recovery(certificate));
+    }
+
+    #[test]
+    fn recovery_certificate_is_single_use_and_new_disconnect_invalidates_it() {
+        let h = UserFeedHealth::new();
+        let certificate = h.recovery_certificate();
+        assert!(h.try_finish_recovery(certificate));
+        assert!(!h.try_finish_recovery(certificate));
+        h.set_recovering(true);
+        assert!(!h.try_finish_recovery(certificate));
+        assert!(h.is_recovering());
+        assert!(h.recovering_for_ns(now_ns().saturating_add(1)) > 0);
+    }
+
+    #[test]
+    fn concurrent_recovery_completion_never_overwrites_private_owner_failure() {
+        let h = UserFeedHealth::new();
+        for _ in 0..32 {
+            let certificate = h.recovery_certificate();
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    h.set_recovering(true);
+                });
+                barrier.wait();
+                let _ = h.try_finish_recovery(certificate);
+            });
+            assert!(h.is_recovering());
+        }
+    }
+
+    #[test]
+    fn recovery_certificates_are_account_local() {
+        let first = UserFeedHealth::new();
+        let second = UserFeedHealth::new();
+        let first_certificate = first.recovery_certificate();
+        let second_certificate = second.recovery_certificate();
+        first.set_recovering(true);
+        assert!(!first.try_finish_recovery(first_certificate));
+        assert!(second.try_finish_recovery(second_certificate));
+        assert!(first.is_recovering());
+        assert!(!second.is_recovering());
+    }
+
+    #[test]
+    fn recovery_revision_exhaustion_stays_closed() {
+        let h = UserFeedHealth::new();
+        h.recovering_state
+            .store(u64::MAX - 2, std::sync::atomic::Ordering::Release);
+        let certificate = h.recovery_certificate();
+        h.set_recovering(true);
+        assert!(!h.try_finish_recovery(certificate));
+        assert!(!h.try_finish_recovery(h.recovery_certificate()));
+        h.set_recovering(false);
+        assert!(h.is_recovering());
     }
 
     #[test]
