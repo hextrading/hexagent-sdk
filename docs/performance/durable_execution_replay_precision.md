@@ -38,3 +38,42 @@ bounded overflow, ordering, replay and instance isolation. No timeout or existin
 risk assertion was relaxed. Live verification must confirm anomaly clearance,
 normal next-event split/quoting, unchanged durable economics, and a fresh fixed
 30-minute observation after deployment.
+
+## Recovery-aware replay deduplication
+
+The next restart exposed a separate recovery defect: durable lifecycle coverage,
+route commit acknowledgements and cold replay caches could all suppress a trade
+whose lifecycle was already confirmed but whose ownership/private-event anomaly
+still required validation. Four persisted replay anchors correctly retained the
+REST range; repeated successful sweeps nevertheless skipped the repair.
+
+Private replay now treats an exact pending anomaly (including maker leg keys) as
+requiring the existing cold validator. It bypasses those three cold-work skip
+conditions, while retaining strategy-delivery deduplication. Successful parsing
+and normal account transition alone clear the exact anomaly; malformed events,
+foreign identity and unrelated anomaly keys remain blocked. The previous exact
+frozen-execution proof remains required. No operator clearing or economics edit
+is involved.
+
+No mutable field or queue is added. Existing immutable anomaly snapshots are
+published by cold account transactions; the private route/cold owners read them.
+An existing release-published uncertainty flag is an advisory replay hint only;
+healthy traffic returns after one atomic read. Existing live/replay lanes remain
+bounded at 1024 with live priority and replay acknowledgement/backpressure;
+owner-local replay caches retain their capacities and ordering. Quote/dispatch
+processing and affinity are unchanged. Further removal of the legacy shared
+ledger high-water lookup should publish owner-specific lifecycle certificates,
+with the same repair and delivery barriers, rather than adding new shared gates.
+
+Three regressions cover all three dedupe layers, malformed retry, retired trade
+replay, duplicate delivery/economics and unrelated instance/anomaly isolation.
+The first two failed against the previous SDK before the repair. The full
+exchange suite also covers overflow, reconnect/replay and ordering.
+
+Paired macOS debug measurement, alternating exact pre-change helper and new
+helper over the same healthy durable replay (20,000 events each). Boundary is
+private lifecycle high-water lookup including the anomaly hint, not quote work:
+old/new P50 4142/4379 ns, P99 4530/4602 ns, P999 25932/25436 ns, max
+78456/65294 ns. Queue depth/overflow 0/0 (synchronous lookup only). This small
+local overhead does not establish production end-to-end improvement; live
+comparison remains required.

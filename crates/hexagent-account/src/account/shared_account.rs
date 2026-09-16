@@ -17622,6 +17622,26 @@ impl SharedAccount {
         })
     }
 
+    /// Published anomaly snapshots are read only by private replay owners.
+    /// A retained lifecycle is not a recovery certificate while its exact
+    /// venue trade (including maker legs) still needs validated cold replay.
+    /// No account lock, allocation or economic mutation occurs here.
+    pub fn private_trade_requires_revalidation(&self, venue_trade_id: &str) -> bool {
+        // The release-published control flag is only a cold-replay hint,
+        // never a strategy admission gate. Healthy traffic avoids ArcSwap reads.
+        if venue_trade_id.is_empty() || !self.uncertain_fast.load(Ordering::Acquire) {
+            return false;
+        }
+        let matches = |key: &str| {
+            key == venue_trade_id
+                || key.strip_prefix(venue_trade_id).is_some_and(|tail| tail.starts_with(':'))
+        };
+        self.anomalous_trade_keys.load().iter().any(|key| matches(key))
+            || self.anomalous_private_event_keys.load().iter().any(|key| {
+                key.strip_prefix("trade:").is_some_and(matches)
+            })
+    }
+
     /// Non-blocking lifecycle high-water lookup for the authenticated private
     /// owner route. A durable later edge covers an earlier replay edge, while
     /// conflicting terminal states never cover one another. A contended shard
