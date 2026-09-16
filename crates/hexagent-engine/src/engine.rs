@@ -13710,6 +13710,9 @@ impl PolyAccountConnectionRoutes {
             self.admission_last_publish_ns = now;
         }
         if transitioned || now.saturating_sub(self.admission_last_diagnostic_ns) >= 30_000_000_000 {
+            // Diagnostics must use the same epoch namespace as strategy
+            // messages, including ticks that do not publish a heartbeat.
+            snapshot.epoch = self.admission_epoch;
             if let Some(sender) = &self.health_diagnostic {
                 try_submit_execution_diagnostic(sender, ExecutionDiagnostic::Admission {
                     account: Arc::clone(&self.health_account), snapshot,
@@ -17486,6 +17489,35 @@ mod market_router_tests {
         assert_eq!(published.owner, 7);
         assert!(published.update.timestamp_ns >= before);
         assert!(published.update.timestamp_ns <= after);
+    }
+
+    #[test]
+    fn periodic_admission_diagnostic_keeps_last_published_strategy_epoch() {
+        let (publisher, snapshots) = snapshot_lane();
+        let (diagnostic_tx, diagnostics) = bounded(4);
+        let mut routes = PolyAccountConnectionRoutes {
+            health: Some(AccountExecutionAdmission::new(1, 1, now_ns())),
+            health_diagnostic: Some(diagnostic_tx),
+            admission_publishers: vec![publisher],
+            admission_epoch: 1000,
+            ..Default::default()
+        };
+        routes.refresh_health(now_ns());
+        let published = snapshots.try_recv().unwrap();
+        let ExecutionDiagnostic::Admission { snapshot: first, .. } =
+            diagnostics.try_recv().unwrap() else { panic!("admission diagnostic expected") };
+        assert_eq!(first.epoch, published.epoch);
+
+        // Force a diagnostics-only tick independently of test scheduler delay.
+        routes.admission_last_publish_ns = u64::MAX;
+        routes.admission_last_diagnostic_ns = 0;
+        routes.refresh_health(now_ns());
+        assert!(snapshots.is_empty());
+        let ExecutionDiagnostic::Admission { snapshot: periodic, .. } =
+            diagnostics.try_recv().unwrap() else { panic!("admission diagnostic expected") };
+        assert_eq!(periodic.epoch, published.epoch);
+        assert_eq!(periodic.state, published.state);
+        assert_eq!(periodic.available_place_slots, published.available_place_slots);
     }
 
     #[test]
