@@ -820,3 +820,133 @@ fn legacy_route_private_event_fast(
         }
     }
 }
+
+#[test]
+fn startup_lifecycle_backpressure_timeout_enters_recovery_and_replay_preserves_economics() {
+    let shared = route_fixture();
+    let (direct_tx, direct_rx) = crossbeam_channel::bounded(1);
+    let (root_tx, root_rx) = crossbeam_channel::bounded(4);
+    let blocked_event = route_event(2, "startup-backpressured");
+    let mut fixture_cache = PrivateExecutionCache::new(Vec::new()).unwrap();
+    let existing = route_private_event_fast_owned(&blocked_event, &shared, &mut fixture_cache)
+        .unwrap()
+        .remove(0);
+    direct_tx
+        .send(RoutedOrderUpdate {
+            owner: existing.owner,
+            update: existing.update,
+            timing: existing.timing,
+        })
+        .unwrap();
+    shared.install_strategy_private_routes(HashMap::from([(0, direct_tx)]));
+    shared.user_feed_health.set_recovering(false);
+    let before = shared.account_state.instance_snapshot("owner-1").unwrap();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (lane, workers) =
+        spawn_private_apply_worker(shared.clone(), root_tx, shutdown.clone()).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        lane.dispatch_live(vec![blocked_event.clone()], None)
+            .unwrap();
+        // Exercise the production two-second bounded send, not a replacement
+        // error classifier. This test injects the authoritative replay payload;
+        // it does not claim to exercise remote REST or an actual socket.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if lane.reconnect_generation.load(Ordering::Acquire) != 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("full private lane did not request recovery");
+        assert!(shared.user_feed_health.is_recovering());
+        assert_eq!(
+            direct_rx.len(),
+            1,
+            "the pre-existing queued update must remain owned"
+        );
+        assert!(
+            root_rx.is_empty(),
+            "failed direct delivery must not silently reroute"
+        );
+        route_close(
+            shared
+                .account_state
+                .instance_snapshot("owner-1")
+                .unwrap()
+                .cash,
+            before.cash,
+        );
+        direct_rx.recv().unwrap();
+
+        let generation = shared.user_feed_health.begin_recovery_delivery();
+        timeout(
+            Duration::from_secs(3),
+            lane.apply_replay_batch(vec![blocked_event.clone()], Some(generation)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let replayed = root_rx.try_recv().unwrap();
+        assert_eq!(
+            replayed.update.trade_id.as_deref(),
+            Some("startup-backpressured")
+        );
+        route_close(replayed.update.avg_fill_price, 0.16218);
+        route_close(replayed.update.trade_fee.unwrap().usdc_fee, 0.14267);
+        let token = shared
+            .user_feed_health
+            .deferred_recovery_update_ack("owner-1", &replayed.update)
+            .unwrap();
+        assert!(shared
+            .user_feed_health
+            .finish_recovery_delivery_enrollment(generation));
+        assert_eq!(
+            shared
+                .user_feed_health
+                .recovery_delivery_progress(generation),
+            Some((true, 1))
+        );
+        let after = shared.account_state.instance_snapshot("owner-1").unwrap();
+        route_close(after.cash, before.cash + 2.4327 - 0.14267);
+        route_close(after.positions[TOKEN], before.positions[TOKEN] - 15.0);
+        token.commit();
+        assert_eq!(
+            shared
+                .user_feed_health
+                .recovery_delivery_progress(generation),
+            Some((true, 0))
+        );
+        timeout(
+            Duration::from_secs(3),
+            lane.apply_replay_batch(vec![blocked_event], None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(root_rx.is_empty());
+        assert!(direct_rx.is_empty());
+        route_close(
+            shared
+                .account_state
+                .instance_snapshot("owner-1")
+                .unwrap()
+                .cash,
+            after.cash,
+        );
+        assert!(
+            shared.user_feed_health.is_recovering(),
+            "replayed economics alone is not complete recovery proof"
+        );
+    });
+    shutdown.store(true, Ordering::Relaxed);
+    drop(lane);
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}

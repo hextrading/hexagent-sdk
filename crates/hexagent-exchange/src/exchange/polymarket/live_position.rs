@@ -315,6 +315,25 @@ impl Drop for RecoveryUpdateAck {
     }
 }
 
+/// A startup-buffered update's original recovery certificate. Dropping this
+/// token never acknowledges delivery: the strategy explicitly commits only
+/// after its owner-local ledger has accepted the retained envelope. It cannot
+/// acknowledge a later reconnect epoch, even when that epoch has the same key.
+#[derive(Debug)]
+pub struct DeferredRecoveryUpdateAck {
+    health: Arc<UserFeedHealth>,
+    generation: u64,
+    key: RecoveryUpdateKey,
+}
+
+impl DeferredRecoveryUpdateAck {
+    /// Nonblocking completion on the existing recovery-owner lane. Saturation
+    /// retains the pending recovery obligation and marks inventory uncertain.
+    pub fn commit(self) {
+        self.health.enqueue_recovery_ack(self.generation, self.key);
+    }
+}
+
 impl UserFeedHealth {
     /// Starts `recovering=true`: until the feed's first connect + gap replay
     /// completes, the ledger isn't trustworthy and the strategy should wait.
@@ -644,6 +663,29 @@ impl UserFeedHealth {
         })
     }
 
+    /// Capture before retaining an envelope for startup replay. This performs
+    /// no owner query and must not be called from market/quote callbacks.
+    pub fn deferred_recovery_update_ack(
+        self: &Arc<Self>,
+        instance_id: &str,
+        update: &OrderUpdate,
+    ) -> Option<DeferredRecoveryUpdateAck> {
+        let generation = self.recovery_generation_fast.load(Ordering::Acquire);
+        if generation == 0 || self.recovery_pending_fast.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let key = RecoveryUpdateKey::new(instance_id, update);
+        // A concurrent new epoch must never borrow the old pending count.
+        if self.recovery_generation_fast.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        Some(DeferredRecoveryUpdateAck {
+            health: Arc::clone(self),
+            generation,
+            key,
+        })
+    }
+
     /// Returns `None` if a newer reconnect superseded this generation;
     /// otherwise `(enrollment_finished, pending_update_count)`.
     pub fn recovery_delivery_progress(&self, generation: u64) -> Option<(bool, usize)> {
@@ -967,7 +1009,8 @@ mod user_feed_health_tests {
         assert_ne!(first, second);
         assert_eq!(health.current_recovery_delivery_generation(), Ok(Some(second)));
     }
-    use super::{UserFeedHealth, RECOVERY_DELIVERY_OWNER_CAPACITY};
+    use super::{RecoveryDeliveryCommand, UserFeedHealth, RECOVERY_DELIVERY_OWNER_CAPACITY};
+    use std::sync::{atomic::Ordering, Arc};
     use crate::types::{now_ns, Exchange, OrderStatus, OrderUpdate, Side};
 
     fn recovery_update(coid: &str) -> OrderUpdate {
@@ -1196,6 +1239,104 @@ mod user_feed_health_tests {
             h.recovery_delivery_progress(new_generation),
             Some((true, 0)),
         );
+    }
+
+    #[test]
+    fn deferred_recovery_ack_requires_explicit_successful_application() {
+        let health = Arc::new(UserFeedHealth::new());
+        let generation = health.begin_recovery_delivery();
+        let update = recovery_update("btc01-startup");
+        health
+            .register_recovery_update(generation, "btc01", &update)
+            .unwrap();
+        assert!(health.finish_recovery_delivery_enrollment(generation));
+        let retained = health
+            .deferred_recovery_update_ack("btc01", &update)
+            .unwrap();
+        assert_eq!(
+            health.recovery_delivery_progress(generation),
+            Some((true, 1))
+        );
+        // Rejection, unknown ownership or destruction of a startup buffer is
+        // not evidence that the owner's ledger applied the update.
+        drop(retained);
+        assert_eq!(
+            health.recovery_delivery_progress(generation),
+            Some((true, 1))
+        );
+        health
+            .deferred_recovery_update_ack("btc01", &update)
+            .unwrap()
+            .commit();
+        assert_eq!(
+            health.recovery_delivery_progress(generation),
+            Some((true, 0))
+        );
+    }
+
+    #[test]
+    fn deferred_recovery_ack_preserves_original_epoch_and_instance() {
+        let health = Arc::new(UserFeedHealth::new());
+        let update = recovery_update("btc01-startup-epoch");
+        let old = health.begin_recovery_delivery();
+        health
+            .register_recovery_update(old, "btc01", &update)
+            .unwrap();
+        let retained = health
+            .deferred_recovery_update_ack("btc01", &update)
+            .unwrap();
+        let current = health.begin_recovery_delivery();
+        health
+            .register_recovery_update(current, "btc01", &update)
+            .unwrap();
+        health
+            .register_recovery_update(current, "btc01", &update)
+            .unwrap();
+        assert!(health.finish_recovery_delivery_enrollment(current));
+        retained.commit();
+        health
+            .deferred_recovery_update_ack("btc02", &update)
+            .unwrap()
+            .commit();
+        assert_eq!(health.recovery_delivery_progress(current), Some((true, 2)));
+        // Each actual replay completion consumes exactly one duplicate.
+        health
+            .deferred_recovery_update_ack("btc01", &update)
+            .unwrap()
+            .commit();
+        assert_eq!(health.recovery_delivery_progress(current), Some((true, 1)));
+        health
+            .deferred_recovery_update_ack("btc01", &update)
+            .unwrap()
+            .commit();
+        assert_eq!(health.recovery_delivery_progress(current), Some((true, 0)));
+    }
+
+    #[test]
+    fn deferred_recovery_ack_queue_overflow_keeps_inventory_fail_closed() {
+        let mut health = UserFeedHealth::new();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        health.recovery_delivery_tx = tx;
+        health.recovery_generation_fast.store(7, Ordering::Release);
+        health.recovery_pending_fast.store(1, Ordering::Release);
+        let health = Arc::new(health);
+        let update = recovery_update("btc01-startup-full");
+        let retained = health
+            .deferred_recovery_update_ack("btc01", &update)
+            .unwrap();
+        let (reply, _result) = crossbeam_channel::bounded(1);
+        health
+            .recovery_delivery_tx
+            .try_send(RecoveryDeliveryCommand::Progress {
+                generation: 7,
+                reply,
+            })
+            .unwrap();
+        retained.commit();
+        assert_eq!(rx.len(), 1);
+        assert_eq!(health.recovery_pending_fast.load(Ordering::Acquire), 1);
+        assert!(health.inventory_uncertain());
+        assert_eq!(health.recovery_delivery_metrics().queue_overflow, 1);
     }
 
     #[test]

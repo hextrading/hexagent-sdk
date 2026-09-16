@@ -235,6 +235,25 @@ pub trait Strategy: Send {
     ) -> Result<(), SignalBatchOverflow> {
         extend_signal_batch(out, self.on_lifecycle_update_owned(envelope)?)
     }
+
+    /// Startup-only backpressure for an owner-local lifecycle handoff buffer.
+    /// The worker caches this value after lifecycle/watchdog callbacks, never
+    /// from a market/quote callback. While paused, all three lifecycle inputs
+    /// remain in their existing bounded lanes; control, history and watchdog
+    /// callbacks continue so bootstrap can complete and release capacity.
+    /// A strategy must retain the update that fills its buffer before returning
+    /// `true`, and keep quote admission closed until its backlog is applied.
+    fn startup_lifecycle_intake_paused(&self) -> bool {
+        false
+    }
+
+    /// Terminal startup handoff failure, queried only after watchdog work.
+    /// The worker quarantines this instance and retains its buffered lifecycle
+    /// ownership until controlled shutdown. Recovery requires restart/replay;
+    /// this hook is not ordinary flow control or a runtime quote gate.
+    fn startup_lifecycle_failure(&self) -> Option<&'static str> {
+        None
+    }
     fn load_hist_data(&self, _ts_event: u64) -> Vec<HistDataRequest> {
         Vec::new()
     }
