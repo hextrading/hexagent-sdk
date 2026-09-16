@@ -1033,3 +1033,124 @@ fn diagnose_actual_price_change_wall_and_thread_cpu() {
     }
     eprintln!("clob_price_change_cpu_tail_storage stored={} omitted={tail_omitted} capacity=1024 threshold_ns=1000000", tails.len());
 }
+
+#[test]
+fn whole_handler_tail_triggers_without_slow_price_change() {
+    let phases = ClobFramePhaseTimings {
+        price_change_apply_ns: 13_000,
+        event_construction_ns: 13_066_000,
+        ..Default::default()
+    };
+    assert_eq!(
+        clob_perf_trigger_stage(Duration::from_micros(13_087), phases)
+            .unwrap()
+            .0,
+        "read_handler"
+    );
+    assert!(clob_perf_trigger_stage(Duration::from_micros(9_999), phases).is_none());
+    let phases = ClobFramePhaseTimings {
+        price_change_apply_ns: 5_000_000,
+        ..Default::default()
+    };
+    assert_eq!(
+        clob_perf_trigger_stage(Duration::from_millis(6), phases)
+            .unwrap()
+            .0,
+        "price_change_apply"
+    );
+}
+
+#[test]
+fn owned_clob_batch_preserves_empty_and_nonempty_wire_order() {
+    let tokens = captured_tokens();
+    let now = Instant::now();
+    for nonempty in [false, true] {
+        let mut books = seed_tokens(&tokens, now);
+        let ((incoming, _, _), _, _) = run_apply(&mut books, CAPTURE, &tokens, now, false);
+        assert!(!incoming.is_empty());
+        let mut old = if nonempty {
+            incoming.clone()
+        } else {
+            Vec::new()
+        };
+        let mut new = old.clone();
+        let storage = incoming.as_ptr();
+        for event in incoming.clone() {
+            push_latest_order_book(&mut old, event);
+        }
+        append_canonical_clob_events(&mut new, incoming);
+        if !nonempty {
+            assert_eq!(new.as_ptr(), storage);
+        }
+        assert_eq!(format!("{old:?}"), format!("{new:?}"));
+    }
+}
+
+#[test]
+#[ignore = "paired actual apply + frame assembly + output destruction benchmark, serial only"]
+fn benchmark_owned_clob_frame_batch() {
+    fn cpu() -> u64 {
+        let mut t: libc::timespec = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) },
+            0
+        );
+        t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+    }
+    const N: usize = 20_000;
+    let tokens = captured_tokens();
+    let now = Instant::now();
+    let mut old = seed_tokens(&tokens, now);
+    let mut new = seed_tokens(&tokens, now);
+    let mut wall = [Vec::with_capacity(N), Vec::with_capacity(N)];
+    let mut cpus = [Vec::with_capacity(N), Vec::with_capacity(N)];
+    let mut alloc = [0usize; 2];
+    let mut bytes = [0usize; 2];
+    for i in 0..N + 256 {
+        for v in [i % 2, 1 - i % 2] {
+            let books = if v == 0 { &mut old } else { &mut new };
+            restore_deleted_levels(books, &tokens);
+            let fields = serde_json::from_str::<PriceChangeFields<'_>>(CAPTURE).unwrap();
+            let mut wire = ClobWireCounters::default();
+            let mut diagnostics = Vec::new();
+            let ((w, c), a, b) = clob_test_allocator::count(|| {
+                let start = std::time::Instant::now();
+                let cpu_start = cpu();
+                let (events, _, repair) = books.apply_price_change(
+                    fields,
+                    now,
+                    1_789_565_389_600_000_000,
+                    &mut wire,
+                    &mut diagnostics,
+                    &tokens,
+                );
+                let mut batch = Vec::new();
+                if v == 0 {
+                    for event in events {
+                        push_latest_order_book(&mut batch, event);
+                    }
+                } else {
+                    append_canonical_clob_events(&mut batch, events);
+                }
+                std::hint::black_box(&batch);
+                drop(batch);
+                drop(repair);
+                drop(diagnostics);
+                let c = cpu().saturating_sub(cpu_start);
+                (start.elapsed().as_nanos() as u64, c)
+            });
+            if i >= 256 {
+                wall[v].push(w);
+                cpus[v].push(c);
+                alloc[v] += a;
+                bytes[v] += b;
+            }
+        }
+    }
+    for v in 0..2 {
+        wall[v].sort_unstable();
+        cpus[v].sort_unstable();
+        eprintln!("owned_clob_batch version={v} n={N} boundary=decoded_apply_plus_batch_assembly_and_output_drop p50_ns={} p99_ns={} p999_ns={} max_ns={} cpu_p50_ns={} cpu_p99_ns={} cpu_p999_ns={} cpu_max_ns={} allocations={} allocated_bytes={} queue_depth=0 overflow=0 allocator=System fixture_decode_and_reset_excluded=true",wall[v][N/2],wall[v][N*99/100],wall[v][N*999/1000],wall[v][N-1],cpus[v][N/2],cpus[v][N*99/100],cpus[v][N*999/1000],cpus[v][N-1],alloc[v],bytes[v]);
+    }
+    assert!(alloc[1] < alloc[0]);
+}
