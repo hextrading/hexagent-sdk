@@ -93,6 +93,53 @@ const REST_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const STALE_THRESHOLD_SPOT: Duration = Duration::from_secs(30);
 const STALE_THRESHOLD_FUTURES: Duration = Duration::from_secs(90);
 
+/// Owned by one socket task. Only successfully received frames renew this
+/// deadline; outbound keepalives must not hide a silent peer. Ping/Pong frames
+/// prove transport liveness, not freshness of the subscribed depth stream.
+struct InboundDeadline {
+    timeout: Duration,
+    expires_at: tokio::time::Instant,
+}
+
+impl InboundDeadline {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            expires_at: tokio::time::Instant::now() + timeout,
+        }
+    }
+
+    fn received(&mut self) {
+        self.expires_at = tokio::time::Instant::now() + self.timeout;
+    }
+
+    async fn next<F: std::future::Future>(
+        &self,
+        inbound: F,
+        ping: &mut tokio::time::Interval,
+    ) -> SocketAction<F::Output> {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(self.expires_at) => SocketAction::Stalled,
+            _ = ping.tick() => SocketAction::Ping,
+            frame = inbound => SocketAction::Inbound(frame),
+        }
+    }
+
+    async fn control_write<F: std::future::Future>(
+        &self,
+        write: F,
+    ) -> std::result::Result<F::Output, tokio::time::error::Elapsed> {
+        tokio::time::timeout_at(self.expires_at, write).await
+    }
+}
+
+enum SocketAction<T> {
+    Inbound(T),
+    Ping,
+    Stalled,
+}
+
 /// Dead-endpoint alert threshold. After this many consecutive
 /// reconnect cycles complete WITHOUT receiving a single data Text
 /// message, escalate the per-cycle `warn!` to a single `error!` so
@@ -888,6 +935,7 @@ async fn binance_ws_task(
 
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.tick().await;
+        let mut inbound_deadline = InboundDeadline::new(stale_threshold);
 
         // Per-cycle data witness — set true the moment ANY Text
         // message is parsed. Used to decide at cycle-end whether to
@@ -899,39 +947,47 @@ async fn binance_ws_task(
         let mut got_data_this_cycle = false;
 
         loop {
-            tokio::select! {
-                biased;
-                _ = ping_interval.tick() => {
-                    if let Err(e) = write.send(Message::Ping(Vec::new())).await {
-                        warn!("[{}] Ping send failed: {}", tag, e);
-                        break;
-                    }
-                }
-                // Read with a stall watchdog. `read.next().await` with
-                // no timeout would block forever on a TCP zombie (silent
-                // half-close, NAT timeout, server reboot without RST).
-                // Wrapping in `tokio::time::timeout` gives us a hard
-                // upper bound on inactivity; on Elapsed we force-break
-                // and the outer loop reconnects.
-                read_result = tokio::time::timeout(stale_threshold, read.next()) => {
-                    let msg = match read_result {
-                        Ok(Some(Ok(m))) => m,
-                        Ok(Some(Err(e))) => {
-                            warn!("[{}] WS read error: {} — reconnecting", tag, e);
+            match inbound_deadline.next(read.next(), &mut ping_interval).await {
+                SocketAction::Ping => {
+                    match inbound_deadline
+                        .control_write(write.send(Message::Ping(Vec::new())))
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!("[{}] Ping send failed: {}", tag, e);
                             break;
                         }
-                        Ok(None) => {
-                            warn!("[{}] WS closed — reconnecting", tag);
-                            break;
-                        }
-                        Err(_elapsed) => {
+                        Err(_) => {
                             warn!(
-                                "[{}] No message for {:.0}s (stall watchdog) — reconnecting",
-                                tag, stale_threshold.as_secs_f64(),
+                                "[{}] Inbound deadline elapsed during Ping send — reconnecting",
+                                tag
                             );
                             break;
                         }
+                    }
+                }
+                SocketAction::Stalled => {
+                    warn!(
+                        "[{}] No message for {:.0}s (stall watchdog) — reconnecting",
+                        tag,
+                        stale_threshold.as_secs_f64(),
+                    );
+                    break;
+                }
+                SocketAction::Inbound(read_result) => {
+                    let msg = match read_result {
+                        Some(Ok(m)) => m,
+                        Some(Err(e)) => {
+                            warn!("[{}] WS read error: {} — reconnecting", tag, e);
+                            break;
+                        }
+                        None => {
+                            warn!("[{}] WS closed — reconnecting", tag);
+                            break;
+                        }
                     };
+                    inbound_deadline.received();
                     match msg {
                         Message::Text(text) => {
                             // Mark the cycle as productive BEFORE parsing —
@@ -943,18 +999,36 @@ async fn binance_ws_task(
                             // Non-kline events flow straight through;
                             // closed klines go through gap-detection +
                             // REST-fill before being forwarded.
-                            if let Some(event) = parse_message_to_event(
-                                &text, futures, &symbol_hint,
-                            ) {
+                            if let Some(event) =
+                                parse_message_to_event(&text, futures, &symbol_hint)
+                            {
                                 if !dispatch_event(
-                                    event, &event_tx, &mut kline_gap_state, data_dir.as_ref(),
-                                ).await {
+                                    event,
+                                    &event_tx,
+                                    &mut kline_gap_state,
+                                    data_dir.as_ref(),
+                                )
+                                .await
+                                {
                                     return;
                                 }
                             }
                         }
                         Message::Ping(payload) => {
-                            let _ = write.send(Message::Pong(payload)).await;
+                            match inbound_deadline
+                                .control_write(write.send(Message::Pong(payload)))
+                                .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    warn!("[{}] Pong send failed: {} — reconnecting", tag, e);
+                                    break;
+                                }
+                                Err(_) => {
+                                    warn!("[{}] Inbound deadline elapsed during Pong send — reconnecting", tag);
+                                    break;
+                                }
+                            }
                         }
                         Message::Close(_) => {
                             warn!("[{}] Server closed WS — reconnecting", tag);
@@ -1166,6 +1240,10 @@ impl ExchangeMarket for BinanceMarket {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "market_deadline_tests.rs"]
+mod deadline_tests;
 
 #[cfg(test)]
 mod tests {

@@ -57,3 +57,4 @@ simd-json = { version = "0.14", features = ["serde_impl"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
