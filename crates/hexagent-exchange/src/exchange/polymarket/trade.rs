@@ -634,6 +634,23 @@ pub(crate) enum ProbeReconcileOutcome {
     Pending,
 }
 
+fn probe_reconcile_lookup_outcome(result: FetchOrderResult) -> ProbeReconcileOutcome {
+    match result {
+        FetchOrderResult::Found(order) if order.status != "LIVE" => ProbeReconcileOutcome::Terminal,
+        FetchOrderResult::NotFound(evidence)
+            if evidence.starts_with("parallel_reconcile_absence") =>
+        {
+            ProbeReconcileOutcome::ParallelAbsent
+        }
+        FetchOrderResult::Unavailable(kind) if kind.is_parallel_absence() => {
+            ProbeReconcileOutcome::ParallelAbsent
+        }
+        FetchOrderResult::Found(_)
+        | FetchOrderResult::NotFound(_)
+        | FetchOrderResult::Unavailable(_) => ProbeReconcileOutcome::Pending,
+    }
+}
+
 fn fetch_order_result_name(result: &FetchOrderResult) -> &'static str {
     match result {
         FetchOrderResult::Found(_) => "found",
@@ -663,6 +680,14 @@ fn combine_parallel_order_lookups(
         other => other,
     };
     if order_lookup_is_absent(&primary) && order_lookup_is_absent(&secondary) {
+        if primary_location.0 != crate::http1_pool::Role::Reconcile
+            || secondary_location.0 != crate::http1_pool::Role::Reconcile
+            || primary_location == secondary_location
+        {
+            return FetchOrderResult::Unavailable(FetchUnavailable::InvalidResponse(
+                "independent reconcile slots required for absence evidence".into(),
+            ));
+        }
         let evidence = format!(
             "parallel_reconcile_absence primary={:?}/{} secondary={:?}/{}",
             primary_location.0, primary_location.1, secondary_location.0, secondary_location.1,
@@ -2647,6 +2672,71 @@ fn instrumented_prewarm_url(url: &str) -> String {
         .unwrap_or_else(|_| "https://clob.polymarket.com/time".to_string())
 }
 
+fn business_http_outcome(
+    reply: &HttpReply,
+    elapsed_ns: u64,
+) -> crate::http1_pool::BusinessHttpOutcome {
+    use crate::http1_pool::BusinessHttpOutcome;
+    // Ordinary business rejections (for example post-only crossing) prove
+    // order-endpoint responsiveness. Auth, throttling and unavailable service
+    // responses cannot authorize a recovery probe to restore place capacity.
+    let responsive = match reply {
+        Ok(_) => true,
+        Err(error @ HttpErr::Status(code, _)) => {
+            (400..500).contains(code)
+                && !error.is_unknown_state()
+                && !matches!(code, 401 | 403 | 408 | 429)
+        }
+        _ => false,
+    };
+    if !responsive {
+        BusinessHttpOutcome::Failure
+    } else if elapsed_ns >= super::network_incident::HTTP_SLOW_SUCCESS_THRESHOLD.as_nanos() as u64 {
+        BusinessHttpOutcome::Slow
+    } else {
+        BusinessHttpOutcome::Healthy
+    }
+}
+
+fn publish_business_http_outcome(
+    client: &crate::http1_pool::PooledClient,
+    attempt_id: u64,
+    method: &reqwest::Method,
+    path: &str,
+    url: &str,
+    elapsed_ns: u64,
+    status_code: u16,
+    reply: &HttpReply,
+) {
+    if method == reqwest::Method::DELETE
+        || (method == reqwest::Method::POST && matches!(path, "/order" | "/orders"))
+    {
+        let outcome = business_http_outcome(reply, elapsed_ns);
+        if business_http_retirement_required(client.role(), outcome) {
+            super::network_incident::note_http_slow_success(
+                client.role(),
+                client.slot(),
+                Duration::from_nanos(elapsed_ns),
+            );
+            // Use the same real-HTTP classification as the admission owner.
+            // Slow business 4xx responses also retire their measured socket;
+            // otherwise the owner could exclude a generation that never repairs.
+            client.note_instrumented_transport_failure(instrumented_prewarm_url(url));
+        }
+        client.record_business_outcome(attempt_id, elapsed_ns, outcome, status_code);
+    }
+}
+
+fn business_http_retirement_required(
+    role: crate::http1_pool::Role,
+    outcome: crate::http1_pool::BusinessHttpOutcome,
+) -> bool {
+    matches!(
+        role,
+        crate::http1_pool::Role::Fast | crate::http1_pool::Role::Cancel
+    ) && outcome == crate::http1_pool::BusinessHttpOutcome::Slow
+}
+
 async fn execute_http_on(
     client: crate::http1_pool::PooledClient,
     attempt_id: u64,
@@ -2690,8 +2780,13 @@ async fn execute_http_on(
         Ok(response) => response,
         Err(error) => {
             record_http1_phase_timings(client.role(), client.slot(), error.timings);
-            client.note_instrumented_transport_failure(instrumented_prewarm_url(url.as_ref()));
-            return Err(match error.kind {
+            let elapsed_ns = error.timings.total_ns;
+            let attempted =
+                error.kind != crate::instrumented_http1::InstrumentedHttp1ErrorKind::InvalidRequest;
+            if attempted {
+                client.note_instrumented_transport_failure(instrumented_prewarm_url(url.as_ref()));
+            }
+            let reply = Err(match error.kind {
                 crate::instrumented_http1::InstrumentedHttp1ErrorKind::Timeout => HttpErr::Timeout,
                 crate::instrumented_http1::InstrumentedHttp1ErrorKind::Transport => {
                     HttpErr::Transport(error.message)
@@ -2700,24 +2795,50 @@ async fn execute_http_on(
                     HttpErr::Other(error.message)
                 }
             });
+            if attempted {
+                publish_business_http_outcome(
+                    &client,
+                    attempt_id,
+                    method,
+                    path,
+                    url.as_ref(),
+                    elapsed_ns,
+                    0,
+                    &reply,
+                );
+            }
+            return reply;
         }
     };
     record_http1_phase_timings(client.role(), client.slot(), response.timings);
     client.note_transport_success();
+    let elapsed_ns = response.timings.total_ns;
     let status = response.status;
     let bytes = response.body;
-    if !status.is_success() {
-        return Err(HttpErr::Status(
+    let reply = if !status.is_success() {
+        Err(HttpErr::Status(
             status.as_u16(),
             String::from_utf8_lossy(&bytes).into_owned(),
-        ));
-    }
-    serde_json::from_slice(&bytes).map_err(|error| {
-        let raw_body = String::from_utf8_lossy(&bytes);
-        HttpErr::InvalidResponse(compact_order_lookup_evidence_text(&format!(
-            "json_parse_error={error} raw_body={raw_body}"
-        )))
-    })
+        ))
+    } else {
+        serde_json::from_slice(&bytes).map_err(|error| {
+            let raw_body = String::from_utf8_lossy(&bytes);
+            HttpErr::InvalidResponse(compact_order_lookup_evidence_text(&format!(
+                "json_parse_error={error} raw_body={raw_body}"
+            )))
+        })
+    };
+    publish_business_http_outcome(
+        &client,
+        attempt_id,
+        method,
+        path,
+        url.as_ref(),
+        elapsed_ns,
+        status.as_u16(),
+        &reply,
+    );
+    reply
 }
 
 fn record_http1_phase_timings(
@@ -2819,9 +2940,14 @@ fn record_http1_phase_timings(
 
 /// DELETE is idempotent by order ID. If its primary connection times out or
 /// fails at the transport layer (reset, broken pipe, TLS EOF, connect failure),
-/// retry exactly once on a different account Cancel slot while new placement
-/// admission remains cluster-gated. Place requests never enter this helper's
-/// alternate-connection branch.
+/// retry exactly once on an available different Cancel slot of this account.
+/// Place requests never enter this helper's alternate-connection branch and a
+/// depleted account cannot bypass its capacity by using a global fallback.
+fn cancel_connection_failure_hedge_allowed(method: &reqwest::Method, reply: &HttpReply) -> bool {
+    *method == reqwest::Method::DELETE
+        && matches!(reply, Err(HttpErr::Timeout | HttpErr::Transport(_)))
+}
+
 async fn execute_http_with_cancel_connection_failure_hedge(
     client: crate::http1_pool::PooledClient,
     attempt_id: u64,
@@ -2835,37 +2961,25 @@ async fn execute_http_with_cancel_connection_failure_hedge(
     let role = client.role();
     let slot = client.slot();
     let hedge_body = (method == reqwest::Method::DELETE).then(|| body.clone());
-    let first_started = std::time::Instant::now();
     let first = execute_http_on(client.clone(), attempt_id, method, url, path, headers, body).await;
-    if first.is_ok() {
-        if super::network_incident::note_http_slow_success(role, slot, first_started.elapsed()) {
-            // A slow successful response can leave this Cloudflare route
-            // alive but unsafe for reuse. Retire only the exact measured
-            // generation; replacement preserves logical pool cardinality.
-            client.note_instrumented_transport_failure(instrumented_prewarm_url(url.as_ref()));
-        }
+    if !cancel_connection_failure_hedge_allowed(method, &first) {
+        return first;
     }
-    let failure_kind = match &first {
-        Err(HttpErr::Timeout) => super::network_incident::ConnectionFailureKind::Timeout,
-        Err(HttpErr::Transport(_)) => super::network_incident::ConnectionFailureKind::Transport,
-        _ => return first,
-    };
-    super::network_incident::note_http_connection_failure(role, slot, failure_kind);
     let Some(hedge_body) = hedge_body else {
         return first;
     };
 
-    let hedge_permit =
-        crate::http1_pool::try_borrow_account(account_id, crate::http1_pool::Role::Cancel);
-    let hedge_client = hedge_permit
-        .as_ref()
-        .map(crate::http1_pool::Permit::pooled_client)
-        .unwrap_or_else(|| crate::http1_pool::pooled_client(crate::http1_pool::Role::Cancel));
-    let hedge_role = hedge_client.role();
-    let hedge_slot = hedge_client.slot();
+    let Some(hedge_permit) =
+        crate::http1_pool::try_borrow_account(account_id, crate::http1_pool::Role::Cancel)
+    else {
+        return first;
+    };
+    if hedge_permit.role() == role && hedge_permit.slot() == slot {
+        return first;
+    }
+    let hedge_client = hedge_permit.pooled_client();
     let hedge_attempt = hedge_client.allocate_attempt_id();
     crate::latency::record_ns("polymarket.http.cancel.connection_failure_hedge", 1);
-    let hedge_started = std::time::Instant::now();
     let hedged = execute_http_on(
         hedge_client.clone(),
         hedge_attempt,
@@ -2876,26 +2990,7 @@ async fn execute_http_with_cancel_connection_failure_hedge(
         hedge_body,
     )
     .await;
-    if hedged.is_ok() {
-        if super::network_incident::note_http_slow_success(
-            hedge_role,
-            hedge_slot,
-            hedge_started.elapsed(),
-        ) {
-            hedge_client
-                .note_instrumented_transport_failure(instrumented_prewarm_url(url.as_ref()));
-        }
-    }
     drop(hedge_permit);
-    if let Some(kind) = match &hedged {
-        Err(HttpErr::Timeout) => Some(super::network_incident::ConnectionFailureKind::Timeout),
-        Err(HttpErr::Transport(_)) => {
-            Some(super::network_incident::ConnectionFailureKind::Transport)
-        }
-        _ => None,
-    } {
-        super::network_incident::note_http_connection_failure(hedge_role, hedge_slot, kind);
-    }
     hedged
 }
 
@@ -3537,6 +3632,10 @@ impl SharedState {
     /// Fail-closed admission for every fresh place, including synthetic RTT
     /// probes. Cancel and reconcile callers deliberately do not consult this
     /// method so they retain a path to authoritative terminal evidence.
+    /// This adapter gate covers authenticated/private-state correctness only.
+    /// Live connection-capacity admission belongs to the engine's account
+    /// dispatcher; standalone/legacy SDK callers must provide their own owner
+    /// admission and cannot inherit a process-global network circuit breaker.
     #[inline]
     pub(crate) fn place_admission_block_reason(&self) -> Option<&'static str> {
         if self.auth_failure_blocked.load(Ordering::Acquire) {
@@ -3547,9 +3646,6 @@ impl SharedState {
             || self.user_feed_health.inventory_uncertain()
         {
             return Some("private gap replay safety gate");
-        }
-        if super::network_incident::place_blocked_by_connection_failure_cluster() {
-            return Some("connection failure cluster safety gate");
         }
         None
     }
@@ -4891,14 +4987,7 @@ impl SharedState {
         } else {
             5_000_000
         };
-        // The cluster edge itself emits one operational WARN. Every quote
-        // rejected during its short safety window remains in the structured
-        // lifecycle recorder, but must not flood the console one order at a
-        // time while the gate is doing exactly what it was designed to do.
-        let aggregated_connection_failure_cluster_reject =
-            stage == "preflight_rejected" && reason == "connection failure cluster safety gate";
-        let warning = (!reason_code.is_empty() && !aggregated_connection_failure_cluster_reject)
-            || status == Some(OrderStatus::Failed);
+        let warning = !reason_code.is_empty() || status == Some(OrderStatus::Failed);
         let slow = !warning && segment_ns >= slow_threshold_ns && segment_ns > 0;
         let trace = traces.get(client_order_id).cloned();
         let (
@@ -6003,6 +6092,21 @@ impl SharedState {
         crossbeam_channel::Receiver<HttpReply>,
         Arc<HttpCompletionTiming>,
     ) {
+        self.http_call_async_on_timed_bytes_rec(client, attempt_id, method, path, body, None)
+    }
+
+    fn http_call_async_on_timed_bytes_rec(
+        &self,
+        client: crate::http1_pool::PooledClient,
+        attempt_id: u64,
+        method: &str,
+        path: &str,
+        body: Bytes,
+        rec_kind_override: Option<crate::latency_record::RequestKind>,
+    ) -> (
+        crossbeam_channel::Receiver<HttpReply>,
+        Arc<HttpCompletionTiming>,
+    ) {
         let timing = Arc::new(HttpCompletionTiming::default());
         let method = match method {
             "POST" => reqwest::Method::POST,
@@ -6022,7 +6126,7 @@ impl SharedState {
         let runtime_queue_stage = http_runtime_queue_stage(role);
         let network_stage = http_network_stage(role);
         let reply_enqueue_stage = http_reply_enqueue_stage(role);
-        let rec_kind = latency_record_kind(method.as_str(), path);
+        let rec_kind = rec_kind_override.or_else(|| latency_record_kind(method.as_str(), path));
         let t_start = crate::latency::Instant::now();
         let url = if path == "/order" {
             Arc::clone(&self.order_url)
@@ -6129,6 +6233,31 @@ impl SharedState {
         self.http_call_async_on(client, method, path, body)
             .recv()
             .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())))
+    }
+
+    /// Cold probe traffic dispatched by the engine onto an exact physical
+    /// owner. Override the single CSV record's kind rather than recording the
+    /// same synthetic request again as ordinary strategy order traffic.
+    pub(crate) fn http_call_sync_on_rec(
+        &self,
+        client: crate::http1_pool::PooledClient,
+        method: &str,
+        path: &str,
+        body: &str,
+        rec_kind_override: Option<crate::latency_record::RequestKind>,
+    ) -> HttpReply {
+        let attempt_id = client.allocate_attempt_id();
+        self.http_call_async_on_timed_bytes_rec(
+            client,
+            attempt_id,
+            method,
+            path,
+            Bytes::copy_from_slice(body.as_bytes()),
+            rec_kind_override,
+        )
+        .0
+        .recv()
+        .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())))
     }
 
     /// [`http_call_sync`] with a latency-CSV kind override — see
@@ -9015,9 +9144,6 @@ impl PolymarketTrade {
         orders: &[OrderRequest],
         reason: &str,
     ) -> Vec<OrderUpdate> {
-        if reason.ends_with("safety gate") {
-            super::network_incident::note_place_gate_rejections(orders.len());
-        }
         orders
             .iter()
             .map(|order| {
@@ -10148,22 +10274,88 @@ impl PolymarketTrade {
                 return ProbeReconcileOutcome::Terminal;
             }
         }
-        match self.fetch_order_by_id(client_order_id, order_id, None, true) {
-            FetchOrderResult::Found(order) if order.status != "LIVE" => {
-                ProbeReconcileOutcome::Terminal
+        probe_reconcile_lookup_outcome(self.fetch_order_by_id(
+            client_order_id,
+            order_id,
+            None,
+            true,
+        ))
+    }
+
+    /// Live probe recovery uses only messages to the owning account's physical
+    /// execution lanes. DELETE remains available while placement is paused.
+    /// Two independent Reconcile slots are required for absence; a missing,
+    /// busy, failed or duplicate slot never becomes terminal evidence and does
+    /// not fall back to a process-global connection.
+    pub(crate) fn reconcile_probe_order_via_transport(
+        &self,
+        client_order_id: &str,
+        order_id: &str,
+        transport: &super::rtt_probe::ProbeHttpTransport,
+    ) -> ProbeReconcileOutcome {
+        let body = serde_json::json!({ "orderID": order_id }).to_string();
+        let deletion = transport.request(
+            &self.shared,
+            &self.instance_id,
+            "DELETE",
+            "/order",
+            &body,
+            Some(crate::latency_record::RequestKind::ProbeCancel),
+            None,
+        );
+        if let Ok(response) = deletion.reply {
+            if matches!(
+                cancel_delete_response_outcome(&response, order_id),
+                CancelReasonOutcome::Cancelled | CancelReasonOutcome::Filled
+            ) {
+                return ProbeReconcileOutcome::Terminal;
             }
-            FetchOrderResult::NotFound(evidence)
-                if evidence.starts_with("parallel_reconcile_absence") =>
-            {
-                ProbeReconcileOutcome::ParallelAbsent
-            }
-            FetchOrderResult::Unavailable(kind) if kind.is_parallel_absence() => {
-                ProbeReconcileOutcome::ParallelAbsent
-            }
-            FetchOrderResult::Found(_)
-            | FetchOrderResult::NotFound(_)
-            | FetchOrderResult::Unavailable(_) => ProbeReconcileOutcome::Pending,
         }
+
+        let path = format!("/data/order/{order_id}");
+        let primary = transport.request(
+            &self.shared,
+            &self.instance_id,
+            "GET",
+            &path,
+            "",
+            None,
+            None,
+        );
+        let Some(primary_location @ (crate::http1_pool::Role::Reconcile, primary_slot)) =
+            primary.location
+        else {
+            return ProbeReconcileOutcome::Pending;
+        };
+        let primary = self.classify_order_lookup_reply(client_order_id, order_id, primary.reply);
+        if matches!(&primary, FetchOrderResult::Found(_)) {
+            return probe_reconcile_lookup_outcome(primary);
+        }
+        let secondary = transport.request(
+            &self.shared,
+            &self.instance_id,
+            "GET",
+            &path,
+            "",
+            None,
+            Some(primary_slot),
+        );
+        let Some(secondary_location @ (crate::http1_pool::Role::Reconcile, secondary_slot)) =
+            secondary.location
+        else {
+            return ProbeReconcileOutcome::Pending;
+        };
+        if primary_slot == secondary_slot {
+            return ProbeReconcileOutcome::Pending;
+        }
+        let secondary =
+            self.classify_order_lookup_reply(client_order_id, order_id, secondary.reply);
+        probe_reconcile_lookup_outcome(combine_parallel_order_lookups(
+            primary,
+            secondary,
+            primary_location,
+            secondary_location,
+        ))
     }
 
     fn classify_order_lookup_reply(
@@ -10269,6 +10461,8 @@ impl PolymarketTrade {
     /// `client`, WITHOUT blocking on the reply. `Ok(pending)` → complete
     /// off-thread via [`Self::complete_submit`]; `Err(update)` → a pre-flight
     /// reject (nothing was sent — the caller should release its permit).
+    /// The caller owns connection-capacity admission and generation readiness;
+    /// this adapter retains auth, private recovery, inventory and rate gates.
     pub fn submit_fire(
         &mut self,
         order: &OrderRequest,
@@ -10542,9 +10736,6 @@ impl PolymarketTrade {
                 None,
             );
         }
-        if !self.shared.check_rate_limit() {
-            return Err(Self::make_rejected(order, "rate limited"));
-        }
         if self.shared.in_trading_disabled_backoff() {
             return Err(Self::make_rejected(order, "trading disabled backoff"));
         }
@@ -10556,6 +10747,9 @@ impl PolymarketTrade {
         }
         if self.shared.in_invalid_token_backoff(&order.symbol) {
             return Err(Self::make_rejected(order, "invalid token backoff"));
+        }
+        if !self.shared.check_rate_limit() {
+            return Err(Self::make_rejected(order, "rate limited"));
         }
         let (order_hash, body) = match self.sign_and_build_body(order) {
             Ok(v) => v,
@@ -13063,6 +13257,127 @@ mod retirement_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn business_http_outcome_preserves_throttle_auth_and_ambiguous_failures() {
+        use crate::http1_pool::BusinessHttpOutcome::*;
+        let threshold =
+            super::super::network_incident::HTTP_SLOW_SUCCESS_THRESHOLD.as_nanos() as u64;
+        let success = Ok(serde_json::json!({"success": true}));
+        assert_eq!(business_http_outcome(&success, threshold - 1), Healthy);
+        assert_eq!(business_http_outcome(&success, threshold), Slow);
+        for code in [400, 404, 409, 422] {
+            let rejection = Err(HttpErr::Status(code, "business rejection".into()));
+            assert_eq!(business_http_outcome(&rejection, 1), Healthy);
+            assert_eq!(business_http_outcome(&rejection, threshold), Slow);
+        }
+        for code in [301, 401, 403, 408, 425, 429, 500, 502, 503, 504] {
+            assert_eq!(
+                business_http_outcome(&Err(HttpErr::Status(code, String::new())), 1),
+                Failure
+            );
+        }
+        for code in 400..600 {
+            let reply = Err(HttpErr::Status(code, String::new()));
+            if reply.as_ref().unwrap_err().is_unknown_state() {
+                assert_eq!(business_http_outcome(&reply, 1), Failure);
+                assert_eq!(business_http_outcome(&reply, threshold), Failure);
+            }
+        }
+        for error in [
+            HttpErr::Timeout,
+            HttpErr::Transport("reset".into()),
+            HttpErr::InvalidResponse("invalid json".into()),
+            HttpErr::Other("failed".into()),
+        ] {
+            assert_eq!(business_http_outcome(&Err(error), 1), Failure);
+        }
+    }
+
+    #[test]
+    fn slow_business_rejections_retire_exact_order_generation_but_queries_do_not() {
+        use crate::http1_pool::{BusinessHttpOutcome, Role};
+        let slow_ns = super::super::network_incident::HTTP_SLOW_SUCCESS_THRESHOLD.as_nanos() as u64;
+        for code in [400, 404, 409, 422] {
+            let response = Err(HttpErr::Status(code, "business rejection".into()));
+            let outcome = business_http_outcome(&response, slow_ns);
+            assert_eq!(outcome, BusinessHttpOutcome::Slow);
+            for role in [Role::Fast, Role::Cancel] {
+                assert!(business_http_retirement_required(role, outcome));
+            }
+            for role in [Role::Query, Role::Reconcile, Role::GapReplay] {
+                assert!(!business_http_retirement_required(role, outcome));
+            }
+        }
+        for code in [401, 403, 408, 425, 429, 503] {
+            let response = Err(HttpErr::Status(code, "unavailable".into()));
+            let outcome = business_http_outcome(&response, slow_ns);
+            assert_eq!(outcome, BusinessHttpOutcome::Failure);
+            assert!(
+                !business_http_retirement_required(Role::Fast, outcome),
+                "service pressure must reduce admission without a socket replacement storm"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_post_is_never_retried_and_delete_hedge_requires_transport_failure() {
+        let timeout = Err(HttpErr::Timeout);
+        let reset = Err(HttpErr::Transport("reset after request write".into()));
+        for method in [reqwest::Method::POST, reqwest::Method::GET] {
+            assert!(!cancel_connection_failure_hedge_allowed(&method, &timeout));
+            assert!(!cancel_connection_failure_hedge_allowed(&method, &reset));
+        }
+        assert!(cancel_connection_failure_hedge_allowed(
+            &reqwest::Method::DELETE,
+            &timeout
+        ));
+        assert!(cancel_connection_failure_hedge_allowed(
+            &reqwest::Method::DELETE,
+            &reset
+        ));
+        for reply in [
+            Ok(serde_json::json!({})),
+            Err(HttpErr::Status(429, "rate limited".into())),
+            Err(HttpErr::Status(503, "busy".into())),
+            Err(HttpErr::InvalidResponse("bad JSON".into())),
+        ] {
+            assert!(!cancel_connection_failure_hedge_allowed(
+                &reqwest::Method::DELETE,
+                &reply
+            ));
+        }
+    }
+
+    #[test]
+    fn place_safety_gate_rejection_does_not_consume_rate_capacity() {
+        let shutdown = ShutdownToken::new();
+        let mut trade = shutdown_test_trade(shutdown.clone());
+        trade
+            .shared
+            .auth_failure_blocked
+            .store(true, Ordering::Release);
+        let order = valid_signing_order();
+        for _ in 0..20 {
+            let rejected = trade
+                .submit_prep(&order, false)
+                .err()
+                .expect("auth gate must reject");
+            assert_eq!(
+                rejected.error.as_deref(),
+                Some("authenticated CLOB credential safety gate")
+            );
+        }
+        for _ in 0..10 {
+            assert!(
+                trade.shared.check_rate_limit(),
+                "blocked places must leave the initial rate burst available"
+            );
+        }
+        shutdown.request();
+        shutdown.finish();
+        trade.shared.join_background_workers();
+    }
+
     pub(super) fn shutdown_test_trade(shutdown: ShutdownToken) -> PolymarketTrade {
         PolymarketTrade::new_with_pool_for_startup_query_repair_and_shutdown(
             "api-key",
@@ -14342,6 +14657,78 @@ mod tests {
         let attempts = ReconcileAttemptCounters::default();
         assert_eq!(attempts.next_placement_with_evidence("coid", 2), 2);
         assert_eq!(attempts.next_placement_with_evidence("coid", 2), 4);
+
+        for secondary_location in [
+            (crate::http1_pool::Role::Reconcile, 0),
+            (crate::http1_pool::Role::Query, 1),
+            (crate::http1_pool::Role::Cancel, 1),
+        ] {
+            let duplicated_or_wrong_role = combine_parallel_order_lookups(
+                FetchOrderResult::NotFound("primary 404".into()),
+                FetchOrderResult::NotFound("secondary 404".into()),
+                (crate::http1_pool::Role::Reconcile, 0),
+                secondary_location,
+            );
+            assert_eq!(
+                probe_reconcile_lookup_outcome(duplicated_or_wrong_role),
+                ProbeReconcileOutcome::Pending,
+                "duplicated or non-reconcile slots cannot prove independent absence",
+            );
+        }
+    }
+
+    #[test]
+    fn live_probe_reconcile_retains_orphan_without_two_independent_owner_responses() {
+        use crate::http1_pool::Role;
+        let shutdown = ShutdownToken::new();
+        let trade = shutdown_test_trade(shutdown.clone());
+        for (secondary_location, expected) in [
+            (
+                Some((Role::Reconcile, 1)),
+                ProbeReconcileOutcome::ParallelAbsent,
+            ),
+            (Some((Role::Reconcile, 0)), ProbeReconcileOutcome::Pending),
+            (Some((Role::Cancel, 1)), ProbeReconcileOutcome::Pending),
+            (None, ProbeReconcileOutcome::Pending),
+        ] {
+            let (transport, requests) = super::super::rtt_probe::probe_http_lane(1);
+            let server = std::thread::spawn(move || {
+                let deletion = requests
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                assert_eq!(deletion.role, Role::Cancel);
+                deletion.reply_for_test(
+                    Ok(serde_json::json!({"canceled": [], "not_canceled": {}})),
+                    Some((Role::Cancel, 0)),
+                );
+                let primary = requests
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                assert_eq!(primary.role, Role::Reconcile);
+                assert_eq!(primary.excluded_slot, None);
+                primary.reply_for_test(
+                    Err(HttpErr::Status(404, "not found".into())),
+                    Some((Role::Reconcile, 0)),
+                );
+                let secondary = requests
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                assert_eq!(secondary.role, Role::Reconcile);
+                assert_eq!(secondary.excluded_slot, Some(0));
+                secondary.reply_for_test(
+                    Err(HttpErr::Status(404, "not found".into())),
+                    secondary_location,
+                );
+            });
+            assert_eq!(
+                trade.reconcile_probe_order_via_transport("probe-test", "0xabc", &transport),
+                expected,
+            );
+            server.join().unwrap();
+        }
+        shutdown.request();
+        shutdown.finish();
+        trade.shared.join_background_workers();
     }
 
     #[test]

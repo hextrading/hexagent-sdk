@@ -1,5 +1,5 @@
 use crate::types::{
-    extend_signal_batch, AssetCtxTick, BarData, Exchange, HistDataRequest, Instrument,
+    extend_signal_batch, AssetCtxTick, BarData, Exchange, ExecutionAdmission, HistDataRequest, Instrument,
     MarketDataHealth, OrderBookSnapshot, OrderSlot, OrderUpdate, QuoteTick, Signal, SignalBatch,
     LifecycleTiming, SignalBatchOverflow, SpotPrice, TickSizeChange, TradeTick,
 };
@@ -142,6 +142,11 @@ pub trait Strategy: Send {
     }
     fn on_connected(&mut self, _exchange: Exchange) {}
     fn on_disconnected(&mut self, _exchange: Exchange, _reason: &str) {}
+    /// Instance-routed execution availability. Called only on the strategy's
+    /// owner thread, before subsequent market callbacks. Implementations keep
+    /// a local epoch/state and suppress fresh placement before creating order
+    /// IDs or reservations; cancels and private-event processing remain live.
+    fn on_execution_admission(&mut self, _admission: ExecutionAdmission) {}
     /// Wall-clock safety callback for live workers. It runs even when every
     /// market-data source is silent, allowing a strategy to cancel resting
     /// orders without using a stale quote event as the trigger.
