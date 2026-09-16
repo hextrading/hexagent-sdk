@@ -15641,20 +15641,46 @@ impl SharedAccount {
         } else {
             0.0
         };
-        if (expected.0 - execution.fee.usdc_fee).abs() > usdc_tolerance
-            || (expected.1 - execution.fee.shares_fee).abs() > shares_tolerance
-            || !execution.fee.usdc_fee.is_finite()
+        if !execution.fee.usdc_fee.is_finite()
             || !execution.fee.shares_fee.is_finite()
             || execution
                 .gross_notional
+                .is_some_and(|gross| !gross.is_finite() || gross <= 0.0 || gross >= quantity)
+        {
+            return TradeTransitionResult::Rejected;
+        }
+        let recomputed_mismatch = (expected.0 - execution.fee.usdc_fee).abs() > usdc_tolerance
+            || (expected.1 - execution.fee.shares_fee).abs() > shares_tolerance
+            || execution
+                .gross_notional
                 .map_or(execution.price != execution.raw_price, |gross| {
-                    !gross.is_finite()
-                        || gross <= 0.0
-                        || gross >= quantity
-                        || execution.price != gross / quantity
+                    execution.price != gross / quantity
                 })
             || (execution.gross_notional.is_some()
-                && (expected.0 != execution.fee.usdc_fee || expected.1 != execution.fee.shares_fee))
+                && (expected.0 != execution.fee.usdc_fee
+                    || expected.1 != execution.fee.shares_fee));
+        if recomputed_mismatch
+            && !(execution.gross_notional.is_some()
+                && self
+                    .private_execution_seed_for_trade(trade_key)
+                    .is_some_and(|seed| {
+                        // Cold account application only; ordinary canonical DTOs
+                        // never perform this lookup. JSON-restored derived price
+                        // can differ by one ULP from gross/quantity. Accept only
+                        // the exact existing frozen execution and owner identity,
+                        // not a recomputed fee or a relaxed new-trade tolerance.
+                        seed.execution == Some(execution)
+                            && seed.is_maker == is_maker
+                            && seed.ownership.account_id == self.account_id
+                            && seed.ownership.trade_key == trade_key
+                            && seed.ownership.token_id == token_id
+                            && seed.ownership.side == side
+                            && seed.ownership.quantity == quantity
+                            && (client_order_id.is_empty()
+                                || seed.ownership.client_order_id == client_order_id)
+                            && normalize_order_id(&seed.ownership.order_id)
+                                == normalize_order_id(order_id)
+                    }))
         {
             return TradeTransitionResult::Rejected;
         }
