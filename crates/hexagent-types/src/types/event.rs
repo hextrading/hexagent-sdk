@@ -181,6 +181,41 @@ pub struct MarketDataHealth {
     pub local_timestamp_ns: u64,
 }
 
+/// Execution capacity published to one strategy owner. These are transport
+/// states, not account or inventory authority; private-event risk gates remain
+/// independent. Recovering may admit a bounded number of fresh requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionAdmissionState {
+    Healthy,
+    Degraded,
+    Paused,
+    Recovering,
+}
+
+/// Compact execution-to-strategy control message. The engine delivers this on
+/// an instance's bounded priority lane, before market-data callbacks, and must
+/// fail closed on lane loss/stale publication. `epoch` is strictly increasing
+/// for the lifetime of that strategy worker; zero is reserved for its initial
+/// paused state. Consumers ignore duplicate or older epochs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionAdmission {
+    pub exchange: Exchange,
+    pub epoch: u64,
+    pub state: ExecutionAdmissionState,
+    pub available_place_slots: u16,
+    pub observed_at_ns: u64,
+}
+
+impl ExecutionAdmission {
+    /// A capacity observation never overrides a hard pause. This only allows
+    /// creating a fresh intent; the execution owner still admits the request
+    /// against its current local connection state.
+    #[inline]
+    pub fn allows_place(self) -> bool {
+        self.state != ExecutionAdmissionState::Paused && self.available_place_slots > 0
+    }
+}
+
 /// Events flowing from market data sources to the strategy engine
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MarketEvent {

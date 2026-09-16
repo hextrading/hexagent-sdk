@@ -17,12 +17,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, ExchangeConfig, RunMode};
+use crate::execution_admission::{AccountExecutionAdmission, LaneObservation};
+use crate::execution_admission_lane::{snapshot_lane, AdmissionConsumer, SnapshotPublisher, HEARTBEAT};
 use crate::exchange::aster::AsterTrade;
 use crate::exchange::binance::{BinanceMarket, BinanceTrade};
 use crate::exchange::hexmarket::{HexmarketMarket, HexmarketTrade};
 use crate::exchange::hyperliquid::HyperliquidTrade;
 use crate::exchange::lighter::LighterTrade;
 use crate::exchange::polymarket::trade::{PendingCancel, PendingSubmit};
+use crate::exchange::polymarket::rtt_probe::{probe_http_lane, ProbeHttpRequest};
 use crate::exchange::polymarket::{
     PolymarketFeedPhase, PolymarketLiveness, PolymarketLivenessSnapshot, PolymarketMarket,
     PolymarketTrade,
@@ -401,6 +404,12 @@ mod sim_lifecycle_router_tests {
 
 #[derive(Debug)]
 enum ExecutionDiagnostic {
+    Admission {
+        account: Arc<str>,
+        snapshot: ExecutionAdmission,
+        paused_total_ns: u64,
+        replaced_snapshots: u64,
+    },
     VenueFailure {
         exchange: Exchange,
         operation: &'static str,
@@ -429,6 +438,11 @@ fn spawn_execution_diagnostics(
             crate::os_tune::pin_background("execution-diagnostics");
             while let Ok(diagnostic) = receiver.recv() {
                 match diagnostic {
+                    ExecutionDiagnostic::Admission { account, snapshot, paused_total_ns, replaced_snapshots } => info!(
+                        "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0",
+                        account, snapshot.state, snapshot.epoch, snapshot.available_place_slots,
+                        paused_total_ns / 1_000_000, replaced_snapshots,
+                    ),
                     ExecutionDiagnostic::VenueFailure {
                         exchange,
                         operation,
@@ -4018,6 +4032,16 @@ impl Engine {
             m
         };
 
+        // Startup binds one replaceable health lane to each exact strategy owner.
+        let (probe_transport, probe_http_rx) = probe_http_lane(64);
+        let mut admission_publishers = HashMap::new();
+        let mut admission_receivers = HashMap::new();
+        for instance_id in poly_states.keys() {
+            let (publisher, receiver) = snapshot_lane();
+            admission_publishers.insert(instance_id.clone(), publisher);
+            admission_receivers.insert(instance_id.clone(), receiver);
+        }
+
         let exec_handle = self.spawn_execution_thread_with_poly_shutdown(
             signal_rx,
             executor_update_tx,
@@ -4025,6 +4049,8 @@ impl Engine {
             stale_threshold_handles.clone(),
             shutdown_done_tx,
             shutdown_token.clone(),
+            admission_publishers,
+            probe_http_rx,
         );
         let user_feed_handle =
             self.spawn_hex_user_feed(private_update_tx.clone(), shutdown.clone());
@@ -4089,7 +4115,7 @@ impl Engine {
                 let enable = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let active_token =
                     crate::exchange::polymarket::rtt_probe::ActiveTokenHandle::new(None);
-                match crate::exchange::polymarket::rtt_probe::spawn_rtt_probe(
+                match crate::exchange::polymarket::rtt_probe::spawn_rtt_probe_with_transport(
                     ps,
                     enable.clone(),
                     tx,
@@ -4098,6 +4124,7 @@ impl Engine {
                     shutdown.clone(),
                     all_probe,
                     id.clone(),
+                    Some(probe_transport.clone()),
                 ) {
                     Ok(h) => {
                         info!(
@@ -4128,6 +4155,7 @@ impl Engine {
             stale_threshold_handles.clone(),
             &poly_states,
             Some(shutdown_done_rx),
+            admission_receivers,
         );
 
         // Strategy construction may spend seconds warming predictors while
@@ -4295,6 +4323,7 @@ impl Engine {
             // the user-feed-health gates stay inactive (empty map).
             &HashMap::new(),
             Some(shutdown_done_rx),
+            HashMap::new(),
         );
 
         Self::wait_for_shutdown(&shutdown, &shutdown_tx);
@@ -4387,7 +4416,7 @@ impl Engine {
                 // best-effort and ignore the disconnected channel.
                 let (tx, _rx) = crossbeam_channel::bounded::<f64>(64);
                 let enable = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-                match crate::exchange::polymarket::rtt_probe::spawn_rtt_probe(
+                match crate::exchange::polymarket::rtt_probe::spawn_rtt_probe_with_transport(
                     ps,
                     enable,
                     tx,
@@ -4396,6 +4425,7 @@ impl Engine {
                     shutdown.clone(),
                     true,
                     id.clone(),
+                    None,
                 ) {
                     Ok(h) => {
                         info!(
@@ -7165,6 +7195,7 @@ impl Engine {
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
         poly_states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
         shutdown_done_rx: Option<Receiver<()>>,
+        admission_receivers: HashMap<String, Receiver<ExecutionAdmission>>,
     ) -> thread::JoinHandle<()> {
         let mut strategies =
             self.build_strategies(rtt_probe_install, stale_threshold_handles, poly_states);
@@ -7638,6 +7669,7 @@ impl Engine {
                 data_dirs,
                 shutdown_done_rx,
                 poly_states,
+                admission_receivers,
             );
         }
         drop(executor_update_rx.take());
@@ -7898,6 +7930,7 @@ impl Engine {
         data_dirs: Vec<PathBuf>,
         shutdown_done_rx: Option<Receiver<()>>,
         poly_states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
+        mut admission_receivers: HashMap<String, Receiver<ExecutionAdmission>>,
     ) -> thread::JoinHandle<()> {
         // Static symbol → instance routing map (lowercased keys). A
         // symbol shared by several instances (e.g. two BTC timeframes on
@@ -7991,6 +8024,7 @@ impl Engine {
                     let stx = signal_tx.with_owner(idx);
                     let dd = data_dirs.clone();
                     let iid = instance_ids[idx].clone();
+                    let admission_rx = admission_receivers.remove(&iid);
                     let heartbeat = Arc::clone(&worker_heartbeats[idx]);
                     let quarantined = Arc::clone(&worker_quarantined[idx]);
                     let shutdown_requested = Arc::clone(&worker_shutdown_requested[idx]);
@@ -8005,7 +8039,7 @@ impl Engine {
                                 Self::run_strategy_worker(
                                     strategy, mrx, latest, urx, direct_private_rx, stx, dd, &iid, idx,
                                     heartbeat, quarantined, shutdown_requested,
-                                    ack_tx, clock_origin,
+                                    ack_tx, clock_origin, admission_rx,
                                 );
                             })).is_err();
                             let _ = status_tx.send((idx, panicked));
@@ -8664,6 +8698,7 @@ impl Engine {
         shutdown_requested: Arc<AtomicBool>,
         shutdown_ack_tx: Sender<usize>,
         clock_origin: Arc<std::time::Instant>,
+        admission_rx: Option<Receiver<ExecutionAdmission>>,
     ) {
         // Optional venue-authenticated private feed. The lane is transferred at
         // startup and consumed only by this strategy owner. Its FIFO updates and
@@ -8714,7 +8749,13 @@ impl Engine {
             crossbeam_channel::never::<crate::exchange::PrivateFeedControl>();
         let never_watchdog_rx = crossbeam_channel::never::<std::time::Instant>();
         let mut last_watchdog_run = std::time::Instant::now();
+        let mut admission = AdmissionConsumer::new(admission_rx);
+        let never_admission_rx = crossbeam_channel::never::<ExecutionAdmission>();
         'worker: loop {
+            // Before quote/lifecycle callbacks: no shared gate reads or heap work.
+            if let Some(snapshot) = admission.poll() {
+                strategy.on_execution_admission(snapshot);
+            }
             if !shutdown_started && shutdown_requested.load(Ordering::Acquire) {
                 strategy.on_exit();
                 shutdown_started = true;
@@ -8740,7 +8781,13 @@ impl Engine {
                 } else {
                     &watchdog_rx
                 };
+            let selectable_admission_rx = admission.receiver().unwrap_or(&never_admission_rx);
             crossbeam_channel::select_biased! {
+                recv(selectable_admission_rx) -> message => {
+                    if let Some(snapshot) = admission.receive(message) {
+                        strategy.on_execution_admission(snapshot);
+                    }
+                },
                 recv(selectable_private_control_rx) -> msg => match msg {
                     Ok(control) => {
                         if quarantined.load(Ordering::Acquire) { break 'worker; }
@@ -11056,6 +11103,8 @@ impl Engine {
             stale_threshold_handles,
             shutdown_done_tx,
             ShutdownToken::new(),
+            HashMap::new(),
+            crossbeam_channel::never(),
         )
     }
 
@@ -11067,6 +11116,8 @@ impl Engine {
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
         shutdown_done_tx: Sender<()>,
         shutdown_token: ShutdownToken,
+        mut admission_publishers: HashMap<String, SnapshotPublisher<ExecutionAdmission>>,
+        probe_http_rx: Receiver<ProbeHttpRequest>,
     ) -> thread::JoinHandle<()> {
         let config = self.config.clone();
         let hex_max_connections = config
@@ -11414,6 +11465,11 @@ impl Engine {
                             Role::Reconcile => routes.reconcile.push(lane),
                             Role::Query | Role::GapReplay => unreachable!(),
                         }
+                        let health_publisher = if matches!(role, Role::Fast | Role::Cancel) {
+                            let (publisher, receiver) = snapshot_lane();
+                            routes.health_lanes.push((role, slot, receiver));
+                            Some(publisher)
+                        } else { None };
                         let router = LiveRouter::new_with_poly_map(&config, &poly_states);
                         let thread_name = match role {
                             Role::Fast => format!("poly-exec-{account_id}-{slot}"),
@@ -11445,10 +11501,27 @@ impl Engine {
                                     role,
                                     rx,
                                     lane_metrics,
+                                    health_publisher,
                                 );
                             })
                             .unwrap();
                         poly_connection_handles.push(h);
+                    }
+                    for (account_id, routes) in &mut poly_connection_routes {
+                        routes.health_account = Arc::from(account_id.as_str());
+                        routes.health_diagnostic = Some(execution_diagnostic_tx.clone());
+                        routes.health = Some(AccountExecutionAdmission::new(
+                            routes.fast.len(), routes.cancel.len() + routes.safety_cancel.len(), now_ns()));
+                        if !routes.safety_cancel.is_empty() {
+                            routes.health.as_mut().unwrap().reserve_cancel_slot(0);
+                        }
+                        for (instance_id, shared) in &poly_states {
+                            if shared.account_state.account_id() == account_id {
+                                if let Some(publisher) = admission_publishers.remove(instance_id) {
+                                    routes.admission_publishers.push(publisher);
+                                }
+                            }
+                        }
                     }
                     let owner_count = poly_connection_handles.len();
                     info!(
@@ -11769,10 +11842,12 @@ impl Engine {
                     })
                     .collect();
                 let mut shutdown_finalized = false;
+                let mut probe_http_rx = probe_http_rx;
 
                 loop {
                     if let Some(routes_by_account) = poly_connection_routes.as_mut() {
                         for routes in routes_by_account.values_mut() {
+                            routes.refresh_health(now_ns());
                             flush_poly_safety_cancel_outbox(routes);
                             flush_poly_cancel_outbox(routes);
                         }
@@ -11803,6 +11878,22 @@ impl Engine {
                         recv(signal_rx) -> routed => match routed {
                             Ok(routed) => Some(routed),
                             Err(_) => break,
+                        },
+                        recv(probe_http_rx) -> request => {
+                            match request {
+                                Ok(request) => {
+                                    let routes = poly_states.get(&request.instance_id)
+                                        .and_then(|shared| poly_connection_routes.as_mut()
+                                            .and_then(|accounts| accounts.get_mut(shared.account_state.account_id())));
+                                    if let Some(routes) = routes {
+                                        dispatch_probe_http(request, routes);
+                                    } else {
+                                        request.reject_not_sent("probe account route unavailable");
+                                    }
+                                }
+                                Err(_) => probe_http_rx = crossbeam_channel::never(),
+                            }
+                            None
                         },
                         default(std::time::Duration::from_millis(1)) => None,
                     };
@@ -13270,7 +13361,11 @@ fn spawn_venue_execution_owner<T: ExchangeTrade + 'static>(
 /// owner.  The owner retains its exact admission slot for its whole lifetime,
 /// so a command never migrates to an arbitrary worker or completion drainer.
 enum PolyConnectionCommand {
+    /// Existing durable RTT probe HTTP legs use the same capacity and generation
+    /// fences as normal orders. The cold probe thread waits on its bounded reply.
+    ProbeHttp { request: ProbeHttpRequest, expected_generation: Option<u64> },
     Place {
+        expected_generation: Option<u64>,
         instance_id: String,
         order: OrderRequest,
         stale_ms: u64,
@@ -13389,7 +13484,13 @@ impl PolyConnectionLaneMetrics {
         if elapsed >= SLOW {
             let streak = self.slow_streak.fetch_add(1, Ordering::AcqRel) + 1;
             let shift = streak.saturating_sub(1).min(4) as u32;
-            let cooldown_secs = (2_u64 << shift).min(30);
+            // Fast eligibility is generation-aware and router-owned. Do not
+            // report a timer quarantine that the new Fast path does not use.
+            let cooldown_secs = if self.role == hexagent_runtime::http1_pool::Role::Fast {
+                0
+            } else {
+                (2_u64 << shift).min(30)
+            };
             let until = now_ns().saturating_add(cooldown_secs * 1_000_000_000);
             self.cooldown_until_ns.fetch_max(until, Ordering::AcqRel);
             let slow_requests = self.slow_requests.fetch_add(1, Ordering::Relaxed) + 1;
@@ -13515,6 +13616,19 @@ impl Drop for PolyConnectionOccupancyGuard {
 }
 
 struct PolyAccountConnectionRoutes {
+    /// Sole writer is the existing pinned execution dispatcher. Physical owners
+    /// publish immutable full snapshots on dedicated capacity-one lanes.
+    health: Option<AccountExecutionAdmission>,
+    health_account: Arc<str>,
+    health_diagnostic: Option<Sender<ExecutionDiagnostic>>,
+    paused_since_ns: Option<u64>,
+    paused_total_ns: u64,
+    admission_last_diagnostic_ns: u64,
+    health_lanes: Vec<(hexagent_runtime::http1_pool::Role, usize, Receiver<LaneObservation>)>,
+    admission_publishers: Vec<SnapshotPublisher<ExecutionAdmission>>,
+    admission_epoch: u64,
+    admission_last_publish_ns: u64,
+    admission_last_value: Option<(ExecutionAdmissionState, u16)>,
     fast: Vec<PolyConnectionLane>,
     cancel: Vec<PolyConnectionLane>,
     safety_cancel: Vec<PolyConnectionLane>,
@@ -13536,6 +13650,17 @@ struct PolyAccountConnectionRoutes {
 impl Default for PolyAccountConnectionRoutes {
     fn default() -> Self {
         Self {
+            health: None,
+            health_account: Arc::from(""),
+            health_diagnostic: None,
+            paused_since_ns: None,
+            paused_total_ns: 0,
+            admission_last_diagnostic_ns: 0,
+            health_lanes: Vec::new(),
+            admission_publishers: Vec::new(),
+            admission_epoch: 0,
+            admission_last_publish_ns: 0,
+            admission_last_value: None,
             fast: Vec::new(),
             cancel: Vec::new(),
             safety_cancel: Vec::new(),
@@ -13551,6 +13676,52 @@ impl Default for PolyAccountConnectionRoutes {
 }
 
 impl PolyAccountConnectionRoutes {
+    fn refresh_health(&mut self, _now: u64) {
+        let Some(health) = self.health.as_mut() else { return; };
+        for (role, slot, receiver) in &self.health_lanes {
+            match receiver.try_recv() {
+                Ok(observation) => { health.observe(*role, *slot, observation, now_ns()); }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    health.mark_delivery_fault(*role, *slot, now_ns());
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+            }
+        }
+        let now = now_ns();
+        let mut snapshot = health.refresh(now);
+        let value = (snapshot.state, snapshot.available_place_slots);
+        let previous_state = self.admission_last_value.map(|value| value.0);
+        let transitioned = previous_state != Some(snapshot.state);
+        if snapshot.state == ExecutionAdmissionState::Paused {
+            self.paused_since_ns.get_or_insert(now);
+        } else if let Some(started) = self.paused_since_ns.take() {
+            self.paused_total_ns = self.paused_total_ns.saturating_add(now.saturating_sub(started));
+        }
+        if self.admission_last_value != Some(value)
+            || now.saturating_sub(self.admission_last_publish_ns) >= 100_000_000
+        {
+            self.admission_epoch = self.admission_epoch.saturating_add(1);
+            snapshot.epoch = self.admission_epoch;
+            snapshot.observed_at_ns = now;
+            for publisher in &mut self.admission_publishers {
+                publisher.publish(snapshot);
+            }
+            self.admission_last_value = Some(value);
+            self.admission_last_publish_ns = now;
+        }
+        if transitioned || now.saturating_sub(self.admission_last_diagnostic_ns) >= 30_000_000_000 {
+            if let Some(sender) = &self.health_diagnostic {
+                try_submit_execution_diagnostic(sender, ExecutionDiagnostic::Admission {
+                    account: Arc::clone(&self.health_account), snapshot,
+                    paused_total_ns: self.paused_total_ns.saturating_add(
+                        self.paused_since_ns.map_or(0, |started| now.saturating_sub(started))),
+                    replaced_snapshots: self.admission_publishers.iter().map(|publisher| publisher.replaced).sum(),
+                });
+            }
+            self.admission_last_diagnostic_ns = now;
+        }
+    }
+
     fn lanes_mut(
         &mut self,
         role: hexagent_runtime::http1_pool::Role,
@@ -13670,15 +13841,37 @@ fn try_send_poly_owner(
     role: hexagent_runtime::http1_pool::Role,
     mut command: PolyConnectionCommand,
 ) -> Result<(), PolyConnectionCommand> {
-    let (lanes, rr) = routes.lanes_mut(role);
+    let now = now_ns();
+    routes.refresh_health(now);
+    let now = now_ns();
+    let PolyAccountConnectionRoutes { fast, cancel, reconcile, fast_rr, cancel_rr,
+        reconcile_rr, health, .. } = routes;
+    let (lanes, rr) = match role {
+        hexagent_runtime::http1_pool::Role::Fast => (&*fast, fast_rr),
+        hexagent_runtime::http1_pool::Role::Cancel => (&*cancel, cancel_rr),
+        hexagent_runtime::http1_pool::Role::Reconcile => (&*reconcile, reconcile_rr),
+        _ => return Err(command),
+    };
     if lanes.is_empty() {
         return Err(command);
     }
     let start = *rr % lanes.len();
-    let now = now_ns();
     for offset in 0..lanes.len() {
         let index = (start + offset) % lanes.len();
-        if lanes[index]
+        if matches!(&command, PolyConnectionCommand::ProbeHttp { request, .. }
+            if request.excluded_slot == Some(lanes[index].metrics.slot)) {
+            continue;
+        }
+        if role == hexagent_runtime::http1_pool::Role::Fast
+            && health.as_mut().is_some_and(|health| !health.lane_place_allowed(lanes[index].metrics.slot, now))
+        {
+            continue;
+        }
+        // Production Fast admission follows generation-aware health. The old
+        // elapsed-command cooldown is retained only for non-Fast fallback lanes
+        // and legacy unit fixtures; it cannot prolong a repaired Fast socket.
+        if !(role == hexagent_runtime::http1_pool::Role::Fast && health.is_some())
+            && lanes[index]
             .metrics
             .cooldown_until_ns
             .load(Ordering::Acquire)
@@ -13690,9 +13883,21 @@ fn try_send_poly_owner(
                 .fetch_add(1, Ordering::Relaxed);
             continue;
         }
+        match &mut command {
+            PolyConnectionCommand::Place { expected_generation, .. }
+            | PolyConnectionCommand::ProbeHttp { expected_generation, .. } if role == hexagent_runtime::http1_pool::Role::Fast => {
+                *expected_generation = health.as_ref().and_then(|health| health.lane_generation(lanes[index].metrics.slot));
+            }
+            _ => {}
+        }
         match lanes[index].try_send(command) {
             Ok(()) => {
                 *rr = index.wrapping_add(1);
+                if role == hexagent_runtime::http1_pool::Role::Fast {
+                    if let Some(health) = health.as_mut() {
+                        health.place_dispatched(lanes[index].metrics.slot, now_ns());
+                    }
+                }
                 return Ok(());
             }
             Err(crossbeam_channel::TrySendError::Full(returned)) => command = returned,
@@ -13709,6 +13914,10 @@ fn try_send_poly_owner(
     ) {
         for offset in 0..lanes.len() {
             let index = (start + offset) % lanes.len();
+        if matches!(&command, PolyConnectionCommand::ProbeHttp { request, .. }
+            if request.excluded_slot == Some(lanes[index].metrics.slot)) {
+            continue;
+        }
             if lanes[index]
                 .metrics
                 .cooldown_until_ns
@@ -13798,15 +14007,48 @@ fn run_poly_connection_owner(
     role: hexagent_runtime::http1_pool::Role,
     rx: Receiver<PolyConnectionCommand>,
     lane_metrics: Arc<PolyConnectionLaneMetrics>,
+    mut health_publisher: Option<SnapshotPublisher<LaneObservation>>,
 ) {
     use hexagent_runtime::http1_pool::Role;
     crate::latency::prepare_polymarket_order_stages();
-    while let Ok(command) = rx.recv() {
+    let mut observation_sequence = 0u64;
+    loop {
+        if let Some(publisher) = health_publisher.as_mut() {
+            let business = permit.business_outcome();
+            let (failures, slow) = permit.business_outcome_totals();
+            observation_sequence += 1;
+            publisher.publish(LaneObservation {
+                sequence: observation_sequence,
+                observed_at_ns: now_ns(),
+                health: permit.health_snapshot(),
+                business,
+                busy: lane_metrics.occupied.load(Ordering::Acquire),
+                cumulative_failures: failures,
+                cumulative_slow: slow,
+            });
+        }
+        let command = match rx.recv_timeout(HEARTBEAT) {
+            Ok(command) => command,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
         lane_metrics.queue_depth.store(0, Ordering::Release);
         let connection = permit.current_pooled_client().connection_snapshot();
         let _occupancy = PolyConnectionOccupancyGuard::new(Arc::clone(&lane_metrics), connection);
         match command {
+            PolyConnectionCommand::ProbeHttp { request, expected_generation } => {
+                let current = permit.health_snapshot();
+                if request.role == Role::Fast
+                    && (current.quarantined || expected_generation != Some(current.pool_generation)
+                        || request.enqueued_at.elapsed() > Duration::from_millis(100))
+                {
+                    request.reject_not_sent("probe admission changed before dispatch");
+                } else {
+                    request.execute_on(permit.current_pooled_client());
+                }
+            }
             PolyConnectionCommand::Place {
+                expected_generation,
                 instance_id,
                 order,
                 stale_ms,
@@ -13840,6 +14082,14 @@ fn run_poly_connection_owner(
                         && now_ns().saturating_sub(timestamp_ns) / 1_000_000 > stale_ms
                 };
                 if stale(order.timestamp_ns) || stale(order.quote_trigger_local_timestamp_ns) {
+                    let _ = send_executor_update(&update_tx, exec_rejected_place(&order));
+                    continue;
+                }
+                // Final owner-local check closes feedback propagation races.
+                // A never-sent order gets one typed lifecycle rejection; POSTs
+                // that reached the transport still follow uncertain reconciliation.
+                let current_health = permit.health_snapshot();
+                if current_health.quarantined || expected_generation != Some(current_health.pool_generation) {
                     let _ = send_executor_update(&update_tx, exec_rejected_place(&order));
                     continue;
                 }
@@ -14216,7 +14466,7 @@ fn exec_rejected_place(order: &OrderRequest) -> OrderUpdate {
         exchange_event_timestamp_ns: None,
         trade_id: None,
         order_audit: None,
-        error: None,
+        error: Some("not_sent: execution admission unavailable or quote stale".into()),
     }
 }
 
@@ -14334,6 +14584,14 @@ fn reconcile_deferred_updates(
     updates
 }
 
+fn dispatch_probe_http(request: ProbeHttpRequest, routes: &mut PolyAccountConnectionRoutes) {
+    let role = request.role;
+    let command = PolyConnectionCommand::ProbeHttp { request, expected_generation: None };
+    if let Err(PolyConnectionCommand::ProbeHttp { request, .. }) = send_poly_owner_lossless(routes, role, command) {
+        request.reject_not_sent("probe account execution admission unavailable");
+    }
+}
+
 fn dispatch_poly_signal_to_connection_owner(
     signal: Signal,
     stale_ms: u64,
@@ -14346,6 +14604,7 @@ fn dispatch_poly_signal_to_connection_owner(
     match signal {
         Signal::NewOrder(order) if order.exchange == Exchange::Polymarket => {
             let command = PolyConnectionCommand::Place {
+                expected_generation: None,
                 instance_id,
                 order,
                 stale_ms,
@@ -14390,6 +14649,7 @@ fn dispatch_poly_signal_to_connection_owner(
         } if exchange == Exchange::Polymarket => {
             for order in orders {
                 let place = PolyConnectionCommand::Place {
+                    expected_generation: None,
                     instance_id: instance_id.clone(),
                     order,
                     stale_ms,
@@ -14455,6 +14715,7 @@ fn dispatch_poly_signal_to_connection_owner(
             // backpressure to occupy the execution router ahead of Fast.
             for order in place_orders {
                 let place = PolyConnectionCommand::Place {
+                    expected_generation: None,
                     instance_id: instance_id.clone(),
                     order,
                     stale_ms,
@@ -16120,6 +16381,8 @@ mod market_router_tests {
             HashMap::new(),
             shutdown_done_tx,
             shutdown.clone(),
+            HashMap::new(),
+            crossbeam_channel::never(),
         );
         let strategy = thread::spawn(|| panic!("injected strategy panic"));
         assert_thread_exits(&strategy, "injected strategy");
@@ -16188,6 +16451,8 @@ mod market_router_tests {
             HashMap::new(),
             shutdown_done_tx,
             shutdown.clone(),
+            HashMap::new(),
+            crossbeam_channel::never(),
         );
 
         // The strategy owns the last ingress producer. Its panic disconnects
@@ -16248,6 +16513,7 @@ mod market_router_tests {
                     shutdown_requested,
                     shutdown_ack_tx,
                     clock_origin,
+                    None,
                 );
             })
             .unwrap();
@@ -17223,6 +17489,72 @@ mod market_router_tests {
     }
 
     #[test]
+    fn recovery_routes_one_place_and_returns_exact_not_sent_lifecycle_for_the_rest() {
+        use hexagent_runtime::http1_pool::{PermitHealthSnapshot, Role};
+        let (fast_a_tx, fast_a_rx) = bounded(1);
+        let (fast_b_tx, fast_b_rx) = bounded(1);
+        let (update_tx, updates) = bounded(8);
+        let now = now_ns();
+        let mut health = AccountExecutionAdmission::new(2, 1, now);
+        for (role, slot) in [(Role::Fast, 0), (Role::Fast, 1), (Role::Cancel, 0)] {
+            health.observe(role, slot, LaneObservation {
+                sequence: 1, observed_at_ns: now,
+                health: PermitHealthSnapshot { pool_generation: 7, quarantined: false },
+                business: None, busy: false, cumulative_failures: 0, cumulative_slow: 0,
+            }, now);
+        }
+        let mut routes = PolyAccountConnectionRoutes {
+            health: Some(health),
+            fast: vec![PolyConnectionLane::for_test(fast_a_tx, Role::Fast, 0),
+                       PolyConnectionLane::for_test(fast_b_tx, Role::Fast, 1)],
+            ..Default::default()
+        };
+        let orders = [order_req("probe-1", "owner"), order_req("probe-2", "owner")];
+        for order in orders {
+            assert!(dispatch_poly_signal_to_connection_owner(Signal::NewOrder(order), 0,
+                ExecutorUpdateSender { owner: 9, tx: update_tx.clone() }, &mut routes));
+        }
+        let command = fast_a_rx.try_recv().unwrap();
+        assert!(matches!(command, PolyConnectionCommand::Place {
+            expected_generation: Some(7), ref order, ..
+        } if order.client_order_id == "probe-1"));
+        assert!(fast_b_rx.is_empty());
+        let rejected = updates.try_recv().unwrap();
+        assert_eq!(rejected.owner, 9);
+        assert_eq!(rejected.update.client_order_id, "probe-2");
+        assert_eq!(rejected.update.status, OrderStatus::ExecutorRejected);
+        assert!(rejected.update.error.unwrap().starts_with("not_sent:"));
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn paused_account_rejects_place_but_preserves_cancel_dispatch() {
+        use hexagent_runtime::http1_pool::Role;
+        let (fast_tx, fast_rx) = bounded(1);
+        let (cancel_tx, cancel_rx) = bounded(1);
+        let (update_tx, updates) = bounded(8);
+        let mut routes = PolyAccountConnectionRoutes {
+            health: Some(AccountExecutionAdmission::new(1, 1, now_ns())),
+            fast: vec![PolyConnectionLane::for_test(fast_tx, Role::Fast, 0)],
+            cancel: vec![PolyConnectionLane::for_test(cancel_tx, Role::Cancel, 0)],
+            ..Default::default()
+        };
+        let sender = ExecutorUpdateSender { owner: 4, tx: update_tx };
+        dispatch_poly_signal_to_connection_owner(
+            Signal::NewOrder(order_req("new", "owner")), 0, sender.clone(), &mut routes);
+        dispatch_poly_signal_to_connection_owner(Signal::CancelOrder {
+            exchange: Exchange::Polymarket, client_order_id: "resting".into(),
+            instance_id: "owner".into(), timestamp_ns: now_ns(),
+        }, 0, sender, &mut routes);
+        assert!(fast_rx.is_empty());
+        assert!(matches!(cancel_rx.try_recv().unwrap(), PolyConnectionCommand::Cancel {
+            ref client_order_id, ..
+        } if client_order_id == "resting"));
+        assert_eq!(updates.try_recv().unwrap().update.client_order_id, "new");
+        assert!(updates.is_empty());
+    }
+
+    #[test]
     fn saturated_replace_sheds_place_but_retains_cancel_lane_work() {
         let (fast_tx, _fast_rx) = bounded(1);
         let (cancel_tx, cancel_rx) = bounded(8);
@@ -17360,6 +17692,7 @@ mod market_router_tests {
             ..Default::default()
         };
         let command = |coid: &str| PolyConnectionCommand::Place {
+            expected_generation: None,
             instance_id: "zhu-03".into(),
             order: order_req(coid, "zhu-03"),
             stale_ms: 100,

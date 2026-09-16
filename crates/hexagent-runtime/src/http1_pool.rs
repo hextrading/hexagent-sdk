@@ -831,6 +831,22 @@ impl ConnectionHealth {
         }
     }
 
+    fn claim_instrumented_rebuild(&self) -> Option<usize> {
+        // Every retired physical generation must eventually be replaced. A
+        // cooldown inherited from an earlier generation would strand a newly
+        // retired slot forever once the owner stops sending on it. The
+        // generation fence and quarantine CAS still admit exactly one repair;
+        // that repair retains the existing bounded prewarm retry backoff.
+        let cooldown = if matches!(self.role, Role::Fast | Role::Cancel) {
+            Duration::ZERO
+        } else {
+            // Query/recovery generations do not retire admission capacity;
+            // preserve their existing rebuild frequency limit.
+            Duration::from_secs(30)
+        };
+        self.claim_rebuild(1, cooldown)
+    }
+
     fn claim_rebuild(&self, threshold: usize, cooldown: Duration) -> Option<usize> {
         if !self.is_current() {
             return None;
@@ -1044,6 +1060,15 @@ struct AttemptTraceSlot {
     signed_ns: AtomicU64,
     account_recorded_ns: AtomicU64,
     dispatched_ns: AtomicU64,
+    // The exclusive permit's HTTP task is the sole writer. The connection
+    // owner consumes this copy after request completion, before dispatching
+    // another request. Exempt clients and warm probes never publish here.
+    business_attempt_id: AtomicU64,
+    business_pool_generation: AtomicU64,
+    business_elapsed_ns: AtomicU64,
+    business_outcome_status: AtomicU64,
+    business_failures: AtomicU64,
+    business_slow: AtomicU64,
 }
 
 impl AttemptTraceSlot {
@@ -1057,8 +1082,76 @@ impl AttemptTraceSlot {
             signed_ns: AtomicU64::new(0),
             account_recorded_ns: AtomicU64::new(0),
             dispatched_ns: AtomicU64::new(0),
+            business_attempt_id: AtomicU64::new(0),
+            business_pool_generation: AtomicU64::new(0),
+            business_elapsed_ns: AtomicU64::new(0),
+            business_outcome_status: AtomicU64::new(0),
+            business_failures: AtomicU64::new(0),
+            business_slow: AtomicU64::new(0),
         }
     }
+
+    fn business_outcome(&self) -> Option<BusinessHttpOutcomeSnapshot> {
+        // Sequentially consistent publication also makes a diagnostic read
+        // racing the next completion fail closed instead of mixing attempts.
+        // Normal owner reads follow the completion handoff and do not race.
+        let attempt_id = self.business_attempt_id.load(Ordering::SeqCst);
+        if attempt_id == 0 {
+            return None;
+        }
+        let pool_generation = self.business_pool_generation.load(Ordering::SeqCst);
+        let elapsed_ns = self.business_elapsed_ns.load(Ordering::SeqCst);
+        let encoded = self.business_outcome_status.load(Ordering::SeqCst);
+        if self.business_attempt_id.load(Ordering::SeqCst) != attempt_id {
+            return None;
+        }
+        let outcome = match encoded >> 16 {
+            1 => BusinessHttpOutcome::Healthy,
+            2 => BusinessHttpOutcome::Slow,
+            3 => BusinessHttpOutcome::Failure,
+            _ => return None,
+        };
+        Some(BusinessHttpOutcomeSnapshot {
+            attempt_id,
+            pool_generation,
+            elapsed_ns,
+            outcome,
+            status_code: encoded as u16,
+        })
+    }
+}
+
+/// Result of a real order-endpoint HTTP request, independent of whether an
+/// order was accepted. Ordinary business rejections can prove a healthy route;
+/// throttling, authentication errors and unavailable endpoints cannot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum BusinessHttpOutcome {
+    Healthy = 1,
+    Slow = 2,
+    Failure = 3,
+}
+
+/// One completed request on the permit's exact logical pool generation.
+/// An unchanged attempt ID means no new HTTP observation (for example, local
+/// preflight rejection); consumers must deduplicate it. A replacement's GET
+/// /time success never changes this value or counts as business recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BusinessHttpOutcomeSnapshot {
+    pub attempt_id: u64,
+    pub pool_generation: u64,
+    pub elapsed_ns: u64,
+    pub outcome: BusinessHttpOutcome,
+    /// Zero when no complete HTTP status was received.
+    pub status_code: u16,
+}
+
+/// Transport readiness only. A prewarmed generation still needs real business
+/// outcomes before an account's admission owner can mark it recovered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PermitHealthSnapshot {
+    pub pool_generation: u64,
+    pub quarantined: bool,
 }
 
 /// Allocation-free handle to the trace record preallocated for one admission
@@ -1204,6 +1297,60 @@ impl PooledClient {
         self.health.note_transport_success();
     }
 
+    /// Publish a completed order-endpoint request before its completion is
+    /// handed back to the connection owner. Call only once per actual HTTP
+    /// attempt, never for preflight rejection, GET probes or the final combined
+    /// outcome of a primary request plus an alternate-connection hedge.
+    /// Storage is preallocated and private to this exclusive admission slot.
+    pub fn record_business_outcome(
+        &self,
+        attempt_id: u64,
+        elapsed_ns: u64,
+        outcome: BusinessHttpOutcome,
+        status_code: u16,
+    ) {
+        if !self.exclusive_admission
+            || !matches!(self.role(), Role::Fast | Role::Cancel)
+            || attempt_id == 0
+            || attempt_id
+                <= self
+                    .attempt_trace
+                    .business_attempt_id
+                    .load(Ordering::SeqCst)
+        {
+            return;
+        }
+        self.attempt_trace
+            .business_attempt_id
+            .store(0, Ordering::SeqCst);
+        self.attempt_trace
+            .business_pool_generation
+            .store(self.health.generation_at_pick, Ordering::SeqCst);
+        self.attempt_trace
+            .business_elapsed_ns
+            .store(elapsed_ns, Ordering::SeqCst);
+        self.attempt_trace.business_outcome_status.store(
+            ((outcome as u64) << 16) | status_code as u64,
+            Ordering::SeqCst,
+        );
+        match outcome {
+            BusinessHttpOutcome::Failure => {
+                self.attempt_trace
+                    .business_failures
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            BusinessHttpOutcome::Slow => {
+                self.attempt_trace
+                    .business_slow
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            BusinessHttpOutcome::Healthy => {}
+        }
+        self.attempt_trace
+            .business_attempt_id
+            .store(attempt_id, Ordering::SeqCst);
+    }
+
     /// Record a transport failure. On the second consecutive failure this
     /// quarantines the slot and starts background rebuild + prewarm. Returns
     /// true when this call claimed the rebuild.
@@ -1222,9 +1369,9 @@ impl PooledClient {
 
     /// Retire the measured HTTP/1 generation and rebuild this exact logical
     /// slot. A single transport failure already identifies the affected
-    /// generation; cluster gating remains responsible for pausing placement.
+    /// generation; the account's connection owner decides placement capacity.
     pub fn note_instrumented_transport_failure(&self, prewarm_url: String) -> bool {
-        let Some(failures) = self.health.claim_rebuild(1, Duration::from_secs(30)) else {
+        let Some(failures) = self.health.claim_instrumented_rebuild() else {
             return false;
         };
         let health = self.health.clone();
@@ -1278,6 +1425,34 @@ impl Permit {
     }
     pub fn generation(&self) -> u64 {
         self.acquired_generation
+    }
+
+    pub fn business_outcome(&self) -> Option<BusinessHttpOutcomeSnapshot> {
+        self.attempt_trace.business_outcome()
+    }
+
+    /// Monotonic (failures, slow) totals for this exact slot across all of its
+    /// generations. Consume after an owner command completes, before starting
+    /// another: one cancel sweep can perform multiple HTTP attempts, so its
+    /// last successful response must not hide an earlier adverse result.
+    pub fn business_outcome_totals(&self) -> (u64, u64) {
+        (
+            self.attempt_trace.business_failures.load(Ordering::SeqCst),
+            self.attempt_trace.business_slow.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Read current transport readiness without borrowing or replacing the
+    /// live client. Conservatively report quarantine if repair crosses the
+    /// read; the next owner poll can observe the completed generation.
+    pub fn health_snapshot(&self) -> PermitHealthSnapshot {
+        let generation_before = self.generation.load(Ordering::Acquire);
+        let quarantined = self.quarantined.load(Ordering::Acquire);
+        let pool_generation = self.generation.load(Ordering::Acquire);
+        PermitHealthSnapshot {
+            pool_generation,
+            quarantined: quarantined || generation_before != pool_generation,
+        }
     }
 
     fn health(&self, generation_at_pick: u64) -> ConnectionHealth {
@@ -2232,6 +2407,176 @@ mod tests {
             first.snapshot().is_none(),
             "an old handle detects admission-slot reuse instead of reading another attempt"
         );
+    }
+
+    #[test]
+    fn business_outcome_is_attempt_fenced_and_account_local() {
+        let first_account = account(1);
+        let second_account = account(1);
+        let permit = first_account.fast.try_acquire().unwrap();
+        let isolated = second_account.fast.try_acquire().unwrap();
+        let client = permit.pooled_client();
+        assert_eq!(permit.business_outcome(), None);
+        let attempt_id = client.allocate_attempt_id();
+        client.record_business_outcome(attempt_id, 42, BusinessHttpOutcome::Failure, 503);
+        let failure = permit.business_outcome().unwrap();
+        assert_eq!(failure.attempt_id, attempt_id);
+        assert_eq!(failure.pool_generation, 0);
+        assert_eq!(failure.elapsed_ns, 42);
+        assert_eq!(failure.outcome, BusinessHttpOutcome::Failure);
+        assert_eq!(failure.status_code, 503);
+        assert_eq!(isolated.business_outcome(), None);
+
+        client.record_business_outcome(attempt_id, 1, BusinessHttpOutcome::Healthy, 200);
+        assert_eq!(
+            permit.business_outcome(),
+            Some(failure),
+            "duplicate cannot rewrite evidence"
+        );
+        let next = client.allocate_attempt_id();
+        client.record_business_outcome(next, 50, BusinessHttpOutcome::Healthy, 200);
+        client.record_business_outcome(attempt_id, 80, BusinessHttpOutcome::Failure, 0);
+        assert_eq!(permit.business_outcome().unwrap().attempt_id, next);
+        assert_eq!(
+            permit.business_outcome().unwrap().outcome,
+            BusinessHttpOutcome::Healthy
+        );
+        assert_eq!(permit.business_outcome_totals(), (1, 0));
+        let slow = client.allocate_attempt_id();
+        client.record_business_outcome(slow, 500_000_000, BusinessHttpOutcome::Slow, 200);
+        client.record_business_outcome(
+            client.allocate_attempt_id(),
+            40,
+            BusinessHttpOutcome::Healthy,
+            200,
+        );
+        assert_eq!(
+            permit.business_outcome().unwrap().outcome,
+            BusinessHttpOutcome::Healthy
+        );
+        assert_eq!(
+            permit.business_outcome_totals(),
+            (1, 1),
+            "a sweep's final success must retain earlier adverse attempts"
+        );
+    }
+
+    #[test]
+    fn replacement_readiness_is_not_business_recovery_and_hedges_keep_identity() {
+        let account = account(1);
+        let primary = account.fast.try_acquire().unwrap();
+        let hedge = account.cancel.try_acquire().unwrap();
+        let client = primary.pooled_client();
+        let attempt = client.allocate_attempt_id();
+        client.record_business_outcome(attempt, 2_000_000_000, BusinessHttpOutcome::Failure, 0);
+        let health = primary.health(primary.generation());
+        let failures = health.claim_rebuild(1, Duration::ZERO).unwrap();
+        assert!(primary.health_snapshot().quarantined);
+        health
+            .install_replacement(health.build_replacement().unwrap(), failures)
+            .unwrap();
+        assert_eq!(
+            primary.health_snapshot(),
+            PermitHealthSnapshot {
+                pool_generation: 1,
+                quarantined: false,
+            }
+        );
+        assert_eq!(primary.business_outcome().unwrap().pool_generation, 0);
+        assert_eq!(
+            primary.business_outcome().unwrap().outcome,
+            BusinessHttpOutcome::Failure
+        );
+
+        let hedge_client = hedge.pooled_client();
+        hedge_client.record_business_outcome(
+            hedge_client.allocate_attempt_id(),
+            20,
+            BusinessHttpOutcome::Healthy,
+            200,
+        );
+        assert_eq!(primary.business_outcome().unwrap().attempt_id, attempt);
+        assert_eq!(
+            primary.business_outcome().unwrap().outcome,
+            BusinessHttpOutcome::Failure
+        );
+        assert_eq!(
+            hedge.business_outcome().unwrap().outcome,
+            BusinessHttpOutcome::Healthy
+        );
+    }
+
+    #[test]
+    fn instrumented_repair_is_single_owner_per_generation_without_cross_generation_cooldown() {
+        let p = pool(1);
+        let permit = p.try_acquire().unwrap();
+        let original = permit.health(permit.generation());
+        let failures = original.claim_instrumented_rebuild().unwrap();
+        for _ in 0..10 {
+            assert!(
+                original.claim_instrumented_rebuild().is_none(),
+                "one repair owns quarantine including every retry"
+            );
+        }
+        original
+            .install_replacement(original.build_replacement().unwrap(), failures)
+            .unwrap();
+        let replacement = permit.health(permit.health_snapshot().pool_generation);
+        assert_eq!(replacement.generation_at_pick, 1);
+        assert!(
+            replacement.claim_instrumented_rebuild().is_some(),
+            "a new retired generation must repair immediately even within 30 seconds"
+        );
+        assert!(
+            replacement.claim_instrumented_rebuild().is_none(),
+            "new generation still permits only one repair"
+        );
+        assert!(
+            original.claim_instrumented_rebuild().is_none(),
+            "stale generations cannot claim or release the replacement repair"
+        );
+        assert!(permit.health_snapshot().quarantined);
+    }
+
+    #[test]
+    fn query_repair_preserves_cross_generation_cooldown() {
+        let account = account(1);
+        let permit = account.reconcile.try_acquire().unwrap();
+        let original = permit.health(permit.generation());
+        let failures = original.claim_instrumented_rebuild().unwrap();
+        original
+            .install_replacement(original.build_replacement().unwrap(), failures)
+            .unwrap();
+        let replacement = permit.health(permit.health_snapshot().pool_generation);
+        assert_eq!(replacement.generation_at_pick, 1);
+        assert!(replacement.claim_instrumented_rebuild().is_none());
+        assert!(!permit.health_snapshot().quarantined);
+    }
+
+    #[test]
+    fn exempt_and_recovery_clients_cannot_publish_owner_business_recovery() {
+        let account = account(1);
+        let permit = account.fast.try_acquire().unwrap();
+        let exempt = account.fast.pooled_client_for_slot(0);
+        exempt.record_business_outcome(
+            exempt.allocate_attempt_id(),
+            1,
+            BusinessHttpOutcome::Healthy,
+            200,
+        );
+        assert_eq!(permit.business_outcome(), None);
+        for pool in [&account.reconcile, &account.gap_replay] {
+            let recovery = pool.try_acquire().unwrap();
+            let client = recovery.pooled_client();
+            client.record_business_outcome(
+                client.allocate_attempt_id(),
+                1,
+                BusinessHttpOutcome::Failure,
+                0,
+            );
+            assert_eq!(recovery.business_outcome(), None);
+            assert_eq!(permit.business_outcome(), None);
+        }
     }
 
     #[test]

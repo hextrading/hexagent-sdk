@@ -102,6 +102,141 @@ use super::trade::{
 
 const PROBE_ORPHAN_OWNER_CAPACITY: usize = 64;
 
+/// Cold probe work joins the same physical connection owners as ordinary
+/// account requests. The engine owns this bounded mailbox; it admits POST on
+/// its account-local Fast budget and retains DELETE on its cancel outbox.
+#[derive(Clone)]
+pub struct ProbeHttpTransport {
+    tx: Sender<ProbeHttpRequest>,
+}
+
+pub fn probe_http_lane(capacity: usize) -> (ProbeHttpTransport, Receiver<ProbeHttpRequest>) {
+    assert!(capacity > 0, "probe HTTP lane must be bounded and nonzero");
+    let (tx, rx) = crossbeam_channel::bounded(capacity);
+    (ProbeHttpTransport { tx }, rx)
+}
+
+pub(crate) struct ProbeHttpResponse {
+    pub(crate) reply: Result<serde_json::Value, HttpErr>,
+    pub(crate) location: Option<(crate::http1_pool::Role, usize)>,
+}
+
+/// An owned HTTP request prepared on the existing probe thread, never on a
+/// quote callback. Fields identifying its owner and physical role are exposed
+/// only for engine routing. Authentication, response interpretation and the
+/// durable orphan remain on the existing exchange/probe paths.
+pub struct ProbeHttpRequest {
+    pub instance_id: String,
+    pub role: crate::http1_pool::Role,
+    pub enqueued_at: Instant,
+    /// A second reconcile lookup must use a distinct physical account slot.
+    pub excluded_slot: Option<usize>,
+    shared: Arc<SharedState>,
+    method: &'static str,
+    path: String,
+    body: String,
+    record_kind: Option<crate::latency_record::RequestKind>,
+    reply: Sender<ProbeHttpResponse>,
+}
+
+impl ProbeHttpRequest {
+    /// Consume on exactly one account connection owner. POST never retries;
+    /// a stale cold intent or role mismatch is proven not_sent. The owner
+    /// publishes the normal business outcome observation after this returns.
+    pub fn execute_on(self, client: crate::http1_pool::PooledClient) {
+        if client.role() != self.role || self.excluded_slot == Some(client.slot()) {
+            self.reject_not_sent("probe physical connection identity mismatch");
+            return;
+        }
+        if self.role == crate::http1_pool::Role::Fast {
+            if self.enqueued_at.elapsed() >= Duration::from_secs(1) {
+                self.reject_not_sent("probe place expired before dispatch");
+                return;
+            }
+            if let Some(reason) = self.shared.place_admission_block_reason() {
+                self.reject_not_sent(reason);
+                return;
+            }
+        }
+        let location = Some((client.role(), client.slot()));
+        let reply = self.shared.http_call_sync_on_rec(
+            client,
+            self.method,
+            &self.path,
+            &self.body,
+            self.record_kind,
+        );
+        // The sole cold consumer may have timed out. A lost reply is ambiguous
+        // there and keeps the durable orphan; never retry a POST here.
+        let _ = self.reply.try_send(ProbeHttpResponse { reply, location });
+    }
+
+    pub fn reject_not_sent(self, reason: &'static str) {
+        let _ = self.reply.try_send(ProbeHttpResponse {
+            reply: Err(HttpErr::Other(reason.to_string())),
+            location: None,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reply_for_test(
+        self,
+        reply: Result<serde_json::Value, HttpErr>,
+        location: Option<(crate::http1_pool::Role, usize)>,
+    ) {
+        let _ = self.reply.try_send(ProbeHttpResponse { reply, location });
+    }
+}
+
+impl ProbeHttpTransport {
+    pub(crate) fn request(
+        &self,
+        shared: &Arc<SharedState>,
+        instance_id: &str,
+        method: &'static str,
+        path: &str,
+        body: &str,
+        record_kind: Option<crate::latency_record::RequestKind>,
+        excluded_slot: Option<usize>,
+    ) -> ProbeHttpResponse {
+        let role = match method {
+            "POST" => crate::http1_pool::Role::Fast,
+            "DELETE" => crate::http1_pool::Role::Cancel,
+            _ => crate::http1_pool::Role::Reconcile,
+        };
+        let (reply, rx) = crossbeam_channel::bounded(1);
+        let request = ProbeHttpRequest {
+            instance_id: instance_id.to_string(),
+            role,
+            enqueued_at: Instant::now(),
+            excluded_slot,
+            shared: Arc::clone(shared),
+            method,
+            path: path.to_string(),
+            body: body.to_string(),
+            record_kind,
+            reply,
+        };
+        if self.tx.try_send(request).is_err() {
+            // Nothing reached an execution owner. For DELETE the already
+            // durable orphan retains retry ownership, so no cancel is lost.
+            return ProbeHttpResponse {
+                reply: Err(HttpErr::Other(
+                    "probe execution lane unavailable before dispatch".into(),
+                )),
+                location: None,
+            };
+        }
+        rx.recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| ProbeHttpResponse {
+                reply: Err(HttpErr::Transport(
+                    "probe execution reply unavailable; outcome uncertain".into(),
+                )),
+                location: None,
+            })
+    }
+}
+
 /// Durable operational state for a synthetic RTT request whose place result
 /// was ambiguous. This intentionally lives outside StrategyAccount's economic
 /// reservations: probes must never make strategy buying power appear spent.
@@ -490,6 +625,9 @@ pub fn pick_probe_side<'a>(
 /// session (as long as an `active_token` is available). When
 /// `all_probe = false` it behaves as the RTT-gate's latency sampler:
 /// fires only while the gate is in PROBE mode (`enable_flag`).
+/// Live execution supplies `transport`, so all probe and orphan requests use
+/// the engine's account connection owners. `None` is retained for the explicit
+/// record-only all-probe mode, which has no live execution router.
 pub fn spawn_rtt_probe(
     shared: Arc<SharedState>,
     enable_flag: Arc<AtomicBool>,
@@ -499,6 +637,32 @@ pub fn spawn_rtt_probe(
     shutdown: Arc<AtomicBool>,
     all_probe: bool,
     instance_id: String,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    spawn_rtt_probe_with_transport(
+        shared,
+        enable_flag,
+        sample_tx,
+        active_token,
+        interval,
+        shutdown,
+        all_probe,
+        instance_id,
+        None,
+    )
+}
+
+/// Live engines supply their account-owner transport. The compatibility entry
+/// point above retains the standalone/record probe API.
+pub fn spawn_rtt_probe_with_transport(
+    shared: Arc<SharedState>,
+    enable_flag: Arc<AtomicBool>,
+    sample_tx: Sender<f64>,
+    active_token: ActiveTokenHandle,
+    interval: Duration,
+    shutdown: Arc<AtomicBool>,
+    all_probe: bool,
+    instance_id: String,
+    transport: Option<ProbeHttpTransport>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("poly-rtt-probe-join".to_string())
@@ -542,7 +706,8 @@ pub fn spawn_rtt_probe(
                     continue;
                 }
 
-                let place_rtt = fire_full_probe(&shared, &active_token, &instance_id);
+                let place_rtt =
+                    fire_full_probe(&shared, &active_token, &instance_id, transport.as_ref());
                 last_fire = Instant::now();
                 if let Some(rtt_ms) = place_rtt {
                     debug!("[RttProbe] place RTT={:.1}ms", rtt_ms);
@@ -584,6 +749,7 @@ fn fire_full_probe(
     shared: &Arc<SharedState>,
     active_token: &ActiveTokenHandle,
     instance_id: &str,
+    transport: Option<&ProbeHttpTransport>,
 ) -> Option<f64> {
     // Live accounts always have a persistent ledger and therefore a durable
     // probe owner. CLI/test states without one skip synthetic placement.
@@ -599,20 +765,27 @@ fn fire_full_probe(
                 &shared.auth.api_key,
                 &orphan.instance_id,
             );
-            let terminal =
-                match route.reconcile_probe_order(&orphan.client_order_id, &orphan.order_id) {
-                    ProbeReconcileOutcome::Terminal => true,
-                    ProbeReconcileOutcome::ParallelAbsent => {
+            let outcome = match transport {
+                Some(transport) => route.reconcile_probe_order_via_transport(
+                    &orphan.client_order_id,
+                    &orphan.order_id,
+                    transport,
+                ),
+                None => route.reconcile_probe_order(&orphan.client_order_id, &orphan.order_id),
+            };
+            let terminal = match outcome {
+                ProbeReconcileOutcome::Terminal => true,
+                ProbeReconcileOutcome::ParallelAbsent => {
                     match orphan_owner.note_parallel_absence(&orphan.order_id) {
-                            Ok(observations) => observations >= 2,
-                            Err(error) => {
-                                warn!("[RttProbe] persist parallel evidence failed: {error}");
-                                false
-                            }
+                        Ok(observations) => observations >= 2,
+                        Err(error) => {
+                            warn!("[RttProbe] persist parallel evidence failed: {error}");
+                            false
                         }
                     }
-                    ProbeReconcileOutcome::Pending => false,
-                };
+                }
+                ProbeReconcileOutcome::Pending => false,
+            };
             if terminal {
                 match orphan_owner.resolve(&orphan.order_id) {
                     Ok(true) => info!(
@@ -740,12 +913,27 @@ fn fire_full_probe(
     // the dedicated `probe_place` kind (not `place`) so offline analysis
     // can separate synthetic probe traffic from real strategy orders.
     let t0 = Instant::now();
-    let res = shared.http_call_sync_rec(
-        "POST",
-        "/order",
-        &body,
-        Some(crate::latency_record::RequestKind::ProbePlace),
-    );
+    let res = match transport {
+        Some(transport) => {
+            transport
+                .request(
+                    shared,
+                    instance_id,
+                    "POST",
+                    "/order",
+                    &body,
+                    Some(crate::latency_record::RequestKind::ProbePlace),
+                    None,
+                )
+                .reply
+        }
+        None => shared.http_call_sync_rec(
+            "POST",
+            "/order",
+            &body,
+            Some(crate::latency_record::RequestKind::ProbePlace),
+        ),
+    };
     let place_rtt = t0.elapsed().as_secs_f64() * 1000.0;
 
     // Resolve the resting order's id for the cancel leg. The server's
@@ -801,12 +989,27 @@ fn fire_full_probe(
     // is recorded at the http layer; we just fire it and log.
     if let Some(oid) = order_id {
         let cbody = serde_json::json!({ "orderID": oid }).to_string();
-        let cres = shared.http_call_sync_rec(
-            "DELETE",
-            "/order",
-            &cbody,
-            Some(crate::latency_record::RequestKind::ProbeCancel),
-        );
+        let cres = match transport {
+            Some(transport) => {
+                transport
+                    .request(
+                        shared,
+                        instance_id,
+                        "DELETE",
+                        "/order",
+                        &cbody,
+                        Some(crate::latency_record::RequestKind::ProbeCancel),
+                        None,
+                    )
+                    .reply
+            }
+            None => shared.http_call_sync_rec(
+                "DELETE",
+                "/order",
+                &cbody,
+                Some(crate::latency_record::RequestKind::ProbeCancel),
+            ),
+        };
         if cres
             .as_ref()
             .is_ok_and(|response| probe_cancel_response_is_terminal(response, &oid))
@@ -826,6 +1029,97 @@ fn fire_full_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_http_cold_lane_preserves_owner_role_exclusion_and_not_sent_vs_ambiguous() {
+        use crate::http1_pool::Role;
+        let shutdown = hexagent_runtime::shutdown::ShutdownToken::new();
+        let trade = PolymarketTrade::new_with_pool_for_startup_query_repair_and_shutdown(
+            "api-key",
+            "c2VjcmV0",
+            "passphrase",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            false,
+            10,
+            super::super::signer::SignatureType::Eoa,
+            super::super::trade::ClobVersion::V2,
+            "",
+            "",
+            true,
+            "probe-http-test",
+            "",
+            super::super::trade::GapReplayConfig::default(),
+            None,
+            shutdown.clone(),
+        )
+        .unwrap();
+        let shared = trade.shared_state();
+        let (transport, requests) = probe_http_lane(1);
+        std::thread::scope(|scope| {
+            for (method, role, excluded) in [
+                ("POST", Role::Fast, None),
+                ("DELETE", Role::Cancel, None),
+                ("GET", Role::Reconcile, Some(2)),
+            ] {
+                let transport_ref = &transport;
+                let shared_ref = &shared;
+                let worker = scope.spawn(move || {
+                    transport_ref.request(
+                        shared_ref, "maker-a", method, "/order", "{}", None, excluded,
+                    )
+                });
+                let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert_eq!(request.instance_id, "maker-a");
+                assert_eq!(request.role, role);
+                assert_eq!(request.excluded_slot, excluded);
+                request.reject_not_sent("test capacity gate");
+                let response = worker.join().unwrap();
+                assert!(matches!(response.reply, Err(HttpErr::Other(_))));
+                assert_eq!(response.location, None);
+            }
+            // Once handed to the router, a lost response cannot prove absence.
+            let worker = scope.spawn(|| {
+                transport.request(&shared, "maker-b", "POST", "/order", "{}", None, None)
+            });
+            let accepted = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(accepted.instance_id, "maker-b");
+            drop(accepted);
+            assert!(matches!(
+                worker.join().unwrap().reply,
+                Err(HttpErr::Transport(_))
+            ));
+        });
+        // A full mailbox rejects before any owner can send the second order.
+        let (reply, _rx) = crossbeam_channel::bounded(1);
+        transport
+            .tx
+            .try_send(ProbeHttpRequest {
+                instance_id: "maker-a".into(),
+                role: Role::Fast,
+                enqueued_at: Instant::now(),
+                excluded_slot: None,
+                shared: Arc::clone(&shared),
+                method: "POST",
+                path: "/order".into(),
+                body: "{}".into(),
+                record_kind: None,
+                reply,
+            })
+            .unwrap_or_else(|_| panic!("first request fits"));
+        let overflow = transport.request(&shared, "maker-b", "POST", "/order", "{}", None, None);
+        assert!(matches!(overflow.reply, Err(HttpErr::Other(_))));
+        assert_eq!(requests.len(), 1);
+        requests.recv().unwrap().reject_not_sent("test shutdown");
+        drop(requests);
+        assert!(matches!(
+            transport
+                .request(&shared, "maker-b", "POST", "/order", "{}", None, None)
+                .reply,
+            Err(HttpErr::Other(_))
+        ));
+        shutdown.finish();
+        shared.join_background_workers();
+    }
 
     #[test]
     fn active_token_handle_publishes_latest_immutable_snapshot() {
