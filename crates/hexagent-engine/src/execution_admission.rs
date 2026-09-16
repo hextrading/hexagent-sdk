@@ -364,6 +364,13 @@ impl AccountExecutionAdmission {
             .filter(|lane| !lane.reserved_cancel)
             .count();
         let busy_fast = self.fast.iter().filter(|lane| lane.busy).count();
+        let eligible_busy_fast = self
+            .fast
+            .iter()
+            .filter(|lane| {
+                lane.fresh(now_ns, self.config.stale_after_ns) && lane.ready() && lane.busy
+            })
+            .count();
         let free_fast = self
             .fast
             .iter()
@@ -384,6 +391,8 @@ impl AccountExecutionAdmission {
             self.probe = None;
             (ExecutionAdmissionState::Paused, 0)
         } else if self.recovery_required {
+            // Recovery promises at most one request in flight account-wide.
+            // An unavailable owner is not evidence its unknown POST completed.
             let slots = usize::from(busy_fast == 0 && self.probe.is_none() && free_fast > 0);
             (ExecutionAdmissionState::Recovering, slots)
         } else if fresh
@@ -396,10 +405,12 @@ impl AccountExecutionAdmission {
             // A partial pool continues quoting at reduced concurrency. Slow
             // generations stay excluded while a repaired generation is eligible
             // for real business evidence, never healed by its /time warmup.
+            // An isolated busy lane keeps its own dispatch/unknown ownership,
+            // but must not also consume this remaining eligible pool's budget.
             let budget = (ready_fast / 2).max(1);
             (
                 ExecutionAdmissionState::Degraded,
-                budget.saturating_sub(busy_fast).min(free_fast),
+                budget.saturating_sub(eligible_busy_fast).min(free_fast),
             )
         };
         let slots = slots.min(u16::MAX as usize) as u16;
@@ -620,6 +631,24 @@ mod tests {
                 ExecutionAdmissionState::Healthy
             );
             harness
+        }
+
+        fn make_fast_busy_and_stale(&mut self, stalled_slot: usize) {
+            self.state.place_dispatched(stalled_slot, self.now);
+            self.fast[stalled_slot].busy = true;
+            // Other owners continue their full heartbeat snapshots throughout
+            // the stall, so the account never suffers an unrelated lease gap.
+            for _ in 0..4 {
+                self.now += self.state.config.stale_after_ns / 3;
+                for slot in 0..self.fast.len() {
+                    if slot != stalled_slot {
+                        self.emit(Role::Fast, slot, |_| {});
+                    }
+                }
+                for slot in 0..self.cancel.len() {
+                    self.emit(Role::Cancel, slot, |_| {});
+                }
+            }
         }
     }
 
@@ -1094,6 +1123,125 @@ mod tests {
             ExecutionAdmissionState::Paused
         );
         assert!(!harness.state.can_place(harness.now));
+    }
+
+    #[test]
+    fn stale_busy_fast_keeps_its_own_slot_without_consuming_healthy_degraded_budget() {
+        let mut harness = Harness::healthy(4, 4);
+        harness.state.reserve_cancel_slot(0);
+        harness.make_fast_busy_and_stale(0);
+        assert_eq!(
+            harness.state.current().state,
+            ExecutionAdmissionState::Degraded
+        );
+        assert_eq!(harness.state.current().available_place_slots, 1);
+        assert!(harness.state.fast[0].busy);
+        assert!(harness.state.fast[0].dispatched_at_ns.is_some());
+        assert!(!harness.state.lane_place_allowed(0, harness.now));
+        assert!(harness.state.lane_place_allowed(1, harness.now));
+
+        // A new real request consumes the one eligible degraded permit. The
+        // unknown old request is neither completed nor replayed by admission.
+        harness.state.place_dispatched(1, harness.now);
+        assert_eq!(harness.state.current().available_place_slots, 0);
+        assert!(!harness.state.lane_place_allowed(2, harness.now));
+        harness.outcome(Role::Fast, 1, BusinessHttpOutcome::Healthy);
+        assert_eq!(harness.state.current().available_place_slots, 1);
+        assert!(harness.state.fast[0].busy);
+
+        harness
+            .state
+            .mark_delivery_fault(Role::Fast, 0, harness.now);
+        assert_eq!(harness.state.current().available_place_slots, 1);
+        harness
+            .state
+            .observe(Role::Fast, 0, harness.fast[0], harness.now);
+        assert!(harness.state.fast[0].busy);
+        assert!(!harness.state.lane_place_allowed(0, harness.now));
+    }
+
+    #[test]
+    fn restored_busy_generation_rejoins_budget_without_becoming_a_free_slot() {
+        let mut harness = Harness::healthy(4, 4);
+        harness.state.reserve_cancel_slot(0);
+        harness.make_fast_busy_and_stale(0);
+        harness.emit(Role::Fast, 0, |observation| {
+            observation.health.pool_generation += 1;
+            observation.busy = true;
+        });
+        assert_eq!(
+            harness.state.current().state,
+            ExecutionAdmissionState::Degraded
+        );
+        // Four eligible lanes give budget two, but the returned busy lane still
+        // consumes one. Its new warm generation does not complete the request.
+        assert_eq!(harness.state.current().available_place_slots, 1);
+        assert!(harness.state.fast[0].busy);
+        assert!(!harness.state.lane_place_allowed(0, harness.now));
+        let mut old_generation = harness.fast[0];
+        old_generation.sequence += 1;
+        old_generation.health.pool_generation -= 1;
+        old_generation.busy = false;
+        harness
+            .state
+            .observe(Role::Fast, 0, old_generation, harness.now);
+        assert!(harness.state.fast[0].busy);
+        harness.state.place_dispatched(1, harness.now);
+        assert_eq!(harness.state.current().available_place_slots, 0);
+        harness.outcome(Role::Fast, 1, BusinessHttpOutcome::Healthy);
+        assert_eq!(harness.state.current().available_place_slots, 1);
+        harness.outcome(Role::Fast, 0, BusinessHttpOutcome::Healthy);
+        assert!(!harness.state.fast[0].busy);
+        assert!(harness.state.fast[0].dispatched_at_ns.is_none());
+        assert_eq!(
+            harness.state.current().state,
+            ExecutionAdmissionState::Healthy
+        );
+        assert_eq!(harness.state.current().available_place_slots, 4);
+    }
+
+    #[test]
+    fn recovering_keeps_unknown_inflight_until_explicit_owner_completion() {
+        let mut harness = Harness::healthy(4, 4);
+        harness.state.reserve_cancel_slot(0);
+        harness.make_fast_busy_and_stale(0);
+        for slot in 1..4 {
+            harness
+                .state
+                .mark_delivery_fault(Role::Fast, slot, harness.now);
+        }
+        assert_eq!(
+            harness.state.current().state,
+            ExecutionAdmissionState::Paused
+        );
+        for slot in 1..4 {
+            harness.emit(Role::Fast, slot, |_| {});
+        }
+        assert_eq!(
+            harness.state.current().state,
+            ExecutionAdmissionState::Recovering
+        );
+        assert_eq!(harness.state.current().available_place_slots, 0);
+        assert!(harness.state.fast[0].busy);
+        harness.emit(Role::Fast, 0, |observation| {
+            observation.health.pool_generation += 1;
+            observation.busy = true;
+        });
+        assert_eq!(harness.state.current().available_place_slots, 0);
+        harness.outcome(Role::Fast, 0, BusinessHttpOutcome::Healthy);
+        assert_eq!(harness.state.recovery_successes, 0);
+        assert_eq!(
+            harness.state.current().state,
+            ExecutionAdmissionState::Recovering
+        );
+        assert_eq!(harness.state.current().available_place_slots, 1);
+        for _ in 0..3 {
+            harness.success(0);
+        }
+        assert_eq!(
+            harness.state.current().state,
+            ExecutionAdmissionState::Healthy
+        );
     }
 
     #[test]
