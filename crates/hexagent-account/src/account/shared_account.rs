@@ -106,10 +106,17 @@ pub struct SharedAccountHandle {
 
 #[derive(Debug, Clone)]
 pub struct WalletCalibrationResult {
+    /// Wallet request generation consumed by the owner, including coalescing.
+    /// This is not an economic ledger or private lifecycle generation.
+    pub generation: u64,
     pub startup_snapshot_newly_applied: bool,
     pub automatic_redeem_attributed: bool,
     pub account_ready: bool,
     pub token_interests: Option<Vec<TokenInterest>>,
+    /// Diagnostic only: conditions with a negative reconciled residual
+    /// and missing authoritative outcomes after owner-side calibration. Ordinary
+    /// wallet decreases already explained by private fills are excluded.
+    pub missing_settlement_conditions: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -6765,30 +6772,35 @@ impl SharedAccount {
                 .min(u64::MAX as u128) as u64,
         );
         let apply_started = crate::latency::Instant::now();
+        let mut missing_settlement_conditions = Vec::new();
         let result = self
-            .apply_scoped_physical_snapshot_versioned(
-                request.generation,
+            .apply_scoped_physical_snapshot_inner_with_diagnostics(
+                Some(request.generation),
                 request.cash,
                 request.positions.clone(),
                 request.authoritative_tokens.clone(),
+                Some(&mut missing_settlement_conditions),
             )
             .and_then(|applied| {
                 let attributed = if !applied && self.is_seeded() {
-                    self.observe_platform_binary_redeem(
+                    self.observe_platform_binary_redeem_inner(
                         request.cash,
                         &request.positions,
                         &request.authoritative_tokens,
+                        Some(&mut missing_settlement_conditions),
                     )
                 } else {
                     false
                 };
                 Ok(WalletCalibrationResult {
+                    generation: request.generation,
                     startup_snapshot_newly_applied: applied,
                     automatic_redeem_attributed: attributed,
                     account_ready: self.startup_snapshot_applied(),
                     token_interests: request
                         .include_token_interests
                         .then(|| self.token_interests()),
+                    missing_settlement_conditions,
                 })
             });
         crate::latency::record("polymarket.account.wallet_calibration.apply", apply_started);
@@ -10994,6 +11006,23 @@ impl SharedAccount {
         positions: HashMap<String, f64>,
         authoritative_tokens: HashSet<String>,
     ) -> Result<bool, String> {
+        self.apply_scoped_physical_snapshot_inner_with_diagnostics(
+            generation,
+            cash,
+            positions,
+            authoritative_tokens,
+            None,
+        )
+    }
+
+    fn apply_scoped_physical_snapshot_inner_with_diagnostics(
+        &self,
+        generation: Option<u64>,
+        cash: f64,
+        positions: HashMap<String, f64>,
+        authoritative_tokens: HashSet<String>,
+        missing_settlement_conditions: Option<&mut Vec<String>>,
+    ) -> Result<bool, String> {
         validate_physical_snapshot(cash, &positions, &authoritative_tokens)?;
         if self.startup_snapshot_applied_fast.load(Ordering::Acquire) {
             return Ok(false);
@@ -11004,6 +11033,7 @@ impl SharedAccount {
                 cash,
                 positions,
                 authoritative_tokens,
+                missing_settlement_conditions,
             );
         }
         // Startup seeding changes only physical/economic leaves. Keep it on
@@ -11023,6 +11053,7 @@ impl SharedAccount {
                 cash,
                 positions,
                 authoritative_tokens,
+                missing_settlement_conditions,
             );
         }
         let missing = missing_initial_token_interest_owners(&state, &authoritative_tokens);
@@ -11075,6 +11106,7 @@ impl SharedAccount {
         cash: f64,
         positions: HashMap<String, f64>,
         authoritative_tokens: HashSet<String>,
+        missing_settlement_conditions: Option<&mut Vec<String>>,
     ) -> Result<bool, String> {
         let mut state = self.lock_economic_state(&authoritative_tokens);
         if state.startup_snapshot_applied_this_process {
@@ -11122,7 +11154,13 @@ impl SharedAccount {
             recompute_reconciliation(&mut state, "authoritative physical snapshot");
         }
         let adjustment_sequence_before = state.internal_adjustment_sequence;
-        try_attribute_binary_redeem(&mut state, &self.account_id);
+        try_attribute_binary_redeem_with_diagnostics(
+            &mut state,
+            &self.account_id,
+            None,
+            None,
+            missing_settlement_conditions,
+        );
         state.startup_snapshot_applied_this_process = true;
         self.publish_control_snapshots(&state);
         if reconciled_failed_trades {
@@ -11180,6 +11218,21 @@ impl SharedAccount {
                     panic!("account owner redeem observation failed: {error}")
                 });
         }
+        self.observe_platform_binary_redeem_inner(
+            observed_cash,
+            observed_positions,
+            authoritative_tokens,
+            None,
+        )
+    }
+
+    fn observe_platform_binary_redeem_inner(
+        &self,
+        observed_cash: f64,
+        observed_positions: &HashMap<String, f64>,
+        authoritative_tokens: &HashSet<String>,
+        missing_settlement_conditions: Option<&mut Vec<String>>,
+    ) -> bool {
         if !observed_cash.is_finite()
             || observed_cash < 0.0
             || observed_positions
@@ -11313,11 +11366,12 @@ impl SharedAccount {
             &pending,
         );
         let adjustment_sequence_before = state.internal_adjustment_sequence;
-        let attributed = try_attribute_binary_redeem_with_pending(
+        let attributed = try_attribute_binary_redeem_with_diagnostics(
             &mut state,
             &self.account_id,
             Some(&pending),
             Some(authoritative_tokens),
+            missing_settlement_conditions,
         );
         self.schedule_wallet_calibration_persist(
             &state.state,
@@ -20873,15 +20927,30 @@ fn log_wallet_reconciliation_alerts(
 /// condition is independent, so incomplete history for one event cannot block
 /// another event. Any additional positive cash remains unallocated instead of
 /// being assigned to strategy inventory.
-fn try_attribute_binary_redeem(state: &mut SharedAccountState, account_id: &str) -> bool {
-    try_attribute_binary_redeem_with_pending(state, account_id, None, None)
-}
-
 fn try_attribute_binary_redeem_with_pending(
     state: &mut SharedAccountState,
     account_id: &str,
     pending: Option<&PendingPhysicalDeltas>,
     authoritative_tokens: Option<&HashSet<String>>,
+) -> bool {
+    try_attribute_binary_redeem_with_diagnostics(
+        state,
+        account_id,
+        pending,
+        authoritative_tokens,
+        None,
+    )
+}
+
+/// Optional diagnostics are collected from the existing failure branches while
+/// the wallet owner still holds its calibration transaction. No second ledger
+/// read, candidate scan, or attribution decision is introduced.
+fn try_attribute_binary_redeem_with_diagnostics(
+    state: &mut SharedAccountState,
+    account_id: &str,
+    pending: Option<&PendingPhysicalDeltas>,
+    authoritative_tokens: Option<&HashSet<String>>,
+    mut missing_settlement_conditions: Option<&mut Vec<String>>,
 ) -> bool {
     let negative_tokens: BTreeSet<String> = state
         .unallocated_positions
@@ -20952,6 +21021,9 @@ fn try_attribute_binary_redeem_with_pending(
             continue;
         }
         let Some(up_value) = state.settled_token_values.get(&up_token_id).copied() else {
+            if let Some(conditions) = missing_settlement_conditions.as_deref_mut() {
+                conditions.push(condition_id.clone());
+            }
             log::warn!(
                 "[shared_account_redeem_attribution_failed] account={} condition={} reason=missing_settled_outcome detail={:?}",
                 account_id,
@@ -20961,6 +21033,9 @@ fn try_attribute_binary_redeem_with_pending(
             continue;
         };
         let Some(down_value) = state.settled_token_values.get(&down_token_id).copied() else {
+            if let Some(conditions) = missing_settlement_conditions.as_deref_mut() {
+                conditions.push(condition_id.clone());
+            }
             log::warn!(
                 "[shared_account_redeem_attribution_failed] account={} condition={} reason=missing_settled_outcome detail={:?}",
                 account_id,
@@ -21404,13 +21479,352 @@ mod tests {
 
         for completion in [first, second] {
             let result = completion.recv().unwrap().unwrap();
+            assert_eq!(result.generation, 2);
             assert!(result.startup_snapshot_newly_applied);
             assert!(result.account_ready);
             assert!(result.token_interests.is_some());
+            assert!(result.missing_settlement_conditions.is_empty());
         }
         let snapshot = account.monitoring_snapshot_fast();
         assert!((snapshot.physical_cash - 125.0).abs() < EPS);
         assert_eq!(account.wallet_calibration_wake_tx.len(), 0);
+    }
+
+    fn calibration_diagnostic_result(
+        account: &Arc<SharedAccount>,
+        owner: &SharedAccountOwnerState,
+        generation: u64,
+        cash: f64,
+        positions: HashMap<String, f64>,
+        scope: HashSet<String>,
+    ) -> WalletCalibrationResult {
+        let completion = account
+            .submit_wallet_calibration(generation, cash, positions, scope, false)
+            .unwrap();
+        owner.wallet_receiver().try_recv().unwrap();
+        owner.execute_wallet_calibration();
+        completion
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn calibration_diagnostic_sell(account: &SharedAccount, id: &str, qty: f64, confirmed: bool) {
+        account
+            .reserve_order("btc", id, id, "UP", Side::Sell, qty, 0.8, 0)
+            .unwrap();
+        account
+            .apply_trade_transition(id, "MATCHED", id, id, "UP", Side::Sell, qty, 0.8)
+            .unwrap();
+        if confirmed {
+            account
+                .apply_trade_transition(id, "CONFIRMED", id, id, "UP", Side::Sell, qty, 0.8)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn wallet_calibration_diagnostic_excludes_booked_sells_48_and_10_01() {
+        let account = Arc::new(SharedAccount::new("wallet-diagnostic-sells"));
+        account.register_instance("btc", 1.0);
+        account
+            .register_token_interest("btc", "active", "UP", "DOWN")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("UP".into(), 160.0), ("DOWN".into(), 160.0)]),
+            )
+            .unwrap();
+        let (_, owner) = account.bind_account_owner().unwrap();
+        owner.mark_current_thread().unwrap();
+        let mut quantity = 160.0;
+        let mut cash = 100.0;
+        for (index, sold) in [48.0, 10.01].into_iter().enumerate() {
+            calibration_diagnostic_sell(&account, &format!("sell-{index}"), sold, true);
+            quantity -= sold;
+            cash += sold * 0.8;
+            let result = calibration_diagnostic_result(
+                &account,
+                &owner,
+                index as u64 + 1,
+                cash,
+                HashMap::from([("UP".into(), quantity), ("DOWN".into(), 160.0)]),
+                HashSet::from(["UP".into(), "DOWN".into()]),
+            );
+            assert!(result.missing_settlement_conditions.is_empty());
+            assert!(!result.automatic_redeem_attributed);
+            assert!(
+                (account.instance_snapshot("btc").unwrap().positions["UP"] - quantity).abs() < EPS
+            );
+            assert!(!account.is_uncertain());
+        }
+    }
+
+    #[test]
+    fn wallet_calibration_diagnostic_coalesces_condition_evidence_with_wallet_generation() {
+        let account = Arc::new(SharedAccount::new("wallet-diagnostic-coalesced"));
+        account.register_instance("btc", 1.0);
+        account
+            .register_token_interest("btc", "historical", "UP", "DOWN")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("UP".into(), 80.0), ("DOWN".into(), 80.0)]),
+            )
+            .unwrap();
+        let (_, owner) = account.bind_account_owner().unwrap();
+        owner.mark_current_thread().unwrap();
+        let scope = HashSet::from(["UP".into(), "DOWN".into()]);
+        let latest = account
+            .submit_wallet_calibration(2, 180.0, HashMap::new(), scope.clone(), false)
+            .unwrap();
+        let older = account
+            .submit_wallet_calibration(
+                1,
+                100.0,
+                HashMap::from([("UP".into(), 80.0), ("DOWN".into(), 80.0)]),
+                scope,
+                false,
+            )
+            .unwrap();
+        owner.wallet_receiver().try_recv().unwrap();
+        owner.execute_wallet_calibration();
+        for completion in [older, latest] {
+            let result = completion
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.generation, 2);
+            assert_eq!(result.missing_settlement_conditions, ["historical"]);
+            assert!(!result.automatic_redeem_attributed);
+        }
+        assert_eq!(
+            account.instance_snapshot("btc").unwrap().positions["UP"],
+            80.0
+        );
+        assert!(account.physical_positions_snapshot_fast().is_empty());
+    }
+
+    #[test]
+    fn wallet_calibration_diagnostic_retains_same_condition_sell_plus_real_redeem() {
+        let account = Arc::new(SharedAccount::new("wallet-diagnostic-mixed-removal"));
+        account.register_instance("btc", 1.0);
+        account
+            .register_token_interest("btc", "ended", "UP", "DOWN")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("UP".into(), 80.0), ("DOWN".into(), 80.0)]),
+            )
+            .unwrap();
+        calibration_diagnostic_sell(&account, "sold-before-redeem", 10.0, true);
+        let (_, owner) = account.bind_account_owner().unwrap();
+        owner.mark_current_thread().unwrap();
+        let scope = HashSet::from(["UP".into(), "DOWN".into()]);
+        for generation in [1, 2] {
+            let result = calibration_diagnostic_result(
+                &account,
+                &owner,
+                generation,
+                178.0,
+                HashMap::new(),
+                scope.clone(),
+            );
+            assert_eq!(result.missing_settlement_conditions, ["ended"]);
+            assert!(!result.automatic_redeem_attributed);
+            let inventory = account.instance_snapshot("btc").unwrap();
+            assert_eq!(inventory.positions["UP"], 70.0);
+            assert_eq!(inventory.positions["DOWN"], 80.0);
+            assert_eq!(inventory.cash, 108.0);
+        }
+        account.record_settled_token_values(&HashMap::from([
+            ("UP".into(), 1.0),
+            ("DOWN".into(), 0.0),
+        ]));
+        let resolved =
+            calibration_diagnostic_result(&account, &owner, 3, 178.0, HashMap::new(), scope);
+        assert!(resolved.missing_settlement_conditions.is_empty());
+        let inventory = account.instance_snapshot("btc").unwrap();
+        assert_eq!(inventory.cash, 178.0);
+        assert!(inventory
+            .positions
+            .values()
+            .all(|quantity| quantity.abs() < EPS));
+    }
+
+    #[test]
+    fn wallet_calibration_diagnostic_isolates_conditions_and_queried_scope() {
+        let account = Arc::new(SharedAccount::new("wallet-diagnostic-conditions"));
+        account.register_instance("btc", 1.0);
+        account
+            .register_token_interest("btc", "active", "UP", "DOWN")
+            .unwrap();
+        account
+            .register_token_interest("btc", "historical", "OLD-UP", "OLD-DOWN")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([
+                    ("UP".into(), 160.0),
+                    ("DOWN".into(), 160.0),
+                    ("OLD-UP".into(), 80.0),
+                    ("OLD-DOWN".into(), 80.0),
+                ]),
+            )
+            .unwrap();
+        calibration_diagnostic_sell(&account, "active-sell", 48.0, true);
+        let (_, owner) = account.bind_account_owner().unwrap();
+        owner.mark_current_thread().unwrap();
+        let positions = HashMap::from([("UP".into(), 112.0), ("DOWN".into(), 160.0)]);
+        let result = calibration_diagnostic_result(
+            &account,
+            &owner,
+            1,
+            218.4,
+            positions.clone(),
+            HashSet::from([
+                "UP".into(),
+                "DOWN".into(),
+                "OLD-UP".into(),
+                "OLD-DOWN".into(),
+            ]),
+        );
+        assert_eq!(result.missing_settlement_conditions, ["historical"]);
+        let scoped = calibration_diagnostic_result(
+            &account,
+            &owner,
+            2,
+            218.4,
+            positions,
+            HashSet::from(["UP".into(), "DOWN".into()]),
+        );
+        assert!(scoped.missing_settlement_conditions.is_empty());
+        assert_eq!(
+            account.instance_snapshot("btc").unwrap().positions["OLD-UP"],
+            80.0
+        );
+    }
+
+    #[test]
+    fn wallet_calibration_diagnostic_does_not_promote_pending_physical_sale_to_redeem() {
+        let account = Arc::new(SharedAccount::new("wallet-diagnostic-pending"));
+        account.register_instance("btc", 1.0);
+        account
+            .register_token_interest("btc", "active", "UP", "DOWN")
+            .unwrap();
+        account
+            .apply_physical_snapshot(
+                100.0,
+                HashMap::from([("UP".into(), 80.0), ("DOWN".into(), 80.0)]),
+            )
+            .unwrap();
+        calibration_diagnostic_sell(&account, "late-confirmation", 10.0, false);
+        let (_, owner) = account.bind_account_owner().unwrap();
+        owner.mark_current_thread().unwrap();
+        let positions = HashMap::from([("UP".into(), 70.0), ("DOWN".into(), 80.0)]);
+        let scope = HashSet::from(["UP".into(), "DOWN".into()]);
+        let pending = calibration_diagnostic_result(
+            &account,
+            &owner,
+            1,
+            108.0,
+            positions.clone(),
+            scope.clone(),
+        );
+        assert!(pending.missing_settlement_conditions.is_empty());
+        assert_eq!(account.physical_positions_snapshot_fast()["UP"], 80.0);
+        account
+            .apply_trade_transition(
+                "late-confirmation",
+                "CONFIRMED",
+                "late-confirmation",
+                "late-confirmation",
+                "UP",
+                Side::Sell,
+                10.0,
+                0.8,
+            )
+            .unwrap();
+        let confirmed = calibration_diagnostic_result(&account, &owner, 2, 108.0, positions, scope);
+        assert!(confirmed.missing_settlement_conditions.is_empty());
+        assert_eq!(account.physical_positions_snapshot_fast()["UP"], 70.0);
+        assert_eq!(
+            account.instance_snapshot("btc").unwrap().positions["UP"],
+            70.0
+        );
+    }
+
+    #[test]
+    fn wallet_calibration_diagnostic_keeps_restart_inventory_without_an_end_marker() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-calibration-diagnostic-restart-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account =
+                SharedAccount::new_persistent("wallet-diagnostic-restart", &path).unwrap();
+            account.register_instance("btc", 1.0);
+            account
+                .register_token_interest("btc", "historical", "UP", "DOWN")
+                .unwrap();
+            account
+                .apply_physical_snapshot(
+                    100.0,
+                    HashMap::from([("UP".into(), 80.0), ("DOWN".into(), 80.0)]),
+                )
+                .unwrap();
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+        let account =
+            Arc::new(SharedAccount::new_persistent("wallet-diagnostic-restart", &path).unwrap());
+        account.reconcile_configured_instances(&HashSet::from(["btc".into()]));
+        assert!(!account.token_event_has_ended("UP"));
+        let (_, owner) = account.bind_account_owner().unwrap();
+        owner.mark_current_thread().unwrap();
+        let scope = HashSet::from(["UP".into(), "DOWN".into()]);
+        let result = calibration_diagnostic_result(
+            &account,
+            &owner,
+            1,
+            180.0,
+            HashMap::new(),
+            scope.clone(),
+        );
+        assert!(result.startup_snapshot_newly_applied);
+        assert_eq!(result.missing_settlement_conditions, ["historical"]);
+        assert_eq!(
+            account.instance_snapshot("btc").unwrap().positions["UP"],
+            80.0
+        );
+        account.record_settled_token_values(&HashMap::from([("UP".into(), 1.0)]));
+        let incomplete = calibration_diagnostic_result(
+            &account,
+            &owner,
+            2,
+            180.0,
+            HashMap::new(),
+            scope.clone(),
+        );
+        assert_eq!(incomplete.missing_settlement_conditions, ["historical"]);
+        assert_eq!(
+            account.instance_snapshot("btc").unwrap().positions["UP"],
+            80.0
+        );
+        account.record_settled_token_values(&HashMap::from([("DOWN".into(), 0.0)]));
+        let resolved =
+            calibration_diagnostic_result(&account, &owner, 3, 180.0, HashMap::new(), scope);
+        assert!(resolved.missing_settlement_conditions.is_empty());
+        assert_eq!(account.instance_snapshot("btc").unwrap().cash, 180.0);
+        account.flush_persistence(Duration::from_secs(2)).unwrap();
+        drop(owner);
+        drop(account);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
