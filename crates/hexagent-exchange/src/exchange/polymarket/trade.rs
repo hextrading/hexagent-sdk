@@ -269,6 +269,12 @@ struct FetchedOrderIdentity {
     fee_rate_bps: Option<u32>,
 }
 
+/// Successful sibling updates must survive another order's unknown REST result.
+pub(crate) struct RuntimeOrderRecovery {
+    pub updates: Vec<OrderUpdate>,
+    pub errors: Vec<String>,
+}
+
 struct RuntimeOrderAuditPass {
     updates: Vec<OrderUpdate>,
     errors: Vec<String>,
@@ -7860,15 +7866,9 @@ impl PolymarketTrade {
 
     /// Audit every locally live or cancellation-pending order after a user
     /// feed reconnect, including associated trades missed by the stream.
-    pub(crate) fn reconcile_runtime_open_orders_with_updates(
-        &self,
-    ) -> std::result::Result<Vec<OrderUpdate>, String> {
+    pub(crate) fn reconcile_runtime_open_orders_with_updates(&self) -> RuntimeOrderRecovery {
         let pass = self.reconcile_runtime_open_orders_pass();
-        if pass.errors.is_empty() {
-            Ok(pass.updates)
-        } else {
-            Err(pass.errors.join("; "))
-        }
+        RuntimeOrderRecovery { updates: pass.updates, errors: pass.errors }
     }
 
     /// Run a complete runtime order audit without discarding successful rows

@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as _;
 use std::fmt;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 #[cfg(test)]
@@ -267,8 +268,14 @@ impl GapReplayOutcome {
 /// never call this helper, so `recovering` stays asserted and quoting remains
 /// paused until the same recovery window has been fetched completely.
 ///
-fn accept_reconnect_replay(shared: &SharedState, _outcome: GapReplayOutcome) {
-    shared.user_feed_health.set_recovering(false);
+fn accept_reconnect_replay(
+    shared: &SharedState,
+    _outcome: GapReplayOutcome,
+    certificate: u64,
+) -> bool {
+    if !shared.user_feed_health.try_finish_recovery(certificate) {
+        return false;
+    }
     if shared
         .auth_failure_blocked
         .swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -281,6 +288,7 @@ fn accept_reconnect_replay(shared: &SharedState, _outcome: GapReplayOutcome) {
     if !shared.account_state.is_uncertain() {
         shared.user_feed_health.set_inventory_uncertain(false);
     }
+    true
 }
 
 fn enqueue_recovery_update(
@@ -318,6 +326,71 @@ fn enqueue_recovery_update(
     }
 }
 
+/// Flush already-enrolled startup updates as soon as the strategy exists,
+/// even while an unrelated order audit remains unknown. Called only by the
+/// one cold recovery job; it never blocks the socket reader.
+fn flush_startup_recovery_updates(
+    shared: &SharedState,
+    generation: u64,
+    update_tx: &Sender<RoutedOrderUpdate>,
+    shutdown: &AtomicBool,
+) -> Result<()> {
+    if !shared.user_feed_health.strategy_consumer_ready() {
+        return Ok(());
+    }
+    let buffered = shared
+        .user_feed_health
+        .take_startup_recovery_updates(generation)
+        .map_err(|error| anyhow!(error))?;
+    let buffered_count = buffered.len();
+    for update in buffered {
+        // Taking the bounded startup buffer transfers ownership to this job.
+        // Retain each update until delivery; re-enrolling it would double its
+        // pending ACK count and discarding it would strand its reservation.
+        loop {
+            let result = (|| -> Result<()> {
+                let instance_id = shared
+                    .account_state
+                    .order_owner_by_coid(&update.client_order_id)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "startup recovery coid={} has no durable owner",
+                            update.client_order_id
+                        )
+                    })?;
+                let owner = shared.strategy_owner(&instance_id).ok_or_else(|| {
+                    anyhow!("startup recovery instance={instance_id} has no numeric owner")
+                })?;
+                update_tx
+                    .send(RoutedOrderUpdate {
+                        owner,
+                        update: update.clone(),
+                        timing: LifecycleTiming::default(),
+                    })
+                    .map_err(|_| anyhow!("startup recovery update channel closed"))
+            })();
+            match result {
+                Ok(()) => break,
+                Err(error) => {
+                    shared.user_feed_health.set_recovering(true);
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Err(error);
+                    }
+                    warn!("[PolyUserFeed] startup recovery delivery blocked: generation={} coid={} error={}", generation, update.client_order_id, error);
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        }
+    }
+    if buffered_count > 0 {
+        info!(
+            "[PolyUserFeed] released {} bounded startup replay update(s) to strategy consumer",
+            buffered_count
+        );
+    }
+    Ok(())
+}
+
 async fn wait_for_recovery_delivery(
     shared: &SharedState,
     generation: u64,
@@ -338,42 +411,7 @@ async fn wait_for_recovery_delivery(
                 ready_started = Some(Instant::now());
             }
             if !startup_buffer_drained {
-                let buffered = shared
-                    .user_feed_health
-                    .take_startup_recovery_updates(generation)
-                    .map_err(|error| anyhow!(error))?;
-                let buffered_count = buffered.len();
-                for update in buffered {
-                    let instance_id = shared
-                        .account_state
-                        .order_owner_by_coid(&update.client_order_id)
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "startup recovery update coid={} has no durable owner",
-                                update.client_order_id,
-                            )
-                        })?;
-                    let owner = shared.strategy_owner(&instance_id).ok_or_else(|| {
-                        anyhow!(
-                            "startup recovery instance={instance_id} has no numeric strategy owner"
-                        )
-                    })?;
-                    update_tx
-                        .send(RoutedOrderUpdate {
-                            owner,
-                            update,
-                            timing: LifecycleTiming::default(),
-                        })
-                        .map_err(|_| {
-                            anyhow!("order update channel closed while draining startup recovery")
-                        })?;
-                }
-                if buffered_count > 0 {
-                    info!(
-                        "[PolyUserFeed] released {} bounded startup replay update(s) to strategy consumer",
-                        buffered_count,
-                    );
-                }
+                flush_startup_recovery_updates(shared, generation, update_tx, shutdown)?;
                 startup_buffer_drained = true;
             }
         }
@@ -1537,7 +1575,14 @@ struct ReplayApplySummary {
 }
 
 enum PrivateApplyCommand {
+    /// Same producer/FIFO as Live: closes enrollment only after all preceding
+    /// recovery-tagged frames have registered their owning strategy updates.
+    RecoveryFence {
+        generation: u64,
+        completion: tokio::sync::oneshot::Sender<bool>,
+    },
     Live {
+        recovery_generation: Option<u64>,
         events: Vec<PrivateEventDelta>,
         enqueued_at: crate::latency::Instant,
     },
@@ -2036,12 +2081,17 @@ fn route_private_event_fast(
 }
 
 impl PrivateApplyLane {
-    fn dispatch_live(&self, events: Vec<PrivateEventDelta>) -> std::result::Result<(), String> {
+    fn dispatch_live(
+        &self,
+        events: Vec<PrivateEventDelta>,
+        recovery_generation: Option<u64>,
+    ) -> std::result::Result<(), String> {
         if events.is_empty() {
             return Ok(());
         }
         self.live_tx
             .try_send(PrivateApplyCommand::Live {
+                recovery_generation,
                 events,
                 enqueued_at: crate::latency::Instant::now(),
             })
@@ -2438,7 +2488,7 @@ fn spawn_private_apply_worker(
                         Err(_) => break,
                     },
                     recv(live_rx) -> command => match command {
-                        Ok(PrivateApplyCommand::Live { events, enqueued_at }) => {
+                        Ok(PrivateApplyCommand::Live { events, enqueued_at, recovery_generation }) => {
                             crate::latency::record(
                                 "polymarket.user.ws_enqueue_to_owner_dequeue",
                                 enqueued_at,
@@ -2447,7 +2497,7 @@ fn spawn_private_apply_worker(
                                 &shared,
                                 &update_tx,
                                 events,
-                                None,
+                                recovery_generation,
                                 &mut route_dedupe,
                                 Some(&cold_committed),
                             ) {
@@ -2470,7 +2520,7 @@ fn spawn_private_apply_worker(
                                 events: routed.events,
                                 identities: routed.identities,
                                 durable_skips: routed.durable_skips,
-                                recovery_generation: None,
+                                recovery_generation,
                                 completion: None,
                                 routed_at: crate::latency::Instant::now(),
                                 feedback: cold_feedback.clone(),
@@ -2483,6 +2533,11 @@ fn spawn_private_apply_worker(
                                 reconnect_generation.fetch_add(1, Ordering::AcqRel);
                                 reconnect_notify.notify_one();
                             }
+                        }
+                        Ok(PrivateApplyCommand::RecoveryFence { generation, completion }) => {
+                            let finished = shared.user_feed_health
+                                .finish_recovery_delivery_enrollment(generation);
+                            let _ = completion.send(finished);
                         }
                         Ok(PrivateApplyCommand::Replay { completion, .. }) => {
                             let _ = completion.send(Err(
@@ -2539,6 +2594,9 @@ fn spawn_private_apply_worker(
                                     }
                                 }
                             }
+                        }
+                        Ok(PrivateApplyCommand::RecoveryFence { completion, .. }) => {
+                            let _ = completion.send(false);
                         }
                         Ok(PrivateApplyCommand::Live { .. }) => {
                             warn!("[PolyUserFeed] live command reached replay lane");
@@ -3467,6 +3525,277 @@ async fn replay_missed_trades_inner(
     })
 }
 
+/// One socket task owns this scalar schedule. REST retries do not reconnect the
+/// socket and never overlap: at most one audit/forward job is owned at a time.
+struct RecoveryAuditSchedule {
+    failures: u32,
+    next_attempt: Instant,
+}
+
+impl RecoveryAuditSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            failures: 0,
+            next_attempt: now,
+        }
+    }
+    fn ready(&self, now: Instant) -> bool {
+        now >= self.next_attempt
+    }
+    fn failed(&mut self, now: Instant) -> Duration {
+        let delay = Duration::from_millis(
+            250u64
+                .saturating_mul(1u64.checked_shl(self.failures.min(63)).unwrap_or(u64::MAX))
+                .min(30_000),
+        );
+        self.failures = self.failures.saturating_add(1);
+        self.next_attempt = now + delay;
+        delay
+    }
+    fn succeeded(&mut self) {
+        self.failures = 0;
+    }
+}
+
+enum RecoveryReadEvent<W, A> {
+    Socket(W),
+    Audit(A),
+}
+
+/// The actual production selection boundary: a pending/failed REST audit must
+/// never prevent an authenticated socket from delivering private frames.
+async fn select_ws_or_recovery<W: Future, A: Future>(
+    ws: W,
+    audit: A,
+) -> RecoveryReadEvent<W::Output, A::Output> {
+    tokio::select! {
+        result = ws => RecoveryReadEvent::Socket(result),
+        result = audit => RecoveryReadEvent::Audit(result),
+    }
+}
+
+enum OpenOrderRecoveryStage {
+    Audit,
+    Fence,
+    Delivery,
+    Ready,
+    Failed,
+}
+
+/// Owned solely by the socket task. The retained JoinHandle makes cancelling a
+/// select arm safe: successful sibling audit updates cannot disappear when the
+/// socket closes. All cold forwarding stays on the existing blocking runtime.
+struct OpenOrderRecovery {
+    generation: u64,
+    live_generation: Option<u64>,
+    stage: OpenOrderRecoveryStage,
+    job: Option<tokio::task::JoinHandle<std::result::Result<(), String>>>,
+    fence: Option<tokio::sync::oneshot::Receiver<bool>>,
+    schedule: RecoveryAuditSchedule,
+}
+
+impl OpenOrderRecovery {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            live_generation: Some(generation),
+            stage: OpenOrderRecoveryStage::Audit,
+            job: None,
+            fence: None,
+            schedule: RecoveryAuditSchedule::new(Instant::now()),
+        }
+    }
+
+    async fn poll(
+        &mut self,
+        shared: &Arc<SharedState>,
+        update_tx: &Sender<RoutedOrderUpdate>,
+        lane: &PrivateApplyLane,
+        shutdown: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        loop {
+            match self.stage {
+                OpenOrderRecoveryStage::Audit => {
+                    if self.job.is_none() {
+                        if shutdown.load(Ordering::Relaxed) {
+                            return Err(anyhow!("shutdown before next order audit"));
+                        }
+                        if !self.schedule.ready(Instant::now()) {
+                            sleep(
+                                self.schedule
+                                    .next_attempt
+                                    .saturating_duration_since(Instant::now()),
+                            )
+                            .await;
+                        }
+                        let shared = shared.clone();
+                        let update_tx = update_tx.clone();
+                        let shutdown = shutdown.clone();
+                        let generation = self.generation;
+                        self.job = Some(tokio::task::spawn_blocking(move || {
+                            let executor = PolymarketTrade::from_shared(shared.clone(), "", "");
+                            let pass = executor.reconcile_runtime_open_orders_with_updates();
+                            deliver_open_order_recovery(
+                                &shared, &update_tx, generation, pass, &shutdown,
+                            )
+                        }));
+                    }
+                    let result = self.job.as_mut().unwrap().await;
+                    self.job = None;
+                    match result {
+                        Ok(Ok(())) => {
+                            self.schedule.succeeded();
+                            self.stage = OpenOrderRecoveryStage::Fence;
+                        }
+                        Err(error) => {
+                            self.stage = OpenOrderRecoveryStage::Failed;
+                            return Err(anyhow!("open-order recovery worker failed: {error}"));
+                        }
+                        result => {
+                            let delay = self.schedule.failed(Instant::now());
+                            warn!("[PolyUserFeed] Open-order recovery pending: generation={} attempt={} next_retry_ms={} result={:?}; private WS remains active, quoting paused",
+                                self.generation, self.schedule.failures, delay.as_millis(), result);
+                        }
+                    }
+                }
+                OpenOrderRecoveryStage::Fence => {
+                    if self.fence.is_none() {
+                        let (completion, done) = tokio::sync::oneshot::channel();
+                        match lane.live_tx.try_send(PrivateApplyCommand::RecoveryFence {
+                            generation: self.generation,
+                            completion,
+                        }) {
+                            Ok(()) => {
+                                // No await between FIFO publication and switching subsequent
+                                // Live frames to normal delivery. Late Some(gen) is impossible.
+                                self.live_generation = None;
+                                self.fence = Some(done);
+                            }
+                            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                sleep(Duration::from_millis(1)).await;
+                                continue;
+                            }
+                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                return Err(anyhow!("private owner stopped before recovery fence"))
+                            }
+                        }
+                    }
+                    let finished = self.fence.as_mut().unwrap().await.unwrap_or(false);
+                    self.fence = None;
+                    if !finished {
+                        return Err(anyhow!(
+                            "recovery fence generation={} superseded",
+                            self.generation
+                        ));
+                    }
+                    self.stage = OpenOrderRecoveryStage::Delivery;
+                }
+                OpenOrderRecoveryStage::Delivery => {
+                    if self.job.is_none() {
+                        let shared = shared.clone();
+                        let update_tx = update_tx.clone();
+                        let shutdown = shutdown.clone();
+                        let generation = self.generation;
+                        let runtime = tokio::runtime::Handle::current();
+                        self.job = Some(tokio::task::spawn_blocking(move || {
+                            runtime
+                                .block_on(wait_for_recovery_delivery(
+                                    &shared, generation, &update_tx, &shutdown,
+                                ))
+                                .map_err(|error| error.to_string())
+                        }));
+                    }
+                    let result = self.job.as_mut().unwrap().await;
+                    self.job = None;
+                    match result {
+                        Ok(Ok(())) => {
+                            self.stage = OpenOrderRecoveryStage::Ready;
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            self.stage = OpenOrderRecoveryStage::Failed;
+                            return Err(anyhow!("recovery delivery worker failed: {error}"));
+                        }
+                        result => {
+                            if shutdown.load(Ordering::Relaxed) {
+                                return Err(anyhow!("shutdown during recovery delivery"));
+                            }
+                            warn!("[PolyUserFeed] Recovery delivery still pending: generation={} result={:?}; private WS remains active", self.generation, result);
+                            sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+                OpenOrderRecoveryStage::Ready => std::future::pending::<()>().await,
+                OpenOrderRecoveryStage::Failed => {
+                    return Err(anyhow!("recovery worker stopped before lossless delivery"))
+                }
+            }
+        }
+    }
+
+    /// A real disconnect invalidates the REST proof, but never its successful
+    /// updates. Drain the one retained job and its owner ACKs before starting a
+    /// new generation; old completion can never clear the new socket's gate.
+    async fn drain_disconnected(
+        &mut self,
+        shared: &Arc<SharedState>,
+        update_tx: &Sender<RoutedOrderUpdate>,
+        lane: &PrivateApplyLane,
+        shutdown: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        if matches!(self.stage, OpenOrderRecoveryStage::Ready) {
+            return Ok(());
+        }
+        if matches!(self.stage, OpenOrderRecoveryStage::Audit) {
+            if let Some(job) = self.job.take() {
+                let _ = job
+                    .await
+                    .map_err(|error| anyhow!("disconnected audit worker failed: {error}"))?;
+            }
+            self.stage = OpenOrderRecoveryStage::Fence;
+        }
+        self.poll(shared, update_tx, lane, shutdown).await
+    }
+}
+
+fn deliver_open_order_recovery(
+    shared: &SharedState,
+    update_tx: &Sender<RoutedOrderUpdate>,
+    generation: u64,
+    pass: super::trade::RuntimeOrderRecovery,
+    shutdown: &AtomicBool,
+) -> std::result::Result<(), String> {
+    flush_startup_recovery_updates(shared, generation, update_tx, shutdown)
+        .map_err(|error| error.to_string())?;
+    // Retain each unsent update locally. An audit may already have committed its
+    // terminal result to the cold ledger, so repeating REST cannot recreate it.
+    // A routing failure therefore cannot discard this batch or release the gate.
+    for update in pass.updates {
+        loop {
+            match enqueue_recovery_update(shared, update_tx, generation, update.clone()) {
+                Ok(()) => break,
+                Err(error) => {
+                    shared.user_feed_health.set_recovering(true);
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Err(error.to_string());
+                    }
+                    warn!("[PolyUserFeed] recovery partial update delivery blocked: generation={} coid={} error={}", generation, update.client_order_id, error);
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        }
+    }
+    if pass.errors.is_empty() {
+        Ok(())
+    } else {
+        Err(pass.errors.join("; "))
+    }
+}
+
+#[cfg(test)]
+#[path = "user_feed_recovery_bench.rs"]
+mod recovery_bench;
+
 /// Async WebSocket loop. Spawned as a tokio task on the shared runtime.
 async fn user_feed_loop(
     api_key: String,
@@ -3713,6 +4042,7 @@ async fn user_feed_loop(
 
         info!("[PolyUserFeed] Connected and authenticated (async)");
         let recovery_generation = shared.user_feed_health.begin_recovery_delivery();
+        let recovery_certificate = shared.user_feed_health.recovery_certificate();
 
         // Gap recovery on (re)connect — whole-wallet, rewind
         // `gap_replay.reconnect_rewind_ms` (default 5s, quantised up to whole
@@ -3767,83 +4097,7 @@ async fn user_feed_loop(
             }
         }
 
-        let recovery_executor = PolymarketTrade::from_shared(shared.clone(), "", "");
-        let open_order_recovery = tokio::task::spawn_blocking(move || {
-            recovery_executor.reconcile_runtime_open_orders_with_updates()
-        })
-        .await;
-        match open_order_recovery {
-            Ok(Ok(updates)) => {
-                let mut enqueue_error = None;
-                for update in updates {
-                    if let Err(error) =
-                        enqueue_recovery_update(&shared, &update_tx, recovery_generation, update)
-                    {
-                        enqueue_error = Some(error);
-                        break;
-                    }
-                }
-                if let Some(error) = enqueue_error {
-                    shared.user_feed_health.set_recovering(true);
-                    let delay = backoff.next_delay();
-                    warn!(
-                        "[PolyUserFeed] reconnect update delivery failed: {}; keeping quoting paused and reconnecting in {:.1}s",
-                        error,
-                        delay.as_secs_f64(),
-                    );
-                    if !shutdown.load(Ordering::Relaxed) {
-                        sleep(delay).await;
-                    }
-                    continue;
-                }
-                if !shared
-                    .user_feed_health
-                    .finish_recovery_delivery_enrollment(recovery_generation)
-                {
-                    warn!(
-                        "[PolyUserFeed] reconnect delivery generation={} was superseded; keeping recovery asserted",
-                        recovery_generation,
-                    );
-                    continue;
-                }
-                if let Err(error) =
-                    wait_for_recovery_delivery(&shared, recovery_generation, &update_tx, &shutdown)
-                        .await
-                {
-                    shared.user_feed_health.set_recovering(true);
-                    let delay = backoff.next_delay();
-                    warn!(
-                        "[PolyUserFeed] reconnect updates were not fully processed: {}; keeping quoting paused and reconnecting in {:.1}s",
-                        error,
-                        delay.as_secs_f64(),
-                    );
-                    if !shutdown.load(Ordering::Relaxed) {
-                        sleep(delay).await;
-                    }
-                    continue;
-                }
-                accept_reconnect_replay(&shared, GapReplayOutcome::Complete { records: 0 });
-                backoff.reset();
-            }
-            Ok(Err(error)) => {
-                shared.user_feed_health.set_recovering(true);
-                let delay = backoff.next_delay();
-                warn!("[PolyUserFeed] Open-order recovery failed: {}; keeping quoting paused and reconnecting in {:.1}s", error, delay.as_secs_f64());
-                if !shutdown.load(Ordering::Relaxed) {
-                    sleep(delay).await;
-                }
-                continue;
-            }
-            Err(error) => {
-                shared.user_feed_health.set_recovering(true);
-                let delay = backoff.next_delay();
-                warn!("[PolyUserFeed] Open-order recovery task failed: {}; keeping quoting paused and reconnecting in {:.1}s", error, delay.as_secs_f64());
-                if !shutdown.load(Ordering::Relaxed) {
-                    sleep(delay).await;
-                }
-                continue;
-            }
-        }
+        let mut recovery = OpenOrderRecovery::new(recovery_generation);
 
         let mut last_ping = Instant::now();
         // Transport heartbeats prove only that the socket is alive. They must
@@ -3882,7 +4136,28 @@ async fn user_feed_loop(
                     }
                     continue;
                 }
-                result = timeout(READ_TIMEOUT, stream.next()) => result,
+                result = select_ws_or_recovery(
+                    timeout(READ_TIMEOUT, stream.next()),
+                    recovery.poll(&shared, &update_tx, &apply_lane, &shutdown),
+                ) => match result {
+                    RecoveryReadEvent::Socket(result) => result,
+                    RecoveryReadEvent::Audit(Ok(())) => {
+                        if apply_lane.reconnect_generation.load(Ordering::Acquire)
+                            != apply_reconnect_generation {
+                            break;
+                        }
+                        if !accept_reconnect_replay(&shared, GapReplayOutcome::Complete { records: 0 }, recovery_certificate) {
+                            warn!("[PolyUserFeed] newer recovery failure invalidated completed delivery; reconnecting fail-closed");
+                            break;
+                        }
+                        backoff.reset();
+                        continue;
+                    }
+                    RecoveryReadEvent::Audit(Err(error)) => {
+                        warn!("[PolyUserFeed] recovery coordination failed: {}; reconnecting fail-closed", error);
+                        break;
+                    }
+                },
             };
             match read_result {
                 Ok(Some(Ok(msg))) => {
@@ -3954,7 +4229,9 @@ async fn user_feed_loop(
                             .filter(|event| !event.is_registered_probe_order(&shared))
                             .collect();
                             let apply_enqueue_started = crate::latency::Instant::now();
-                            if let Err(error) = apply_lane.dispatch_live(events) {
+                            if let Err(error) =
+                                apply_lane.dispatch_live(events, recovery.live_generation)
+                            {
                                 shared.user_feed_health.set_recovering(true);
                                 shared.user_feed_health.set_inventory_uncertain(true);
                                 warn!(
@@ -4019,14 +4296,27 @@ async fn user_feed_loop(
             }
         }
 
-        // Disconnected
-        info!("[PolyUserFeed] Disconnected, will reconcile on reconnect");
-        shared.user_feed_health.set_recovering(true);
-        let last_match_time_secs = shared.live_position_last_match_secs();
-        let replay_anchor = replay_match_time_anchor(&shared, last_match_time_secs);
+        // Snapshot the replay floor before waiting: live/cold jobs can advance
+        // their watermark while this disconnected socket is being drained.
+        let disconnect_anchor =
+            replay_match_time_anchor(&shared, shared.live_position_last_match_secs());
         recovery_checkpoint.get_or_insert_with(|| {
-            GapReplayCheckpoint::new(replay_anchor.saturating_sub(reconnect_rewind_secs))
+            GapReplayCheckpoint::new(disconnect_anchor.saturating_sub(reconnect_rewind_secs))
         });
+        shared.user_feed_health.set_recovering(true);
+        if let Err(error) = recovery
+            .drain_disconnected(&shared, &update_tx, &apply_lane, &shutdown)
+            .await
+        {
+            // Never replace a generation whose lossless updates were not drained.
+            warn!(
+                "[PolyUserFeed] cannot drain disconnected recovery: {}; stopping feed fail-closed",
+                error
+            );
+            break;
+        }
+
+        info!("[PolyUserFeed] Disconnected, will reconcile on reconnect");
         if !shutdown.load(Ordering::Relaxed) {
             let delay = backoff.next_delay();
             warn!("[PolyUserFeed] Reconnecting in {:.1}s", delay.as_secs_f64());
@@ -4252,6 +4542,283 @@ mod tests {
         shared
     }
 
+    fn recovery_test_update(
+        shared: &SharedState,
+        coid: &str,
+        oid: &str,
+        owner: &str,
+    ) -> OrderUpdate {
+        shared
+            .account_state
+            .reserve_order(owner, coid, oid, "TOKEN", Side::Buy, 1.0, 0.5, 0)
+            .unwrap();
+        shared.register_order_id(coid, oid, "TOKEN");
+        OrderUpdate {
+            order_slot: Default::default(),
+            client_order_id: coid.into(),
+            exchange: Exchange::Polymarket,
+            symbol: "TOKEN".into(),
+            side: Side::Buy,
+            exchange_order_id: Some(oid.into()),
+            status: OrderStatus::Cancelled,
+            liquidity: None,
+            filled_quantity: 0.0,
+            remaining_quantity: 1.0,
+            avg_fill_price: 0.5,
+            timestamp_ns: now_ns(),
+            exchange_event_timestamp_ns: None,
+            trade_id: None,
+            order_audit: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn partial_audit_failure_delivers_successful_siblings_to_exact_owners() {
+        let shared = test_shared();
+        shared.account_state.register_instance("owner-1", 1.0);
+        shared.account_state.register_instance("owner", 1.0);
+        shared
+            .account_state
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        let first = recovery_test_update(&shared, "coid-a", "0xa1", "owner-1");
+        let second = recovery_test_update(&shared, "coid-b", "0xb1", "owner");
+        shared.user_feed_health.mark_strategy_consumer_ready();
+        let generation = shared.user_feed_health.begin_recovery_delivery();
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let result = deliver_open_order_recovery(
+            &shared,
+            &tx,
+            generation,
+            super::super::trade::RuntimeOrderRecovery {
+                updates: vec![first, second],
+                errors: vec!["unknown sibling: JSON null".into()],
+            },
+            &AtomicBool::new(false),
+        );
+        assert!(result.unwrap_err().contains("JSON null"));
+        let a = rx.try_recv().unwrap();
+        let b = rx.try_recv().unwrap();
+        assert_eq!((a.owner, b.owner), (0, 1));
+        assert_eq!(
+            shared
+                .user_feed_health
+                .recovery_delivery_progress(generation),
+            Some((false, 2))
+        );
+        assert!(!shared
+            .user_feed_health
+            .acknowledge_recovery_update("owner", &a.update));
+        assert!(shared
+            .user_feed_health
+            .acknowledge_recovery_update("owner-1", &a.update));
+        assert!(!shared
+            .user_feed_health
+            .acknowledge_recovery_update("owner-1", &a.update));
+        assert!(shared
+            .user_feed_health
+            .acknowledge_recovery_update("owner", &b.update));
+        assert!(shared.user_feed_health.is_recovering());
+    }
+
+    #[test]
+    fn pending_audit_flushes_startup_updates_without_double_enrollment() {
+        let shared = test_shared();
+        shared.account_state.register_instance("owner-1", 1.0);
+        shared
+            .account_state
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        let update = recovery_test_update(&shared, "coid-startup", "0xe1", "owner-1");
+        let generation = shared.user_feed_health.begin_recovery_delivery();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        enqueue_recovery_update(&shared, &tx, generation, update).unwrap();
+        assert!(rx.is_empty());
+        shared.user_feed_health.mark_strategy_consumer_ready();
+        let result = deliver_open_order_recovery(
+            &shared,
+            &tx,
+            generation,
+            super::super::trade::RuntimeOrderRecovery {
+                updates: Vec::new(),
+                errors: vec!["null".into()],
+            },
+            &AtomicBool::new(false),
+        );
+        assert_eq!(result.unwrap_err(), "null");
+        let routed = rx.try_recv().unwrap();
+        assert_eq!(routed.update.client_order_id, "coid-startup");
+        assert_eq!(
+            shared
+                .user_feed_health
+                .recovery_delivery_progress(generation),
+            Some((false, 1))
+        );
+        assert!(shared
+            .user_feed_health
+            .acknowledge_recovery_update("owner-1", &routed.update));
+        assert_eq!(
+            shared
+                .user_feed_health
+                .recovery_delivery_progress(generation),
+            Some((false, 0))
+        );
+        assert!(shared.user_feed_health.is_recovering());
+    }
+
+    #[test]
+    fn recovery_audit_schedule_is_bounded_and_resettable() {
+        let mut now = Instant::now();
+        let mut schedule = RecoveryAuditSchedule::new(now);
+        for expected in [250, 500, 1000, 2000, 4000, 8000, 16000, 30000, 30000] {
+            assert!(schedule.ready(now));
+            let delay = schedule.failed(now);
+            assert_eq!(delay, Duration::from_millis(expected));
+            assert!(!schedule.ready(now + delay - Duration::from_nanos(1)));
+            now += delay;
+        }
+        schedule.succeeded();
+        assert_eq!(schedule.failed(now), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn panicked_recovery_job_cannot_be_retried_as_a_successful_drain() {
+        let shared = test_shared();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let (live_tx, _live_rx) = crossbeam_channel::bounded(1);
+        let (replay_tx, _replay_rx) = crossbeam_channel::bounded(1);
+        let lane = PrivateApplyLane {
+            live_tx,
+            replay_tx,
+            reconnect_generation: Arc::new(AtomicU64::new(0)),
+            reconnect_notify: Arc::new(tokio::sync::Notify::new()),
+        };
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for stage in [
+                OpenOrderRecoveryStage::Audit,
+                OpenOrderRecoveryStage::Delivery,
+            ] {
+                let generation = shared.user_feed_health.begin_recovery_delivery();
+                let mut recovery = OpenOrderRecovery::new(generation);
+                recovery.stage = stage;
+                recovery.job = Some(tokio::spawn(async { panic!("injected cold worker panic") }));
+                assert!(recovery.poll(&shared, &tx, &lane, &shutdown).await.is_err());
+                assert!(matches!(recovery.stage, OpenOrderRecoveryStage::Failed));
+                assert!(recovery
+                    .drain_disconnected(&shared, &tx, &lane, &shutdown)
+                    .await
+                    .is_err());
+                assert!(shared.user_feed_health.is_recovering());
+            }
+        });
+    }
+
+    #[test]
+    fn disconnected_recovery_drains_retained_partial_job_before_new_generation() {
+        let shared = test_shared();
+        shared.account_state.register_instance("owner-1", 1.0);
+        shared.account_state.register_instance("owner", 1.0);
+        shared
+            .account_state
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        let update = recovery_test_update(&shared, "coid-drain", "0xd1", "owner-1");
+        shared.user_feed_health.mark_strategy_consumer_ready();
+        let generation = shared.user_feed_health.begin_recovery_delivery();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (lane, workers) =
+            spawn_private_apply_worker(shared.clone(), tx.clone(), shutdown.clone()).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut recovery = OpenOrderRecovery::new(generation);
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let shared_job = shared.clone();
+            let tx_job = tx.clone();
+            recovery.job = Some(tokio::spawn(async move {
+                wait.await.unwrap();
+                deliver_open_order_recovery(
+                    &shared_job,
+                    &tx_job,
+                    generation,
+                    super::super::trade::RuntimeOrderRecovery {
+                        updates: vec![update],
+                        errors: vec!["null".into()],
+                    },
+                    &AtomicBool::new(false),
+                )
+            }));
+            // A cancelled select must retain the exact in-flight job.
+            assert!(timeout(
+                Duration::from_millis(5),
+                recovery.poll(&shared, &tx, &lane, &shutdown)
+            )
+            .await
+            .is_err());
+            assert!(recovery.job.is_some());
+            assert_eq!(recovery.live_generation, Some(generation));
+            release.send(()).unwrap();
+            let delivery = async {
+                loop {
+                    if let Ok(routed) = rx.try_recv() {
+                        assert_eq!(routed.owner, 0);
+                        assert!(shared.user_feed_health.is_recovering());
+                        assert_eq!(
+                            shared
+                                .user_feed_health
+                                .recovery_delivery_progress(generation)
+                                .unwrap()
+                                .1,
+                            1
+                        );
+                        assert!(shared
+                            .user_feed_health
+                            .acknowledge_recovery_update("owner-1", &routed.update));
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            };
+            let drain = recovery.drain_disconnected(&shared, &tx, &lane, &shutdown);
+            let (drained, ()) = timeout(Duration::from_secs(2), async {
+                tokio::join!(drain, delivery)
+            })
+            .await
+            .unwrap();
+            drained.unwrap();
+            assert_eq!(
+                shared
+                    .user_feed_health
+                    .recovery_delivery_progress(generation),
+                Some((true, 0))
+            );
+            assert!(
+                shared.user_feed_health.is_recovering(),
+                "old socket drain is never a health proof"
+            );
+            assert!(matches!(recovery.stage, OpenOrderRecoveryStage::Ready));
+            let next = shared.user_feed_health.begin_recovery_delivery();
+            assert_ne!(next, generation);
+            assert!(!shared
+                .user_feed_health
+                .finish_recovery_delivery_enrollment(generation));
+        });
+        shutdown.store(true, Ordering::Relaxed);
+        drop(lane);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
     #[test]
     fn registered_probe_order_is_filtered_before_private_owner_lane() {
         let shared = test_shared();
@@ -4289,10 +4856,7 @@ mod tests {
         let shared = test_shared();
         let (owner0_tx, owner0_rx) = crossbeam_channel::bounded(4);
         let (owner1_tx, owner1_rx) = crossbeam_channel::bounded(4);
-        shared.install_strategy_private_routes(HashMap::from([
-            (0, owner0_tx),
-            (1, owner1_tx),
-        ]));
+        shared.install_strategy_private_routes(HashMap::from([(0, owner0_tx), (1, owner1_tx)]));
         let (root_tx, root_rx) = crossbeam_channel::bounded(4);
         let make = |coid: &str| RoutedOrderUpdate {
             owner: 0,
@@ -5191,7 +5755,11 @@ mod tests {
         // A failed REST result never reaches `accept_reconnect_replay`.
         let failed: Result<GapReplayOutcome> = Err(anyhow!("temporary REST failure"));
         if let Ok(outcome) = failed {
-            accept_reconnect_replay(&shared, outcome);
+            accept_reconnect_replay(
+                &shared,
+                outcome,
+                shared.user_feed_health.recovery_certificate(),
+            );
         }
         assert!(
             shared.user_feed_health.is_recovering(),
@@ -5201,7 +5769,11 @@ mod tests {
             .auth_failure_blocked
             .load(std::sync::atomic::Ordering::Acquire));
 
-        accept_reconnect_replay(&shared, GapReplayOutcome::Complete { records: 3 });
+        accept_reconnect_replay(
+            &shared,
+            GapReplayOutcome::Complete { records: 3 },
+            shared.user_feed_health.recovery_certificate(),
+        );
         assert!(!shared.user_feed_health.is_recovering());
         assert!(!shared.user_feed_health.inventory_uncertain());
         assert!(!shared

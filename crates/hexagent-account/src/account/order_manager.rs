@@ -429,8 +429,14 @@ impl OrderManager {
                 // and the private user stream. Once a DELETE was emitted, a
                 // duplicate/late Accepted only proves the order existed; it
                 // must not reopen the cancel gate and trigger a second DELETE.
+                // Likewise, a delayed placement/audit ACK cannot undo full
+                // private-trade coverage. Only a failed constituent trade can
+                // reopen Matched through the dedicated Failed branch below.
                 // Cancelled remains the deliberate resurrection exception.
-                if order.status != LocalOrderStatus::Cancelling {
+                if !matches!(
+                    order.status,
+                    LocalOrderStatus::Cancelling | LocalOrderStatus::Matched
+                ) {
                     order.status = LocalOrderStatus::Active;
                 }
             }
@@ -1314,6 +1320,78 @@ mod tests {
             m.active_bid().is_none(),
             "Cancelling cannot be cancelled twice"
         );
+    }
+
+    #[test]
+    fn late_audit_accepted_cannot_reopen_fully_matched_private_order() {
+        for side in [Side::Buy, Side::Sell] {
+            let mut manager = om();
+            manager.inject_open_order("matched".into(), side, 0.40, 5.0);
+            let mut first = upd("matched", side, OrderStatus::PartiallyFilled);
+            first.trade_id = Some("trade-first".into());
+            first.filled_quantity = 2.0;
+            first.remaining_quantity = 3.0;
+            assert!(manager.on_order_update(&first).is_none());
+            assert_eq!(manager.live_count(side), 1);
+            let mut second = first.clone();
+            second.trade_id = Some("trade-second".into());
+            second.filled_quantity = 3.0;
+            second.remaining_quantity = 0.0;
+            assert!(manager.on_order_update(&second).is_none());
+            assert_eq!(manager.orders["matched"].status, LocalOrderStatus::Matched);
+
+            // This REST response was captured before either private fill and
+            // arrives after cumulative trade coverage reached the full size.
+            let mut late_audit = upd("matched", side, OrderStatus::Accepted);
+            late_audit.remaining_quantity = 5.0;
+            late_audit.order_audit = Some(crate::types::AuthoritativeOrderAudit {
+                original_size: Some("5".into()),
+                size_matched: Some("0".into()),
+                associate_trades: Vec::new(),
+            });
+            first.status = OrderStatus::Filled;
+            second.status = OrderStatus::Filled;
+            for update in [&late_audit, &first, &first, &late_audit, &second, &second] {
+                assert!(manager.on_order_update(update).is_none());
+                assert_eq!(manager.orders["matched"].status, LocalOrderStatus::Matched);
+                assert_eq!(manager.live_count(side), 0);
+                assert!(manager.active_bid().is_none());
+                assert!(manager.active_ask().is_none());
+                assert_eq!(manager.locked_buy_cost(), 0.0);
+                assert_eq!(manager.locked_sell_qty(), 0.0);
+                assert!(manager.cancel_all(100).is_empty(), "no redundant DELETE");
+            }
+            assert_eq!(manager.orders["matched"].filled_by_trade.len(), 2);
+            assert_eq!(manager.open_count(), 1, "retain the reversible matched row");
+        }
+    }
+
+    #[test]
+    fn failed_private_trade_reopens_matched_order_before_normal_accepted() {
+        let mut manager = om();
+        manager.inject_open_order("matched".into(), Side::Buy, 0.40, 5.0);
+        let mut trade = upd("matched", Side::Buy, OrderStatus::PartiallyFilled);
+        trade.trade_id = Some("trade-failed-later".into());
+        trade.filled_quantity = 5.0;
+        assert!(manager.on_order_update(&trade).is_none());
+        assert_eq!(manager.orders["matched"].status, LocalOrderStatus::Matched);
+        let accepted = upd("matched", Side::Buy, OrderStatus::Accepted);
+        assert!(manager.on_order_update(&accepted).is_none());
+        assert_eq!(manager.live_count(Side::Buy), 0);
+
+        trade.status = OrderStatus::Failed;
+        assert!(manager.on_order_update(&trade).is_none());
+        assert!(manager.orders["matched"].filled_by_trade.is_empty());
+        assert_eq!(manager.orders["matched"].status, LocalOrderStatus::Active);
+        assert_eq!(manager.live_count(Side::Buy), 1);
+        assert!(manager.on_order_update(&accepted).is_none());
+        assert!(manager.active_bid().is_some());
+        let cancels = manager.cancel_all(100);
+        assert_eq!(cancels.len(), 1, "the failed trade left a real live order");
+        assert!(matches!(
+            &cancels[0],
+            Signal::CancelOrder { client_order_id, .. } if client_order_id == "matched"
+        ));
     }
 
     // Cancelled is KEPT in the map (not removed) and excluded from live/active
