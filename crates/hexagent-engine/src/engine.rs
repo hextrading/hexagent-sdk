@@ -2481,6 +2481,22 @@ fn should_spawn_per_instance_strategy_workers(backtest: bool, strategy_count: us
     !backtest && strategy_count > 0
 }
 
+/// Leave lifecycle ownership in the existing bounded input lane while a
+/// startup-only consumer buffer is full. Both receivers are allocated before
+/// the worker loop; selecting one borrows it without cloning or allocation.
+#[inline]
+fn startup_lifecycle_receiver<'a, T>(
+    paused: bool,
+    receiver: &'a Receiver<T>,
+    never: &'a Receiver<T>,
+) -> &'a Receiver<T> {
+    if paused {
+        never
+    } else {
+        receiver
+    }
+}
+
 #[derive(Debug)]
 struct QueuedOrderUpdate {
     update: OrderUpdate,
@@ -8746,6 +8762,11 @@ impl Engine {
         let mut shutdown_started = false;
         let watchdog_rx = crossbeam_channel::tick(std::time::Duration::from_millis(100));
         let never_private_update_rx = crossbeam_channel::never::<OrderUpdate>();
+        let never_direct_private_rx = crossbeam_channel::never::<RoutedOrderUpdate>();
+        let never_compat_update_rx = crossbeam_channel::never::<QueuedOrderUpdate>();
+        // Sole writer: this strategy worker. Refresh only at lifecycle/watchdog
+        // boundaries; market/quote callbacks never poll strategy bootstrap state.
+        let mut lifecycle_intake_paused = strategy.startup_lifecycle_intake_paused();
         let never_private_control_rx =
             crossbeam_channel::never::<crate::exchange::PrivateFeedControl>();
         let never_watchdog_rx = crossbeam_channel::never::<std::time::Instant>();
@@ -8766,22 +8787,34 @@ impl Engine {
             // Lifecycle lanes are lossless and strict-priority. Market state
             // is replaceable, so it must never be selected while an account
             // mutation is already queued for this sole-writer strategy.
-            let selectable_private_update_rx = if private_feed_updates_open {
-                &private_feed_update_rx
-            } else {
-                &never_private_update_rx
-            };
+            let selectable_private_update_rx = startup_lifecycle_receiver(
+                lifecycle_intake_paused || !private_feed_updates_open,
+                &private_feed_update_rx,
+                &never_private_update_rx,
+            );
+            let selectable_direct_private_rx = startup_lifecycle_receiver(
+                lifecycle_intake_paused,
+                &direct_private_rx,
+                &never_direct_private_rx,
+            );
+            let selectable_compat_update_rx = startup_lifecycle_receiver(
+                lifecycle_intake_paused,
+                &update_rx,
+                &never_compat_update_rx,
+            );
             let selectable_private_control_rx = if private_feed_control_open {
                 &private_feed_control_rx
             } else {
                 &never_private_control_rx
             };
-            let selectable_watchdog_rx =
-                if !market_rx.is_empty() && last_watchdog_run.elapsed() < WATCHDOG_MAX_DEFERRAL {
-                    &never_watchdog_rx
-                } else {
-                    &watchdog_rx
-                };
+            let selectable_watchdog_rx = if !lifecycle_intake_paused
+                && !market_rx.is_empty()
+                && last_watchdog_run.elapsed() < WATCHDOG_MAX_DEFERRAL
+            {
+                &never_watchdog_rx
+            } else {
+                &watchdog_rx
+            };
             let selectable_admission_rx = admission.receiver().unwrap_or(&never_admission_rx);
             crossbeam_channel::select_biased! {
                 recv(selectable_admission_rx) -> message => {
@@ -8817,7 +8850,7 @@ impl Engine {
                 // was completed on the private producer, so this dedicated
                 // lossless lane bypasses the root router and is drained before
                 // every compatibility lifecycle or market-data lane.
-                recv(direct_private_rx) -> msg => match msg {
+                recv(selectable_direct_private_rx) -> msg => match msg {
                     Ok(routed) => {
                         if routed.owner as usize != idx {
                             error!(
@@ -8852,6 +8885,7 @@ impl Engine {
                             );
                             break 'worker;
                         }
+                        lifecycle_intake_paused = strategy.startup_lifecycle_intake_paused();
                         if !shutdown_started {
                             for sig in callback_signal_batch.drain(..) {
                                 if !emit(sig) { break 'worker; }
@@ -8891,6 +8925,7 @@ impl Engine {
                             );
                             break 'worker;
                         }
+                        lifecycle_intake_paused = strategy.startup_lifecycle_intake_paused();
                         crate::latency::record(
                             "strategy.private_feed.callback",
                             callback_started,
@@ -8903,7 +8938,7 @@ impl Engine {
                     }
                     Err(_) => private_feed_updates_open = false,
                 },
-                recv(update_rx) -> msg => match msg {
+                recv(selectable_compat_update_rx) -> msg => match msg {
                     Ok(queued) => {
                         if queued.update.exchange == Exchange::Polymarket {
                             hexagent_runtime::latency::record_ns(
@@ -8941,6 +8976,7 @@ impl Engine {
                             );
                             break 'worker;
                         }
+                        lifecycle_intake_paused = strategy.startup_lifecycle_intake_paused();
                         if !shutdown_started {
                             for sig in callback_signal_batch.drain(..) {
                                 if !emit(sig) { break 'worker; }
@@ -8992,6 +9028,49 @@ impl Engine {
                             &quarantined,
                             instance_id,
                         );
+                        break 'worker;
+                    }
+                    lifecycle_intake_paused = strategy.startup_lifecycle_intake_paused();
+                    if let Some(reason) = strategy.startup_lifecycle_failure() {
+                        // Startup-only terminal path: retain strategy/FIFO and
+                        // upstream lifecycle ownership until explicit shutdown.
+                        // Restart/replay is required; no partial signal batch
+                        // or recovery ACK can turn this into successful startup.
+                        callback_signal_batch.clear();
+                        lifecycle_intake_paused = true;
+                        quarantined.store(true, Ordering::Release);
+                        error!(
+                            "[strategy_worker] instance={} startup lifecycle handoff failed: {}; quarantined pending controlled restart/replay",
+                            instance_id, reason,
+                        );
+                        let _ = enqueue_emergency_instance_cancel(
+                            idx, instance_id, reason, &signal_tx,
+                        );
+                        loop {
+                            if shutdown_requested.load(Ordering::Acquire) {
+                                if !shutdown_started {
+                                    strategy.on_exit();
+                                    shutdown_started = true;
+                                    let _ = shutdown_ack_tx.send(idx);
+                                }
+                                break;
+                            }
+                            match market_rx.recv_timeout(Duration::from_millis(100)) {
+                                Ok(queued) => {
+                                    if resolve_market_event(queued, &latest_market)
+                                        .is_some_and(|event| matches!(event.event.as_ref(), MarketEvent::Exit))
+                                    {
+                                        if !shutdown_started {
+                                            strategy.on_exit();
+                                            shutdown_started = true;
+                                        }
+                                        break;
+                                    }
+                                }
+                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
                         break 'worker;
                     }
                     for sig in callback_signal_batch.drain(..) {
@@ -9176,7 +9255,10 @@ impl Engine {
         // Dispatchers are joined before the router closes market_txs, so all
         // final updates are available here before the report is generated.
         let mut shutdown_lifecycle_overflow = false;
-        while let Ok(update) = private_feed_update_rx.try_recv() {
+        while !lifecycle_intake_paused {
+            let Ok(update) = private_feed_update_rx.try_recv() else {
+                break;
+            };
             lifecycle_sequence = lifecycle_sequence.saturating_add(1);
             callback_signal_batch.clear();
             if let Err(overflow) = strategy.on_lifecycle_update_owned_into(
@@ -9195,9 +9277,13 @@ impl Engine {
                 shutdown_lifecycle_overflow = true;
                 break;
             }
+            lifecycle_intake_paused = strategy.startup_lifecycle_intake_paused();
         }
         if !shutdown_lifecycle_overflow {
-            while let Ok(queued) = update_rx.try_recv() {
+            while !lifecycle_intake_paused {
+                let Ok(queued) = update_rx.try_recv() else {
+                    break;
+                };
                 lifecycle_sequence = lifecycle_sequence.saturating_add(1);
                 callback_signal_batch.clear();
                 if let Err(overflow) = strategy.on_lifecycle_update_owned_into(
@@ -9215,6 +9301,7 @@ impl Engine {
                     handle_signal_batch_overflow(overflow, &signal_tx, &quarantined, instance_id);
                     break;
                 }
+                lifecycle_intake_paused = strategy.startup_lifecycle_intake_paused();
             }
         }
         let _ = strategy.on_shutdown();
@@ -15872,6 +15959,10 @@ impl ExchangeTrade for LiveRouter {
         "live"
     }
 }
+
+#[cfg(test)]
+#[path = "startup_lifecycle_intake_tests.rs"]
+mod startup_lifecycle_intake_tests;
 
 #[cfg(test)]
 mod market_router_tests {

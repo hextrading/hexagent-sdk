@@ -1386,6 +1386,24 @@ pub struct InstanceAccountSnapshot {
     pub reserved_positions: HashMap<String, f64>,
 }
 
+/// One coherent, instance-scoped bootstrap cut of the cold account mirror.
+/// Balances and replay identities must come from the same transaction: mixing
+/// a live balance snapshot with a later trade list can suppress a real fill.
+/// This payload is prepared only by startup workers; it is never a runtime
+/// admission authority. The strategy must retain lifecycle messages received
+/// during startup and replay them after installing this seed.
+#[derive(Debug, Clone)]
+pub struct InstanceStartupSeed {
+    pub snapshot: InstanceAccountSnapshot,
+    pub restored_trades: Vec<RestoredTrade>,
+    pub orders: Vec<OrderOwnership>,
+    pub passive_admission_allowed: bool,
+    pub fee_degraded_only: bool,
+    pub uncertain: bool,
+    pub uncertain_reason: Option<Arc<String>>,
+    pub settled_outcomes: Arc<SettledTokenValuesSnapshot>,
+}
+
 /// Immutable, lock-free view of account-wide authoritative binary outcomes.
 /// Writers publish a new `Arc` only when the generation advances; quote and
 /// watchdog callbacks therefore never enter the aggregate account lock merely
@@ -12462,6 +12480,77 @@ impl SharedAccount {
                 total
             },
         })
+    }
+
+    /// Capture balances, orders and trade replay identities atomically from
+    /// the cold mirror. Cloning and the existing cold-state lock stay on the
+    /// startup fetch worker, never on the strategy or private lifecycle owner.
+    /// A bound mirror may lag its producer, but each trade projection updates
+    /// its balance and replay row under this same lock. Buffered lifecycle
+    /// replay therefore either deduplicates a represented fill or books it.
+    pub fn capture_instance_startup_seed(&self, instance_id: &str) -> Option<InstanceStartupSeed> {
+        let persistence_error = self
+            .persistence
+            .as_ref()
+            .and_then(AccountPersistence::last_error);
+        let mirror_failed = self
+            .lifecycle_mirror_incident_active
+            .load(Ordering::Acquire);
+        let capture = |state: &SharedAccountState| {
+            if !state.startup_snapshot_applied_this_process {
+                return None;
+            }
+            let instance = state.instances.get(instance_id)?;
+            let failed = persistence_error.is_some() || mirror_failed;
+            let fee_only = !failed && fee_degradation_is_only_uncertainty(state);
+            Some(InstanceStartupSeed {
+                snapshot: InstanceAccountSnapshot {
+                    instance_id: instance_id.to_owned(),
+                    weight: instance.weight,
+                    ledger_generation: state.ledger_generation,
+                    cash: instance.cash,
+                    positions: instance.positions.clone(),
+                    reserved_cash: instance.total_reserved_cash(),
+                    reserved_positions: instance.total_reserved_positions(),
+                },
+                restored_trades: state
+                    .trades
+                    .values()
+                    .filter(|trade| trade.ownership.instance_id == instance_id)
+                    .filter_map(restored_trade_from_applied)
+                    .collect(),
+                orders: state
+                    .orders
+                    .values()
+                    .filter(|order| order.instance_id == instance_id)
+                    .cloned()
+                    .collect(),
+                passive_admission_allowed: !failed
+                    && state.seeded
+                    && (!state.uncertain || fee_only),
+                fee_degraded_only: state.seeded && fee_only,
+                uncertain: failed || state.uncertain,
+                uncertain_reason: persistence_error
+                    .clone()
+                    .or_else(|| {
+                        mirror_failed
+                            .then(|| "startup lifecycle mirror has an unresolved gap".to_owned())
+                    })
+                    .or_else(|| state.uncertain_reason.clone())
+                    .map(Arc::new),
+                settled_outcomes: Arc::new(SettledTokenValuesSnapshot {
+                    generation: Self::effective_settled_token_values_generation(state),
+                    values: state.settled_token_values.clone(),
+                }),
+            })
+        };
+        if self.account_lifecycle_lane_bound.load(Ordering::Acquire) {
+            self.read_cold_state(capture)
+        } else {
+            // CLI/tests before owner binding still use the startup transaction
+            // to collect their shards. Live workers always take the read path.
+            capture(&self.lock_state())
+        }
     }
 
     pub fn availability(&self, instance_id: &str, token: &str) -> Option<AccountAvailability> {
@@ -32709,3 +32798,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
 #[cfg(test)]
 #[path = "shared_account_execution_tests.rs"]
 mod execution_tests;
+
+#[cfg(test)]
+#[path = "shared_account_startup_seed_tests.rs"]
+mod startup_seed_tests;
