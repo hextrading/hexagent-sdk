@@ -6650,6 +6650,20 @@ struct PriceChangeFields<'a> {
     timestamp: Option<WireUnsigned<'a>>,
 }
 
+/// Scratch for one already bounded wire frame. The CLOB owner borrows token
+/// identities until apply returns; none of these keys escape into book state.
+/// At most one entry exists per wire change, so the decoder's 64-entry bound
+/// also bounds this table and its validation/touched order lists.
+struct PriceChangeTokenScratch<'a> {
+    token: &'a str,
+    condition_identity: Option<u16>,
+    entries: usize,
+    before: Option<(Option<Decimal>, Option<Decimal>)>,
+    reported_bbo: ReportedBbo,
+    has_reported_bbo: bool,
+    off_tick: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ReportedBbo {
     /// Outer Option means the field was present; inner Option is the
@@ -7335,6 +7349,19 @@ struct ClobCanonicalRole {
     condition_id: String,
     up_token: String,
     is_down: bool,
+    /// Exact condition interning performed once by this CLOB owner's startup.
+    /// None retains exact string comparisons for compatibility/overflow.
+    condition_identity: Option<u16>,
+}
+
+fn intern_clob_condition_identity<'a>(
+    identities: &mut HashMap<&'a str, Option<u16>>,
+    condition: &'a str,
+) -> Option<u16> {
+    // IDs are never derived from token layout or narrowed with `as`: distinct
+    // conditions beyond the representable range retain the exact fallback.
+    let next = u16::try_from(identities.len()).ok();
+    *identities.entry(condition).or_insert(next)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -7483,7 +7510,12 @@ impl ClobLocalBooks {
             canonical_books: HashMap::with_capacity(specs.len()),
             ..Self::default()
         };
+        // Startup-only, borrowed keys. The lookup is dropped after immutable
+        // Copy identities are installed in this owner's already-existing roles.
+        let mut condition_identities = HashMap::with_capacity(specs.len());
         for spec in specs {
+            let condition_identity =
+                intern_clob_condition_identity(&mut condition_identities, &spec.condition_id);
             state
                 .canonical_books
                 .entry(spec.condition_id.clone())
@@ -7497,6 +7529,7 @@ impl ClobLocalBooks {
                     condition_id: spec.condition_id.clone(),
                     up_token: spec.up_token.clone(),
                     is_down: false,
+                    condition_identity,
                 },
             );
             state.roles.insert(
@@ -7505,6 +7538,7 @@ impl ClobLocalBooks {
                     condition_id: spec.condition_id.clone(),
                     up_token: spec.up_token.clone(),
                     is_down: true,
+                    condition_identity,
                 },
             );
             for token in [&spec.up_token, &spec.down_token] {
@@ -8366,22 +8400,38 @@ impl ClobLocalBooks {
             return (Vec::new(), 0, Vec::new());
         }
         let mut immediate = Vec::new();
-        let entry_counts: HashMap<String, usize> =
-            fields
-                .price_changes
-                .iter()
-                .fold(HashMap::new(), |mut counts, change| {
-                    *counts.entry(change.asset_id.to_string()).or_insert(0) += 1;
-                    counts
+        let mut scratch =
+            arrayvec::ArrayVec::<PriceChangeTokenScratch<'_>, CLOB_PRICE_CHANGE_CAPACITY>::new();
+        for change in &fields.price_changes {
+            let token = change.asset_id.as_ref();
+            if let Some(entry) = scratch.iter_mut().find(|entry| entry.token == token) {
+                entry.entries += 1;
+            } else {
+                // The input is itself ArrayVec<_, CLOB_PRICE_CHANGE_CAPACITY>.
+                // Distinct tokens cannot exceed entries; push never truncates.
+                scratch.push(PriceChangeTokenScratch {
+                    token,
+                    condition_identity: self
+                        .roles
+                        .get(token)
+                        .and_then(|role| role.condition_identity),
+                    entries: 1,
+                    before: None,
+                    reported_bbo: ReportedBbo::default(),
+                    has_reported_bbo: false,
+                    off_tick: false,
                 });
-        let mut before: HashMap<String, (Option<Decimal>, Option<Decimal>)> = HashMap::new();
-        let mut reported_bbo: HashMap<String, ReportedBbo> = HashMap::new();
-        let mut off_tick_tokens: HashSet<String> = HashSet::new();
+            }
+        }
 
-        for change in fields.price_changes {
+        for change in &fields.price_changes {
             counters.price_change_entries = counters.price_change_entries.saturating_add(1);
-            let token = change.asset_id;
-            let emit_diagnostic = subscribed_token(active_tokens, &token);
+            let token = change.asset_id.as_ref();
+            let token_scratch = scratch
+                .iter_mut()
+                .find(|entry| entry.token == token)
+                .expect("all wire tokens entered bounded frame scratch");
+            let emit_diagnostic = subscribed_token(active_tokens, token);
             let Some(price) = change.price.decimal() else {
                 counters.ignored = counters.ignored.saturating_add(1);
                 if emit_diagnostic {
@@ -8412,10 +8462,10 @@ impl ClobLocalBooks {
                 }
                 continue;
             }
-            if !self.price_is_on_current_tick(token.as_ref(), price) {
-                off_tick_tokens.insert(token.to_string());
+            if !self.price_is_on_current_tick(token, price) {
+                token_scratch.off_tick = true;
             }
-            let Some(current_book) = self.token_books.get(token.as_ref()) else {
+            let Some(current_book) = self.token_books.get(token) else {
                 counters.unseeded_deltas = counters.unseeded_deltas.saturating_add(1);
                 counters.ignored = counters.ignored.saturating_add(1);
                 if emit_diagnostic {
@@ -8442,10 +8492,10 @@ impl ClobLocalBooks {
             let sequence = self.next_sequence();
             let book = self
                 .token_books
-                .get_mut(token.as_ref())
+                .get_mut(token)
                 .expect("book existence checked above");
-            if !before.contains_key(token.as_ref()) {
-                before.insert(token.to_string(), book.top());
+            if token_scratch.before.is_none() {
+                token_scratch.before = Some(book.top());
             }
             let side = change.side.trim();
             let levels = if side.eq_ignore_ascii_case("BUY") {
@@ -8477,7 +8527,8 @@ impl ClobLocalBooks {
             book.dirty_since.get_or_insert(received_at);
             let _ = change.hash;
 
-            let reported = reported_bbo.entry(token.to_string()).or_default();
+            token_scratch.has_reported_bbo = true;
+            let reported = &mut token_scratch.reported_bbo;
             if let Some(value) = change.best_bid.as_ref() {
                 match value.decimal() {
                     Some(price) => reported.bid = Some(normalize_reported_bbo(price)),
@@ -8504,30 +8555,35 @@ impl ClobLocalBooks {
         // batch can span multiple WebSocket frames with the same millisecond
         // timestamp. Merge expectations by token+timestamp and publish only
         // after the local top agrees (or the short quiet window expires).
-        let mut validation_tokens: HashSet<String> = reported_bbo.keys().cloned().collect();
-        validation_tokens.extend(off_tick_tokens.iter().cloned());
-        let mut validation_tokens: Vec<_> = validation_tokens.into_iter().collect();
-        validation_tokens.sort();
-        for token in validation_tokens {
-            if !before.contains_key(&token) {
+        let mut validation_order = arrayvec::ArrayVec::<usize, CLOB_PRICE_CHANGE_CAPACITY>::new();
+        for (index, entry) in scratch.iter().enumerate() {
+            if entry.has_reported_bbo || entry.off_tick {
+                validation_order.push(index);
+            }
+        }
+        validation_order.sort_unstable_by(|a, b| scratch[*a].token.cmp(scratch[*b].token));
+        for index in validation_order {
+            let entry = &scratch[index];
+            let token = entry.token;
+            if entry.before.is_none() {
                 continue;
             }
-            let newer_expected = reported_bbo.remove(&token).unwrap_or_default();
+            let newer_expected = entry.reported_bbo;
             let actual = self
                 .token_books
-                .get(&token)
+                .get(token)
                 .map(ClobLocalBook::top)
                 .unwrap_or_default();
-            let off_tick = off_tick_tokens.contains(&token);
-            let summary = subscribed_token(active_tokens, &token).then(|| BboFrameSample {
+            let off_tick = entry.off_tick;
+            let summary = subscribed_token(active_tokens, token).then(|| BboFrameSample {
                 exchange_timestamp_ns,
-                entries: entry_counts.get(&token).copied().unwrap_or(0),
+                entries: entry.entries,
                 expected: newer_expected,
                 actual,
             });
             let pending =
                 self.pending_bbo
-                    .entry(token.clone())
+                    .entry(token.to_owned())
                     .or_insert_with(|| PendingBboCheck {
                         exchange_timestamp_ns,
                         expected: ReportedBbo::default(),
@@ -8568,12 +8624,12 @@ impl ClobLocalBooks {
             } else {
                 None
             };
-            if self.roles.contains_key(&token) {
+            if self.roles.contains_key(token) {
                 if let Some((bid, ask)) = advertised_l1 {
                     if let (Some(bid_price), Some(ask_price)) = (bid.to_f64(), ask.to_f64()) {
                         let quote = QuoteTick {
                             exchange: Exchange::Polymarket,
-                            symbol: token.clone(),
+                            symbol: token.to_owned(),
                             bid_price,
                             bid_qty: 0.0,
                             ask_price,
@@ -8589,49 +8645,59 @@ impl ClobLocalBooks {
             }
         }
 
-        let mut touched_order: Vec<_> = before
-            .keys()
-            .filter_map(|token| {
-                self.token_books
-                    .get(token)
-                    .map(|book| (book.wire_sequence, token.clone()))
-            })
-            .collect();
-        touched_order.sort_by_key(|(sequence, _)| *sequence);
-        let health_tokens: Vec<String> = touched_order
-            .iter()
-            .map(|(_, token)| token.clone())
-            .collect();
-        for (_, token) in touched_order {
+        let mut touched_order =
+            arrayvec::ArrayVec::<(u64, usize), CLOB_PRICE_CHANGE_CAPACITY>::new();
+        for (index, entry) in scratch.iter().enumerate() {
+            if entry.before.is_some() {
+                if let Some(book) = self.token_books.get(entry.token) {
+                    touched_order.push((book.wire_sequence, index));
+                }
+            }
+        }
+        touched_order.sort_unstable_by_key(|(sequence, _)| *sequence);
+        for &(_, index) in &touched_order {
+            let entry = &scratch[index];
+            let token = entry.token;
             let (top_changed, semantically_valid) = self
                 .token_books
-                .get(&token)
+                .get(token)
                 .map(|book| {
                     (
-                        before.get(&token).copied() != Some(book.top()),
+                        entry.before != Some(book.top()),
                         book.is_semantically_valid(),
                     )
                 })
                 .unwrap_or((false, false));
-            let _ = self.resolve_pending_if_ready(&token, received_at, counters);
+            let _ = self.resolve_pending_if_ready(token, received_at, counters);
             if top_changed
                 && semantically_valid
-                && !self.pending_bbo.contains_key(&token)
-                && !self.market_is_quarantined(&token)
+                && !self.pending_bbo.contains_key(token)
+                && !self.market_is_quarantined(token)
             {
-                if let Some(book) = self.token_books.get_mut(&token) {
+                if let Some(book) = self.token_books.get_mut(token) {
                     book.dirty_since = None;
                 }
-                if let Some(event) = self.canonicalize_token(&token, local_now) {
+                if let Some(event) = self.canonicalize_token(token, local_now) {
                     push_latest_order_book(&mut immediate, event);
                 }
             }
         }
-        let mut reconciled_markets = HashSet::new();
-        for token in health_tokens {
-            if reconciled_markets.insert(self.market_key(&token)) {
+        let mut reconciled_tokens = arrayvec::ArrayVec::<usize, CLOB_PRICE_CHANGE_CAPACITY>::new();
+        for &(_, index) in &touched_order {
+            let entry = &scratch[index];
+            let token = entry.token;
+            // Registered conditions compare startup Copy IDs. Unknown roles or
+            // overflowing identities retain exact borrowed-key comparison;
+            // None is never a shared sentinel representing multiple markets.
+            if !reconciled_tokens.iter().any(|&prior| {
+                match (scratch[prior].condition_identity, entry.condition_identity) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => self.market_key_ref(scratch[prior].token) == self.market_key_ref(token),
+                }
+            }) {
+                reconciled_tokens.push(index);
                 if let Some(event) = self.reconcile_health(
-                    &token,
+                    token,
                     "BBO checkpoint state changed",
                     received_at,
                     local_now,
@@ -9685,6 +9751,10 @@ static CLOB_TEST_ALLOCATOR: clob_test_allocator::CountingAllocator =
 #[cfg(test)]
 #[path = "clob_canonical_cache_tests.rs"]
 mod clob_canonical_cache_tests;
+
+#[cfg(test)]
+#[path = "clob_price_change_scratch_tests.rs"]
+mod clob_price_change_scratch_tests;
 
 #[cfg(test)]
 #[path = "clob_quantity_path_tests.rs"]
