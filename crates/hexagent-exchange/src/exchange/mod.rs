@@ -997,6 +997,7 @@ mod tests {
             timestamp_ns: sequence as u64,
             exchange_event_timestamp_ns: None,
             trade_id: Some(format!("trade-{sequence}")),
+            trade_fee: None,
             order_audit: None,
             error: None,
             order_slot: Default::default(),

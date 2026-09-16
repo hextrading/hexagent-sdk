@@ -963,6 +963,7 @@ mod user_feed_health_tests {
             timestamp_ns: 1,
             exchange_event_timestamp_ns: None,
             trade_id: Some("trade-1".to_string()),
+            trade_fee: None,
             order_audit: None,
             error: None,
             order_slot: Default::default(),
@@ -1419,6 +1420,8 @@ mod update_trade_dedup_tests {
             .unwrap()
             .as_secs();
         let restored = RestoredTrade {
+                fee_attributed: true,
+                fee_settlement: Default::default(),
             ownership: hexagent_account::account::shared_account::TradeOwnership {
                 account_id: "account".to_string(),
                 instance_id: "instance".to_string(),

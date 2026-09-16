@@ -110,6 +110,7 @@ fn market_detail_to_binary_option(
         base_fee: 0,
         fee_exponent: 0.0,
         fee_rate: 0.0,
+            fee_settlement: Default::default(),
     }
 }
 

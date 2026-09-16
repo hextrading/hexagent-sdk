@@ -6,7 +6,7 @@
 //! instance's weighted virtual balance/inventory is its private ceiling.
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use hexagent_types::types::{AuthoritativeOrderAudit, BinaryOption, OrderSlot, OrderStatus, Side};
+use hexagent_types::types::{AuthoritativeOrderAudit, BinaryOption, FeeBasis, FeeSettlement, TradeFee, OrderSlot, OrderStatus, Side};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::cell::UnsafeCell;
@@ -401,6 +401,10 @@ enum AccountOwnerOperation {
         wait: Duration,
     },
     MonitoringSnapshot(crossbeam_channel::Sender<AccountMonitoringSnapshot>),
+    RegisterTokenFeeConfig {
+        token_ids: Vec<String>, rate: f64, exponent: f64, settlement: FeeSettlement,
+        reply: crossbeam_channel::Sender<Result<(), ReservationError>>,
+    },
     ReserveOrder {
         instance_id: String,
         client_order_id: String,
@@ -424,6 +428,7 @@ enum AccountOwnerOperation {
         price: f64,
         is_maker: bool,
         match_time_secs: u64,
+        fee_context: Option<ExecutionFeeContext>,
         reply: crossbeam_channel::Sender<TradeTransitionResult>,
     },
     ApplyTradeTransitionLegacy {
@@ -660,6 +665,9 @@ impl AccountOwnerCommand {
             MonitoringSnapshot(reply) => {
                 let _ = reply.send(account.monitoring_snapshot());
             }
+            RegisterTokenFeeConfig { token_ids, rate, exponent, settlement, reply } => {
+                let _ = reply.send(account.register_token_fee_config_with_settlement(&token_ids, rate, exponent, settlement));
+            }
             ReserveOrder {
                 instance_id,
                 client_order_id,
@@ -695,9 +703,10 @@ impl AccountOwnerCommand {
                 price,
                 is_maker,
                 match_time_secs,
+                fee_context,
                 reply,
             } => {
-                let _ = reply.send(account.apply_trade_transition_with_context(
+                let _ = reply.send(account.apply_trade_transition_with_fee_context(
                     &trade_key,
                     &status,
                     &client_order_id,
@@ -708,6 +717,7 @@ impl AccountOwnerCommand {
                     price,
                     is_maker,
                     match_time_secs,
+                    fee_context,
                 ));
             }
             ApplyTradeTransitionLegacy {
@@ -1051,6 +1061,10 @@ mod batch_tests;
 #[cfg(test)]
 #[path = "shared_account_route_bytes_tests.rs"]
 mod route_bytes_tests;
+
+#[cfg(test)]
+#[path = "shared_account_v2_fee_tests.rs"]
+mod v2_fee_tests;
 
 #[cfg(test)]
 #[path = "shared_account_terminal_fee_tests.rs"]
@@ -1748,9 +1762,18 @@ pub struct OrderOwnership {
     pub price: f64,
     #[serde(default)]
     pub fee_rate_bps: u32,
+    /// None decodes historical bps-based reservations without changing them.
+    #[serde(default)]
+    pub cash_fee_per_share: Option<f64>,
     pub reserved_cash: f64,
     pub reserved_quantity: f64,
     pub status: OrderStatus,
+}
+
+impl OrderOwnership {
+    pub fn reservation_cash_per_share(&self) -> f64 {
+        self.price + self.cash_fee_per_share.unwrap_or(self.price * self.fee_rate_bps as f64 / 10_000.0)
+    }
 }
 
 /// Durable recovery input for an order lifecycle event whose process-local
@@ -1850,6 +1873,7 @@ pub struct TradeTransitionAccounting {
     pub ownership: TradeOwnership,
     pub fill_delta: f64,
     pub matched_size: f64,
+    pub trade_fee: Option<TradeFee>,
 }
 
 impl TradeTransitionResult {
@@ -1883,6 +1907,14 @@ impl TradeTransitionResult {
         }
     }
 
+    pub fn trade_fee(&self) -> Option<TradeFee> {
+        match self {
+            Self::Applied(accounting) | Self::AppliedButPersistencePending(accounting)
+            | Self::OwnedNoop(accounting) | Self::OwnedNoopButPersistencePending(accounting) => accounting.trade_fee,
+            Self::Rejected => None,
+        }
+    }
+
     pub fn persistence_pending(&self) -> bool {
         matches!(
             self,
@@ -1908,6 +1940,9 @@ enum VirtualTradeAttempt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RestoredTrade {
+    /// True only after maker-zero proof or authoritative curve attribution.
+    pub fee_attributed: bool,
+    pub fee_settlement: FeeSettlement,
     pub ownership: TradeOwnership,
     pub booked: bool,
     pub usdc_fee: f64,
@@ -2495,6 +2530,13 @@ impl VirtualAccount {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AppliedTrade {
+    /// Missing legacy fields retain V1. A new row without metadata remains
+    /// unresolved until its first fee attribution.
+    #[serde(default = "legacy_fee_settlement")]
+    fee_settlement: Option<FeeSettlement>,
+    /// Immutable economics for replay, including zero-fee and FAILED rows.
+    #[serde(default)]
+    fee_config: Option<TokenFeeConfig>,
     ownership: TradeOwnership,
     booked: bool,
     /// Whether the base cash/token delta has reached the physical wallet view.
@@ -2503,7 +2545,7 @@ struct AppliedTrade {
     /// this explicitly and advance it only at MINED/CONFIRMED.
     #[serde(default = "default_true")]
     physical_booked: bool,
-    /// Taker fees are reported in USDC for SELL and shares for BUY. They are
+    /// Fee assets follow the frozen protocol convention. They are
     /// attached after the strategy resolves the market fee curve, so each has
     /// its own idempotent virtual/physical lifecycle flags.
     #[serde(default)]
@@ -2559,10 +2601,12 @@ pub struct MaintenanceOperation {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TokenFeeConfig {
-    rate: f64,
-    exponent: f64,
+type TokenFeeConfig = FeeBasis;
+
+#[derive(Debug, Clone, Copy)]
+struct ExecutionFeeContext {
+    settlement: FeeSettlement,
+    fallback: Option<FeeBasis>,
 }
 
 /// Cross-instance ownership of the late-fill audit retained by each strategy's
@@ -10808,6 +10852,24 @@ impl SharedAccount {
         rate: f64,
         exponent: f64,
     ) -> Result<(), ReservationError> {
+        self.register_token_fee_config_with_settlement(token_ids, rate, exponent, FeeSettlement::LegacyV1)
+    }
+
+    /// Install the convention for future executions. Existing executions retain
+    /// their original curve and currency; this is never a historical migration.
+    pub fn register_token_fee_config_with_settlement(
+        &self, token_ids: &[String], rate: f64, exponent: f64, settlement: FeeSettlement,
+    ) -> Result<(), ReservationError> {
+        // Metadata registration is a cold control operation. When live, the
+        // existing bounded lifecycle mailbox serializes the provenance freeze
+        // with trade application before acknowledging this transaction.
+        if self.must_dispatch_lifecycle_to_owner() {
+            return self.request_account_lifecycle_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::RegisterTokenFeeConfig {
+                    token_ids: token_ids.to_vec(), rate, exponent, settlement, reply,
+                })
+            }).map_err(ReservationError::PersistenceUnavailable)?;
+        }
         if token_ids.is_empty()
             || token_ids.iter().any(|token| token.is_empty())
             || BinaryOption::validate_polymarket_fee_curve(rate, exponent, 0).is_err()
@@ -10818,82 +10880,24 @@ impl SharedAccount {
         }
         let token_set: HashSet<&str> = token_ids.iter().map(String::as_str).collect();
         let mut state = self.lock_state();
-        let next_config = TokenFeeConfig { rate, exponent };
-        let revised_tokens: HashSet<String> = token_ids
-            .iter()
-            .filter(|token| {
-                state
-                    .token_fee_configs
-                    .get(*token)
-                    .is_some_and(|current| !fee_configs_equal(current, &next_config))
-            })
-            .cloned()
-            .collect();
-
-        // A curve swap cannot be made atomic while any affected trade still
-        // lacks its role. Leave the old curve and account economics untouched;
-        // the role-pending blocker remains the owner of admission.
-        if let Some((trade_key, _)) = state.trades.iter().find(|(_, trade)| {
-            revised_tokens.contains(&trade.ownership.token_id) && trade.is_maker.is_none()
-        }) {
-            return Err(ReservationError::InvalidOrder(format!(
-                "cannot revise token fee curve while trade `{trade_key}` has unresolved maker/taker role"
-            )));
-        }
-
-        for token in token_ids {
-            state
-                .token_fee_configs
-                .insert(token.clone(), next_config.clone());
-        }
-
-        // Reprice every already-attributed execution before exposing the new
-        // curve. Pending rows remain zero/unbooked and are handled by the retry
-        // loop below. Trade-derived economics belong to virtual shards; the
-        // authoritative wallet snapshot remains the sole physical-ledger writer.
-        let attributed: Vec<(String, AppliedTrade)> = state
-            .trades
-            .iter()
-            .filter(|(_, trade)| revised_tokens.contains(&trade.ownership.token_id))
-            .filter(|(_, trade)| {
-                trade.virtual_fee_booked
-                    || trade.physical_fee_booked
-                    || trade.failed
-                    || trade.usdc_fee > EPS
-                    || trade.shares_fee > EPS
-            })
-            .map(|(trade_key, trade)| (trade_key.clone(), trade.clone()))
-            .collect();
-        let mut generation_updates = Vec::new();
-        for (trade_key, previous) in attributed {
-            let is_maker = previous
-                .is_maker
-                .expect("fee-curve revision preflight rejected unresolved role");
-            let (next_usdc, next_shares) = configured_fee_amounts(
-                &previous.ownership,
-                is_maker,
-                (!is_maker).then_some(&next_config),
-            );
-            let usdc_delta = previous.usdc_fee - next_usdc;
-            let shares_delta = previous.shares_fee - next_shares;
-            let changed = usdc_delta.abs() > EPS || shares_delta.abs() > EPS;
-            if previous.virtual_fee_booked && changed {
-                if let Some(instance) = state.instances.get_mut(&previous.ownership.instance_id) {
-                    instance.cash += usdc_delta;
-                    *instance
-                        .positions
-                        .entry(previous.ownership.token_id.clone())
-                        .or_insert(0.0) += shares_delta;
+        let next_config = TokenFeeConfig { rate, exponent, settlement };
+        // Freeze legacy rows against the prior registry before replacing it.
+        // This uses the existing cold owner transaction; no extra live lock or
+        // hot-path lookup is introduced. Pending rows keep their execution's
+        // explicit legacy convention and bind only when metadata is available.
+        {
+            let SharedAccountState { trades, token_fee_configs, .. } = &mut *state;
+            for trade in trades.values_mut() {
+                if token_set.contains(trade.ownership.token_id.as_str()) && trade.fee_config.is_none() {
+                    if let Some(config) = fee_config_for_trade(trade, token_fee_configs.get(&trade.ownership.token_id)) {
+                        trade.fee_settlement = Some(config.settlement);
+                        trade.fee_config = Some(config);
+                    }
                 }
-                generation_updates.push(trade_key.clone());
-            }
-            if let Some(trade) = state.trades.get_mut(&trade_key) {
-                trade.usdc_fee = next_usdc;
-                trade.shares_fee = next_shares;
             }
         }
-        for trade_key in generation_updates {
-            advance_trade_ledger_generation(&mut state, &trade_key);
+        for token in token_ids {
+            state.token_fee_configs.insert(token.clone(), next_config);
         }
         let retry: Vec<(String, OrderStatus, bool)> = state
             .fee_attribution_pending
@@ -12390,6 +12394,7 @@ impl SharedAccount {
             terminal_trade_ids_authoritative: false,
             price,
             fee_rate_bps,
+            cash_fee_per_share: Some(if side == Side::Buy { price * fee_rate_bps as f64 / 10_000.0 } else { 0.0 }),
             reserved_cash,
             reserved_quantity,
             status: OrderStatus::Pending,
@@ -12621,6 +12626,7 @@ impl SharedAccount {
             terminal_trade_ids_authoritative: false,
             price,
             fee_rate_bps,
+            cash_fee_per_share: Some(if side == Side::Buy { price * fee_rate_bps as f64 / 10_000.0 } else { 0.0 }),
             reserved_cash: reserve_cash,
             reserved_quantity: reserve_qty,
             status: OrderStatus::Pending,
@@ -15100,6 +15106,52 @@ impl SharedAccount {
         is_maker: bool,
         match_time_secs: u64,
     ) -> TradeTransitionResult {
+        self.apply_trade_transition_with_fee_context(
+            trade_key, status, client_order_id, order_id, token_id, side, quantity,
+            price, is_maker, match_time_secs, None,
+        )
+    }
+
+    /// The authenticated adapter supplies the execution protocol before token
+    /// metadata is ready. Existing trade rows always retain their own basis.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_trade_transition_with_context_and_fee_settlement(
+        &self, trade_key: &str, status: &str, client_order_id: &str,
+        order_id: &str, token_id: &str, side: Side, quantity: f64, price: f64,
+        is_maker: bool, match_time_secs: u64, fee_settlement: FeeSettlement,
+    ) -> TradeTransitionResult {
+        self.apply_trade_transition_with_fee_context(
+            trade_key, status, client_order_id, order_id, token_id, side, quantity,
+            price, is_maker, match_time_secs, Some(ExecutionFeeContext { settlement: fee_settlement, fallback: None }),
+        )
+    }
+
+    /// Explicit adapter fallback, used only when no token curve exists. An
+    /// existing registry supplies rate/exponent while this execution supplies
+    /// settlement currency. Existing trades always retain their frozen basis.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_trade_transition_with_context_and_fee_basis(
+        &self, trade_key: &str, status: &str, client_order_id: &str,
+        order_id: &str, token_id: &str, side: Side, quantity: f64, price: f64,
+        is_maker: bool, match_time_secs: u64, fallback: FeeBasis,
+    ) -> TradeTransitionResult {
+        if BinaryOption::validate_polymarket_fee_curve(fallback.rate, fallback.exponent, 0).is_err() {
+            return TradeTransitionResult::Rejected;
+        }
+        self.apply_trade_transition_with_fee_context(
+            trade_key, status, client_order_id, order_id, token_id, side, quantity,
+            price, is_maker, match_time_secs, Some(ExecutionFeeContext {
+                settlement: fallback.settlement, fallback: Some(fallback),
+            }),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_trade_transition_with_fee_context(
+        &self, trade_key: &str, status: &str, client_order_id: &str,
+        order_id: &str, token_id: &str, side: Side, quantity: f64, price: f64,
+        is_maker: bool, match_time_secs: u64, fee_context: Option<ExecutionFeeContext>,
+    ) -> TradeTransitionResult {
         if self.must_dispatch_lifecycle_to_owner() {
             return self
                 .request_account_lifecycle_owner(|reply| {
@@ -15114,6 +15166,7 @@ impl SharedAccount {
                         price,
                         is_maker,
                         match_time_secs,
+                        fee_context,
                         reply,
                     })
                 })
@@ -15130,7 +15183,7 @@ impl SharedAccount {
             side,
             quantity,
             price,
-            Some((is_maker, match_time_secs)),
+            Some((is_maker, match_time_secs, fee_context)),
             &mut persistence_required,
             &mut owned_noop,
         );
@@ -15312,6 +15365,7 @@ impl SharedAccount {
             ownership,
             fill_delta: 0.0,
             matched_size: 0.0,
+            trade_fee: None,
         })
     }
 
@@ -15327,7 +15381,7 @@ impl SharedAccount {
         side: Side,
         quantity: f64,
         price: f64,
-        trade_context: Option<(bool, u64)>,
+        trade_context: Option<(bool, u64, Option<ExecutionFeeContext>)>,
         instance_id: &str,
     ) -> VirtualTradeAttempt {
         if trade_key.is_empty()
@@ -15380,7 +15434,7 @@ impl SharedAccount {
                     return VirtualTradeAttempt::Fallback;
                 }
                 let mut changed = false;
-                if let Some((is_maker, match_time_secs)) = trade_context {
+                if let Some((is_maker, match_time_secs, _)) = trade_context {
                     if applied.is_maker.is_some_and(|stored| stored != is_maker) {
                         return VirtualTradeAttempt::Fallback;
                     }
@@ -15439,6 +15493,7 @@ impl SharedAccount {
                     ownership: applied.ownership.clone(),
                     fill_delta: 0.0,
                     matched_size,
+                    trade_fee: lifecycle.trades.get(trade_key).and_then(attributed_trade_fee),
                 });
             }
         }
@@ -15478,7 +15533,7 @@ impl SharedAccount {
             {
                 return VirtualTradeAttempt::Fallback;
             }
-            if let Some((is_maker, _)) = trade_context {
+            if let Some((is_maker, _, _)) = trade_context {
                 if applied.is_maker.is_some_and(|stored| stored != is_maker) {
                     return VirtualTradeAttempt::Fallback;
                 }
@@ -15487,7 +15542,7 @@ impl SharedAccount {
                     .flatten();
                 if is_maker || config.is_some() {
                     let (expected_usdc, expected_shares) =
-                        configured_fee_amounts(&applied.ownership, is_maker, config.as_ref());
+                        configured_fee_amounts(&applied.ownership, is_maker, fee_config_for_trade(applied, config.as_ref()).as_ref());
                     if (applied.usdc_fee > EPS && (applied.usdc_fee - expected_usdc).abs() > EPS)
                         || (applied.shares_fee > EPS
                             && (applied.shares_fee - expected_shares).abs() > EPS)
@@ -15544,11 +15599,11 @@ impl SharedAccount {
                     trade.ownership.status = normalized.to_string();
                     ownership.status = normalized.to_string();
                 }
-                if let Some((_, match_time_secs)) = trade_context {
+                if let Some((_, match_time_secs, _)) = trade_context {
                     trade.match_time_secs = trade.match_time_secs.max(match_time_secs);
                 }
             }
-            if let Some((is_maker, _)) = trade_context {
+            if let Some((is_maker, _, _)) = trade_context {
                 let config = (!is_maker)
                     .then(|| self.token_fee_configs_fast.load().get(token_id).cloned())
                     .flatten();
@@ -15590,6 +15645,7 @@ impl SharedAccount {
                 ownership,
                 fill_delta: 0.0,
                 matched_size: order.filled_quantity,
+                trade_fee: lifecycle.trades.get(trade_key).and_then(attributed_trade_fee),
             });
         }
 
@@ -15705,9 +15761,24 @@ impl SharedAccount {
             price,
             status: normalized.to_string(),
         };
+        let current_fee_config = self.token_fee_configs_fast.load().get(token_id).copied();
+        let execution_context = trade_context.and_then(|(_, _, context)| context);
+        let execution_fee_config = existing.as_ref().map_or_else(
+            || current_fee_config.or_else(|| execution_context.and_then(|context| context.fallback))
+                .map(|mut config| {
+                    if let Some(context) = execution_context { config.settlement = context.settlement; }
+                    config
+                }),
+            |trade| fee_config_for_trade(trade, current_fee_config.as_ref()),
+        );
+        let execution_fee_settlement = existing.as_ref().and_then(|trade| trade.fee_settlement)
+            .or_else(|| execution_context.map(|context| context.settlement))
+            .or_else(|| execution_fee_config.map(|config| config.settlement));
         lifecycle.trades.insert(
             trade_key.to_string(),
             AppliedTrade {
+                fee_settlement: execution_fee_settlement,
+                fee_config: execution_fee_config,
                 ownership: ownership.clone(),
                 booked: should_book || (already_booked && !should_reverse),
                 // Retain the durable field for schema compatibility; it now
@@ -15730,11 +15801,11 @@ impl SharedAccount {
                         .as_ref()
                         .is_some_and(|trade| trade.failure_reconciled),
                 is_maker: trade_context
-                    .map(|(is_maker, _)| is_maker)
+                    .map(|(is_maker, _, _)| is_maker)
                     .or_else(|| existing.as_ref().and_then(|trade| trade.is_maker)),
                 match_time_secs: trade_context.map_or_else(
                     || existing.as_ref().map_or(0, |trade| trade.match_time_secs),
-                    |(_, match_time_secs)| match_time_secs,
+                    |(_, match_time_secs, _)| match_time_secs,
                 ),
                 ledger_generation: existing.as_ref().map_or(0, |trade| trade.ledger_generation),
             },
@@ -15749,7 +15820,7 @@ impl SharedAccount {
         }
 
         let mut fee_economics_changed = false;
-        if let Some((is_maker, _)) = trade_context {
+        if let Some((is_maker, _, _)) = trade_context {
             let config = (!is_maker)
                 .then(|| self.token_fee_configs_fast.load().get(token_id).cloned())
                 .flatten();
@@ -15772,6 +15843,10 @@ impl SharedAccount {
             lifecycle
                 .fee_attribution_pending
                 .insert(trade_key.to_string());
+            self.mark_virtual_fee_pending();
+        }
+
+        if lifecycle.fee_attribution_pending.contains(trade_key) {
             self.mark_virtual_fee_pending();
         }
 
@@ -15818,6 +15893,7 @@ impl SharedAccount {
             ownership,
             fill_delta: matched_size - order.filled_quantity,
             matched_size,
+            trade_fee: lifecycle.trades.get(trade_key).and_then(attributed_trade_fee),
         })
     }
 
@@ -15831,7 +15907,7 @@ impl SharedAccount {
         side: Side,
         quantity: f64,
         price: f64,
-        trade_context: Option<(bool, u64)>,
+        trade_context: Option<(bool, u64, Option<ExecutionFeeContext>)>,
         persistence_required: &mut bool,
         owned_noop: &mut bool,
     ) -> Option<TradeTransitionAccounting> {
@@ -15958,7 +16034,7 @@ impl SharedAccount {
                 let was_uncertain = state.uncertain;
                 let recovered = state.ownership_anomalies.remove(&anomaly_key).is_some();
                 let mut changed = recovered;
-                if let Some((is_maker, match_time_secs)) = trade_context {
+                if let Some((is_maker, match_time_secs, _)) = trade_context {
                     let role_changed = applied.is_maker != Some(is_maker);
                     let match_time_changed = applied.match_time_secs < match_time_secs;
                     let fee_pending = state.fee_attribution_pending.contains(trade_key);
@@ -16017,6 +16093,7 @@ impl SharedAccount {
                     ownership: applied.ownership.clone(),
                     fill_delta: 0.0,
                     matched_size,
+                    trade_fee: state.trades.get(trade_key).and_then(attributed_trade_fee),
                 });
             }
         }
@@ -16035,12 +16112,12 @@ impl SharedAccount {
                     &tombstone.ownership, client_order_id, order_id, token_id,
                     side, quantity, price,
                 ).and_then(|()| {
-                    if trade_context.is_some_and(|(is_maker, _)| {
+                    if trade_context.is_some_and(|(is_maker, _, _)| {
                         tombstone.is_maker.is_some_and(|stored| stored != is_maker)
                     }) {
                         Err(format!(
                             "trade `{trade_key}` retired ownership role changed incoming_maker={} stored_maker={}",
-                            trade_context.map(|(is_maker, _)| is_maker).unwrap_or(false),
+                            trade_context.map(|(is_maker, _, _)| is_maker).unwrap_or(false),
                             tombstone.is_maker.unwrap_or(false),
                         ))
                     } else { Ok(()) }
@@ -16074,6 +16151,7 @@ impl SharedAccount {
                     ownership: tombstone.ownership,
                     fill_delta: 0.0,
                     matched_size,
+                    trade_fee: None,
                 });
             }
             // A bounded tombstone can expire while its process-local route
@@ -16206,10 +16284,10 @@ impl SharedAccount {
                     applied.ownership.status = normalized.clone();
                 }
                 let ownership = applied.ownership.clone();
-                if let Some((_, match_time_secs)) = trade_context {
+                if let Some((_, match_time_secs, _)) = trade_context {
                     applied.match_time_secs = applied.match_time_secs.max(match_time_secs);
                 }
-                if let Some((is_maker, _)) = trade_context {
+                if let Some((is_maker, _, _)) = trade_context {
                     let fee_status = if normalized == "FAILED" {
                         OrderStatus::Failed
                     } else {
@@ -16229,6 +16307,7 @@ impl SharedAccount {
                     ownership,
                     fill_delta: 0.0,
                     matched_size,
+                    trade_fee: state.trades.get(trade_key).and_then(attributed_trade_fee),
                 });
             }
         }
@@ -16372,9 +16451,24 @@ impl SharedAccount {
             price,
             status: normalized,
         };
+        let current_fee_config = state.token_fee_configs.get(token_id).copied();
+        let execution_context = trade_context.and_then(|(_, _, context)| context);
+        let execution_fee_config = existing.as_ref().map_or_else(
+            || current_fee_config.or_else(|| execution_context.and_then(|context| context.fallback))
+                .map(|mut config| {
+                    if let Some(context) = execution_context { config.settlement = context.settlement; }
+                    config
+                }),
+            |trade| fee_config_for_trade(trade, current_fee_config.as_ref()),
+        );
+        let execution_fee_settlement = existing.as_ref().and_then(|trade| trade.fee_settlement)
+            .or_else(|| execution_context.map(|context| context.settlement))
+            .or_else(|| execution_fee_config.map(|config| config.settlement));
         state.trades.insert(
             trade_key.into(),
             AppliedTrade {
+                fee_settlement: execution_fee_settlement,
+                fee_config: execution_fee_config,
                 ownership: ownership.clone(),
                 booked: should_book || (already_booked && !should_reverse),
                 physical_booked: should_book_physical
@@ -16396,9 +16490,9 @@ impl SharedAccount {
                         .as_ref()
                         .is_some_and(|trade| trade.failure_reconciled),
                 is_maker: trade_context
-                    .map(|(maker, _)| maker)
+                    .map(|(maker, _, _)| maker)
                     .or_else(|| existing.as_ref().and_then(|trade| trade.is_maker)),
-                match_time_secs: trade_context.map(|(_, ts)| ts).unwrap_or_else(|| {
+                match_time_secs: trade_context.map(|(_, ts, _)| ts).unwrap_or_else(|| {
                     existing
                         .as_ref()
                         .map(|trade| trade.match_time_secs)
@@ -16433,7 +16527,7 @@ impl SharedAccount {
             // supplies the role. It is never a healthy, restart-invalid row.
             state.fee_attribution_pending.insert(trade_key.to_string());
         }
-        if let Some((is_maker, _)) = trade_context {
+        if let Some((is_maker, _, _)) = trade_context {
             let fee_status = if is_failed {
                 OrderStatus::Failed
             } else {
@@ -16455,6 +16549,7 @@ impl SharedAccount {
             ownership,
             fill_delta: matched_size - order.filled_quantity,
             matched_size,
+            trade_fee: state.trades.get(trade_key).and_then(attributed_trade_fee),
         })
     }
 
@@ -16498,6 +16593,8 @@ impl SharedAccount {
                     .cloned()
             })
             .flatten();
+        let config = fee_config_for_trade(&existing, config.as_ref());
+        if let Some(trade) = state.trades.get_mut(trade_key) { bind_trade_fee_config(trade, config); }
         if !is_maker && config.is_none() {
             state.fee_attribution_pending.insert(trade_key.to_string());
             recompute_reconciliation(&mut state, "missing token fee config");
@@ -16507,24 +16604,7 @@ impl SharedAccount {
         self.schedule_persist(&state);
         drop(state);
 
-        let notional = config.map_or(0.0, |config| {
-            let price = existing.ownership.price.clamp(0.0, 1.0);
-            existing.ownership.quantity
-                * config.rate
-                * (price * (1.0 - price)).max(0.0).powf(config.exponent)
-        });
-        let (usdc_fee, shares_fee) = if is_maker {
-            (0.0, 0.0)
-        } else if existing.ownership.side == Side::Buy {
-            let shares = if existing.ownership.price > EPS {
-                notional / existing.ownership.price
-            } else {
-                0.0
-            };
-            (0.0, shares)
-        } else {
-            (notional, 0.0)
-        };
+        let (usdc_fee, shares_fee) = configured_fee_amounts(&existing.ownership, is_maker, config.as_ref());
         self.apply_trade_fee_transition(trade_key, status, usdc_fee, shares_fee)
     }
 
@@ -16564,6 +16644,8 @@ impl SharedAccount {
         let config = (!is_maker)
             .then(|| state.token_fee_configs.get(&existing.ownership.token_id))
             .flatten();
+        let config = fee_config_for_trade(&existing, config);
+        if let Some(trade) = state.trades.get_mut(trade_key) { bind_trade_fee_config(trade, config); }
         if !is_maker && config.is_none() {
             state.fee_attribution_pending.insert(trade_key.to_string());
             recompute_reconciliation(&mut state, "missing token fee config");
@@ -16571,7 +16653,7 @@ impl SharedAccount {
             return false;
         }
         let (expected_usdc, expected_shares) =
-            configured_fee_amounts(&existing.ownership, is_maker, config);
+            configured_fee_amounts(&existing.ownership, is_maker, config.as_ref());
         if (usdc_fee - expected_usdc).abs()
             > reconciliation_tolerance(usdc_fee, expected_usdc).max(EPS)
             || (shares_fee - expected_shares).abs()
@@ -16858,14 +16940,16 @@ impl SharedAccount {
             .values()
             .filter_map(|trade| {
                 Some(RestoredTrade {
+                    fee_attributed: applied_trade_fee_attributed(trade),
+                    fee_settlement: trade.fee_settlement.unwrap_or_default(),
                     ownership: trade.ownership.clone(),
                     booked: trade.booked,
-                    usdc_fee: if trade.virtual_fee_booked {
+                    usdc_fee: if trade.virtual_fee_booked || trade.failed {
                         trade.usdc_fee
                     } else {
                         0.0
                     },
-                    shares_fee: if trade.virtual_fee_booked {
+                    shares_fee: if trade.virtual_fee_booked || trade.failed {
                         trade.shares_fee
                     } else {
                         0.0
@@ -16911,14 +16995,16 @@ impl SharedAccount {
             .filter(|trade| token_ids.contains(&trade.ownership.token_id))
             .filter_map(|trade| {
                 Some(RestoredTrade {
+                    fee_attributed: applied_trade_fee_attributed(trade),
+                    fee_settlement: trade.fee_settlement.unwrap_or_default(),
                     ownership: trade.ownership.clone(),
                     booked: trade.booked,
-                    usdc_fee: if trade.virtual_fee_booked {
+                    usdc_fee: if trade.virtual_fee_booked || trade.failed {
                         trade.usdc_fee
                     } else {
                         0.0
                     },
-                    shares_fee: if trade.virtual_fee_booked {
+                    shares_fee: if trade.virtual_fee_booked || trade.failed {
                         trade.shares_fee
                     } else {
                         0.0
@@ -17867,9 +17953,34 @@ fn clear_confirmed_maintenance_risk_blockers(state: &mut SharedAccountState) -> 
     cleared
 }
 
-fn fee_configs_equal(left: &TokenFeeConfig, right: &TokenFeeConfig) -> bool {
-    left.rate.to_bits() == right.rate.to_bits()
-        && left.exponent.to_bits() == right.exponent.to_bits()
+fn attributed_trade_fee(trade: &AppliedTrade) -> Option<TradeFee> {
+    applied_trade_fee_attributed(trade).then(|| TradeFee {
+        settlement: trade.fee_settlement.unwrap_or_default(),
+        usdc_fee: trade.usdc_fee,
+        shares_fee: trade.shares_fee,
+    })
+}
+
+fn legacy_fee_settlement() -> Option<FeeSettlement> {
+    Some(FeeSettlement::LegacyV1)
+}
+
+fn fee_config_for_trade(trade: &AppliedTrade, current: Option<&TokenFeeConfig>) -> Option<TokenFeeConfig> {
+    trade.fee_config.or_else(|| current.copied().filter(|config| {
+        // A legacy pending row with no prior curve is not proof that current
+        // V2 metadata describes its original execution. Keep it risk-off.
+        trade.fee_settlement.is_none_or(|settlement| settlement == config.settlement)
+    }))
+}
+
+fn bind_trade_fee_config(trade: &mut AppliedTrade, config: Option<TokenFeeConfig>) {
+    if let Some(config) = config {
+        trade.fee_settlement = Some(config.settlement);
+        trade.fee_config = Some(config);
+    } else if trade.is_maker == Some(true) && trade.fee_settlement.is_none() {
+        // A maker's explicit zero-fee proof is independent of the curve.
+        trade.fee_settlement = Some(FeeSettlement::LegacyV1);
+    }
 }
 
 fn configured_fee_amounts(
@@ -17886,17 +17997,7 @@ fn configured_fee_amounts(
     let price = ownership.price.clamp(0.0, 1.0);
     let notional =
         ownership.quantity * config.rate * (price * (1.0 - price)).max(0.0).powf(config.exponent);
-    match ownership.side {
-        Side::Buy => (
-            0.0,
-            if ownership.price > EPS {
-                notional / ownership.price
-            } else {
-                0.0
-            },
-        ),
-        Side::Sell => (notional, 0.0),
-    }
+    config.settlement.amounts(ownership.side, notional, ownership.price)
 }
 
 fn apply_trade_fee_transition_virtual(
@@ -17921,13 +18022,15 @@ fn apply_trade_fee_transition_virtual(
     if let Some(trade) = lifecycle.trades.get_mut(trade_key) {
         trade.is_maker = Some(is_maker);
     }
+    let config = fee_config_for_trade(&existing, config);
+    if let Some(trade) = lifecycle.trades.get_mut(trade_key) { bind_trade_fee_config(trade, config); }
     if !is_maker && config.is_none() {
         lifecycle
             .fee_attribution_pending
             .insert(trade_key.to_string());
         return Ok(existing.is_maker != Some(is_maker));
     }
-    let (usdc_fee, shares_fee) = configured_fee_amounts(&existing.ownership, is_maker, config);
+    let (usdc_fee, shares_fee) = configured_fee_amounts(&existing.ownership, is_maker, config.as_ref());
     if (existing.usdc_fee > EPS && (existing.usdc_fee - usdc_fee).abs() > EPS)
         || (existing.shares_fee > EPS && (existing.shares_fee - shares_fee).abs() > EPS)
     {
@@ -18021,13 +18124,15 @@ fn apply_configured_trade_fee_locked(
                 .cloned()
         })
         .flatten();
+    let config = fee_config_for_trade(&existing, config.as_ref());
+    if let Some(trade) = state.trades.get_mut(trade_key) { bind_trade_fee_config(trade, config); }
     if !is_maker && config.is_none() {
         state.fee_attribution_pending.insert(trade_key.to_string());
         recompute_reconciliation(state, "missing token fee config");
         return false;
     }
     let (usdc_fee, shares_fee) =
-        configured_fee_amounts(&existing.ownership, is_maker, config.as_ref());
+        configured_fee_amounts(&existing.ownership, is_maker, fee_config_for_trade(&existing, config.as_ref()).as_ref());
     apply_trade_fee_transition_locked(state, trade_key, status, usdc_fee, shares_fee)
 }
 
@@ -18277,16 +18382,23 @@ fn terminal_order_audit_complete_locked(state: &SharedAccountState, client_order
     (covered - target).abs() <= tolerance
 }
 
+fn applied_trade_fee_attributed(trade: &AppliedTrade) -> bool {
+    trade.is_maker == Some(true) || trade.virtual_fee_booked || trade.physical_fee_booked
+        || (trade.failed && trade.is_maker == Some(false) && trade.fee_config.is_some())
+}
+
 fn restored_trade_from_applied(trade: &AppliedTrade) -> Option<RestoredTrade> {
     Some(RestoredTrade {
+                    fee_attributed: applied_trade_fee_attributed(trade),
+                    fee_settlement: trade.fee_settlement.unwrap_or_default(),
         ownership: trade.ownership.clone(),
         booked: trade.booked,
-        usdc_fee: if trade.virtual_fee_booked {
+        usdc_fee: if trade.virtual_fee_booked || trade.failed {
             trade.usdc_fee
         } else {
             0.0
         },
-        shares_fee: if trade.virtual_fee_booked {
+        shares_fee: if trade.virtual_fee_booked || trade.failed {
             trade.shares_fee
         } else {
             0.0
@@ -18390,7 +18502,7 @@ fn desired_order_reservation(order: &OrderOwnership) -> (f64, f64) {
     let remaining = (target - order.filled_quantity).max(0.0);
     match order.side {
         Side::Buy => (
-            remaining * order.price * (1.0 + order.fee_rate_bps as f64 / 10_000.0),
+            remaining * order.reservation_cash_per_share(),
             0.0,
         ),
         Side::Sell => (0.0, remaining),
@@ -20004,6 +20116,8 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
             || !order.price.is_finite()
             || order.price <= 0.0
             || order.price >= 1.0
+            || order.cash_fee_per_share.is_some_and(|fee| !fee.is_finite() || fee < 0.0)
+            || !order.reservation_cash_per_share().is_finite()
             || !order.reserved_cash.is_finite()
             || order.reserved_cash < -EPS
             || !order.reserved_quantity.is_finite()
@@ -20117,6 +20231,12 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
                 "trade `{trade_key}` contains invalid ownership/accounting fields"
             ));
         }
+        if let Some(config) = trade.fee_config {
+            if trade.fee_settlement != Some(config.settlement) {
+                return Err(format!("trade `{trade_key}` has conflicting frozen fee settlement"));
+            }
+            BinaryOption::validate_polymarket_fee_curve(config.rate, config.exponent, 0)?;
+        }
         let Some(is_maker) = trade.is_maker else {
             if !state.fee_attribution_pending.contains(trade_key)
                 || trade.virtual_fee_booked
@@ -20143,37 +20263,18 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
                 ));
             }
         } else {
-            match ownership.side {
-                Side::Buy if trade.usdc_fee.abs() > fee_tolerance => {
-                    return Err(format!(
-                        "BUY taker trade `{trade_key}` stores fee in USDC instead of shares"
-                    ));
-                }
-                Side::Sell if trade.shares_fee.abs() > fee_tolerance => {
-                    return Err(format!(
-                        "SELL taker trade `{trade_key}` stores fee in shares instead of USDC"
-                    ));
-                }
-                _ => {}
+            let settlement = trade.fee_settlement.unwrap_or_default();
+            if !settlement.accepts_fee_amounts(ownership.side, false, trade.usdc_fee, trade.shares_fee, fee_tolerance) {
+                return Err(format!("taker trade `{trade_key}` stores fee in the wrong settlement asset"));
             }
             if trade.virtual_fee_booked || trade.usdc_fee > EPS || trade.shares_fee > EPS {
-                let config = state
-                    .token_fee_configs
-                    .get(&ownership.token_id)
-                    .ok_or_else(|| {
-                        format!("attributed taker trade `{trade_key}` is missing token fee curve")
-                    })?;
+                let config = fee_config_for_trade(trade, state.token_fee_configs.get(&ownership.token_id))
+                    .ok_or_else(|| format!("attributed taker trade `{trade_key}` is missing token fee curve"))?;
                 BinaryOption::validate_polymarket_fee_curve(config.rate, config.exponent, 0)
                     .map_err(|error| {
                         format!("trade `{trade_key}` has invalid token fee curve: {error}")
                     })?;
-                let notional = ownership.quantity
-                    * config.rate
-                    * (ownership.price * (1.0 - ownership.price)).powf(config.exponent);
-                let (expected_usdc, expected_shares) = match ownership.side {
-                    Side::Buy => (0.0, notional / ownership.price),
-                    Side::Sell => (notional, 0.0),
-                };
+                let (expected_usdc, expected_shares) = configured_fee_amounts(ownership, false, Some(&config));
                 if (trade.usdc_fee - expected_usdc).abs()
                     > reconciliation_tolerance(trade.usdc_fee, expected_usdc).max(fee_tolerance)
                     || (trade.shares_fee - expected_shares).abs()
@@ -22254,6 +22355,8 @@ mod tests {
 
     pub(super) fn applied_trade_with_generation(generation: u64) -> AppliedTrade {
         AppliedTrade {
+                fee_settlement: Some(FeeSettlement::LegacyV1),
+                fee_config: None,
             ownership: TradeOwnership {
                 order_slot: Default::default(),
                 account_id: "acct".to_string(),
@@ -22459,11 +22562,14 @@ mod tests {
                     terminal_trade_ids_authoritative: true,
                     price: 0.5,
                     fee_rate_bps: 0,
+                    cash_fee_per_share: None,
                     reserved_cash: 0.0,
                     reserved_quantity: 0.0,
                     status: OrderStatus::Filled,
                 };
                 let trade = AppliedTrade {
+                fee_settlement: Some(FeeSettlement::LegacyV1),
+                fee_config: None,
                     ownership: TradeOwnership {
                         order_slot: Default::default(),
                         account_id: "settled-gc-bench".into(),
@@ -22806,6 +22912,7 @@ mod tests {
                 terminal_trade_ids_authoritative: false,
                 price: 0.00646972,
                 fee_rate_bps: 0,
+                    cash_fee_per_share: None,
                 reserved_cash: order_reserved_cash,
                 reserved_quantity: 0.0,
                 status: OrderStatus::Accepted,
@@ -23097,6 +23204,7 @@ mod tests {
                 terminal_trade_ids_authoritative: true,
                 price: 0.49,
                 fee_rate_bps: 700,
+                    cash_fee_per_share: None,
                 reserved_cash: 0.0,
                 reserved_quantity: 5.88,
                 status: OrderStatus::Filled,
@@ -23148,6 +23256,8 @@ mod tests {
         state.trades.insert(
             format!("{confirmed_id}:{oid}"),
             AppliedTrade {
+                fee_settlement: Some(FeeSettlement::LegacyV1),
+                fee_config: None,
                 ownership: ownership(confirmed_id, 4.12, "CONFIRMED"),
                 booked: true,
                 physical_booked: true,
@@ -25254,11 +25364,14 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 terminal_trade_ids_authoritative: true,
                 price: 0.5,
                 fee_rate_bps: 0,
+                    cash_fee_per_share: None,
                 reserved_cash: 0.0,
                 reserved_quantity: 0.0,
                 status: OrderStatus::Filled,
             };
             let trade = AppliedTrade {
+                fee_settlement: Some(FeeSettlement::LegacyV1),
+                fee_config: None,
                 ownership: TradeOwnership {
                     order_slot: Default::default(),
                     account_id: "acct".into(),
@@ -25816,7 +25929,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     }
 
     #[test]
-    fn token_fee_curve_revision_reprices_virtual_trade_and_leaves_snapshot_physical() {
+    fn token_fee_curve_revision_preserves_frozen_virtual_trade_and_snapshot_physical() {
         let account = seeded_account();
         account
             .register_token_fee_config(&["UP".to_string()], 0.02, 1.0)
@@ -25857,15 +25970,15 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             .unwrap();
 
         let instance = account.instance_snapshot("a").unwrap();
-        assert!((instance.positions["UP"] - 19.8).abs() < EPS);
-        assert!(instance.ledger_generation > before_generation);
+        assert!((instance.positions["UP"] - 19.9).abs() < EPS);
+        assert_eq!(instance.ledger_generation, before_generation);
         assert!((account.monitoring_snapshot().physical_positions["UP"] - 40.0).abs() < EPS);
         let restored = account
             .restored_trades()
             .into_iter()
             .find(|trade| trade.ownership.trade_key == "trade-reprice")
             .unwrap();
-        assert!((restored.shares_fee - 0.2).abs() < EPS);
+        assert!((restored.shares_fee - 0.1).abs() < EPS);
         assert!(restored.virtual_fee_booked);
         assert!(!account.is_uncertain());
         assert!(validate_persisted_state("acct", &account.lock_state()).is_ok());
@@ -26070,6 +26183,8 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         lifecycle.trades.insert(
             "trade".into(),
             AppliedTrade {
+                fee_settlement: Some(FeeSettlement::LegacyV1),
+                fee_config: None,
                 ownership: TradeOwnership {
                     order_slot: Default::default(),
                     account_id: "acct".into(),
@@ -29195,6 +29310,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 terminal_trade_ids_authoritative: true,
                 price: 0.5,
                 fee_rate_bps: 0,
+                    cash_fee_per_share: None,
                 reserved_cash: 0.0,
                 reserved_quantity: 0.0,
                 status: OrderStatus::Filled,
@@ -29207,6 +29323,8 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.trades.insert(
             trade_key.to_string(),
             AppliedTrade {
+                fee_settlement: Some(FeeSettlement::LegacyV1),
+                fee_config: None,
                 ownership: TradeOwnership {
                     order_slot: Default::default(),
                     account_id: account_id.to_string(),
@@ -29346,6 +29464,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 terminal_trade_ids_authoritative: false,
                 price: 0.43,
                 fee_rate_bps: 0,
+                    cash_fee_per_share: None,
                 reserved_cash: 0.0,
                 reserved_quantity: 0.0,
                 status: OrderStatus::Cancelled,
@@ -29354,6 +29473,8 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.trades.insert(
             "trade-mined:0xCANCELLEDPARTIAL".to_string(),
             AppliedTrade {
+                fee_settlement: Some(FeeSettlement::LegacyV1),
+                fee_config: None,
                 ownership: TradeOwnership {
                     order_slot: Default::default(),
                     account_id: account_id.to_string(),
@@ -29460,6 +29581,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 terminal_trade_ids_authoritative: true,
                 price: 0.5,
                 fee_rate_bps: 0,
+                    cash_fee_per_share: None,
                 reserved_cash: 0.0,
                 reserved_quantity: 0.0,
                 status: OrderStatus::Filled,
@@ -29570,6 +29692,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 terminal_trade_ids_authoritative: false,
                 price: 0.5,
                 fee_rate_bps: 0,
+                    cash_fee_per_share: None,
                 reserved_cash: 0.0,
                 reserved_quantity: 0.0,
                 status: OrderStatus::Accepted,
@@ -29648,6 +29771,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 terminal_trade_ids_authoritative: false,
                 price: 0.5,
                 fee_rate_bps: 0,
+                    cash_fee_per_share: None,
                 reserved_cash: 0.0,
                 reserved_quantity: 0.0,
                 status: OrderStatus::Accepted,
@@ -29703,6 +29827,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 terminal_trade_ids_authoritative: false,
                 price: 0.5,
                 fee_rate_bps: 0,
+                    cash_fee_per_share: None,
                 reserved_cash: 0.0,
                 reserved_quantity: 10.0,
                 status: OrderStatus::Accepted,
@@ -29766,6 +29891,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 terminal_trade_ids_authoritative: false,
                 price: 0.5,
                 fee_rate_bps: 0,
+                    cash_fee_per_share: None,
                 reserved_cash: 5.0,
                 reserved_quantity: 0.0,
                 status: OrderStatus::Accepted,
@@ -29783,6 +29909,8 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.trades.insert(
             "trade".to_string(),
             AppliedTrade {
+                fee_settlement: Some(FeeSettlement::LegacyV1),
+                fee_config: None,
                 ownership: TradeOwnership {
                     order_slot: Default::default(),
                     account_id: "account".to_string(),
@@ -29839,6 +29967,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 terminal_trade_ids_authoritative: false,
                 price: 0.5,
                 fee_rate_bps: 0,
+                    cash_fee_per_share: None,
                 reserved_cash: 4.5,
                 reserved_quantity: 0.0,
                 status: OrderStatus::PartiallyFilled,
@@ -29851,6 +29980,8 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.trades.insert(
             "trade".to_string(),
             AppliedTrade {
+                fee_settlement: Some(FeeSettlement::LegacyV1),
+                fee_config: None,
                 ownership: TradeOwnership {
                     order_slot: Default::default(),
                     account_id: "account".to_string(),
@@ -29919,6 +30050,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 terminal_trade_ids_authoritative: false,
                 price: 0.5,
                 fee_rate_bps: 0,
+                    cash_fee_per_share: None,
                 reserved_cash: 0.0,
                 reserved_quantity: 2.0,
                 status: OrderStatus::Accepted,
@@ -30192,7 +30324,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         wrong_currency.trades.get_mut("fee-trade").unwrap().usdc_fee = 0.1;
         let currency_error = validate_persisted_state("acct", &wrong_currency).unwrap_err();
         assert!(
-            currency_error.contains("instead of shares"),
+            currency_error.contains("wrong settlement asset"),
             "{currency_error}"
         );
 

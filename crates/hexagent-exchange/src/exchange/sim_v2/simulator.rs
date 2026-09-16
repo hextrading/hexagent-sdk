@@ -845,6 +845,7 @@ impl Simulator {
                 timestamp_ns: deliver,
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
+                trade_fee: None,
                 order_audit: None,
                 error: Some("observed_connection_admission_blocked".into()),
                 order_slot: order.order_slot,
@@ -1077,6 +1078,7 @@ impl Simulator {
             timestamp_ns: deadline,
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: Some("sim_v2_reconcile_timeout".into()),
             order_slot: self
@@ -3376,6 +3378,7 @@ impl Simulator {
             timestamp_ns: ts,
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: None,
             order_slot,
@@ -3972,6 +3975,7 @@ mod tests {
                     base_fee: 0,
                     fee_exponent: 0.0,
                     fee_rate: 0.0,
+            fee_settlement: Default::default(),
                 },
             ));
             let gap = BookContinuityRecord {
@@ -4969,6 +4973,7 @@ mod tests {
             timestamp_ns: exchange_when,
             exchange_event_timestamp_ns: None,
             trade_id: Some("trade-1".into()),
+            trade_fee: None,
             order_audit: None,
             error: None,
             order_slot: Default::default(),
@@ -5005,6 +5010,7 @@ mod tests {
                 timestamp_ns: exchange_when,
                 exchange_event_timestamp_ns: None,
                 trade_id: Some("trade-early".into()),
+                trade_fee: None,
                 order_audit: None,
                 error: None,
                 order_slot: Default::default(),

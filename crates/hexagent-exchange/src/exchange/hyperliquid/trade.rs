@@ -436,6 +436,7 @@ impl StatusEntry {
             timestamp_ns: crate::types::now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: err,
         };
@@ -492,6 +493,7 @@ fn cancel_update(client_order_id: &str, ok: bool, err: Option<String>) -> OrderU
         timestamp_ns: crate::types::now_ns(),
         exchange_event_timestamp_ns: None,
         trade_id: None,
+        trade_fee: None,
         order_audit: None,
         error: err,
     }

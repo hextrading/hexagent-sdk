@@ -303,6 +303,7 @@ mod sim_lifecycle_router_tests {
             timestamp_ns: 100,
             exchange_event_timestamp_ns: None,
             trade_id: fill.then(|| "stable-trade-id".into()),
+            trade_fee: None,
             order_audit: None,
             error: None,
         }
@@ -13205,6 +13206,7 @@ fn rejected_venue_signal(signal: &Signal, detail: &str) -> Vec<OrderUpdate> {
         timestamp_ns: now_ns(),
         exchange_event_timestamp_ns: None,
         trade_id: None,
+        trade_fee: None,
         order_audit: None,
         error: Some(detail.to_string()),
     };
@@ -14254,6 +14256,7 @@ fn safety_cancel_uncertain(signal: &Signal, detail: impl Into<String>) -> OrderU
         timestamp_ns: now_ns(),
         exchange_event_timestamp_ns: None,
         trade_id: None,
+        trade_fee: None,
         order_audit: None,
         error: Some(detail.into()),
     }
@@ -14280,6 +14283,7 @@ fn control_lane_rejected(signal: &Signal, detail: impl Into<String>) -> OrderUpd
         timestamp_ns: now_ns(),
         exchange_event_timestamp_ns: None,
         trade_id: None,
+        trade_fee: None,
         order_audit: None,
         error: Some(detail.into()),
     }
@@ -14382,6 +14386,7 @@ fn execute_safety_cancel_signal(
                         timestamp_ns: now_ns(),
                         exchange_event_timestamp_ns: None,
                         trade_id: None,
+                        trade_fee: None,
                         order_audit: None,
                         error: Some(error),
                     });
@@ -14468,6 +14473,7 @@ fn exec_rejected_place(order: &OrderRequest) -> OrderUpdate {
         timestamp_ns: now_ns(),
         exchange_event_timestamp_ns: None,
         trade_id: None,
+        trade_fee: None,
         order_audit: None,
         error: Some("not_sent: execution admission unavailable or quote stale".into()),
     }
@@ -14491,6 +14497,7 @@ fn exec_rejected_cancel(coid: String, exchange: Exchange) -> OrderUpdate {
         timestamp_ns: now_ns(),
         exchange_event_timestamp_ns: None,
         trade_id: None,
+        trade_fee: None,
         order_audit: None,
         error: None,
     }
@@ -14526,6 +14533,7 @@ fn reconcile_deferred_updates(
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: Some(ORPHAN_RECONCILE_DEFERRED.to_string()),
         });
@@ -14549,6 +14557,7 @@ fn reconcile_deferred_updates(
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: Some(ORPHAN_RECONCILE_DEFERRED.to_string()),
         });
@@ -14580,6 +14589,7 @@ fn reconcile_deferred_updates(
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: Some(trade_id.clone()),
+            trade_fee: None,
             order_audit: None,
             error: Some(ORPHAN_RECONCILE_DEFERRED.to_string()),
         });
@@ -14857,6 +14867,7 @@ fn execute_fallback_signal(
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: None,
         }
@@ -14919,6 +14930,7 @@ fn execute_fallback_signal(
                         timestamp_ns: now_ns(),
                         exchange_event_timestamp_ns: None,
                         trade_id: None,
+                        trade_fee: None,
                         order_audit: None,
                         error: None,
                     }]
@@ -15161,6 +15173,7 @@ fn execute_fallback_signal(
                         timestamp_ns: now_ns(),
                         exchange_event_timestamp_ns: None,
                         trade_id: None,
+                        trade_fee: None,
                         order_audit: None,
                         error: Some(error.to_string()),
                     }];
@@ -15221,6 +15234,7 @@ fn execute_fallback_signal(
                         timestamp_ns: now_ns(),
                         exchange_event_timestamp_ns: None,
                         trade_id: None,
+                        trade_fee: None,
                         order_audit: None,
                         error: Some(error),
                     });
@@ -16118,6 +16132,7 @@ mod market_router_tests {
             base_fee: 0,
             fee_exponent: 0.0,
             fee_rate: 0.0,
+            fee_settlement: Default::default(),
         })
     }
 
@@ -17201,6 +17216,7 @@ mod market_router_tests {
                 timestamp_ns: now_ns(),
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
+                trade_fee: None,
                 order_audit: None,
                 error: None,
             })
@@ -18319,6 +18335,7 @@ mod market_router_tests {
                     timestamp_ns: 1,
                     exchange_event_timestamp_ns: None,
                     trade_id: None,
+                    trade_fee: None,
                     order_audit: None,
                     error: None,
                 },
@@ -18365,6 +18382,7 @@ mod market_router_tests {
                     timestamp_ns: now_ns(),
                     exchange_event_timestamp_ns: None,
                     trade_id: Some("trade-private".into()),
+                    trade_fee: None,
                     order_audit: None,
                     error: None,
                 },
@@ -18405,6 +18423,7 @@ mod market_router_tests {
                 timestamp_ns: 1,
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
+                trade_fee: None,
                 order_audit: None,
                 error: None,
             },
@@ -18431,6 +18450,7 @@ mod market_router_tests {
                     timestamp_ns: 2,
                     exchange_event_timestamp_ns: None,
                     trade_id: None,
+                    trade_fee: None,
                     order_audit: None,
                     error: None,
                 },
@@ -18478,6 +18498,7 @@ mod market_router_tests {
             timestamp_ns: 1,
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: None,
         };
@@ -18543,6 +18564,7 @@ mod market_router_tests {
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: None,
         };

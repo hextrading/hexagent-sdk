@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use super::market::{Exchange, Side};
+use super::instrument::TradeFee;
 
 /// Marker attached to a terminal `OrderUpdate` produced by an explicit orphan
 /// reconciliation GET. Consumers use it to distinguish a fresh server audit
@@ -347,6 +348,11 @@ pub struct OrderUpdate {
     /// of double-counting.
     #[serde(default)]
     pub trade_id: Option<String>,
+    /// Immutable fee amounts chosen by the account owner. Consumers must not
+    /// recompute this trade using a newer instrument curve. Old recordings and
+    /// adapters without attribution retain None.
+    #[serde(default)]
+    pub trade_fee: Option<TradeFee>,
     /// Present only on an authoritative order-specific GET result.
     #[serde(default)]
     pub order_audit: Option<AuthoritativeOrderAudit>,
