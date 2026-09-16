@@ -238,6 +238,213 @@ fn actual_vwap_and_rounded_fee_survive_wal_restart_then_reverse_once() {
 }
 
 #[test]
+fn restored_one_ulp_execution_replay_preserves_frozen_economics_and_clears_false_anomaly() {
+    // maker02: all three confirmed taker sells had gross=19.6, quantity=20,
+    // persisted price=0.98 while gross/quantity is the adjacent f64.
+    let path = std::env::temp_dir().join(format!(
+        "hexagent-execution-ulp-{}-{}.json",
+        std::process::id(),
+        wall_clock_ms()
+    ));
+    let original =
+        FrozenTradeExecution::new(0.98, 20.0, 19.6, Side::Sell, false, basis(0.07)).unwrap();
+    {
+        let account = SharedAccount::new_persistent(ACCOUNT, &path).unwrap();
+        setup(&account, Side::Sell, 20.0, 0.98);
+        for status in ["MATCHED", "CONFIRMED"] {
+            assert!(!matches!(
+                apply(&account, status, Side::Sell, 20.0, original),
+                TradeTransitionResult::Rejected
+            ));
+        }
+        account.flush_persistence(Duration::from_secs(2)).unwrap();
+    }
+    {
+        let account = SharedAccount::new_persistent(ACCOUNT, &path).unwrap();
+        let restored = account
+            .private_execution_seed_for_trade("trade")
+            .unwrap()
+            .execution
+            .unwrap();
+        assert_eq!(restored.price, 0.98);
+        assert_eq!(
+            restored
+                .price
+                .to_bits()
+                .abs_diff((19.6_f64 / 20.0).to_bits()),
+            1
+        );
+        assert_eq!(restored.fee.usdc_fee, 0.02744);
+        // Simulate the exact prior fallback symptom; matching replay must
+        // recover it through the normal durable validator, never a manual clear.
+        assert!(matches!(
+            account.record_authenticated_terminal_trade_noop(
+                "trade",
+                "CONFIRMED",
+                "oid",
+                "UP",
+                Side::Sell,
+                20.0,
+                0.98,
+                false,
+            ),
+            TradeTransitionResult::Rejected
+        ));
+        let owner_before = account.instance_snapshot("owner").unwrap();
+        let sibling_before = account.instance_snapshot("sibling").unwrap();
+        let row_before = serde_json::to_value(&account.lock_state().trades["trade"]).unwrap();
+        for status in ["CONFIRMED", "CONFIRMED", "MATCHED"] {
+            let result = apply(&account, status, Side::Sell, 20.0, restored);
+            assert!(
+                matches!(
+                    result,
+                    TradeTransitionResult::OwnedNoop(_)
+                        | TradeTransitionResult::OwnedNoopButPersistencePending(_)
+                ),
+                "{result:?}"
+            );
+            assert_eq!(result.fill_delta(), Some(0.0));
+            assert_eq!(result.trade_fee(), Some(restored.fee));
+            assert_eq!(
+                serde_json::to_value(&account.lock_state().trades["trade"]).unwrap(),
+                row_before
+            );
+            assert_eq!(
+                account.instance_snapshot("owner").unwrap().cash,
+                owner_before.cash
+            );
+            assert_eq!(
+                account.instance_snapshot("sibling").unwrap().cash,
+                sibling_before.cash
+            );
+        }
+        assert!(!account
+            .lock_state()
+            .ownership_anomalies
+            .contains_key("trade:trade"));
+        assert!(validate_persisted_state(ACCOUNT, &account.lock_state()).is_ok());
+        account.flush_persistence(Duration::from_secs(2)).unwrap();
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(persistence_wal_path(&path));
+}
+
+#[test]
+fn restored_execution_exception_cannot_admit_new_or_changed_economics_or_foreign_identity() {
+    let account = SharedAccount::new(ACCOUNT);
+    setup(&account, Side::Sell, 20.0, 0.98);
+    let original =
+        FrozenTradeExecution::new(0.98, 20.0, 19.6, Side::Sell, false, basis(0.07)).unwrap();
+    let restored = FrozenTradeExecution {
+        price: 0.98,
+        ..original
+    };
+    assert!(matches!(
+        apply(&account, "MATCHED", Side::Sell, 20.0, restored),
+        TradeTransitionResult::Rejected
+    ));
+    assert!(!matches!(
+        apply(&account, "MATCHED", Side::Sell, 20.0, original),
+        TradeTransitionResult::Rejected
+    ));
+    // Same serialization boundary as a retained row restored from JSON.
+    {
+        let mut state = account.lock_state();
+        let raw = serde_json::to_string(&state.trades["trade"]).unwrap();
+        state
+            .trades
+            .insert("trade".into(), serde_json::from_str(&raw).unwrap());
+    }
+    let restored = account
+        .private_execution_seed_for_trade("trade")
+        .unwrap()
+        .execution
+        .unwrap();
+    assert_eq!(restored.price, 0.98);
+    let before = serde_json::to_value(&*account.lock_state()).unwrap();
+    let mut changed_fee = restored;
+    changed_fee.fee.usdc_fee = f64::from_bits(changed_fee.fee.usdc_fee.to_bits() + 1);
+    for dto in [
+        changed_fee,
+        FrozenTradeExecution {
+            price: 0.97999,
+            ..restored
+        },
+        FrozenTradeExecution {
+            gross_notional: Some(19.600001),
+            ..restored
+        },
+        FrozenTradeExecution {
+            fee_basis: basis(0.08),
+            ..restored
+        },
+    ] {
+        assert!(matches!(
+            apply(&account, "MINED", Side::Sell, 20.0, dto),
+            TradeTransitionResult::Rejected
+        ));
+        assert_eq!(
+            serde_json::to_value(&*account.lock_state()).unwrap(),
+            before
+        );
+    }
+    for (trade, coid, oid, token, side, quantity, maker) in [
+        ("different", "order", "oid", "UP", Side::Sell, 20.0, false),
+        (
+            "trade",
+            "sibling-order",
+            "oid",
+            "UP",
+            Side::Sell,
+            20.0,
+            false,
+        ),
+        (
+            "trade",
+            "order",
+            "foreign-oid",
+            "UP",
+            Side::Sell,
+            20.0,
+            false,
+        ),
+        ("trade", "order", "oid", "FOREIGN", Side::Sell, 20.0, false),
+        ("trade", "order", "oid", "UP", Side::Buy, 20.0, false),
+        ("trade", "order", "oid", "UP", Side::Sell, 20.01, false),
+        ("trade", "order", "oid", "UP", Side::Sell, 20.0, true),
+    ] {
+        assert!(matches!(
+            account.apply_trade_transition_with_frozen_execution(
+                trade, "MINED", coid, oid, token, side, quantity, maker, 100, restored,
+            ),
+            TradeTransitionResult::Rejected
+        ));
+        assert_eq!(
+            serde_json::to_value(&*account.lock_state()).unwrap(),
+            before
+        );
+    }
+    account
+        .register_token_fee_config_with_settlement(
+            &["UP".into()],
+            0.09,
+            1.0,
+            FeeSettlement::CollateralV2,
+        )
+        .unwrap();
+    for status in ["MINED", "FAILED", "FAILED"] {
+        let result = apply(&account, status, Side::Sell, 20.0, restored);
+        assert!(!matches!(result, TradeTransitionResult::Rejected));
+        assert_eq!(result.trade_fee(), Some(restored.fee));
+        close(
+            account.instance_snapshot("owner").unwrap().cash,
+            if status == "MINED" { 119.57256 } else { 100.0 },
+        );
+        close(account.instance_snapshot("sibling").unwrap().cash, 100.0);
+    }
+}
+
+#[test]
 fn conflicting_or_non_finite_execution_cannot_mutate_owner_economics() {
     let account = SharedAccount::new(ACCOUNT);
     setup(&account, Side::Sell, 15.0, 0.16);
