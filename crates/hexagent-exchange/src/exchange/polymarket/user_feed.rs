@@ -11,6 +11,7 @@ use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
 #[cfg(test)]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -27,6 +28,13 @@ use super::live_position::{LivePositionManager, TradeStatus};
 use super::trade::{PolymarketTrade, SharedState};
 use crate::async_rt;
 use crate::types::*;
+
+/// Current BTC crypto live default, matching the app's event fallback. Existing
+/// token curves take precedence; the selected amounts travel with the update.
+/// Non-crypto adapters must supply their own explicit basis instead of this policy.
+fn private_crypto_fee_fallback(settlement: FeeSettlement) -> FeeBasis {
+    FeeBasis { settlement, rate: 0.07, exponent: 1.0 }
+}
 
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
 const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
@@ -1130,6 +1138,7 @@ fn parse_order_event(
         timestamp_ns: now_ns(),
         exchange_event_timestamp_ns: None,
         trade_id: None,
+        trade_fee: None,
         order_audit: Some(order_audit),
         error: None,
     };
@@ -1882,6 +1891,7 @@ fn route_private_event_fast(
                     timestamp_ns: produced_ns,
                     exchange_event_timestamp_ns: None,
                     trade_id: None,
+                    trade_fee: None,
                     order_audit: Some(AuthoritativeOrderAudit {
                         original_size: Some(original_size.to_string()),
                         size_matched: Some(size_matched.to_string()),
@@ -1997,6 +2007,7 @@ fn route_private_event_fast(
                                 timestamp_ns: produced_ns,
                                 exchange_event_timestamp_ns: exchange_timestamp_ns,
                                 trade_id: Some(key.clone()),
+                                trade_fee: None,
                                 order_audit: None,
                                 error: failure_reason.clone(),
                             },
@@ -2064,6 +2075,7 @@ fn route_private_event_fast(
                             timestamp_ns: produced_ns,
                             exchange_event_timestamp_ns: exchange_timestamp_ns,
                             trade_id: Some(trade_id.to_string()),
+                            trade_fee: None,
                             order_audit: None,
                             error: failure_reason,
                         },
@@ -2946,7 +2958,7 @@ fn parse_user_event_validated(
 
                     let runtime_coid = shared.lookup_coid(mo_order_id).unwrap_or_default();
                     let transition_started = crate::latency::Instant::now();
-                    let transition = shared.account_state.apply_trade_transition_with_context(
+                    let transition = shared.account_state.apply_trade_transition_with_context_and_fee_basis(
                         &leg_id,
                         status_str,
                         &runtime_coid,
@@ -2957,7 +2969,8 @@ fn parse_user_event_validated(
                         mo_price,
                         true,
                         match_time.business_secs,
-                    );
+                            private_crypto_fee_fallback(shared.clob_version.fee_settlement()),
+                );
                     crate::latency::record(
                         "polymarket.user.account_trade_transition",
                         transition_started,
@@ -3061,6 +3074,7 @@ fn parse_user_event_validated(
                         } else {
                             Some(leg_id)
                         },
+                        trade_fee: transition.trade_fee(),
                         order_audit: None,
                         error: failure_reason.clone(),
                     };
@@ -3088,7 +3102,7 @@ fn parse_user_event_validated(
 
                 let runtime_coid = shared.lookup_coid(taker_order_id).unwrap_or_default();
                 let transition_started = crate::latency::Instant::now();
-                let transition = shared.account_state.apply_trade_transition_with_context(
+                let transition = shared.account_state.apply_trade_transition_with_context_and_fee_basis(
                     trade_id,
                     status_str,
                     &runtime_coid,
@@ -3099,6 +3113,7 @@ fn parse_user_event_validated(
                     price,
                     false,
                     match_time.business_secs,
+                    private_crypto_fee_fallback(shared.clob_version.fee_settlement()),
                 );
                 crate::latency::record(
                     "polymarket.user.account_trade_transition",
@@ -3197,6 +3212,7 @@ fn parse_user_event_validated(
                     } else {
                         Some(trade_id.to_string())
                     },
+                    trade_fee: transition.trade_fee(),
                     order_audit: None,
                     error: failure_reason.clone(),
                 };
@@ -4568,6 +4584,7 @@ mod tests {
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: None,
         }
@@ -4858,6 +4875,7 @@ mod tests {
         let (owner1_tx, owner1_rx) = crossbeam_channel::bounded(4);
         shared.install_strategy_private_routes(HashMap::from([(0, owner0_tx), (1, owner1_tx)]));
         let (root_tx, root_rx) = crossbeam_channel::bounded(4);
+        let frozen_fee = Some(TradeFee { settlement: FeeSettlement::CollateralV2, usdc_fee: 0.0175, shares_fee: 0.0 });
         let make = |coid: &str| RoutedOrderUpdate {
             owner: 0,
             update: OrderUpdate {
@@ -4875,6 +4893,7 @@ mod tests {
                 timestamp_ns: now_ns(),
                 exchange_event_timestamp_ns: Some(now_ns()),
                 trade_id: Some("duplicate-id".into()),
+                trade_fee: frozen_fee,
                 order_audit: None,
                 error: None,
             },
@@ -4897,6 +4916,7 @@ mod tests {
             queue_high_water = queue_high_water.max(owner0_rx.len());
             let received = owner0_rx.recv().unwrap();
             assert_eq!(received.update.client_order_id, format!("sample-{index}"));
+            assert_eq!(received.update.trade_fee, frozen_fee);
             samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         }
         samples.sort_unstable();
@@ -4915,6 +4935,71 @@ mod tests {
     }
 
     #[test]
+    fn private_v2_missing_metadata_routes_explicit_default_fee_without_gate() {
+        let shared = test_shared();
+        shared.account_state.register_instance("owner", 1.0);
+        shared.account_state.apply_physical_snapshot(100.0, HashMap::new()).unwrap();
+        shared.account_state.reserve_order("owner", "owner-1", "0xabc1", "TOKEN", Side::Buy, 14.0, 0.85, 700).unwrap();
+        shared.register_order_id("owner-1", "0xabc1", "TOKEN");
+        let mut event = serde_json::json!({
+            "event_type": "trade", "id": "fallback-trade", "status": "MATCHED",
+            "asset_id": "TOKEN", "side": "BUY", "size": "14", "price": "0.85",
+            "taker_order_id": "0xabc1", "maker_orders": []
+        });
+        let first = parse_user_event_with_health(&event, &shared);
+        assert!(first.valid_business_event);
+        let fee = first.updates[0].trade_fee.unwrap();
+        assert_eq!(fee.settlement, FeeSettlement::CollateralV2);
+        assert!((fee.usdc_fee - 0.12495).abs() < 1e-9);
+        assert_eq!(fee.shares_fee, 0.0);
+        assert!(!shared.account_state.is_uncertain());
+        shared.account_state.register_token_fee_config_with_settlement(&["TOKEN".into()], 0.12, 2.0, FeeSettlement::CollateralV2).unwrap();
+        event["status"] = serde_json::json!("FAILED");
+        let failed = parse_user_event_with_health(&event, &shared);
+        assert_eq!(failed.updates[0].trade_fee, Some(fee));
+        assert!((shared.account_state.instance_snapshot("owner").unwrap().cash - 100.0).abs() < 1e-9);
+        let encoded = serde_json::to_value(&first.updates[0]).unwrap();
+        let decoded: OrderUpdate = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.trade_fee, Some(fee));
+        let mut old = encoded;
+        old.as_object_mut().unwrap().remove("trade_fee");
+        assert!(serde_json::from_value::<OrderUpdate>(old).unwrap().trade_fee.is_none());
+    }
+
+    #[test]
+    fn private_v2_trade_binds_protocol_before_legacy_registry_is_refreshed() {
+        let shared = test_shared();
+        shared.account_state.register_instance("owner", 1.0);
+        shared.account_state.apply_physical_snapshot(100.0, HashMap::new()).unwrap();
+        shared.account_state.register_token_fee_config(&["TOKEN".into()], 0.07, 1.0).unwrap();
+        shared.account_state.reserve_order("owner", "owner-1", "0xabc1", "TOKEN", Side::Buy, 14.0, 0.85, 700).unwrap();
+        shared.register_order_id("owner-1", "0xabc1", "TOKEN");
+        let mut event = serde_json::json!({
+            "event_type": "trade", "id": "v2-fee-trade", "status": "MATCHED",
+            "asset_id": "TOKEN", "side": "BUY", "size": "14", "price": "0.85",
+            "taker_order_id": "0xabc1", "maker_orders": []
+        });
+        let first = parse_user_event_with_health(&event, &shared);
+        assert!(first.valid_business_event);
+        assert!(!shared.account_state.is_uncertain(), "previous event curve must avoid a metadata gate");
+        let fee = first.updates[0].trade_fee.expect("owner-selected fee travels with private update");
+        assert!((fee.usdc_fee - 0.12495).abs() < 1e-9);
+        assert_eq!(fee.settlement, FeeSettlement::CollateralV2);
+        shared.account_state.register_token_fee_config_with_settlement(&["TOKEN".into()], 0.12, 2.0, crate::types::FeeSettlement::CollateralV2).unwrap();
+        for status in ["MINED", "CONFIRMED", "CONFIRMED"] {
+            event["status"] = serde_json::json!(status);
+            parse_user_event_with_health(&event, &shared);
+            let owner = shared.account_state.instance_snapshot("owner").unwrap();
+            assert!((owner.cash - 87.97505).abs() < 1e-9);
+            assert!((owner.positions["TOKEN"] - 14.0).abs() < 1e-9);
+        }
+        let row = shared.account_state.restored_trades().pop().unwrap();
+        assert_eq!(row.fee_settlement, crate::types::FeeSettlement::CollateralV2);
+        assert!((row.usdc_fee - 0.12495).abs() < 1e-9);
+        assert_eq!(row.shares_fee, 0.0);
+    }
+
+    #[test]
     fn private_actor_routes_owned_trade_before_cold_account_apply() {
         let shared = test_shared();
         shared.account_state.register_instance("owner-1", 1.0);
@@ -4924,7 +5009,7 @@ mod tests {
             .unwrap();
         shared
             .account_state
-            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
             .unwrap();
         shared
             .account_state
@@ -4999,7 +5084,7 @@ mod tests {
             .unwrap();
         shared
             .account_state
-            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
             .unwrap();
         shared
             .account_state
@@ -5073,7 +5158,7 @@ mod tests {
             .unwrap();
         shared
             .account_state
-            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
             .unwrap();
         shared
             .account_state
@@ -5263,7 +5348,7 @@ mod tests {
             .apply_physical_snapshot(100.0, HashMap::new());
         shared
             .account_state
-            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
             .unwrap();
         shared
             .account_state
@@ -5338,7 +5423,7 @@ mod tests {
             .apply_physical_snapshot(200.0, HashMap::new());
         shared
             .account_state
-            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
             .unwrap();
         shared
             .account_state
@@ -5565,7 +5650,7 @@ mod tests {
             .apply_physical_snapshot(200.0, HashMap::new());
         shared
             .account_state
-            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
             .unwrap();
         for (instance, coid, oid) in [
             ("maker-owner", "maker-coid", "0xB001"),
@@ -5648,7 +5733,7 @@ mod tests {
             .apply_physical_snapshot(100.0, HashMap::new());
         shared
             .account_state
-            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
             .unwrap();
         shared
             .account_state
@@ -5868,7 +5953,7 @@ mod tests {
             .unwrap();
         shared
             .account_state
-            .register_token_fee_config(&["TOKEN".to_string()], 0.0, 1.0)
+            .register_token_fee_config_with_settlement(&["TOKEN".to_string()], 0.0, 1.0, crate::types::FeeSettlement::CollateralV2)
             .unwrap();
         shared
             .account_state

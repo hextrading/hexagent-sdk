@@ -663,6 +663,7 @@ impl From<PolyMarketInfo> for crate::types::BinaryOption {
             base_fee: m.base_fee,
             fee_exponent: m.fee_schedule.exponent,
             fee_rate: m.fee_schedule.rate,
+            fee_settlement: Default::default(),
         }
     }
 }

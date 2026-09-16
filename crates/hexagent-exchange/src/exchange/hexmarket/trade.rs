@@ -490,6 +490,7 @@ impl ExchangeTrade for HexmarketTrade {
                 timestamp_ns: now_ns(),
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
+                trade_fee: None,
                 order_audit: None,
                 error: Some(e.to_string()),
             });
@@ -521,6 +522,7 @@ impl ExchangeTrade for HexmarketTrade {
                     timestamp_ns: now_ns(),
                     exchange_event_timestamp_ns: None,
                     trade_id: None,
+                    trade_fee: None,
                     order_audit: None,
                     error: None,
                 })
@@ -542,6 +544,7 @@ impl ExchangeTrade for HexmarketTrade {
                     timestamp_ns: now_ns(),
                     exchange_event_timestamp_ns: None,
                     trade_id: None,
+                    trade_fee: None,
                     order_audit: None,
                     error: Some(detail),
                 })
@@ -580,6 +583,7 @@ impl ExchangeTrade for HexmarketTrade {
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: None,
         })
@@ -623,6 +627,7 @@ impl ExchangeTrade for HexmarketTrade {
                 timestamp_ns: now,
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
+                trade_fee: None,
                 order_audit: None,
                 error: None,
             };
@@ -682,6 +687,7 @@ impl ExchangeTrade for HexmarketTrade {
                     timestamp_ns: now,
                     exchange_event_timestamp_ns: None,
                     trade_id: None,
+                    trade_fee: None,
                     order_audit: None,
                     error: Some(detail.clone()),
                 })?;
@@ -718,6 +724,7 @@ impl ExchangeTrade for HexmarketTrade {
                     timestamp_ns: now,
                     exchange_event_timestamp_ns: None,
                     trade_id: None,
+                    trade_fee: None,
                     order_audit: None,
                     error: Some(detail.to_owned()),
                 })?;
@@ -745,6 +752,7 @@ impl ExchangeTrade for HexmarketTrade {
                 timestamp_ns: now,
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
+                trade_fee: None,
                 order_audit: None,
                 error: None,
             })?;
@@ -825,6 +833,7 @@ impl ExchangeTrade for HexmarketTrade {
                 timestamp_ns: now,
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
+                trade_fee: None,
                 order_audit: None,
                 error: error.map(str::to_owned),
             })?;
@@ -930,6 +939,7 @@ impl ExchangeTrade for HexmarketTrade {
                 timestamp_ns: now,
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
+                trade_fee: None,
                 order_audit: None,
                 error: error.map(str::to_owned),
             })?;
@@ -956,6 +966,7 @@ impl ExchangeTrade for HexmarketTrade {
                     timestamp_ns: now,
                     exchange_event_timestamp_ns: None,
                     trade_id: None,
+                    trade_fee: None,
                     order_audit: None,
                     error: Some(detail.to_owned()),
                 })?;
@@ -983,6 +994,7 @@ impl ExchangeTrade for HexmarketTrade {
                 timestamp_ns: now,
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
+                trade_fee: None,
                 order_audit: None,
                 error: None,
             })?;

@@ -49,6 +49,7 @@ impl ExchangeTrade for PaperTrade {
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: None,
         };
@@ -77,6 +78,7 @@ impl ExchangeTrade for PaperTrade {
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: None,
         })

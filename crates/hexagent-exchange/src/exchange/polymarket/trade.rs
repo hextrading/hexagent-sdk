@@ -40,14 +40,13 @@ pub enum ClobVersion {
 }
 
 impl ClobVersion {
-    /// Parse a config string. Accepts "v1" / "v2" (case-insensitive).
-    /// Default is V2 (Polymarket cut over 2026-04-28; v1 wire is dead):
-    /// empty string and anything unrecognised resolve to V2. Only an
-    /// explicit "v1" / "1" opts back into the legacy v1 path. NOTE: this
-    /// `parse` is only reached from `build_poly_shared_states_map`
-    /// (live/record), so the default flip cannot change backtests — the
-    /// strategy reads the raw `clob_version` string directly, which stays
-    /// "" (⇒ v1 behaviour) for any backtest config that doesn't set it.
+    /// Live wire support is V2 only; legacy fee accounting remains available
+    /// through FeeSettlement for historical ledgers and recorded simulation.
+    pub fn fee_settlement(self) -> FeeSettlement {
+        match self { Self::V2 => FeeSettlement::CollateralV2 }
+    }
+
+    /// Parse the live protocol selector; unsupported versions fail closed.
     pub fn parse(s: &str) -> Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "" | "v2" | "2" => Ok(ClobVersion::V2),
@@ -7248,6 +7247,7 @@ impl PolymarketTrade {
                         terminal_trade_ids_authoritative: false,
                         price: identity.price,
                         fee_rate_bps,
+                        cash_fee_per_share: Some(if identity.side == Side::Buy { identity.price * fee_rate_bps as f64 / 10_000.0 } else { 0.0 }),
                         reserved_cash: reserve_cash,
                         reserved_quantity: reserve_quantity,
                         status: OrderStatus::Pending,
@@ -7827,6 +7827,7 @@ impl PolymarketTrade {
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: None,
         }
@@ -7859,6 +7860,7 @@ impl PolymarketTrade {
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: Some(audit),
             error: Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string()),
         }
@@ -7930,6 +7932,7 @@ impl PolymarketTrade {
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string()),
         })
@@ -8172,6 +8175,7 @@ impl PolymarketTrade {
                 timestamp_ns: now_ns(),
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
+                trade_fee: None,
                 order_audit: Some(fetched.audit),
                 error: None,
             });
@@ -8380,6 +8384,7 @@ impl PolymarketTrade {
                         timestamp_ns: now_ns(),
                         exchange_event_timestamp_ns: None,
                         trade_id: None,
+                        trade_fee: None,
                         order_audit: None,
                         error: Some(format!(
                             "shutdown authoritative absence after {} clean cancel passes: {}",
@@ -9130,6 +9135,7 @@ impl PolymarketTrade {
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: if msg.is_empty() {
                 None
@@ -9182,6 +9188,7 @@ impl PolymarketTrade {
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: None,
         }
@@ -9229,6 +9236,7 @@ impl PolymarketTrade {
             timestamp_ns: now_ns(),
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: None,
         }
@@ -9347,6 +9355,7 @@ impl PolymarketTrade {
             // Metadata is valid only when that same GET returned an
             // authoritative terminal status. A LIVE snapshot followed by
             // an ambiguous retry DELETE must trigger another audit.
+            trade_fee: None,
             order_audit: authoritative_terminal_audit.cloned(),
             error: if matches!(status, OrderStatus::Cancelled | OrderStatus::Filled) {
                 Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string())
@@ -9464,6 +9473,7 @@ impl PolymarketTrade {
                             timestamp_ns: now_ns(),
                             exchange_event_timestamp_ns: None,
                             trade_id: None,
+                            trade_fee: None,
                             order_audit: None,
                             error: Some(format!(
                                 "placement orphan followed by {} consecutive reconcile not-found observations",
@@ -9568,6 +9578,7 @@ impl PolymarketTrade {
                             timestamp_ns: now_ns(),
                             exchange_event_timestamp_ns: None,
                             trade_id: None,
+                            trade_fee: None,
                             order_audit: order_audit.clone(),
                             error: None,
                         });
@@ -9618,6 +9629,7 @@ impl PolymarketTrade {
                             timestamp_ns: now_ns(),
                             exchange_event_timestamp_ns: None,
                             trade_id: None,
+                            trade_fee: None,
                             order_audit: order_audit.clone(),
                             error: Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string()),
                         });
@@ -9697,6 +9709,7 @@ impl PolymarketTrade {
                             timestamp_ns: now_ns(),
                             exchange_event_timestamp_ns: None,
                             trade_id: None,
+                            trade_fee: None,
                             order_audit: order_audit.clone(),
                             error: Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL.to_string()),
                         });
@@ -9746,6 +9759,7 @@ impl PolymarketTrade {
                             timestamp_ns: now_ns(),
                             exchange_event_timestamp_ns: None,
                             trade_id: None,
+                            trade_fee: None,
                             order_audit: None,
                             error: Some("server status=INVALID (validation failed)".to_string()),
                         });
@@ -11107,6 +11121,7 @@ impl PolymarketTrade {
                 timestamp_ns: now_ns(),
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
+                trade_fee: None,
                 order_audit: None,
                 error: None,
             }
@@ -11447,6 +11462,7 @@ impl PolymarketTrade {
                 timestamp_ns: now_ns(),
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
+                trade_fee: None,
                 order_audit: None,
                 error: None,
             };
@@ -11637,6 +11653,7 @@ impl ExchangeTrade for PolymarketTrade {
                 timestamp_ns: now_ns(),
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
+                trade_fee: None,
                 order_audit: None,
                 error: None,
             });
@@ -11978,6 +11995,7 @@ impl ExchangeTrade for PolymarketTrade {
                             timestamp_ns: now_ns(),
                             exchange_event_timestamp_ns: None,
                             trade_id: None,
+                            trade_fee: None,
                             order_audit: None,
                             error: (!success && !error_msg.is_empty()).then_some(error_msg),
                         });
@@ -12308,6 +12326,7 @@ impl ExchangeTrade for PolymarketTrade {
                     timestamp_ns: now_ns(),
                     exchange_event_timestamp_ns: None,
                     trade_id: None,
+                    trade_fee: None,
                     order_audit: None,
                     error: None,
                 });
@@ -12344,6 +12363,7 @@ impl ExchangeTrade for PolymarketTrade {
                 timestamp_ns: now_ns(),
                 exchange_event_timestamp_ns: None,
                 trade_id: None,
+                trade_fee: None,
                 order_audit: None,
                 error: None,
             });
@@ -12945,6 +12965,7 @@ impl ExchangeTrade for PolymarketTrade {
                     timestamp_ns: now_ns(),
                     exchange_event_timestamp_ns: None,
                     trade_id: None,
+                    trade_fee: None,
                     order_audit: None,
                     error: None,
                 });
@@ -13132,6 +13153,7 @@ impl ExchangeTrade for PolymarketTrade {
                             timestamp_ns: now_ns(),
                             exchange_event_timestamp_ns: None,
                             trade_id: None,
+                            trade_fee: None,
                             order_audit: None,
                             error: err_field,
                         });
@@ -13751,6 +13773,7 @@ mod tests {
             terminal_trade_ids_authoritative: false,
             price: 0.5,
             fee_rate_bps: 0,
+                cash_fee_per_share: None,
             reserved_cash: 5.0,
             reserved_quantity: 0.0,
             status: OrderStatus::Pending,
@@ -14024,6 +14047,7 @@ mod tests {
             terminal_trade_ids_authoritative: true,
             price: 0.5,
             fee_rate_bps: 0,
+                cash_fee_per_share: None,
             reserved_cash: 1.5,
             reserved_quantity: 0.0,
             status: OrderStatus::Filled,

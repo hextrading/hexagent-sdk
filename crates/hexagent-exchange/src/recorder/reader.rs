@@ -2463,6 +2463,7 @@ mod tests {
             base_fee: 0,
             fee_exponent: 0.0,
             fee_rate: 0.0,
+            fee_settlement: Default::default(),
         })
     }
 

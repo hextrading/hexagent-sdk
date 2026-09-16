@@ -16,6 +16,7 @@ fn ownership(side: Side, coid: &str, oid: &str, instance: &str) -> OrderOwnershi
         terminal_trade_ids_authoritative: false,
         price: 0.58,
         fee_rate_bps: 0,
+                cash_fee_per_share: None,
         reserved_cash: if side == Side::Buy { 9.28 } else { 0.0 },
         reserved_quantity: if side == Side::Sell { 16.0 } else { 0.0 },
         status: OrderStatus::CancelUncertain,

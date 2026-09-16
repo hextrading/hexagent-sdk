@@ -4,7 +4,7 @@ use log::{debug, info, warn};
 
 use crate::account::orderbook::OrderbookManager;
 use crate::account::shared_account::RestoredTrade;
-use crate::types::{Liquidity, OrderStatus, OrderUpdate, Side};
+use crate::types::{FeeSettlement, Liquidity, OrderStatus, OrderUpdate, Side};
 
 /// A single position snapshot for a symbol. Produced on demand from the
 /// underlying trade ledger by `PositionManager::positions()` / `get()`,
@@ -115,10 +115,25 @@ pub struct TradeRecord {
     pub price: f64,
     pub status: TradeStatus,
     pub is_maker: bool,
-    /// USDC fee deducted from balance (TAKER SELL only). 0 otherwise.
+    /// Collateral fee deducted from balance (V2 BUY/SELL, V1 SELL).
     pub usdc_fee: f64,
     /// Shares fee deducted from acquired shares (TAKER BUY only). 0 otherwise.
     pub shares_fee: f64,
+    #[serde(default)]
+    pub fee_settlement: FeeSettlement,
+    /// Legacy snapshots describe completed attribution, including actual zero
+    /// fees. Only explicitly unresolved restored rows may bind a fee later.
+    #[serde(default = "default_fee_attributed")]
+    pub fee_attributed: bool,
+}
+
+fn default_fee_attributed() -> bool { true }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TradeFeeAttribution {
+    pub applied: bool,
+    pub cash_delta: f64,
+    pub quantity_delta: f64,
 }
 
 /// An in-flight order not yet reflected in the trade ledger. Kept alongside
@@ -135,6 +150,9 @@ pub struct PendingOrder {
     /// Remaining (unfilled) quantity. Decrements on PartiallyFilled updates
     /// and the entry is removed entirely on Filled / Cancelled / Rejected.
     pub remaining_quantity: f64,
+    /// Conservative collateral-fee lock per remaining BUY share.
+    #[serde(default)]
+    pub cash_fee_per_share: f64,
 }
 
 fn valid_pending_order_fields(
@@ -203,7 +221,7 @@ impl IncrementalQueries {
             return;
         }
         let (cash, quantity) = match trade.side {
-            Side::Buy => (-trade.size * trade.price, trade.size - trade.shares_fee),
+            Side::Buy => (-trade.size * trade.price - trade.usdc_fee, trade.size - trade.shares_fee),
             Side::Sell => (trade.size * trade.price - trade.usdc_fee, -trade.size),
         };
         self.cash.add(cash * live_delta);
@@ -345,7 +363,7 @@ impl PositionManager {
             { continue; }
             if row.booked && status != TradeStatus::Failed {
                 let cash_delta = match ownership.side {
-                    Side::Buy => -ownership.quantity * ownership.price,
+                    Side::Buy => -ownership.quantity * ownership.price - row.usdc_fee,
                     Side::Sell => ownership.quantity * ownership.price - row.usdc_fee,
                 };
                 manager.init_balance -= cash_delta;
@@ -368,6 +386,8 @@ impl PositionManager {
                 is_maker: row.is_maker,
                 usdc_fee: row.usdc_fee,
                 shares_fee: row.shares_fee,
+                fee_settlement: row.fee_settlement,
+                fee_attributed: row.fee_attributed,
             });
         }
         manager
@@ -415,17 +435,17 @@ impl PositionManager {
                 return Err(format!("snapshot contains invalid trade {trade_id}"));
             }
             let fee_tolerance = 1e-10_f64.max(trade.size.abs() * 1e-8);
-            if (trade.is_maker
-                && (trade.usdc_fee.abs() > fee_tolerance || trade.shares_fee.abs() > fee_tolerance))
-                || (!trade.is_maker
-                    && match trade.side {
-                        Side::Buy => trade.usdc_fee.abs() > fee_tolerance,
-                        Side::Sell => trade.shares_fee.abs() > fee_tolerance,
-                    })
+            if !trade.fee_settlement.accepts_fee_amounts(
+                trade.side, trade.is_maker, trade.usdc_fee, trade.shares_fee, fee_tolerance,
+            )
             {
                 return Err(format!(
                     "snapshot trade {trade_id} has fee in the wrong role/currency"
                 ));
+            }
+            if !trade.fee_attributed && trade.status != TradeStatus::Failed
+                && (trade.usdc_fee > fee_tolerance || trade.shares_fee > fee_tolerance) {
+                return Err(format!("snapshot trade {trade_id} has fees without attribution"));
             }
             if trade.status != TradeStatus::Failed {
                 let notional = trade.size * trade.price;
@@ -450,6 +470,10 @@ impl PositionManager {
                 || !valid_pending_order_fields(
                     client_order_id, &pending.symbol, pending.price, pending.original_quantity,
                 )
+                || !pending.cash_fee_per_share.is_finite()
+                || pending.cash_fee_per_share < 0.0
+                || (pending.side == Side::Sell && pending.cash_fee_per_share != 0.0)
+                || !(pending.price + pending.cash_fee_per_share).is_finite()
                 || !pending.remaining_quantity.is_finite()
                 || pending.remaining_quantity < 0.0
                 || pending.remaining_quantity > pending.original_quantity + 1e-8
@@ -555,6 +579,7 @@ impl PositionManager {
                 row.usdc_fee,
                 row.shares_fee,
                 None,
+                row.fee_settlement,
                 false,
             );
             if !result.applied {
@@ -627,6 +652,20 @@ impl PositionManager {
         // pushes that arrive without error metadata).
         error: Option<&str>,
     ) -> UpsertResult {
+        self.upsert_trade_with_fee_settlement(
+            trade_id, asset_id, side, size, price, status, is_maker,
+            usdc_fee, shares_fee, error, FeeSettlement::LegacyV1,
+        )
+    }
+
+    /// Apply an explicitly versioned fee; existing trade provenance is immutable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_trade_with_fee_settlement(
+        &mut self, trade_id: &str, asset_id: &str, side: Side,
+        size: f64, price: f64, status: TradeStatus, is_maker: bool,
+        usdc_fee: f64, shares_fee: f64, error: Option<&str>,
+        fee_settlement: FeeSettlement,
+    ) -> UpsertResult {
         self.upsert_trade_inner(
             trade_id,
             asset_id,
@@ -638,6 +677,7 @@ impl PositionManager {
             usdc_fee,
             shares_fee,
             error,
+            fee_settlement,
             true,
         )
     }
@@ -655,6 +695,7 @@ impl PositionManager {
         usdc_fee: f64,
         shares_fee: f64,
         error: Option<&str>,
+        fee_settlement: FeeSettlement,
         log_transition: bool,
     ) -> UpsertResult {
         if trade_id.trim().is_empty() || asset_id.trim().is_empty()
@@ -662,6 +703,7 @@ impl PositionManager {
             || !price.is_finite() || price <= 0.0 || price > 1.0 + 1e-8
             || !usdc_fee.is_finite() || usdc_fee < 0.0
             || !shares_fee.is_finite() || shares_fee < 0.0
+            || !fee_settlement.accepts_fee_amounts(side, is_maker, usdc_fee, shares_fee, 1e-10_f64.max(size.abs() * 1e-8))
         {
             return UpsertResult::NOOP;
         }
@@ -674,6 +716,7 @@ impl PositionManager {
             let shares_fee_tolerance = 1e-10_f64.max(existing.shares_fee.abs() * 1e-8);
             if existing.asset_id != asset_id || existing.side != side
                 || existing.is_maker != is_maker
+                || existing.fee_settlement != fee_settlement
                 || (existing.size - size).abs() > size_tolerance
                 || (existing.price - price).abs() > price_tolerance
                 || (existing.usdc_fee - usdc_fee).abs() > usdc_fee_tolerance
@@ -720,7 +763,8 @@ impl PositionManager {
         } else {
             let trade = TradeRecord {
                 trade_id: trade_id.to_string(), asset_id: asset_id.to_string(), side,
-                size, price, status, is_maker, usdc_fee, shares_fee,
+                size, price, status, is_maker, usdc_fee, shares_fee, fee_settlement,
+                fee_attributed: true,
             };
             if let Some(queries) = &mut self.incremental_queries {
                 queries.transition(&trade, None);
@@ -779,6 +823,61 @@ impl PositionManager {
         }
 
         outcome
+    }
+
+    /// Bind fees exactly once on an existing, explicitly unattributed row.
+    /// Called on the strategy owner from a durable metadata/recovery message.
+    /// It changes no principal, lifecycle status, reservation or volume and
+    /// touches only this trade and its existing incremental aggregate entry.
+    /// The caller subsequently applies the durable lifecycle status normally.
+    pub fn attribute_restored_trade_fee(
+        &mut self, row: &RestoredTrade,
+    ) -> Result<TradeFeeAttribution, String> {
+        let identity = &row.ownership;
+        let Some(trade) = self.trades.get_mut(&identity.trade_key) else {
+            return Err("fee attribution requires an existing trade".into());
+        };
+        let tolerance = 1e-10_f64.max(trade.size.abs() * 1e-8);
+        if !row.fee_attributed
+            || trade.asset_id != identity.token_id || trade.side != identity.side
+            || trade.is_maker != row.is_maker
+            || !identity.quantity.is_finite() || !identity.price.is_finite()
+            || (trade.size - identity.quantity).abs() > tolerance
+            || (trade.price - identity.price).abs() > 1e-10_f64.max(trade.price.abs() * 1e-8)
+            || !row.fee_settlement.accepts_fee_amounts(identity.side, row.is_maker, row.usdc_fee, row.shares_fee, tolerance)
+        {
+            return Err("fee attribution has unresolved or conflicting trade provenance".into());
+        }
+        if trade.fee_attributed {
+            if trade.fee_settlement != row.fee_settlement
+                || (trade.usdc_fee - row.usdc_fee).abs() > tolerance
+                || (trade.shares_fee - row.shares_fee).abs() > tolerance
+            { return Err("cannot reprice an attributed trade".into()); }
+            return Ok(TradeFeeAttribution::default());
+        }
+        let live = trade.status != TradeStatus::Failed;
+        let cash_delta = if live { trade.usdc_fee - row.usdc_fee } else { 0.0 };
+        let quantity_delta = if live { trade.shares_fee - row.shares_fee } else { 0.0 };
+        if live {
+            if let Some(queries) = &mut self.incremental_queries {
+                let Some(totals) = queries.symbols.get_mut(&trade.asset_id) else {
+                    return Err("fee attribution is missing its incremental symbol index".into());
+                };
+                queries.cash.add(cash_delta);
+                if trade.side == Side::Buy || trade.status == TradeStatus::Confirmed {
+                    queries.available_cash.add(cash_delta);
+                }
+                totals.quantity.add(quantity_delta);
+                if trade.side == Side::Sell || trade.status == TradeStatus::Confirmed {
+                    totals.available_quantity.add(quantity_delta);
+                }
+            }
+        }
+        trade.usdc_fee = row.usdc_fee;
+        trade.shares_fee = row.shares_fee;
+        trade.fee_settlement = row.fee_settlement;
+        trade.fee_attributed = true;
+        Ok(TradeFeeAttribution { applied: true, cash_delta, quantity_delta })
     }
 
     /// Ingest a fill OrderUpdate with no fee information. Fees are left at 0
@@ -890,6 +989,7 @@ impl PositionManager {
                         price: update.avg_fill_price,
                         original_quantity: update.remaining_quantity,
                         remaining_quantity: update.remaining_quantity,
+                        cash_fee_per_share: 0.0,
                     });
                 }
             }
@@ -926,7 +1026,7 @@ impl PositionManager {
         for t in self.trades.values() {
             if t.status == TradeStatus::Failed { continue; }
             match t.side {
-                Side::Buy => b -= t.size * t.price,
+                Side::Buy => b -= t.size * t.price + t.usdc_fee,
                 Side::Sell => b += t.size * t.price - t.usdc_fee,
             }
         }
@@ -985,7 +1085,7 @@ impl PositionManager {
     pub fn locked_buy_cost(&self) -> f64 {
         self.pending_orders.values()
             .filter(|o| o.side == Side::Buy)
-            .map(|o| o.price * o.remaining_quantity)
+            .map(|o| (o.price + o.cash_fee_per_share) * o.remaining_quantity)
             .sum()
     }
 
@@ -1020,7 +1120,7 @@ impl PositionManager {
             }
             match t.side {
                 // BUY: money goes out regardless of confirmation state.
-                Side::Buy => b -= t.size * t.price,
+                Side::Buy => b -= t.size * t.price + t.usdc_fee,
                 // SELL: only credit proceeds once Confirmed. Matched/Mined
                 // pending SELLs don't count toward available cash.
                 Side::Sell => {
@@ -1079,6 +1179,16 @@ impl PositionManager {
         price: f64,
         quantity: f64,
     ) {
+        self.register_pending_order_with_cash_fee(client_order_id, symbol, side, price, quantity, 0.0);
+    }
+
+    pub fn register_pending_order_with_cash_fee(
+        &mut self, client_order_id: &str, symbol: &str, side: Side,
+        price: f64, quantity: f64, cash_fee_per_share: f64,
+    ) {
+        if !cash_fee_per_share.is_finite() || cash_fee_per_share < 0.0
+            || !(price + cash_fee_per_share).is_finite()
+            || (side == Side::Sell && cash_fee_per_share != 0.0) { return; }
         if !valid_pending_order_fields(client_order_id, symbol, price, quantity) { return; }
         self.pending_orders.insert(client_order_id.to_string(), PendingOrder {
             client_order_id: client_order_id.to_string(),
@@ -1087,6 +1197,7 @@ impl PositionManager {
             price,
             original_quantity: quantity,
             remaining_quantity: quantity,
+            cash_fee_per_share,
         });
     }
 
@@ -1336,6 +1447,8 @@ mod tests {
             quantity: 14.95, avg_price: 0.4, current_value: 0.0,
         })]);
         let mut row = RestoredTrade {
+            fee_attributed: true,
+            fee_settlement: FeeSettlement::LegacyV1,
             ownership: TradeOwnership {
                 account_id: "acct".into(), instance_id: "instance".into(),
                 trade_key: "restored".into(), client_order_id: "order".into(),
@@ -1386,6 +1499,7 @@ mod tests {
             timestamp_ns: 0,
             exchange_event_timestamp_ns: None,
             trade_id: None,
+            trade_fee: None,
             order_audit: None,
             error: None,
             order_slot: Default::default(),
@@ -1433,6 +1547,8 @@ mod tests {
         let rebuilt = PositionManager::rebuild_from_snapshot_baseline(
             pm.snapshot(),
             [RestoredTrade {
+            fee_attributed: true,
+            fee_settlement: FeeSettlement::LegacyV1,
                 ownership: TradeOwnership {
                     account_id: "acct".into(),
                     instance_id: "instance".into(),
@@ -1787,6 +1903,8 @@ mod tests {
             quantity: 5.0, avg_price: 0.4, current_value: 2.0,
         })]);
         let restored = RestoredTrade {
+            fee_attributed: true,
+            fee_settlement: FeeSettlement::LegacyV1,
             ownership: TradeOwnership {
                 account_id: "acct".into(), instance_id: "a".into(),
                 trade_key: "restored".into(), client_order_id: "a-1".into(),
@@ -1851,3 +1969,7 @@ mod tests {
         assert!(pm.pending_orders().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "position_v2_fee_tests.rs"]
+mod v2_fee_tests;
