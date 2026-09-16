@@ -1492,7 +1492,16 @@ impl PrivateEventDelta {
     }
 }
 
+fn trade_payload_requires_revalidation(payload: &serde_json::Value, shared: &SharedState) -> bool {
+    payload.get("id").or_else(|| payload.get("trade_id"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| shared.account_state.private_trade_requires_revalidation(id.trim()))
+}
+
 fn trade_lifecycle_is_durably_covered(payload: &serde_json::Value, shared: &SharedState) -> bool {
+    if trade_payload_requires_revalidation(payload, shared) {
+        return false;
+    }
     let status = payload
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -2574,9 +2583,12 @@ fn route_private_batch(
                 return Err(error);
             }
         };
+        let requires_revalidation = event.kind == PrivateEventKind::Trade
+            && trade_payload_requires_revalidation(payload, shared);
         event.needs_execution_repair = needs_repair;
         crate::latency::record("polymarket.user.validate_route", validate_started);
         let cold_already_committed = !routed.is_empty()
+            && !requires_revalidation
             && cold_committed
                 .is_some_and(|dedupe| routed.iter().all(|routed| dedupe.seen(&routed.identity)));
         for routed in routed {
@@ -2665,6 +2677,7 @@ fn apply_private_cold_batch_owned(
         let payload = event.payload();
         let is_trade = event.kind == PrivateEventKind::Trade;
         if !event.needs_execution_repair
+            && !(is_trade && trade_payload_requires_revalidation(payload, shared))
             && ((is_trade && replay.lifecycle_seen(payload))
                 || event
                     .terminal_trade_key()
@@ -4381,6 +4394,10 @@ fn deliver_open_order_recovery(
         Err(pass.errors.join("; "))
     }
 }
+
+#[cfg(test)]
+#[path = "private_anomaly_replay_tests.rs"]
+mod anomaly_replay_tests;
 
 #[cfg(test)]
 #[path = "private_execution_repair_tests.rs"]
