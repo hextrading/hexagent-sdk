@@ -51,6 +51,7 @@ const PING_INTERVAL: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const STALE_TIMEOUT: Duration = Duration::from_secs(30);
 const RECOVERY_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const RECOVERY_LOCAL_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const GAP_USER_AGENT: &str = "hexbot-gap-replay/1";
 const FAILED_TRADE_DIAGNOSTIC_CAPACITY: usize = 4096;
 const TERMINAL_GAP_REPLAY_DEDUPE_CAPACITY: usize = 32_768;
@@ -4165,6 +4166,47 @@ enum RecoveryReadEvent<W, A> {
     Audit(A),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryRetryWake {
+    Deadline,
+    OpenOrdersDrained,
+}
+
+/// A local immutable snapshot is only a hint to rerun the complete audit.
+/// Never clear recovery here. The caller retains the probe deadline across
+/// cancelled socket-select arms, so private traffic cannot turn this into an
+/// unbounded snapshot polling loop. An already-empty failed audit receives no
+/// shortcut, preserving REST backoff on routing/ledger/transport failures.
+async fn wait_for_order_audit_retry(
+    deadline: tokio::time::Instant,
+    audit_started_nonempty: bool,
+    next_local_check: &mut tokio::time::Instant,
+    mut has_open_orders: impl FnMut() -> bool,
+    shutdown: &AtomicBool,
+) -> Result<RecoveryRetryWake> {
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Err(anyhow!("shutdown before next order audit"));
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(RecoveryRetryWake::Deadline);
+        }
+        if audit_started_nonempty && now >= *next_local_check {
+            *next_local_check = now + RECOVERY_LOCAL_PROGRESS_INTERVAL;
+            if !has_open_orders() {
+                return Ok(RecoveryRetryWake::OpenOrdersDrained);
+            }
+        }
+        let wake = if audit_started_nonempty {
+            deadline.min(*next_local_check)
+        } else {
+            deadline
+        };
+        tokio::time::sleep_until(wake).await;
+    }
+}
+
 /// The actual production selection boundary: a pending/failed REST audit must
 /// never prevent an authenticated socket from delivering private frames.
 async fn select_ws_or_recovery<W: Future, A: Future>(
@@ -4195,6 +4237,9 @@ struct OpenOrderRecovery {
     job: Option<tokio::task::JoinHandle<std::result::Result<(), String>>>,
     fence: Option<tokio::sync::oneshot::Receiver<bool>>,
     schedule: RecoveryAuditSchedule,
+    // Socket-task-owned retry hints; they cannot authorize release or Ready.
+    audit_started_nonempty: bool,
+    next_local_check: tokio::time::Instant,
 }
 
 impl OpenOrderRecovery {
@@ -4206,6 +4251,8 @@ impl OpenOrderRecovery {
             job: None,
             fence: None,
             schedule: RecoveryAuditSchedule::new(Instant::now()),
+            audit_started_nonempty: false,
+            next_local_check: tokio::time::Instant::now(),
         }
     }
 
@@ -4224,13 +4271,20 @@ impl OpenOrderRecovery {
                             return Err(anyhow!("shutdown before next order audit"));
                         }
                         if !self.schedule.ready(Instant::now()) {
-                            sleep(
-                                self.schedule
-                                    .next_attempt
-                                    .saturating_duration_since(Instant::now()),
-                            )
-                            .await;
+                            let wake = wait_for_order_audit_retry(
+                                tokio::time::Instant::from_std(self.schedule.next_attempt),
+                                self.audit_started_nonempty,
+                                &mut self.next_local_check,
+                                || shared.execution_snapshot().open_orders.len() != 0,
+                                shutdown,
+                            ).await?;
+                            if wake == RecoveryRetryWake::OpenOrdersDrained {
+                                info!("[PolyUserFeed] Open-order recovery retry expedited: generation={} remaining_backoff_ms={} reason=local_open_orders_drained; complete audit and delivery fence still required",
+                                    self.generation, self.schedule.next_attempt.saturating_duration_since(Instant::now()).as_millis());
+                            }
                         }
+                        self.audit_started_nonempty =
+                            shared.execution_snapshot().open_orders.len() != 0;
                         let shared = shared.clone();
                         let update_tx = update_tx.clone();
                         let shutdown = shutdown.clone();
@@ -4990,6 +5044,10 @@ pub fn spawn_user_feed(
 
     Ok(handle)
 }
+
+#[cfg(test)]
+#[path = "user_feed_recovery_wakeup_tests.rs"]
+mod recovery_wakeup_tests;
 
 #[cfg(test)]
 mod tests {
