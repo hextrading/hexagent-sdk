@@ -36,7 +36,7 @@ const MAINTENANCE_ATTRIBUTION_RISK_BLOCKER_PREFIX: &str = "maintenance_attributi
 const TRADE_PERSISTENCE_RISK_BLOCKER: &str = "account_persistence:trade";
 const FEE_ATTRIBUTION_RISK_BLOCKER_PREFIX: &str = "fee_attribution:";
 /// Maintenance waits for its reservation WAL record to become durable before
-/// any chain side effect is allowed. Live full-snapshot WAL batches can
+/// any chain side effect is allowed. Live cold-transaction WAL batches can
 /// legitimately exceed 250 ms (306 ms observed on 2026-08-21), so the generic
 /// deadline produced false split failures. Only the per-account maintenance
 /// worker uses this longer bound; ordinary admission retains its old deadline.
@@ -2156,7 +2156,7 @@ impl std::fmt::Display for ReservationError {
 
 impl std::error::Error for ReservationError {}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct InstanceLedger {
     weight: f64,
     cash: f64,
@@ -2645,7 +2645,7 @@ impl VirtualAccount {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct AppliedTrade {
     /// None preserves pre-VWAP ledger economics, including already-settled and
     /// FAILED rows. Only a new, validated execution may select the V2 rounding
@@ -2825,7 +2825,7 @@ fn select_execution_price(
 /// settled-event FIFO. An empty `instances` set means every strategy has
 /// evicted the event, but account cleanup is still waiting for a non-revisable
 /// order/trade terminal state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct SettledAuditReference {
     condition_id: String,
     asset_ids: BTreeSet<String>,
@@ -2843,7 +2843,7 @@ struct RiskBlocker {
 /// booked again: a matching replay can only prove ownership and no-op; a
 /// mismatch remains a sticky ownership anomaly. The immutable ownership and
 /// quantity still prove a surviving parent order's derived `filled_quantity`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct RetiredTradeOwnershipTombstone {
     ownership: TradeOwnership,
     #[serde(default)]
@@ -2864,7 +2864,7 @@ struct RetiredTradeOwnershipTombstone {
 /// Keeping the proof prevents a late replay of the same private order event
 /// from recreating an account-wide blocker after its original lifecycle row
 /// has already been retired.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct RetiredOrderAuditTombstone {
     order_id: String,
     #[serde(default)]
@@ -2885,7 +2885,7 @@ struct RetiredOrderAuditTombstone {
     audited_at_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct OrphanOrderAnomalyHint {
     /// Preserve the authenticated wire spelling (including a possible `0x`
     /// prefix) for the authoritative REST lookup.
@@ -3101,10 +3101,14 @@ use prune_persistence::SettledPrunePersistenceDelta;
 
 #[derive(Debug, Clone)]
 enum PersistenceJobPayload {
-    /// Owned compatibility fallback for cold/complex mutations. The cold
-    /// account owner clones while it already owns the state; the WAL writer
-    /// never reaches back into live account state.
-    FullSnapshot(Box<SharedAccountState>),
+    /// Only the cold transaction's changes may reach the WAL. Its aggregate
+    /// mirror can lag already-persisted lifecycle/trade deltas, so `after`
+    /// must never replace the durable tree. Both values belong to the cold
+    /// owner; serialization/diff and file I/O remain on the existing writer.
+    ColdTransaction {
+        before: Arc<SharedAccountState>,
+        after: Arc<SharedAccountState>,
+    },
     Changes(Vec<PersistenceWalChange>),
     SettledPrune(SettledPrunePersistenceDelta),
     /// Raw reservation data is converted to JSON only on the WAL writer. This
@@ -3291,8 +3295,9 @@ enum PersistenceCommand {
 /// Single-writer incremental WAL. Hot order/trade mutations enqueue typed
 /// entry deltas while they already hold the account mutex; the writer never
 /// re-locks or clones the full account for those generations. Cold/complex
-/// mutations retain a full-snapshot fallback until their domain gets a typed
-/// delta. Filesystem I/O is always confined to this thread.
+/// mutations publish before/after transaction images until their domain gets
+/// a typed delta. An image is never a replacement for newer owner messages.
+/// Filesystem I/O is always confined to this thread.
 #[derive(Debug)]
 struct AccountPersistence {
     path: PathBuf,
@@ -3487,59 +3492,10 @@ impl AccountPersistence {
                             }
                         }
                         let result = (|| -> Result<(), String> {
-                            let last_full_snapshot = jobs.iter().rposition(|job| {
-                                matches!(job.payload, PersistenceJobPayload::FullSnapshot(_))
-                            });
-                            let changes = if let Some(full_index) = last_full_snapshot {
-                                let snapshot = match &jobs[full_index].payload {
-                                    PersistenceJobPayload::FullSnapshot(snapshot) => snapshot,
-                                    _ => unreachable!("full snapshot index must name a snapshot"),
-                                };
-                                let mut next_state = serde_json::to_value(snapshot).map_err(
-                                    |error| {
-                                        format!(
-                                            "serialize account ledger WAL fallback {}: {error}",
-                                            thread_path.display()
-                                        )
-                                    },
-                                )?;
-                                // Virtual-account hot deltas scheduled after
-                                // the latest cold snapshot are not present in
-                                // the owned cold snapshot. Replay only that
-                                // suffix on top of the snapshot; earlier
-                                // absolute deltas were already folded by the
-                                // cold control transaction.
-                                for job in jobs.iter().skip(full_index + 1) {
-                                    for change in materialize_persistence_job(job)? {
-                                        apply_persistence_wal_change(&mut next_state, change)?;
-                                    }
-                                }
-                                let changes = persistence_json_diff(&durable_state, &next_state);
-                                // Full snapshots are intentionally rare cold-control
-                                // fallbacks. Keep their detached replacement semantics;
-                                // unlike ordinary typed batches, replacing the complete
-                                // tree is the operation being requested.
-                                if !changes.is_empty() {
-                                    append_persistence_wal(
-                                        &thread_path,
-                                        &PersistenceWalRecord {
-                                            version: PERSISTENCE_WAL_VERSION,
-                                            account_id: account_id.clone(),
-                                            generation,
-                                            changes,
-                                        },
-                                        &mut durable_wal_len,
-                                    )?;
-                                }
-                                durable_state = next_state;
-                                return Ok(());
-                            } else {
-                                let mut changes = Vec::new();
-                                for job in &jobs {
-                                    changes.extend(materialize_persistence_job(job)?);
-                                }
-                                changes
-                            };
+                            let mut changes = Vec::new();
+                            for job in &jobs {
+                                changes.extend(materialize_persistence_job(job)?);
+                            }
                             if !changes.is_empty() {
                                 // Apply typed deltas transactionally in place. The old
                                 // implementation cloned the complete durable JSON tree
@@ -3632,14 +3588,6 @@ impl AccountPersistence {
             write_delay_ms,
             writer: Some(writer),
         })
-    }
-
-    fn schedule(&self, state: &SharedAccountState) {
-        if self.enqueue_failed.load(Ordering::Acquire) {
-            self.queue_overflows.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        self.enqueue(PersistenceJobPayload::FullSnapshot(Box::new(state.clone())));
     }
 
     fn schedule_delta(&self, changes: Vec<PersistenceWalChange>) {
@@ -3846,6 +3794,139 @@ fn persistence_json_diff(
     changes
 }
 
+/// Diff against the transaction's own input, never against the writer's more
+/// recent state. Account-wide audit sets need per-member edits so a cold
+/// mutation for one order cannot erase a concurrently published sibling.
+fn persistence_cold_transaction_diff(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Vec<PersistenceWalChange> {
+    const AUDIT_SETS: [&str; 4] = [
+        "fee_attribution_pending",
+        "recovery_pending_orders",
+        "startup_query_repair_orders",
+        "routine_cancel_audits",
+    ];
+    let mut changes = persistence_json_diff(before, after);
+    changes.retain(|change| {
+        !matches!(change,
+            PersistenceWalChange::Set { path, .. }
+                if path.len() == 1 && (AUDIT_SETS.contains(&path[0].as_str())
+                    || COLD_PERSISTED_COUNTERS.contains(&path[0].as_str()))
+        )
+    });
+    // Cold-only counters historically ride on the next cold commit; their
+    // mutators do not enqueue additional WAL work. Keep that behavior scoped
+    // to these fields, without publishing stale lifecycle mirror contents.
+    for field in COLD_PERSISTED_COUNTERS {
+        if let Some(value) = after.get(field) {
+            changes.push(PersistenceWalChange::Set {
+                path: vec![field.to_owned()],
+                value: value.clone(),
+            });
+        }
+    }
+    for field in AUDIT_SETS {
+        let members = |state: &serde_json::Value| -> BTreeSet<String> {
+            state[field]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .expect("serialized account audit member")
+                        .to_owned()
+                })
+                .collect()
+        };
+        let old = members(before);
+        let new = members(after);
+        for member in old.difference(&new) {
+            changes.push(PersistenceWalChange::SetRemove {
+                path: vec![field.to_owned()],
+                value: serde_json::Value::String(member.clone()),
+            });
+        }
+        for member in new.difference(&old) {
+            changes.push(PersistenceWalChange::SetInsert {
+                path: vec![field.to_owned()],
+                value: serde_json::Value::String(member.clone()),
+            });
+        }
+    }
+    changes
+}
+
+const COLD_PERSISTED_COUNTERS: [&str; 6] = [
+    "gap_replay_last_pages",
+    "gap_replay_max_pages",
+    "gap_replay_total_pages",
+    "maintenance_queue_last_wait_ms",
+    "maintenance_queue_max_wait_ms",
+    "maintenance_queue_jobs",
+];
+
+fn materialize_cold_transaction(
+    before: &SharedAccountState,
+    after: &SharedAccountState,
+) -> Result<Vec<PersistenceWalChange>, String> {
+    let mut old = serde_json::Map::new();
+    let mut new = serde_json::Map::new();
+    // Comparing typed fields avoids serializing unchanged historical orders
+    // and trades twice. Exhaustive destructuring makes adding a state field
+    // without choosing its persistence policy a compile error.
+    macro_rules! fields {
+        ($($field:ident),*; skip $($transient:ident),*) => {
+            let SharedAccountState { $($field: _,)* $($transient: _,)* } = after;
+            $(if before.$field != after.$field || COLD_PERSISTED_COUNTERS.contains(&stringify!($field)) {
+                old.insert(stringify!($field).into(), serde_json::to_value(&before.$field).map_err(|e| e.to_string())?);
+                new.insert(stringify!($field).into(), serde_json::to_value(&after.$field).map_err(|e| e.to_string())?);
+            })*
+        };
+    }
+    fields!(
+        seeded, seed_baseline, compacted_economic_effects, physical_cash,
+        physical_positions, unallocated_cash, unallocated_positions,
+        provisional_position_owners, instances, orders, oid_to_coid, trades,
+        retired_trade_ownership_tombstones, retired_order_audit_tombstones,
+        verified_trade_replay_recoveries, ledger_generation, uncertain,
+        uncertain_reason, uncertain_since_ms, risk_blockers, external_adjustments,
+        internal_adjustment_sequence, gap_replay_last_pages, gap_replay_max_pages,
+        gap_replay_total_pages, maintenance_queue_last_wait_ms,
+        maintenance_queue_max_wait_ms, maintenance_queue_jobs, settled_token_values,
+        settled_token_values_generation, token_fee_configs, settled_audit_references,
+        fee_attribution_pending, recovery_pending_orders, startup_query_repair_orders,
+        routine_cancel_audits, instance_registry_issue, allocation_migration_required,
+        cash_allocation_migrations, ownership_anomalies, orphan_order_anomaly_hints,
+        unresolved_trade_match_times, maintenance_ops, sidecar_checkpoints;
+        skip last_physical_snapshot_generation, startup_snapshot_applied_this_process,
+        initial_token_barrier_started_ms, initial_token_barrier_degraded_members
+    );
+    Ok(persistence_cold_transaction_diff(&old.into(), &new.into()))
+}
+
+fn materialize_control_entry<T: Serialize>(
+    state: &SharedAccountState,
+    map: &str,
+    key: &str,
+    value: Option<&T>,
+) -> Result<Vec<PersistenceWalChange>, String> {
+    let mut changes = Vec::with_capacity(7);
+    persistence_wal_map_entry(&mut changes, map, key, value)?;
+    for (field, value) in COLD_PERSISTED_COUNTERS.into_iter().zip([
+        state.gap_replay_last_pages,
+        state.gap_replay_max_pages,
+        state.gap_replay_total_pages,
+        state.maintenance_queue_last_wait_ms,
+        state.maintenance_queue_max_wait_ms,
+        state.maintenance_queue_jobs,
+    ]) {
+        persistence_wal_set(&mut changes, [field.to_owned()], &value)?;
+    }
+    Ok(changes)
+}
+
 fn persistence_wal_set<T: Serialize>(
     changes: &mut Vec<PersistenceWalChange>,
     path: impl IntoIterator<Item = String>,
@@ -3896,8 +3977,8 @@ fn persistence_wal_set_membership<T: Serialize>(
 
 fn materialize_persistence_job(job: &PersistenceJob) -> Result<Vec<PersistenceWalChange>, String> {
     match &job.payload {
-        PersistenceJobPayload::FullSnapshot(_) => {
-            Err("full snapshot persistence job cannot be materialized as a typed delta".to_string())
+        PersistenceJobPayload::ColdTransaction { before, after } => {
+            materialize_cold_transaction(before, after)
         }
         PersistenceJobPayload::Changes(changes) => Ok(changes.clone()),
         PersistenceJobPayload::SettledPrune(delta) => delta.materialize(),
@@ -4091,7 +4172,8 @@ fn materialize_persistence_job(job: &PersistenceJob) -> Result<Vec<PersistenceWa
 /// Collapse repeated absolute updates for the same owned row inside one
 /// detached writer batch. Cross-kind ordering is preserved: an order lifecycle
 /// update is never discarded merely because a trade for the same coid exists.
-/// Full snapshots and arbitrary change vectors remain untouched.
+/// Cold transactions and arbitrary changes are ordering barriers: their
+/// partial updates may depend on the preceding complete owned-row update.
 fn coalesce_persistence_jobs(jobs: Vec<PersistenceJob>) -> Vec<PersistenceJob> {
     let mut reservations = HashSet::new();
     let mut lifecycles = HashSet::new();
@@ -4110,16 +4192,17 @@ fn coalesce_persistence_jobs(jobs: Vec<PersistenceJob>) -> Vec<PersistenceJob> {
             PersistenceJobPayload::UnresolvedTradeMatchTime { trade_key, .. } => {
                 unresolved.insert(trade_key.clone())
             }
-            PersistenceJobPayload::SettledPrune(_) => {
-                // A prune deletes rows and compacts their economics. Never
-                // coalesce an update across that replay/retirement boundary.
+            PersistenceJobPayload::SettledPrune(_)
+            | PersistenceJobPayload::ColdTransaction { .. }
+            | PersistenceJobPayload::Changes(_) => {
+                // Cold changes may patch/delete earlier rows. Never coalesce
+                // an owned-row update across this transaction boundary.
                 reservations.clear();
                 lifecycles.clear();
                 trades.clear();
                 unresolved.clear();
                 true
             }
-            PersistenceJobPayload::FullSnapshot(_) | PersistenceJobPayload::Changes(_) => true,
         };
         if keep {
             retained.push(job);
@@ -6192,6 +6275,51 @@ struct AccountStateGuard<'a> {
     reservation_epochs: BTreeMap<String, u64>,
     trade_epochs: BTreeMap<String, u64>,
     acquired_at: Instant,
+    persistence_capture: ColdPersistenceCapture,
+}
+
+/// Owned by one cold transaction, never shared with the lifecycle thread.
+/// The baseline is captured lazily before its first mutable access. Read-only
+/// and typed/scoped transactions do not clone historical account state.
+#[derive(Default)]
+struct ColdPersistenceCapture {
+    enabled: bool,
+    before: std::cell::RefCell<Option<Arc<SharedAccountState>>>,
+}
+
+impl ColdPersistenceCapture {
+    fn before_mutation(&mut self, state: &SharedAccountState, persistent: bool) {
+        if self.enabled && persistent && self.before.get_mut().is_none() {
+            *self.before.get_mut() = Some(Arc::new(state.clone()));
+        }
+    }
+
+    fn take_job(
+        &self,
+        state: &SharedAccountState,
+    ) -> Result<Option<PersistenceJobPayload>, String> {
+        if !self.enabled {
+            return Err("cold persistence requires a transaction baseline".to_string());
+        }
+        Ok(self
+            .before
+            .borrow_mut()
+            .take()
+            .map(|before| PersistenceJobPayload::ColdTransaction {
+                before,
+                after: Arc::new(state.clone()),
+            }))
+    }
+}
+
+trait ColdPersistenceTransaction: Deref<Target = SharedAccountState> {
+    fn persistence_capture(&self) -> &ColdPersistenceCapture;
+}
+
+impl ColdPersistenceTransaction for AccountStateGuard<'_> {
+    fn persistence_capture(&self) -> &ColdPersistenceCapture {
+        &self.persistence_capture
+    }
 }
 
 /// Narrow cold transaction for absolute wallet calibration. It mirrors only
@@ -6208,6 +6336,13 @@ struct EconomicStateGuard<'a> {
     scoped_tokens: Vec<String>,
     token_interest_retirement: Option<(String, String)>,
     acquired_at: Instant,
+    persistence_capture: ColdPersistenceCapture,
+}
+
+impl ColdPersistenceTransaction for EconomicStateGuard<'_> {
+    fn persistence_capture(&self) -> &ColdPersistenceCapture {
+        &self.persistence_capture
+    }
 }
 
 impl Deref for EconomicStateGuard<'_> {
@@ -6220,6 +6355,8 @@ impl Deref for EconomicStateGuard<'_> {
 
 impl DerefMut for EconomicStateGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        self.persistence_capture
+            .before_mutation(&self.state, self.account.persistence.is_some());
         &mut self.state
     }
 }
@@ -6324,6 +6461,8 @@ impl Deref for AccountStateGuard<'_> {
 
 impl DerefMut for AccountStateGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        self.persistence_capture
+            .before_mutation(&self.state, self.account.persistence.is_some());
         &mut self.state
     }
 }
@@ -6332,7 +6471,7 @@ impl Drop for AccountStateGuard<'_> {
     fn drop(&mut self) {
         // Replay anchors may advance while this cold transaction holds the
         // control writer. Fold the authoritative private-event map back into
-        // the aggregate immediately before any full snapshot can observe it;
+        // the diagnostic aggregate before publishing the cold control view;
         // the typed WAL still preserves every ordered insert/remove.
         self.state.unresolved_trade_match_times = self
             .account
@@ -7175,12 +7314,18 @@ impl SharedAccount {
                 .store(state.uncertain_reason.clone().map(Arc::new));
         }
         let seeded = state.seeded;
-        let passive = seeded && (!state.uncertain || fee_degradation_is_only_uncertainty(state));
+        let persistence_failed = self
+            .persistence
+            .as_ref()
+            .is_some_and(|persistence| persistence.enqueue_failed.load(Ordering::Acquire));
+        let uncertain = state.uncertain || persistence_failed;
+        let passive = seeded
+            && !persistence_failed
+            && (!state.uncertain || fee_degradation_is_only_uncertainty(state));
         self.seeded_fast.store(seeded, Ordering::Release);
-        self.uncertain_fast
-            .store(state.uncertain, Ordering::Release);
+        self.uncertain_fast.store(uncertain, Ordering::Release);
         self.admission_fast
-            .store(seeded && !state.uncertain, Ordering::Release);
+            .store(seeded && !uncertain, Ordering::Release);
         self.passive_admission_fast
             .store(passive, Ordering::Release);
     }
@@ -7196,8 +7341,14 @@ impl SharedAccount {
         self.admission_fast.store(false, Ordering::Release);
         // Missing taker attribution is the one degraded mode in which passive
         // maker admission remains safe.
-        self.passive_admission_fast
-            .store(self.seeded_fast.load(Ordering::Acquire), Ordering::Release);
+        self.passive_admission_fast.store(
+            self.seeded_fast.load(Ordering::Acquire)
+                && !self
+                    .persistence
+                    .as_ref()
+                    .is_some_and(|p| p.enqueue_failed.load(Ordering::Acquire)),
+            Ordering::Release,
+        );
     }
 
     pub fn new(account_id: impl Into<String>) -> Self {
@@ -7757,6 +7908,21 @@ impl SharedAccount {
         Ok(account)
     }
 
+    fn lock_state_for_persistence(&self) -> AccountStateGuard<'_> {
+        let mut guard = self.lock_state();
+        guard.persistence_capture.enabled = true;
+        guard
+    }
+
+    fn lock_economic_state_for_persistence(
+        &self,
+        tokens: &HashSet<String>,
+    ) -> EconomicStateGuard<'_> {
+        let mut guard = self.lock_economic_state(tokens);
+        guard.persistence_capture.enabled = true;
+        guard
+    }
+
     fn lock_state(&self) -> AccountStateGuard<'_> {
         let wait_started = Instant::now();
         let control = self.control_gate.write().unwrap();
@@ -7816,6 +7982,7 @@ impl SharedAccount {
             reservation_epochs,
             trade_epochs,
             acquired_at,
+            persistence_capture: ColdPersistenceCapture::default(),
         }
     }
 
@@ -7918,6 +8085,7 @@ impl SharedAccount {
             scoped_tokens,
             token_interest_retirement: None,
             acquired_at,
+            persistence_capture: ColdPersistenceCapture::default(),
         }
     }
 
@@ -7966,6 +8134,7 @@ impl SharedAccount {
             reservation_epochs,
             trade_epochs,
             acquired_at,
+            persistence_capture: ColdPersistenceCapture::default(),
         }
     }
 
@@ -8813,15 +8982,36 @@ impl SharedAccount {
         *current
     }
 
-    fn schedule_persist(&self, state: &SharedAccountState) {
+    fn schedule_persist(&self, state: &impl ColdPersistenceTransaction) {
         if let Some(persistence) = &self.persistence {
-            persistence.schedule(state);
+            match state.persistence_capture().take_job(state) {
+                Ok(Some(job)) => persistence.enqueue(job),
+                Ok(None) => {}
+                Err(error) => self.fail_persistence_capture(error),
+            }
+        }
+    }
+
+    fn fail_persistence_capture(&self, error: String) {
+        if let Some(persistence) = &self.persistence {
+            // A serialization/capture failure cannot be repaired by replacing
+            // newer owner state with an unversioned aggregate snapshot.
+            persistence.enqueue_failed.store(true, Ordering::Release);
+            persistence.last_error.store(Some(Arc::new(error.clone())));
+            self.uncertain_fast.store(true, Ordering::Release);
+            self.admission_fast.store(false, Ordering::Release);
+            self.passive_admission_fast.store(false, Ordering::Release);
+            log::error!(
+                "[shared_account] account={} persistence capture failed: {}",
+                self.account_id,
+                error
+            );
         }
     }
 
     fn schedule_typed_persist(
         &self,
-        state: &SharedAccountState,
+        _state: &SharedAccountState,
         changes: Result<Vec<PersistenceWalChange>, String>,
     ) {
         let Some(persistence) = &self.persistence else {
@@ -8830,14 +9020,26 @@ impl SharedAccount {
         match changes {
             Ok(changes) if !changes.is_empty() => persistence.schedule_delta(changes),
             Ok(_) => {}
-            Err(error) => {
-                log::error!(
-                    "[shared_account] account={} typed WAL delta capture failed; falling back to full snapshot: {}",
-                    self.account_id,
-                    error,
-                );
-                persistence.schedule(state);
-            }
+            Err(error) => self.fail_persistence_capture(error),
+        }
+    }
+
+    /// Cold-owned journals/checkpoints have no reason to capture lifecycle
+    /// history. Keep these frequent triggers narrow even though complex cold
+    /// transactions still use before/after images during incremental migration.
+    fn schedule_control_entry<T: Serialize>(
+        &self,
+        state: &SharedAccountState,
+        map: &str,
+        key: &str,
+        value: Option<&T>,
+    ) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        match materialize_control_entry(state, map, key, value) {
+            Ok(changes) => persistence.schedule_delta(changes),
+            Err(error) => self.fail_persistence_capture(error),
         }
     }
 
@@ -9337,7 +9539,7 @@ impl SharedAccount {
             }
             return;
         }
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         if state
             .ownership_anomalies
             .remove(&format!("order_cancel_audit:{client_order_id}"))
@@ -9592,7 +9794,7 @@ impl SharedAccount {
             .and_then(AccountPersistence::last_error)
             .is_some()
         {
-            let state = self.lock_state();
+            let state = self.lock_state_for_persistence();
             self.schedule_persist(&state);
             drop(state);
             self.flush_admission_persistence()?;
@@ -9681,7 +9883,12 @@ impl SharedAccount {
         state
             .sidecar_checkpoints
             .insert(sidecar_id.to_string(), checkpoint);
-        self.schedule_persist(&state);
+        self.schedule_control_entry(
+            &state,
+            "sidecar_checkpoints",
+            sidecar_id,
+            state.sidecar_checkpoints.get(sidecar_id),
+        );
         Ok(true)
     }
 
@@ -9737,7 +9944,12 @@ impl SharedAccount {
         state
             .sidecar_checkpoints
             .insert(sidecar_id.to_string(), replacement);
-        self.schedule_persist(&state);
+        self.schedule_control_entry(
+            &state,
+            "sidecar_checkpoints",
+            sidecar_id,
+            state.sidecar_checkpoints.get(sidecar_id),
+        );
         Ok(true)
     }
 
@@ -9755,7 +9967,7 @@ impl SharedAccount {
         } else {
             1.0
         };
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let previous = state
             .instances
             .get(instance_id)
@@ -9794,7 +10006,7 @@ impl SharedAccount {
         if instance_id.is_empty() || scope_key.is_empty() {
             return;
         }
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let Some(instance) = state.instances.get_mut(instance_id) else {
             set_ownership_anomaly(
                 &mut state,
@@ -9833,7 +10045,7 @@ impl SharedAccount {
             ));
         }
 
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         if let Some(existing) = state.cash_allocation_migrations.get(operation_id) {
             return if existing.target_weights == *target_weights {
                 Ok(existing.clone())
@@ -9970,7 +10182,7 @@ impl SharedAccount {
                 "token interest requires instance/condition/up/down identifiers".into(),
             ));
         }
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let Some(instance) = state.instances.get_mut(instance_id) else {
             return Err(ReservationError::UnknownInstance(instance_id.into()));
         };
@@ -10031,7 +10243,7 @@ impl SharedAccount {
                 Vec::new()
             });
         }
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let now_ms = wall_clock_ms();
         // Keep every owned historical token in the explicit ERC-1155 and
         // settlement-query scope until physical and virtual quantities both
@@ -10173,7 +10385,7 @@ impl SharedAccount {
             }
             return;
         }
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let retired_interest = state
             .instances
             .get_mut(instance_id)
@@ -10816,7 +11028,7 @@ impl SharedAccount {
     /// their ledger rows for late attribution, but make admission fail closed
     /// until an explicit external ownership migration is recorded.
     pub fn reconcile_configured_instances(&self, configured: &HashSet<String>) {
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let mut stale = Vec::new();
         for (instance_id, instance) in &state.instances {
             if configured.contains(instance_id) {
@@ -11116,7 +11328,7 @@ impl SharedAccount {
             ));
         }
         let token_set: HashSet<&str> = token_ids.iter().map(String::as_str).collect();
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let next_config = TokenFeeConfig {
             rate,
             exponent,
@@ -11362,7 +11574,7 @@ impl SharedAccount {
         authoritative_tokens: HashSet<String>,
         missing_settlement_conditions: Option<&mut Vec<String>>,
     ) -> Result<bool, String> {
-        let mut state = self.lock_economic_state(&authoritative_tokens);
+        let mut state = self.lock_economic_state_for_persistence(&authoritative_tokens);
         if state.startup_snapshot_applied_this_process {
             return Ok(false);
         }
@@ -11742,7 +11954,7 @@ impl SharedAccount {
         } else {
             reason
         };
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let since_ms = state
             .risk_blockers
             .get(source)
@@ -11811,7 +12023,7 @@ impl SharedAccount {
         if source.is_empty() || !self.risk_blocker_sources_fast.load().contains(source) {
             return false;
         }
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         if state.risk_blockers.remove(source).is_none() {
             self.risk_blocker_sources_fast.rcu(|current| {
                 let mut next = (**current).clone();
@@ -12077,7 +12289,7 @@ impl SharedAccount {
             ));
         }
         let authoritative_tokens: HashSet<String> = position_deltas.keys().cloned().collect();
-        let mut state = self.lock_economic_state(&authoritative_tokens);
+        let mut state = self.lock_economic_state_for_persistence(&authoritative_tokens);
         if let Some(existing) = state.external_adjustments.get(operation_id) {
             if existing.instance_id == instance_id
                 && (existing.cash_delta - cash_delta).abs() <= EPS
@@ -13097,7 +13309,7 @@ impl SharedAccount {
             );
             return true;
         }
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let Some(old_order_id) = state
             .orders
             .get(client_order_id)
@@ -13153,7 +13365,7 @@ impl SharedAccount {
     }
 
     fn record_order_binding_anomaly(&self, client_order_id: &str, reason: String) -> bool {
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         set_ownership_anomaly(
             &mut state,
             format!("order_binding:{client_order_id}"),
@@ -13182,7 +13394,7 @@ impl SharedAccount {
         {
             return;
         }
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         set_ownership_anomaly(
             &mut state,
             format!("private_event:{payload_key}"),
@@ -13220,7 +13432,7 @@ impl SharedAccount {
         }
         let payload_key = format!("order:{normalized}");
         let _transition = self.private_anomaly_transition.lock().unwrap();
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         // A prior authenticated zero-fill terminal audit is stronger than a
         // delayed lifecycle replay.  Never recreate the historical blocker.
         if state
@@ -13317,7 +13529,7 @@ impl SharedAccount {
             return false;
         }
         let _transition = self.private_anomaly_transition.lock().unwrap();
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         if state
             .orders
             .values()
@@ -13370,7 +13582,7 @@ impl SharedAccount {
             return false;
         }
         let _transition = self.private_anomaly_transition.lock().unwrap();
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         if state
             .orders
             .values()
@@ -13450,7 +13662,7 @@ impl SharedAccount {
         {
             return;
         }
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         if state
             .ownership_anomalies
             .remove(&format!("private_event:{payload_key}"))
@@ -13531,7 +13743,7 @@ impl SharedAccount {
     }
 
     pub fn repair_ownership_anomaly(&self, anomaly_key: &str) -> bool {
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         if state.ownership_anomalies.remove(anomaly_key).is_none() {
             return false;
         }
@@ -14183,7 +14395,7 @@ impl SharedAccount {
             lifecycle
                 .cancel_audit_anomalies
                 .insert(client_order_id.to_string());
-            let mut state = self.lock_state();
+            let mut state = self.lock_state_for_persistence();
             set_ownership_anomaly(
                 &mut state,
                 format!("order_cancel_audit:{client_order_id}"),
@@ -14252,6 +14464,22 @@ impl SharedAccount {
         let Some(order) = lifecycle.orders.get_mut(client_order_id) else {
             return false;
         };
+        // DELETE acknowledges cancellation but carries no fill/audit facts.
+        // A prior private/REST audit (including an incomplete trade-ID audit)
+        // is stronger. Keep its exact metadata, residual reservation and
+        // recovery obligation; duplicate HTTP replies must not requeue it.
+        if order.terminal_matched_quantity.is_some()
+            || order.terminal_trade_ids_authoritative
+            || matches!(
+                order.status,
+                OrderStatus::Filled | OrderStatus::Failed | OrderStatus::Rejected
+            )
+            || (order.status == OrderStatus::Cancelled
+                && lifecycle.routine_cancel_audits.contains(client_order_id))
+        {
+            return lifecycle.recovery_pending_orders.contains(client_order_id)
+                || lifecycle.routine_cancel_audits.contains(client_order_id);
+        }
         order.status = OrderStatus::Cancelled;
         order.terminal_matched_quantity = None;
         order.terminal_trade_ids.clear();
@@ -14338,7 +14566,7 @@ impl SharedAccount {
         allocations: &HashMap<String, f64>,
     ) -> Result<(), ReservationError> {
         self.ensure_admission_persistence()?;
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         if !state.seeded {
             return Err(ReservationError::AccountNotSeeded);
         }
@@ -14388,7 +14616,7 @@ impl SharedAccount {
     }
 
     pub fn release_split_allocations(&self, allocations: &HashMap<String, f64>) {
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         for (instance_id, amount) in allocations {
             if let Some(instance) = state.instances.get_mut(instance_id) {
                 instance.reserved_cash = (instance.reserved_cash - *amount).max(0.0);
@@ -14405,7 +14633,7 @@ impl SharedAccount {
         down_token: &str,
         allocations: &HashMap<String, f64>,
     ) -> Result<(), ReservationError> {
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let total: f64 = allocations.values().copied().sum();
         if total > state.physical_cash + EPS {
             return Err(ReservationError::InsufficientPhysicalCash {
@@ -14474,7 +14702,7 @@ impl SharedAccount {
         }
         let authoritative_tokens: HashSet<String> =
             legs.iter().map(|(token, _, _)| token.clone()).collect();
-        let mut state = self.lock_economic_state(&authoritative_tokens);
+        let mut state = self.lock_economic_state_for_persistence(&authoritative_tokens);
         if !state.seeded {
             return Err(ReservationError::AccountNotSeeded);
         }
@@ -14548,7 +14776,7 @@ impl SharedAccount {
         allocations: &HashMap<String, f64>,
     ) -> Result<(), ReservationError> {
         self.ensure_admission_persistence()?;
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         if !state.seeded {
             return Err(ReservationError::AccountNotSeeded);
         }
@@ -14625,7 +14853,7 @@ impl SharedAccount {
         down_token: &str,
         allocations: &HashMap<String, f64>,
     ) {
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         for (instance_id, amount) in allocations {
             if let Some(instance) = state.instances.get_mut(instance_id) {
                 for token in [up_token, down_token] {
@@ -14646,7 +14874,7 @@ impl SharedAccount {
         down_token: &str,
         allocations: &HashMap<String, f64>,
     ) -> Result<(), ReservationError> {
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let total: f64 = allocations.values().copied().sum();
         for token in [up_token, down_token] {
             let physical = state.physical_positions.get(token).copied().unwrap_or(0.0);
@@ -14806,7 +15034,7 @@ impl SharedAccount {
         }
         let authoritative_tokens =
             HashSet::from([up_token_id.to_string(), down_token_id.to_string()]);
-        let mut state = self.lock_economic_state(&authoritative_tokens);
+        let mut state = self.lock_economic_state_for_persistence(&authoritative_tokens);
         if let Some(existing) = state.maintenance_ops.get(operation_id) {
             let expected_allocations: BTreeMap<String, f64> = allocations
                 .iter()
@@ -14987,7 +15215,12 @@ impl SharedAccount {
         operation.tx_id = Some(tx_id.to_string());
         operation.status = MaintenanceOperationStatus::Submitted;
         operation.updated_at_ms = wall_clock_ms();
-        self.schedule_persist(&state);
+        self.schedule_control_entry(
+            &state,
+            "maintenance_ops",
+            operation_id,
+            state.maintenance_ops.get(operation_id),
+        );
         Ok(())
     }
 
@@ -15013,7 +15246,7 @@ impl SharedAccount {
             }
             return;
         }
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         if let Some(operation) = state.maintenance_ops.get_mut(operation_id) {
             operation.status = MaintenanceOperationStatus::Uncertain;
             operation.updated_at_ms = wall_clock_ms();
@@ -15070,7 +15303,7 @@ impl SharedAccount {
                 })
                 .unwrap_or(0);
         }
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let cleared = clear_confirmed_maintenance_risk_blockers(&mut state);
         if cleared.is_empty() {
             return 0;
@@ -15172,7 +15405,7 @@ impl SharedAccount {
             operation_scope.up_token_id.clone(),
             operation_scope.down_token_id.clone(),
         ]);
-        let mut state = self.lock_economic_state(&authoritative_tokens);
+        let mut state = self.lock_economic_state_for_persistence(&authoritative_tokens);
         let Some(existing) = state.maintenance_ops.get(operation_id).cloned() else {
             return;
         };
@@ -15236,7 +15469,7 @@ impl SharedAccount {
             operation_scope.up_token_id.clone(),
             operation_scope.down_token_id.clone(),
         ]);
-        let mut state = self.lock_economic_state(&authoritative_tokens);
+        let mut state = self.lock_economic_state_for_persistence(&authoritative_tokens);
         let Some(existing) = state.maintenance_ops.get(operation_id).cloned() else {
             return Err(ReservationError::InvalidOrder(format!(
                 "unknown maintenance operation `{operation_id}`"
@@ -15798,7 +16031,7 @@ impl SharedAccount {
         } else {
             format!("trade:{trade_key}")
         };
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let reject = |state: &mut SharedAccountState, reason: String| {
             set_ownership_anomaly(state, anomaly_key.clone(), reason);
         };
@@ -17227,7 +17460,7 @@ impl SharedAccount {
         status: OrderStatus,
         is_maker: bool,
     ) -> bool {
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let Some(existing) = state.trades.get(trade_key).cloned() else {
             set_uncertain(
                 &mut state,
@@ -17294,7 +17527,7 @@ impl SharedAccount {
         {
             return false;
         }
-        let mut state = self.lock_state();
+        let mut state = self.lock_state_for_persistence();
         let Some(existing) = state.trades.get(trade_key).cloned() else {
             set_uncertain(
                 &mut state,
@@ -22388,6 +22621,10 @@ fn redistribute_all(state: &mut SharedAccountState) {
 }
 
 #[cfg(test)]
+#[path = "shared_account_persistence_regression_tests.rs"]
+mod persistence_regression_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -23284,14 +23521,14 @@ mod tests {
         assert!(summary.2 < 20_000_000);
     }
 
-    fn persistence_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn persistence_test_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn seeded_account() -> SharedAccount {
+    pub(super) fn seeded_account() -> SharedAccount {
         let account = SharedAccount::new("acct");
         account.register_instance("a", 1.0);
         account.register_instance("b", 3.0);
@@ -23718,10 +23955,10 @@ mod tests {
                 .iter()
                 .map(|job| job.generation)
                 .collect::<Vec<_>>(),
-            vec![2, 3, 4],
+            vec![1, 2, 3, 4],
         );
         assert!(matches!(
-            &coalesced[1].payload,
+            &coalesced[2].payload,
             PersistenceJobPayload::UnresolvedTradeMatchTime {
                 trade_key,
                 match_time_secs: None,
@@ -27673,7 +27910,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 .apply_physical_snapshot(100.0, HashMap::new())
                 .unwrap();
             {
-                let mut state = account.lock_state();
+                let mut state = account.lock_state_for_persistence();
                 state.physical_cash = 99.894124;
                 recompute_reconciliation(&mut state, "legacy wallet residual fixture");
                 state.uncertain = true;
@@ -29880,7 +30117,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         let wal_path = persistence_wal_path(&path);
         {
             let account = SharedAccount::new_persistent("wal-delta", &path).unwrap();
-            let mut state = account.lock_state();
+            let mut state = account.lock_state_for_persistence();
             for index in 0..5_000 {
                 state
                     .settled_token_values
@@ -29895,7 +30132,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         {
             let account = SharedAccount::new_persistent("wal-delta", &path).unwrap();
             let snapshot_len = std::fs::metadata(&path).unwrap().len();
-            let mut state = account.lock_state();
+            let mut state = account.lock_state_for_persistence();
             state
                 .settled_token_values
                 .insert("token-00000".to_string(), 0.0);
@@ -29984,7 +30221,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         );
     }
 
-    fn remove_persistence_test_files(path: &Path) {
+    pub(super) fn remove_persistence_test_files(path: &Path) {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(persistence_wal_path(path));
         let mut tmp_path = path.as_os_str().to_os_string();
