@@ -508,6 +508,15 @@ enum HistoricalOrderTradeAudit {
 fn fetch_historical_order_trade_audit(
     order_id: &str,
     submitted_at_ms: u64,
+    get: impl FnMut(&str) -> Result<serde_json::Value, String>,
+) -> HistoricalOrderTradeAudit {
+    fetch_historical_order_trade_audit_in_market(order_id, submitted_at_ms, None, get)
+}
+
+fn fetch_historical_order_trade_audit_in_market(
+    order_id: &str,
+    submitted_at_ms: u64,
+    market: Option<&str>,
     mut get: impl FnMut(&str) -> Result<serde_json::Value, String>,
 ) -> HistoricalOrderTradeAudit {
     let after_secs = (submitted_at_ms / 1_000).saturating_sub(ORPHAN_TRADE_AUDIT_REWIND_SECS);
@@ -515,11 +524,19 @@ fn fetch_historical_order_trade_audit(
     let mut seen_cursors = HashSet::new();
     let mut matching_records = 0usize;
     for page in 1..=ORPHAN_TRADE_AUDIT_MAX_PAGES {
-        let path = if cursor.is_empty() {
-            format!("{AUTHENTICATED_TRADES_PATH}?after={after_secs}")
-        } else {
-            format!("{AUTHENTICATED_TRADES_PATH}?after={after_secs}&next_cursor={cursor}")
-        };
+        let mut url = reqwest::Url::parse("https://clob.polymarket.com/data/trades")
+            .expect("constant authenticated history URL");
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("after", &after_secs.to_string());
+            if let Some(market) = market {
+                query.append_pair("market", market);
+            }
+            if !cursor.is_empty() {
+                query.append_pair("next_cursor", &cursor);
+            }
+        }
+        let path = format!("{}?{}", url.path(), url.query().expect("after query"));
         let json = match get(&path) {
             Ok(json) => json,
             Err(error) => {
@@ -7550,7 +7567,29 @@ impl PolymarketTrade {
         event_has_ended: bool,
         absence: &str,
     ) -> Option<OrderUpdate> {
-        if !is_recovered || !event_has_ended {
+        self.recover_absent_order_after_trade_audit_with(
+            ownership,
+            order_id,
+            is_recovered,
+            event_has_ended,
+            absence,
+            |oid, submitted_at_ms| self.audit_historical_order_trades(oid, submitted_at_ms),
+        )
+    }
+
+    /// The caller must establish either durable restart recovery or a clean
+    /// market-wide cancel after expiry. Unknown order replies alone do not
+    /// authorize this historical proof or release any reservation.
+    fn recover_absent_order_after_trade_audit_with(
+        &self,
+        ownership: &OrderOwnership,
+        order_id: &str,
+        recovery_scope_authorized: bool,
+        event_has_ended: bool,
+        absence: &str,
+        audit_history: impl FnOnce(&str, u64) -> HistoricalOrderTradeAudit,
+    ) -> Option<OrderUpdate> {
+        if !recovery_scope_authorized || !event_has_ended {
             return None;
         }
         // A no-fill history cannot override already observed matched quantity
@@ -7567,27 +7606,28 @@ impl PolymarketTrade {
             return None;
         }
         let submitted_at_ms = coid_wall_clock_ms(&ownership.client_order_id)?;
-        match self.audit_historical_order_trades(order_id, submitted_at_ms) {
+        match audit_history(order_id, submitted_at_ms) {
             HistoricalOrderTradeAudit::CompleteNoFill { pages, after_secs } => {
                 let audit = AuthoritativeOrderAudit {
                     original_size: Some(ownership.quantity.to_string()),
                     size_matched: Some("0".to_string()),
                     associate_trades: Vec::new(),
                 };
-                self.shared.commit_authoritative_terminal_audit(
+                // Revalidate on the sole lifecycle writer, never against the
+                // potentially lagging cold mirror after historical I/O.
+                match self.shared.account_state.apply_zero_fill_recovery(ownership) {
+                    Ok(crate::account::shared_account::FillAuditPendingTransition::Resolved) => {}
+                    Ok(_) => return None,
+                    Err(error) => {
+                        info!("[PolymarketTrade] no-fill recovery superseded coid={} reason={}; retaining current owner state",
+                            ownership.client_order_id, error);
+                        return None;
+                    }
+                }
+                self.shared.remove_order_after_authoritative_commit(
                     &ownership.client_order_id,
                     OrderStatus::Cancelled,
-                    &audit,
                 );
-                if !self
-                    .shared
-                    .account_state
-                    .terminal_order_audit_complete(&ownership.client_order_id)
-                {
-                    return None;
-                }
-                self.shared
-                    .remove_order_resolved_as(&ownership.client_order_id, OrderStatus::Cancelled);
                 info!("[PolymarketTrade] recovered order no-fill proof coid={} orderID={} event_ended=true absence={} trade_pages={} after_secs={} oid_matches=0 terminal=Cancelled reservation_released=true",
                     ownership.client_order_id, order_id, absence, pages, after_secs);
                 Some(Self::authoritative_recovery_update(
@@ -7603,6 +7643,48 @@ impl PolymarketTrade {
                 None
             }
         }
+    }
+
+    /// Expiry already canceled every asset successfully, but a single-order
+    /// replica may keep returning null long before the venue retires tokens.
+    /// Reuse the complete authenticated history proof on this cold path; do
+    /// not wait for token retirement or treat null itself as cancellation.
+    fn recover_expired_market_absent_orders(
+        &self,
+        audit: &RuntimeOrderAuditPass,
+        event_has_ended: bool,
+        remote_clean: bool,
+        mut audit_history: impl FnMut(&str, u64) -> HistoricalOrderTradeAudit,
+    ) -> Vec<OrderUpdate> {
+        if !event_has_ended
+            || !remote_clean
+            || audit.errors.len() != audit.retired_market_absent.len()
+        {
+            return Vec::new();
+        }
+        let mut updates = Vec::new();
+        for missing in &audit.retired_market_absent {
+            let Some(ownership) = self.shared.account_state.order(&missing.client_order_id) else {
+                continue;
+            };
+            if ownership.instance_id != missing.tracked.instance_id
+                || ownership.token_id != missing.tracked.symbol
+                || ownership.side != missing.tracked.side
+            {
+                continue;
+            }
+            if let Some(update) = self.recover_absent_order_after_trade_audit_with(
+                &ownership,
+                &missing.order_id,
+                true,
+                event_has_ended,
+                "expired_market_cancel_clean_order_absent",
+                &mut audit_history,
+            ) {
+                updates.push(update);
+            }
+        }
+        updates
     }
 
     pub fn reconcile_recovered_orders(&self) -> usize {
@@ -8822,8 +8904,8 @@ impl PolymarketTrade {
                 }
             }
 
-            let audit = self.reconcile_runtime_orders_for_tokens_pass(&tokens);
-            all_updates.extend(audit.updates);
+            let mut audit = self.reconcile_runtime_orders_for_tokens_pass(&tokens);
+            all_updates.append(&mut audit.updates);
             let terminal_token_responses =
                 invalid_token_responses.saturating_add(cancels_disabled_responses);
             let complete_retired_evidence_pass = terminal_token_responses == tokens.len()
@@ -8849,6 +8931,7 @@ impl PolymarketTrade {
                 );
             let retired_absent_count = audit.retired_market_absent.len();
             let mut retired_closed = 0usize;
+            let mut historical_no_fill_closed = 0usize;
             if retired_market_terminal {
                 for missing in &audit.retired_market_absent {
                     if let Some(update) =
@@ -8858,6 +8941,27 @@ impl PolymarketTrade {
                         retired_closed = retired_closed.saturating_add(1);
                     }
                 }
+            } else {
+                let recovered = self.recover_expired_market_absent_orders(
+                    &audit,
+                    allow_expired_market_terminalization,
+                    remote_clean,
+                    |oid, submitted_at_ms| {
+                        // Coids use a process-seeded sequence, so their suffix
+                        // can precede placement by hours. Restrict the complete
+                        // authenticated scan to this ended market, never the
+                        // whole account history since process startup.
+                        fetch_historical_order_trade_audit_in_market(
+                            oid,
+                            submitted_at_ms,
+                            Some(market_condition_id),
+                            |path| self.shared.http_call_sync("GET", path, "")
+                                .map_err(|error| error.to_string()),
+                        )
+                    },
+                );
+                historical_no_fill_closed = recovered.len();
+                all_updates.extend(recovered);
             }
             let open_orders = self
                 .shared
@@ -8882,10 +8986,12 @@ impl PolymarketTrade {
             let local_clean = if retired_market_terminal {
                 retired_closed == retired_absent_count && open_orders == 0 && recovery_pending == 0
             } else {
-                audit.errors.is_empty() && open_orders == 0 && recovery_pending == 0
+                audit.errors.len() == historical_no_fill_closed
+                    && open_orders == 0
+                    && recovery_pending == 0
             };
             last_detail = format!(
-                "attempt={} remote=[{}] invalid_token_responses={} cancels_disabled_responses={} terminal_token_responses={}/{} retired_evidence_streak={} parallel_absence_fast_path={} retired_market_terminal={} retired_orders_closed={}/{} open_orders={} recovery_pending={} audit_errors={:?}",
+                "attempt={} remote=[{}] invalid_token_responses={} cancels_disabled_responses={} terminal_token_responses={}/{} retired_evidence_streak={} parallel_absence_fast_path={} retired_market_terminal={} retired_orders_closed={}/{} historical_no_fill_closed={} open_orders={} recovery_pending={} audit_errors={:?}",
                 attempt_idx + 1,
                 remote_details.join(", "),
                 invalid_token_responses,
@@ -8897,6 +9003,7 @@ impl PolymarketTrade {
                 retired_market_terminal,
                 retired_closed,
                 retired_absent_count,
+                historical_no_fill_closed,
                 open_orders,
                 recovery_pending,
                 audit.errors,
@@ -13431,6 +13538,10 @@ mod reconcile_identity_tests;
 #[cfg(test)]
 #[path = "trade_retirement_tests.rs"]
 mod retirement_tests;
+
+#[cfg(test)]
+#[path = "trade_expired_recovery_tests.rs"]
+mod expired_recovery_tests;
 
 #[cfg(test)]
 mod tests {
