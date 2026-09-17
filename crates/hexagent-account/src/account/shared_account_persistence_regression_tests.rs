@@ -1,5 +1,139 @@
 use super::*;
 
+#[test]
+fn zero_fill_recovery_revalidates_on_lifecycle_owner_before_releasing_reservation() {
+    let account = Arc::new(SharedAccount::new("zero-fill-owner"));
+    for iid in ["a", "b"] {
+        account.register_instance(iid, 1.0);
+    }
+    account
+        .apply_physical_snapshot(200.0, HashMap::from([("UP".into(), 80.0)]))
+        .unwrap();
+    for (iid, coid) in [("a", "a-order"), ("b", "b-order")] {
+        account
+            .reserve_order(iid, coid, coid, "UP", Side::Sell, 20.0, 0.5, 0)
+            .unwrap();
+        account.mark_order_status(coid, OrderStatus::NewOrderTimeout);
+    }
+    let a = account.order("a-order").unwrap();
+    let b = account.order("b-order").unwrap();
+    let (_, cold_owner) = account.bind_account_owner().unwrap();
+    cold_owner.mark_current_thread().unwrap();
+    let owner = account.bind_account_lifecycle_owner().unwrap();
+    let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+    let worker = std::thread::spawn(move || {
+        owner.mark_current_thread().unwrap();
+        loop {
+            crossbeam_channel::select_biased! {
+                recv(owner.receiver()) -> command => match command {
+                    Ok(command) => owner.execute(command), Err(_) => break,
+                },
+                recv(stop_rx) -> _ => break,
+            }
+        }
+    });
+    account
+        .apply_authoritative_order_audit(
+            "a-order",
+            OrderStatus::Cancelled,
+            &AuthoritativeOrderAudit {
+                original_size: Some("20".into()),
+                size_matched: Some("4".into()),
+                associate_trades: vec!["late-trade".into()],
+            },
+        )
+        .unwrap();
+    cold_owner.execute_lifecycle_mirror();
+    let matched = account.order("a-order").unwrap();
+    assert!(account.apply_zero_fill_recovery(&a).is_err());
+    assert_eq!(account.order("a-order").unwrap(), matched);
+    let mut wrong_owner = b.clone();
+    wrong_owner.instance_id = "a".into();
+    assert!(account.apply_zero_fill_recovery(&wrong_owner).is_err());
+    assert_eq!(account.order("b-order").unwrap().reserved_quantity, 20.0);
+    assert_eq!(
+        account.apply_zero_fill_recovery(&b).unwrap(),
+        FillAuditPendingTransition::Resolved
+    );
+    cold_owner.execute_lifecycle_mirror();
+    let terminal = account.order("b-order").unwrap();
+    assert_eq!(terminal.status, OrderStatus::Cancelled);
+    assert_eq!(terminal.reserved_quantity, 0.0);
+    assert!(terminal.terminal_trade_ids_authoritative);
+    assert_eq!(
+        account.apply_zero_fill_recovery(&b).unwrap(),
+        FillAuditPendingTransition::Resolved
+    );
+    assert_eq!(account.order("b-order").unwrap(), terminal);
+    assert_eq!(account.order("a-order").unwrap(), matched);
+    assert_eq!(account.account_lifecycle_queue_metrics().2, 0);
+    stop_tx.send(()).unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+#[ignore = "focused no-fill recovery owner dispatch/commit microbenchmark"]
+fn benchmark_zero_fill_recovery_owner_commit() {
+    let account = Arc::new(SharedAccount::new("zero-fill-benchmark"));
+    account.register_instance("a", 1.0);
+    account
+        .apply_physical_snapshot(1_000_000.0, HashMap::new())
+        .unwrap();
+    let count = 300;
+    let mut candidates = Vec::new();
+    for i in 0..(count * 2) {
+        let coid = format!("a-{i}");
+        account
+            .reserve_order("a", &coid, &coid, "UP", Side::Buy, 20.0, 0.5, 0)
+            .unwrap();
+        candidates.push(account.order(&coid).unwrap());
+    }
+    let owner = account.bind_account_lifecycle_owner().unwrap();
+    let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+    let worker = std::thread::spawn(move || {
+        owner.mark_current_thread().unwrap();
+        loop {
+            crossbeam_channel::select_biased! {
+                recv(owner.receiver()) -> command => match command {
+                    Ok(command) => owner.execute(command), Err(_) => break,
+                },
+                recv(stop_rx) -> _ => break,
+            }
+        }
+    });
+    let audit = AuthoritativeOrderAudit {
+        original_size: Some("20".into()),
+        size_matched: Some("0".into()),
+        associate_trades: vec![],
+    };
+    for (mode, orders) in [
+        ("previous_unconditional", &candidates[..count]),
+        ("conditional_owner_commit", &candidates[count..]),
+    ] {
+        let mut samples = Vec::new();
+        for order in orders {
+            let start = std::time::Instant::now();
+            let result = if mode == "previous_unconditional" {
+                account.apply_authoritative_order_audit(
+                    &order.client_order_id,
+                    OrderStatus::Cancelled,
+                    &audit,
+                )
+            } else {
+                account.apply_zero_fill_recovery(order)
+            };
+            samples.push(start.elapsed().as_nanos() as u64);
+            assert_eq!(result.unwrap(), FillAuditPendingTransition::Resolved);
+        }
+        samples.sort_unstable();
+        let q = |p: f64| samples[((samples.len() as f64 * p).ceil() as usize).saturating_sub(1)];
+        let queue = account.account_lifecycle_queue_metrics();
+        eprintln!("zero_fill boundary=owner_dispatch+conditional_check+account_commit+reply mode={mode} n={count} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth={} queue_high_water={} overflow={} network_and_disk=false", q(0.5), q(0.99), q(0.999), samples.last().unwrap(), queue.0, queue.1, queue.2);
+    }
+    stop_tx.send(()).unwrap();
+    worker.join().unwrap();
+}
+
 fn raw_durable(path: &Path) -> SharedAccountState {
     let mut persisted: PersistedAccount =
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();

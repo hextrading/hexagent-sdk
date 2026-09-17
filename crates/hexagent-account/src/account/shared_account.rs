@@ -481,6 +481,10 @@ enum AccountOwnerOperation {
         audit: AuthoritativeOrderAudit,
         reply: crossbeam_channel::Sender<Result<FillAuditPendingTransition, String>>,
     },
+    ApplyZeroFillRecovery {
+        expected: OrderOwnership,
+        reply: crossbeam_channel::Sender<Result<FillAuditPendingTransition, String>>,
+    },
     MarkCancelledPendingAudit {
         client_order_id: String,
         reply: crossbeam_channel::Sender<bool>,
@@ -801,6 +805,9 @@ impl AccountOwnerCommand {
                     status,
                     &audit,
                 ));
+            }
+            ApplyZeroFillRecovery { expected, reply } => {
+                let _ = reply.send(account.apply_zero_fill_recovery(&expected));
             }
             MarkCancelledPendingAudit {
                 client_order_id,
@@ -14214,6 +14221,43 @@ impl SharedAccount {
                 })
             })?;
         }
+        self.apply_authoritative_order_audit_inner(client_order_id, status, audit, None)
+    }
+
+    /// Commit a completed historical no-fill proof only if the owning
+    /// lifecycle writer still observes the exact candidate identity with no
+    /// matched quantity or trade obligation. The check and terminal mutation
+    /// execute in one owner turn; a cold pre-I/O snapshot is not authority.
+    pub fn apply_zero_fill_recovery(
+        &self,
+        expected: &OrderOwnership,
+    ) -> Result<FillAuditPendingTransition, String> {
+        if self.must_dispatch_lifecycle_to_owner() {
+            let expected = expected.clone();
+            return self.request_account_lifecycle_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::ApplyZeroFillRecovery { expected, reply })
+            })?;
+        }
+        let audit = AuthoritativeOrderAudit {
+            original_size: Some(expected.quantity.to_string()),
+            size_matched: Some("0".to_string()),
+            associate_trades: Vec::new(),
+        };
+        self.apply_authoritative_order_audit_inner(
+            &expected.client_order_id,
+            OrderStatus::Cancelled,
+            &audit,
+            Some(expected),
+        )
+    }
+
+    fn apply_authoritative_order_audit_inner(
+        &self,
+        client_order_id: &str,
+        status: OrderStatus,
+        audit: &AuthoritativeOrderAudit,
+        expected_unmatched: Option<&OrderOwnership>,
+    ) -> Result<FillAuditPendingTransition, String> {
         if !matches!(status, OrderStatus::Filled | OrderStatus::Cancelled) {
             return Err(format!(
                 "authoritative terminal audit requires Filled/Cancelled, got {status:?}",
@@ -14259,6 +14303,22 @@ impl SharedAccount {
             );
             return Ok(FillAuditPendingTransition::NotTracked);
         };
+        if let Some(expected) = expected_unmatched {
+            if existing.account_id != expected.account_id
+                || existing.instance_id != expected.instance_id
+                || existing.order_id != expected.order_id
+                || existing.token_id != expected.token_id
+                || existing.side != expected.side
+                || existing.order_slot != expected.order_slot
+                || existing.quantity != expected.quantity
+                || matches!(existing.status, OrderStatus::Filled | OrderStatus::Failed | OrderStatus::Rejected | OrderStatus::ExecutorRejected)
+                || existing.filled_quantity != 0.0
+                || existing.terminal_matched_quantity.is_some_and(|quantity| quantity != 0.0)
+                || !existing.terminal_trade_ids.is_empty()
+            {
+                return Err(format!("zero-fill recovery candidate changed coid={client_order_id}"));
+            }
+        }
         let tolerance = existing.quantity.abs().max(1.0) * 1e-8;
         if !original.is_finite()
             || (original - existing.quantity).abs() > tolerance

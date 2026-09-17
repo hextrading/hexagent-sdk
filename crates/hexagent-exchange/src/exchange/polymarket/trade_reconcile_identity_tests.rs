@@ -1,6 +1,6 @@
 use super::*;
 
-fn ownership(side: Side, coid: &str, oid: &str, instance: &str) -> OrderOwnership {
+pub(super) fn ownership(side: Side, coid: &str, oid: &str, instance: &str) -> OrderOwnership {
     OrderOwnership {
         order_slot: OrderSlot::with_generation(8147, 18),
         account_id: "shutdown-test".into(),
@@ -23,7 +23,7 @@ fn ownership(side: Side, coid: &str, oid: &str, instance: &str) -> OrderOwnershi
     }
 }
 
-fn tracked(order: &OrderOwnership) -> TrackedOrder {
+pub(super) fn tracked(order: &OrderOwnership) -> TrackedOrder {
     TrackedOrder {
         order_slot: order.order_slot,
         symbol: order.token_id.clone(),
@@ -53,7 +53,7 @@ fn snapshot(order: &OrderOwnership) -> ExecutionStateSnapshot {
     }
 }
 
-fn install(shared: &SharedState, order: &OrderOwnership) {
+pub(super) fn install(shared: &SharedState, order: &OrderOwnership) {
     shared
         .account_state
         .register_instance(&order.instance_id, 1.0);
