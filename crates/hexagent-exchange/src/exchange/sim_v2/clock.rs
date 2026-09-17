@@ -101,6 +101,22 @@ impl Scheduler {
             .is_some_and(|item| item.deadline_priority == 0)
     }
 
+    /// Exclusive insertion watermark. Used only by offline recovery to wait
+    /// for already-created messages without admitting later work into the gate.
+    pub(crate) fn enqueue_watermark(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Read-only inspection retains heap ordering, payload ownership and all
+    /// simulator lifecycle references. Iteration order is intentionally opaque.
+    pub(crate) fn events(&self) -> impl Iterator<Item = (u64, u64, &SimEvent)> {
+        self.heap.iter().map(|item| (item.seq, item.when, &item.ev))
+    }
+
+    pub(crate) fn peek_event(&self) -> Option<(u64, &SimEvent)> {
+        self.heap.peek().map(|item| (item.seq, &item.ev))
+    }
+
     pub fn len(&self) -> usize {
         self.heap.len()
     }

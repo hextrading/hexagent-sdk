@@ -160,6 +160,32 @@ pub trait Strategy: Send {
     ) -> Result<(), SignalBatchOverflow> {
         extend_signal_batch(out, self.on_watchdog(now_ns))
     }
+    /// Offline scheduler hook. Enabled only for the explicit virtual-owner
+    /// backtest arm; default preserves existing strategy behavior.
+    fn set_backtest_owner_scheduler(&mut self, _enabled: bool) {}
+    /// Offline warm-checkpoint gate. Existing account/order state is retained;
+    /// new-place callbacks must remain closed until catch-up and fresh inputs.
+    fn set_backtest_recovery_gate(&mut self, _closed: bool) {}
+    /// Causal archive query response applied only after a modeled restart query
+    /// completes. Historical reports must not be replayed as current market
+    /// callbacks. Return an error if required event boundaries remain unknown.
+    fn on_backtest_recovery_oracle_history(
+        &mut self,
+        _reports: &[SpotPrice],
+        _query_cutoff_ns: u64,
+        _applied_ns: u64,
+    ) -> Result<usize, String> {
+        Ok(0)
+    }
+    /// Virtual timer callback. Strategies with live-only I/O in on_watchdog
+    /// override this to apply only their deterministic backtest maintenance.
+    fn on_backtest_watchdog_into(
+        &mut self,
+        now_ns: u64,
+        out: &mut SignalBatch,
+    ) -> Result<(), SignalBatchOverflow> {
+        self.on_watchdog_into(now_ns, out)
+    }
     fn on_exit(&mut self) {}
 
     /// Transfer an optional venue-private event lane to the engine at strategy

@@ -68,6 +68,14 @@ fn config(
         None
     };
     let cfg = SimV2Config {
+        liquidity_ledger_enabled: bt.sim_v2_liquidity_ledger,
+        match_time_liquidity: bt.sim_v2_match_time_liquidity,
+        network_outbound_fraction_bps: bt.sim_v2_network_outbound_fraction_bps,
+        market_rules_path: bt.sim_v2_market_rules_path.clone(),
+        arrival_interval_audit: bt.sim_v2_arrival_interval_audit,
+        historical_self_depth_path: bt.sim_v2_historical_self_depth_path.clone(),
+        historical_self_depth_fraction: bt.sim_v2_historical_self_depth_fraction,
+        queue_uncertainty_strength: bt.sim_v2_queue_uncertainty_strength,
         replay_arrival_time_strict: bt.sim_replay_arrival_time_strict,
         raw_server_clock: bt.sim_v2_raw_server_clock,
         strict_admission: bt.sim_v2_strict_admission,
@@ -387,8 +395,12 @@ fn main() -> Result<()> {
     // diagnostic assigns its unknown internal split through the sensitivity
     // fraction and must not append the independent baseline taker overhead.
     sim.set_taker_overhead_enabled(false);
+    sim.configure_selection(&bt.sim_v2_selection_mode,&bt.sim_v2_selection_model_path,bt.sim_v2_selection_strength,bt.sim_latency_seed,bt.sim_v2_selection_audit)?;
+    sim.configure_selection_roles(bt.sim_v2_selection_maker_strength, bt.sim_v2_selection_taker_strength)?;
+    sim.configure_maker_trade_through_recovery(bt.sim_v2_maker_trade_through_recovery)?;
     std::fs::create_dir_all(&args[5])?;
     let output = Path::new(&args[5]);
+    let mut selection_writer=if bt.sim_v2_selection_audit {Some(BufWriter::new(File::create(output.join("selection_audit.jsonl"))?))} else {None};
     let mut updates = BufWriter::new(File::create(output.join("updates.jsonl"))?);
     let mut arrivals = BufWriter::new(File::create(output.join("command_arrivals.jsonl"))?);
     let mut admission = if bt.sim_v2_admission_audit {
@@ -401,6 +413,13 @@ fn main() -> Result<()> {
     let mut execution_timing = if bt.sim_v2_execution_timing_audit {
         Some(BufWriter::new(File::create(
             output.join("execution_timing_audit.jsonl"),
+        )?))
+    } else {
+        None
+    };
+    let mut arrival_intervals = if bt.sim_v2_arrival_interval_audit {
+        Some(BufWriter::new(File::create(
+            output.join("arrival_interval_audit.jsonl"),
         )?))
     } else {
         None
@@ -444,7 +463,11 @@ fn main() -> Result<()> {
         } else {
             let command = &commands[cursor];
             let rtt = command.completed_ns - command.dispatched_ns;
-            let l1 = (rtt as f64 * fraction).round() as u64;
+            let l1 = if bt.sim_v2_network_outbound_fraction_bps == 5000 {
+                (rtt as f64 * fraction).round() as u64
+            } else {
+                ((rtt as u128 * bt.sim_v2_network_outbound_fraction_bps as u128) / 10_000) as u64
+            };
             let l2 = rtt.saturating_sub(l1);
             let cancel_timing = if command.kind == "cancel" {
                 sim.cancel_timing_preview(command.dispatched_ns, l1, l2)
@@ -502,13 +525,32 @@ fn main() -> Result<()> {
             writeln!(arrivals)?;
             cursor += 1;
         }
+        if let Some(writer)=selection_writer.as_mut() {
+            for row in sim.drain_selection_audit() {serde_json::to_writer(&mut *writer,&row)?;writeln!(writer)?;}
+        }
         if let Some(writer) = execution_timing.as_mut() {
             for row in sim.drain_execution_timing_audit() {
                 serde_json::to_writer(&mut *writer, &row)?;
                 writeln!(writer)?;
             }
         }
+        if let Some(writer) = arrival_intervals.as_mut() {
+            for row in sim.drain_arrival_interval_audit() {
+                serde_json::to_writer(&mut *writer, &row)?;
+                writeln!(writer)?;
+            }
+        }
     }
+    sim.finish_arrival_interval_audit();
+    if let Some(writer) = arrival_intervals.as_mut() {
+        for row in sim.drain_arrival_interval_audit() {
+            serde_json::to_writer(&mut *writer, &row)?;
+            writeln!(writer)?;
+        }
+        writer.flush()?;
+    }
+    if let Some(writer)=selection_writer.as_mut() {writer.flush()?;}
+    std::fs::write(output.join("selection_summary.json"),serde_json::to_vec_pretty(sim.selection_stats())?)?;
     updates.flush()?;
     arrivals.flush()?;
     if let Some(writer) = execution_timing.as_mut() {
@@ -597,12 +639,16 @@ fn main() -> Result<()> {
     let summary = json!({"commands": cursor, "local_events": local_events,
         "first_fill_exact_timestamp_public_evidence_rows": evidence_rows,
         "sim_events": sim_events, "updates": update_count,
-        "outbound_fraction_assumption": fraction, "window_epochs": [start_epoch, end_epoch],
+        "outbound_fraction_assumption": if bt.sim_v2_network_outbound_fraction_bps == 5000 {fraction} else {bt.sim_v2_network_outbound_fraction_bps as f64 / 10_000.0}, "window_epochs": [start_epoch, end_epoch],
         "cancel_finality_fraction": bt.sim_v2_cancel_finality_delay_frac,
         "cancel_timing_stats": sim.cancel_timing_stats(),
         "execution_timing_audit": sim.execution_timing_stats(),
+        "arrival_interval_audit": sim.arrival_interval_stats(),
+        "v6_fidelity": sim.v6_fidelity_stats(),
+        "market_rules": sim.market_rule_stats(),
         "replay_complete": cursor == commands.len() && next_local.is_none() && sim.peek_when().is_none()
-            && sim.execution_timing_stats().queued == 0,
+            && sim.execution_timing_stats().queued == 0 && sim.arrival_interval_stats().pending == 0
+            && sim.arrival_interval_stats().queued == 0,
         "scheduler_pending_at_end": sim.peek_when().is_some(),
         "core_stats_taker_maker_reject": sim.core_stats(),
         "trade_anchor_stats": sim.trade_anchor_stats(),

@@ -28,6 +28,7 @@
 //! model. P4: timeout/orphan + RTT calibration refinement.
 
 pub mod admission;
+pub mod arrival_interval;
 pub mod book;
 pub mod clock;
 pub mod event;
@@ -35,7 +36,9 @@ pub mod evidence;
 pub mod exchange;
 pub mod feed;
 pub mod latency;
+pub mod market_rules;
 pub mod simulator;
+pub mod selection;
 pub mod timing;
 pub mod wallet;
 
