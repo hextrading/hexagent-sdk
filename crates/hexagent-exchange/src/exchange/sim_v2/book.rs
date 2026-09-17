@@ -44,6 +44,14 @@ pub struct TokenBook {
 #[derive(Default)]
 pub struct BookSet {
     books: HashMap<String, TokenBook>,
+    // Offline exchange-thread-owned counterfactual consumption. Entries have
+    // exactly the current snapshot's levels; retirement drops the token.
+    liquidity_ledger_enabled: bool,
+    consumed: HashMap<String, TokenBook>,
+    consumed_qty: f64,
+    reconciled_qty: f64,
+    ledger_snapshots: u64,
+    ledger_level_high_water: usize,
     /// token ↔ complement token (binary markets).
     pairs: HashMap<String, String>,
     /// One-step lookahead snapshots for the "race" model (design: maker/taker
@@ -88,25 +96,43 @@ fn finite_levels(levels: &[PriceLevel]) -> impl Iterator<Item = &PriceLevel> {
 /// Build the merged effective ladder a taker sweeps from a direct book and an
 /// optional complement book. `is_buy`: `direct.asks` ∪ `comp.bids`→(1−p) sorted
 /// ascending; else `direct.bids` ∪ `comp.asks`→(1−p) sorted descending.
-fn merged_ladder(direct: Option<&TokenBook>, comp: Option<&TokenBook>, is_buy: bool) -> Vec<PriceLevel> {
+fn merged_ladder(
+    direct: Option<&TokenBook>,
+    comp: Option<&TokenBook>,
+    is_buy: bool,
+) -> Vec<PriceLevel> {
     let mut v: Vec<PriceLevel> = Vec::new();
     if let Some(b) = direct {
         let levels = if is_buy { &b.asks } else { &b.bids };
         for l in finite_levels(levels) {
-            v.push(PriceLevel { price: l.price, quantity: l.quantity });
+            v.push(PriceLevel {
+                price: l.price,
+                quantity: l.quantity,
+            });
         }
     }
     if let Some(cb) = comp {
         let levels = if is_buy { &cb.bids } else { &cb.asks };
         for l in finite_levels(levels) {
-            v.push(PriceLevel { price: 1.0 - l.price, quantity: l.quantity });
+            v.push(PriceLevel {
+                price: 1.0 - l.price,
+                quantity: l.quantity,
+            });
         }
     }
     v.retain(|l| l.price > 0.0 && l.price < 1.0 && l.quantity > 0.0);
     if is_buy {
-        v.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+        v.sort_by(|a, b| {
+            a.price
+                .partial_cmp(&b.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     } else {
-        v.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+        v.sort_by(|a, b| {
+            b.price
+                .partial_cmp(&a.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
     v
 }
@@ -119,7 +145,13 @@ fn merged_ladder(direct: Option<&TokenBook>, comp: Option<&TokenBook>, is_buy: b
 /// caller passes `comp = None` (see `comp_book`): the canonical book already holds
 /// the mirrored down liquidity, so a non-None `comp` here would double-count the
 /// SAME orders (up.bid[p] ≡ down.ask[1−p]).
-fn merged_depth(direct: Option<&TokenBook>, comp: Option<&TokenBook>, side: Side, price: f64, tick: f64) -> f64 {
+fn merged_depth(
+    direct: Option<&TokenBook>,
+    comp: Option<&TokenBook>,
+    side: Side,
+    price: f64,
+    tick: f64,
+) -> f64 {
     let want = price_to_ticks(price, tick);
     let mut sum = 0.0;
     if let Some(b) = direct {
@@ -148,6 +180,76 @@ fn merged_depth(direct: Option<&TokenBook>, comp: Option<&TokenBook>, side: Side
     sum
 }
 
+// Preserve outstanding consumption across unchanged snapshots. A decrease
+// absorbs existing debt first; an increase creates fresh available quantity.
+// Thus 10, consume 6, raw 6 leaves 4 executable; raw 0 then raw 10 restores 10.
+// This is an explicit minimum-replacement L2 assumption, not reconstructed MBO.
+fn reconcile_consumed(debt: &mut Vec<PriceLevel>, old: &[PriceLevel], new: &[PriceLevel]) {
+    debt.retain_mut(|entry| {
+        let Some(level) = new.iter().find(|l| (l.price - entry.price).abs() < 1e-9) else {
+            return false;
+        };
+        let prior = old
+            .iter()
+            .find(|l| (l.price - entry.price).abs() < 1e-9)
+            .map_or(0.0, |l| l.quantity);
+        entry.quantity = (entry.quantity - (prior - level.quantity).max(0.0))
+            .max(0.0)
+            .min(level.quantity.max(0.0));
+        true
+    });
+    for level in new {
+        if !debt.iter().any(|l| (l.price - level.price).abs() < 1e-9) {
+            debt.push(PriceLevel {
+                price: level.price,
+                quantity: 0.0,
+            });
+        }
+    }
+}
+
+fn consume_raw_level(
+    raw: &TokenBook,
+    debt: &mut TokenBook,
+    side: Side,
+    price: f64,
+    tick: f64,
+    left: &mut f64,
+) {
+    let (raw, debt) = if side == Side::Buy {
+        (&raw.bids, &mut debt.bids)
+    } else {
+        (&raw.asks, &mut debt.asks)
+    };
+    let want = price_to_ticks(price, tick);
+    for d in debt {
+        if price_to_ticks(d.price, tick) != want {
+            continue;
+        }
+        let qty = raw
+            .iter()
+            .filter(|l| (l.price - d.price).abs() < 1e-9)
+            .map(|l| l.quantity)
+            .sum::<f64>();
+        let take = (qty - d.quantity).max(0.0).min(*left);
+        d.quantity += take;
+        *left -= take;
+    }
+}
+
+fn aggregate_equal_prices(levels: &mut Vec<PriceLevel>) {
+    let mut write = 0usize;
+    for read in 0..levels.len() {
+        if write > 0 && (levels[read].price - levels[write - 1].price).abs() < 1e-9 {
+            levels[write - 1].quantity += levels[read].quantity;
+        } else {
+            levels[write] = levels[read].clone();
+            write += 1;
+        }
+    }
+    levels.truncate(write);
+}
+
 /// Sum ladder volume reachable within `lim` (None = market: all of it).
 fn within_volume(ladder: &[PriceLevel], is_buy: bool, lim: Option<f64>) -> f64 {
     ladder
@@ -164,6 +266,178 @@ fn within_volume(ladder: &[PriceLevel], is_buy: bool, lim: Option<f64>) -> f64 {
 impl BookSet {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_liquidity_ledger_enabled(&mut self, enabled: bool) {
+        self.liquidity_ledger_enabled = enabled;
+        self.consumed.clear();
+        self.ladder_cache.get_mut().clear();
+        if enabled {
+            for (token, book) in &self.books {
+                self.consumed.insert(
+                    token.clone(),
+                    TokenBook {
+                        bids: book
+                            .bids
+                            .iter()
+                            .map(|l| PriceLevel {
+                                price: l.price,
+                                quantity: 0.0,
+                            })
+                            .collect(),
+                        asks: book
+                            .asks
+                            .iter()
+                            .map(|l| PriceLevel {
+                                price: l.price,
+                                quantity: 0.0,
+                            })
+                            .collect(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Available counterfactual quantity; the historical book stays untouched
+    /// for observation, queue evidence and later snapshot reconciliation.
+    pub fn executable_level_qty(
+        &self,
+        token: &str,
+        maker_side: Side,
+        price: f64,
+        tick: f64,
+    ) -> f64 {
+        let raw = self.level_depth(token, maker_side, price, tick);
+        if !self.liquidity_ledger_enabled {
+            return raw;
+        }
+        let comp = self.pairs.get(token).and_then(|c| self.consumed.get(c));
+        let used = merged_depth(self.consumed.get(token), comp, maker_side, price, tick);
+        (raw - used).max(0.0)
+    }
+
+    /// Commit a successful simulated execution only after FOK and wallet
+    /// validation. One ledger is shared by every simulated order in this venue.
+    pub fn consume_level(
+        &mut self,
+        token: &str,
+        maker_side: Side,
+        price: f64,
+        tick: f64,
+        qty: f64,
+    ) -> f64 {
+        if !self.liquidity_ledger_enabled || qty <= 0.0 {
+            return 0.0;
+        }
+        let mut left = qty;
+        if let (Some(raw), Some(debt)) = (self.books.get(token), self.consumed.get_mut(token)) {
+            consume_raw_level(raw, debt, maker_side, price, tick, &mut left);
+        }
+        if let Some(comp) = self.pairs.get(token) {
+            if let (Some(raw), Some(debt)) = (self.books.get(comp), self.consumed.get_mut(comp)) {
+                let side = if maker_side == Side::Buy {
+                    Side::Sell
+                } else {
+                    Side::Buy
+                };
+                consume_raw_level(raw, debt, side, 1.0 - price, tick, &mut left);
+            }
+        }
+        self.consumed_qty += qty - left;
+        qty - left
+    }
+
+    pub fn liquidity_ledger_stats(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": self.liquidity_ledger_enabled,
+            "consumed_qty": self.consumed_qty,
+            "reconciled_qty": self.reconciled_qty,
+            "snapshots": self.ledger_snapshots,
+            "active_tokens": self.consumed.len(),
+            "max_levels_per_token": self.ledger_level_high_water,
+            "outstanding_debt": self.consumed.values().flat_map(|b| b.bids.iter().chain(&b.asks)).map(|l| l.quantity).sum::<f64>(),
+            "snapshot_policy": "observed decreases absorb consumption; only increases replenish",
+        })
+    }
+
+    pub fn executable_volume(&self, token: &str, taker_side: Side, limit: f64, tick: f64) -> f64 {
+        let ladder = if taker_side == Side::Buy {
+            self.buy_ladder(token)
+        } else {
+            self.sell_ladder(token)
+        };
+        let maker_side = if taker_side == Side::Buy {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        ladder
+            .iter()
+            .filter(|l| {
+                if taker_side == Side::Buy {
+                    l.price <= limit + 1e-9
+                } else {
+                    l.price >= limit - 1e-9
+                }
+            })
+            .map(|l| self.executable_level_qty(token, maker_side, l.price, tick))
+            .sum()
+    }
+
+    pub fn consume_sweep(
+        &mut self,
+        token: &str,
+        taker_side: Side,
+        limit: f64,
+        tick: f64,
+        qty: f64,
+    ) -> f64 {
+        let ladder = if taker_side == Side::Buy {
+            self.buy_ladder(token)
+        } else {
+            self.sell_ladder(token)
+        };
+        let maker_side = if taker_side == Side::Buy {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        let mut remaining = qty;
+        for level in ladder.iter() {
+            if if taker_side == Side::Buy {
+                level.price > limit + 1e-9
+            } else {
+                level.price < limit - 1e-9
+            } {
+                break;
+            }
+            remaining -= self.consume_level(token, maker_side, level.price, tick, remaining);
+            if remaining <= 1e-9 {
+                break;
+            }
+        }
+        qty - remaining
+    }
+
+    /// Zero inside a visible side's covered range is observed empty. A missing
+    /// side or a price beyond its last recorded level remains unknown.
+    pub fn level_is_observed(&self, token: &str, side: Side, price: f64, tick: f64) -> bool {
+        let ladder = if side == Side::Buy {
+            self.sell_ladder(token)
+        } else {
+            self.buy_ladder(token)
+        };
+        let Some(edge) = ladder.last() else {
+            return false;
+        };
+        let want = price_to_ticks(price, tick);
+        let edge = price_to_ticks(edge.price, tick);
+        if side == Side::Buy {
+            want >= edge
+        } else {
+            want <= edge
+        }
     }
 
     pub fn set_pair(&mut self, a: &str, b: &str) {
@@ -212,8 +486,52 @@ impl BookSet {
         self.pairs.get(token)
     }
 
+    /// Called immediately before a snapshot update. A decrease already
+    /// explained by public trades cannot also erase hypothetical own fills.
+    /// Compensate the legacy minimum-replacement debt reconciliation once.
+    pub fn protect_debt_from_public_drop(&mut self, token: &str, maker_side: Side, price: f64, public_qty: f64, next: &[PriceLevel]) {
+        let (Some(raw),Some(debt))=(self.books.get(token),self.consumed.get_mut(token)) else {return;};
+        let (old,used)=match maker_side {Side::Buy=>(&raw.bids,&mut debt.bids),Side::Sell=>(&raw.asks,&mut debt.asks)};
+        let Some(d)=used.iter_mut().find(|l| (l.price-price).abs()<1e-9 && l.quantity>0.) else {return;};
+        let before=old.iter().find(|l| (l.price-price).abs()<1e-9).map_or(0.,|l|l.quantity);
+        let after=next.iter().find(|l| (l.price-price).abs()<1e-9).map_or(0.,|l|l.quantity);
+        d.quantity += (before-after).max(0.).min(public_qty);
+    }
+
     pub fn update(&mut self, token: &str, bids: Vec<PriceLevel>, asks: Vec<PriceLevel>) {
-        self.books.insert(token.to_string(), TokenBook { bids, asks });
+        if self.liquidity_ledger_enabled {
+            let old = self.books.get(token);
+            let debt = self.consumed.entry(token.to_string()).or_default();
+            let before = debt
+                .bids
+                .iter()
+                .chain(&debt.asks)
+                .map(|l| l.quantity)
+                .sum::<f64>();
+            reconcile_consumed(
+                &mut debt.bids,
+                old.map(|b| b.bids.as_slice()).unwrap_or(&[]),
+                &bids,
+            );
+            reconcile_consumed(
+                &mut debt.asks,
+                old.map(|b| b.asks.as_slice()).unwrap_or(&[]),
+                &asks,
+            );
+            let after = debt
+                .bids
+                .iter()
+                .chain(&debt.asks)
+                .map(|l| l.quantity)
+                .sum::<f64>();
+            self.reconciled_qty += (before - after).max(0.0);
+            self.ledger_snapshots += 1;
+            self.ledger_level_high_water = self
+                .ledger_level_high_water
+                .max(debt.bids.len() + debt.asks.len());
+        }
+        self.books
+            .insert(token.to_string(), TokenBook { bids, asks });
         self.invalidate_ladder(token);
     }
 
@@ -223,6 +541,7 @@ impl BookSet {
     /// settled and it is never referenced again.
     pub fn retire_token(&mut self, token: &str) {
         self.books.remove(token);
+        self.consumed.remove(token);
         self.pairs.remove(token);
         self.next.remove(token);
         self.next_window.remove(token);
@@ -231,7 +550,8 @@ impl BookSet {
 
     /// Stash the *next* book snapshot for `token` (one-step race lookahead).
     pub fn set_next(&mut self, token: &str, bids: Vec<PriceLevel>, asks: Vec<PriceLevel>) {
-        self.next.insert(token.to_string(), TokenBook { bids, asks });
+        self.next
+            .insert(token.to_string(), TokenBook { bids, asks });
     }
     /// Append a window snapshot for `token` (taker windowed race). Each call adds
     /// one book seen in the in-flight horizon; `available_volume_next` mins over
@@ -251,12 +571,16 @@ impl BookSet {
     /// Raw (single-token) best bid/ask, ignoring cross-outcome liquidity.
     pub fn token_best_bid(&self, token: &str) -> Option<f64> {
         self.books.get(token).and_then(|b| {
-            finite_levels(&b.bids).map(|l| l.price).fold(None, |m, p| Some(m.map_or(p, |x: f64| x.max(p))))
+            finite_levels(&b.bids)
+                .map(|l| l.price)
+                .fold(None, |m, p| Some(m.map_or(p, |x: f64| x.max(p))))
         })
     }
     pub fn token_best_ask(&self, token: &str) -> Option<f64> {
         self.books.get(token).and_then(|b| {
-            finite_levels(&b.asks).map(|l| l.price).fold(None, |m, p| Some(m.map_or(p, |x: f64| x.min(p))))
+            finite_levels(&b.asks)
+                .map(|l| l.price)
+                .fold(None, |m, p| Some(m.map_or(p, |x: f64| x.min(p))))
         })
     }
 
@@ -264,29 +588,67 @@ impl BookSet {
     /// `token.asks` ∪ `complement.bids` mapped to `1 − price`. Memoised per token
     /// (invalidated on `update`); the `Rc` clone is cheap and shared.
     pub fn buy_ladder(&self, token: &str) -> Rc<Vec<PriceLevel>> {
-        if let Some(l) = self.ladder_cache.borrow().get(token).and_then(|e| e.0.clone()) {
+        if let Some(l) = self
+            .ladder_cache
+            .borrow()
+            .get(token)
+            .and_then(|e| e.0.clone())
+        {
             return l;
         }
-        let l = Rc::new(merged_ladder(self.books.get(token), self.comp_book(&self.books, token), true));
-        self.ladder_cache.borrow_mut().entry(token.to_string()).or_default().0 = Some(l.clone());
+        let mut levels = merged_ladder(
+            self.books.get(token),
+            self.comp_book(&self.books, token),
+            true,
+        );
+        if self.liquidity_ledger_enabled {
+            aggregate_equal_prices(&mut levels);
+        }
+        let l = Rc::new(levels);
+        self.ladder_cache
+            .borrow_mut()
+            .entry(token.to_string())
+            .or_default()
+            .0 = Some(l.clone());
         l
     }
 
     /// Effective ladder a taker SELLING `token` sweeps, highest first:
     /// `token.bids` ∪ `complement.asks` mapped to `1 − price`. Memoised per token.
     pub fn sell_ladder(&self, token: &str) -> Rc<Vec<PriceLevel>> {
-        if let Some(l) = self.ladder_cache.borrow().get(token).and_then(|e| e.1.clone()) {
+        if let Some(l) = self
+            .ladder_cache
+            .borrow()
+            .get(token)
+            .and_then(|e| e.1.clone())
+        {
             return l;
         }
-        let l = Rc::new(merged_ladder(self.books.get(token), self.comp_book(&self.books, token), false));
-        self.ladder_cache.borrow_mut().entry(token.to_string()).or_default().1 = Some(l.clone());
+        let mut levels = merged_ladder(
+            self.books.get(token),
+            self.comp_book(&self.books, token),
+            false,
+        );
+        if self.liquidity_ledger_enabled {
+            aggregate_equal_prices(&mut levels);
+        }
+        let l = Rc::new(levels);
+        self.ladder_cache
+            .borrow_mut()
+            .entry(token.to_string())
+            .or_default()
+            .1 = Some(l.clone());
         l
     }
 
     /// Complement's book from `src`, falling back to the *current* book when the
     /// complement is absent from `src` (lets a one-sided `next` snapshot still
     /// merge cross-outcome depth from the live book).
-    fn comp_book<'a>(&'a self, src: &'a HashMap<String, TokenBook>, token: &str) -> Option<&'a TokenBook> {
+    fn comp_book<'a>(
+        &'a self,
+        src: &'a HashMap<String, TokenBook>,
+        token: &str,
+    ) -> Option<&'a TokenBook> {
         // INVARIANT: under outcome-folding `pairs` is empty (see `on_instrument`),
         // so this returns None and the complement-merge in `level_depth` /
         // `buy_ladder` / `sell_ladder` stays inert — the canonical book already
@@ -294,14 +656,21 @@ impl BookSet {
         // double-count the same orders (up.bid[p] ≡ down.ask[1−p]).
         let comp = self.pairs.get(token)?;
         let res = src.get(comp).or_else(|| self.books.get(comp));
-        debug_assert!(!self.folded || res.is_none(), "comp_book must be inert under folding (would double-count mirror liquidity)");
+        debug_assert!(
+            !self.folded || res.is_none(),
+            "comp_book must be inert under folding (would double-count mirror liquidity)"
+        );
         res
     }
 
     /// Total effective volume a taker can fill within `lim` (None = market), on
     /// the *current* book. Used as the "now" leg of the taker race.
     pub fn available_volume(&self, token: &str, is_buy: bool, lim: Option<f64>) -> f64 {
-        let ladder = if is_buy { self.buy_ladder(token) } else { self.sell_ladder(token) };
+        let ladder = if is_buy {
+            self.buy_ladder(token)
+        } else {
+            self.sell_ladder(token)
+        };
         within_volume(&ladder, is_buy, lim)
     }
 
@@ -311,7 +680,12 @@ impl BookSet {
     /// liquidity pulled at ANY instant in the in-flight horizon counts as a
     /// potential miss, not just the endpoint. Falls back to the single `next`
     /// snapshot when no window was primed. `None` ⇒ no lookahead (race inactive).
-    pub fn available_volume_next(&self, token: &str, is_buy: bool, lim: Option<f64>) -> Option<f64> {
+    pub fn available_volume_next(
+        &self,
+        token: &str,
+        is_buy: bool,
+        lim: Option<f64>,
+    ) -> Option<f64> {
         // Windowed taker race (folding only): each frame is a single canonical
         // book carrying all liquidity (caller mirrored siblings), so no
         // cross-outcome merge — take the MIN fillable volume over the window.
@@ -336,14 +710,26 @@ impl BookSet {
     /// (an ask @ price): `token` asks @ price + complement bids @ (1−price).
     /// Excludes our own order (it's not in the recorded book).
     pub fn level_depth(&self, token: &str, side: Side, price: f64, tick: f64) -> f64 {
-        merged_depth(self.books.get(token), self.comp_book(&self.books, token), side, price, tick)
+        merged_depth(
+            self.books.get(token),
+            self.comp_book(&self.books, token),
+            side,
+            price,
+            tick,
+        )
     }
 
     /// Merged queue length at our level on the stashed *next* snapshot (one-step
     /// race lookahead). `None` when there's no lookahead book for `token`.
     pub fn level_depth_next(&self, token: &str, side: Side, price: f64, tick: f64) -> Option<f64> {
         let direct = self.next.get(token)?;
-        Some(merged_depth(Some(direct), self.comp_book(&self.next, token), side, price, tick))
+        Some(merged_depth(
+            Some(direct),
+            self.comp_book(&self.next, token),
+            side,
+            price,
+            tick,
+        ))
     }
 
     /// Effective best ask for buying `token` (min over the buy ladder).
@@ -394,7 +780,13 @@ impl BookSet {
     ///     from touch → level qty) over the recorded levels, evaluated at our
     ///     distance and clamped to the recorded [min, max] qty band (so the
     ///     projection stays within observed depths and never goes ≤ 0).
-    pub fn extrapolate_level_depth(&self, token: &str, side: Side, price: f64, tick: f64) -> Option<f64> {
+    pub fn extrapolate_level_depth(
+        &self,
+        token: &str,
+        side: Side,
+        price: f64,
+        tick: f64,
+    ) -> Option<f64> {
         self.extrapolate_level_depth_with_decay(token, side, price, tick)
             .map(|(qty, _)| qty)
     }
@@ -408,8 +800,8 @@ impl BookSet {
     ) -> Option<(f64, f64)> {
         // Merged resting ladder on our side, grouped per tick (price→qty).
         let ladder = match side {
-            Side::Sell => self.buy_ladder(token),  // asks, ascending
-            Side::Buy => self.sell_ladder(token),  // bids, descending
+            Side::Sell => self.buy_ladder(token), // asks, ascending
+            Side::Buy => self.sell_ladder(token), // bids, descending
         };
         if ladder.is_empty() {
             return None;
@@ -442,7 +834,10 @@ impl BookSet {
         // level. decay=1 → flat (outermost depth verbatim); 0<decay<1 → geometric
         // thinning per tick beyond the window. Needs only the edge level.
         if self.deep_queue_decay > 0.0 {
-            let q_edge = levels.iter().find(|(t, _)| dist(*t) as f64 == edge_d).map(|(_, q)| *q)?;
+            let q_edge = levels
+                .iter()
+                .find(|(t, _)| dist(*t) as f64 == edge_d)
+                .map(|(_, q)| *q)?;
             let mut ratios = Vec::new();
             for pair in levels.windows(2) {
                 let d0 = dist(pair[0].0) as f64;
@@ -459,9 +854,8 @@ impl BookSet {
                 .unwrap_or(self.deep_queue_decay)
                 .clamp(self.dynamic_deep_queue_min_decay.max(1e-6), 1.0);
             let strength = self.dynamic_deep_queue_strength.clamp(0.0, 1.0);
-            let effective = (self.deep_queue_decay
-                + strength * (local - self.deep_queue_decay))
-                .max(1e-6);
+            let effective =
+                (self.deep_queue_decay + strength * (local - self.deep_queue_decay)).max(1e-6);
             return Some((q_edge * effective.powf(our_d - edge_d), effective));
         }
         if levels.len() < 2 {
@@ -493,9 +887,59 @@ mod tests {
     }
 
     #[test]
+    fn v6_liquidity_snapshot_reconciliation_does_not_refill_unchanged_depth() {
+        let mut bs = BookSet::new();
+        bs.set_liquidity_ledger_enabled(true);
+        bs.update("up", vec![lvl(0.49, 10.0)], vec![lvl(0.51, 10.0)]);
+        assert_eq!(bs.consume_level("up", Side::Sell, 0.51, 0.01, 6.0), 6.0);
+        assert_eq!(bs.executable_level_qty("up", Side::Sell, 0.51, 0.01), 4.0);
+        bs.update("up", vec![], vec![lvl(0.51, 10.0)]);
+        assert_eq!(bs.executable_level_qty("up", Side::Sell, 0.51, 0.01), 4.0);
+        bs.update("up", vec![], vec![lvl(0.51, 6.0)]);
+        assert_eq!(bs.executable_level_qty("up", Side::Sell, 0.51, 0.01), 4.0);
+        bs.update("up", vec![], vec![]);
+        bs.update("up", vec![], vec![lvl(0.51, 10.0)]);
+        assert_eq!(bs.executable_level_qty("up", Side::Sell, 0.51, 0.01), 10.0);
+        assert_eq!(bs.consumed["up"].asks.len(), 1);
+        bs.retire_token("up");
+        assert!(bs.consumed.is_empty());
+    }
+
+    #[test]
+    fn v6_liquidity_complement_views_share_consumption() {
+        let mut bs = BookSet::new();
+        bs.set_liquidity_ledger_enabled(true);
+        bs.set_pair("up", "down");
+        bs.update("up", vec![], vec![lvl(0.60, 10.0)]);
+        bs.update("down", vec![lvl(0.40, 5.0)], vec![]);
+        assert_eq!(bs.buy_ladder("up").len(), 1);
+        assert_eq!(bs.consume_level("up", Side::Sell, 0.60, 0.01, 12.0), 12.0);
+        assert_eq!(bs.executable_level_qty("up", Side::Sell, 0.60, 0.01), 3.0);
+        assert_eq!(bs.executable_level_qty("down", Side::Buy, 0.40, 0.01), 3.0);
+    }
+
+    #[test]
+    fn v6_liquidity_observed_gap_is_distinct_from_unknown_truncation() {
+        let mut bs = BookSet::new();
+        bs.update(
+            "up",
+            vec![lvl(0.49, 10.0), lvl(0.47, 10.0)],
+            vec![lvl(0.51, 10.0)],
+        );
+        assert!(bs.level_is_observed("up", Side::Buy, 0.50, 0.01));
+        assert!(bs.level_is_observed("up", Side::Buy, 0.48, 0.01));
+        assert!(!bs.level_is_observed("up", Side::Buy, 0.46, 0.01));
+        assert!(!bs.level_is_observed("missing", Side::Buy, 0.50, 0.01));
+    }
+
+    #[test]
     fn single_token_best_prices() {
         let mut bs = BookSet::new();
-        bs.update("up", vec![lvl(0.60, 100.0), lvl(0.59, 50.0)], vec![lvl(0.62, 80.0), lvl(0.63, 40.0)]);
+        bs.update(
+            "up",
+            vec![lvl(0.60, 100.0), lvl(0.59, 50.0)],
+            vec![lvl(0.62, 80.0), lvl(0.63, 40.0)],
+        );
         assert_eq!(bs.token_best_bid("up"), Some(0.60));
         assert_eq!(bs.token_best_ask("up"), Some(0.62));
     }

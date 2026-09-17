@@ -360,6 +360,48 @@ impl Default for RecordingConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BacktestConfig {
+    /// Opt-in v6 conservation ledger. False preserves historical v5 matching.
+    #[serde(default)]
+    pub sim_v2_liquidity_ledger: bool,
+    /// Match against replenished liquidity at the actual matching time; disable
+    /// the historical minimum-in-transit race cap and overlapping flow haircut.
+    #[serde(default)]
+    pub sim_v2_match_time_liquidity: bool,
+    /// Deterministic backtest-only owner application lane; no live threads/sleeps.
+    #[serde(default)]
+    pub sim_v2_owner_scheduler: bool,
+    #[serde(default)]
+    pub sim_v2_owner_apply_delay_us: u64,
+    #[serde(default)]
+    pub sim_v2_owner_service_time_us: u64,
+    #[serde(default = "default_sim_v2_owner_queue_capacity")]
+    pub sim_v2_owner_queue_capacity: usize,
+    #[serde(default = "default_sim_v2_owner_watchdog_interval_ms")]
+    pub sim_v2_owner_watchdog_interval_ms: u64,
+    #[serde(default)]
+    pub sim_v2_owner_history_delay_ms: u64,
+    #[serde(default)]
+    pub sim_v2_owner_recovery_path: String,
+    #[serde(default = "default_sim_v2_owner_watchdog_interval_ms")]
+    pub sim_v2_owner_recovery_reconcile_ms: u64,
+    /// Independent historical depth proxy; never inferred from simulated size.
+    #[serde(default)]
+    pub sim_v2_historical_self_depth_path: String,
+    #[serde(default = "default_sim_v2_historical_self_depth_fraction")]
+    pub sim_v2_historical_self_depth_fraction: f64,
+    #[serde(default)]
+    pub sim_v2_queue_uncertainty_strength: f64,
+    /// Assumed outbound share of the network RTT, not a measured venue clock.
+    #[serde(default = "default_sim_v2_network_outbound_fraction_bps")]
+    pub sim_v2_network_outbound_fraction_bps: u16,
+    /// Startup-validated per-token rule/effective-time journal. Empty means no
+    /// historical rule is asserted; never infer taker hold from today's metadata.
+    #[serde(default)]
+    pub sim_v2_market_rules_path: String,
+    /// Diagnostic interval classification only; future interval observations
+    /// cannot influence an earlier admission or strategy callback.
+    #[serde(default)]
+    pub sim_v2_arrival_interval_audit: bool,
     /// Root directory containing recorded data (same as recording.output_dir).
     #[serde(default = "default_output_dir")]
     pub data_dir: String,
@@ -930,6 +972,25 @@ pub struct BacktestConfig {
     #[serde(default = "default_true")]
     pub sim_v2_taker_overhead_enabled: bool,
 
+    /// Offline execution selection: off/collect/causal/forward. Forward is diagnostic only.
+    #[serde(default)]
+    pub sim_v2_selection_mode: String,
+    #[serde(default)]
+    pub sim_v2_selection_model_path: String,
+    #[serde(default)]
+    pub sim_v2_selection_strength: f64,
+    /// Optional role overrides; omitted values inherit the shared strength.
+    #[serde(default)]
+    pub sim_v2_selection_maker_strength: Option<f64>,
+    #[serde(default)]
+    pub sim_v2_selection_taker_strength: Option<f64>,
+    /// Recover better-priced resting candidates from a strict trade-through
+    /// witness. Requires the canonical quantity ledger; disabled by default.
+    #[serde(default)]
+    pub sim_v2_maker_trade_through_recovery: bool,
+    #[serde(default)]
+    pub sim_v2_selection_audit: bool,
+
     /// Optional observed new-place admission intervals (UTC nanosecond CSV).
     /// Diagnostic replay only: rejected attempts do not consume HTTP samples;
     /// cancellation, reconciliation and resting fills continue during a gate.
@@ -1274,6 +1335,22 @@ fn default_sim_rtt_mode() -> String {
 impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
+            sim_v2_liquidity_ledger: false,
+            sim_v2_match_time_liquidity: false,
+            sim_v2_owner_scheduler: false,
+            sim_v2_owner_apply_delay_us: 0,
+            sim_v2_owner_service_time_us: 0,
+            sim_v2_owner_queue_capacity: default_sim_v2_owner_queue_capacity(),
+            sim_v2_owner_watchdog_interval_ms: default_sim_v2_owner_watchdog_interval_ms(),
+            sim_v2_owner_history_delay_ms: 0,
+            sim_v2_owner_recovery_path: String::new(),
+            sim_v2_owner_recovery_reconcile_ms: default_sim_v2_owner_watchdog_interval_ms(),
+            sim_v2_historical_self_depth_path: String::new(),
+            sim_v2_historical_self_depth_fraction: default_sim_v2_historical_self_depth_fraction(),
+            sim_v2_queue_uncertainty_strength: 0.0,
+            sim_v2_network_outbound_fraction_bps: default_sim_v2_network_outbound_fraction_bps(),
+            sim_v2_market_rules_path: String::new(),
+            sim_v2_arrival_interval_audit: false,
             data_dir: default_output_dir(),
             replay_cache_mode: String::new(),
             replay_cache_dir: String::new(),
@@ -1384,6 +1461,13 @@ impl Default for BacktestConfig {
             sim_reconcile_timeout_ms: 0,
             sim_v2_separate_taker_private_fills: false,
             sim_v2_taker_overhead_enabled: true,
+            sim_v2_selection_mode: String::new(),
+            sim_v2_selection_model_path: String::new(),
+            sim_v2_selection_strength: 0.0,
+            sim_v2_selection_maker_strength: None,
+            sim_v2_selection_taker_strength: None,
+            sim_v2_maker_trade_through_recovery: false,
+            sim_v2_selection_audit: false,
             sim_v2_observed_admission_path: String::new(),
             sim_matched_cant_cancel_window_ms: default_sim_matched_cant_cancel_window_ms(),
             sim_strategy_warmup_secs: 0.0,
@@ -2572,6 +2656,18 @@ mod shared_secrets_tests {
     }
 }
 
+fn default_sim_v2_owner_queue_capacity() -> usize {
+    4096
+}
+fn default_sim_v2_historical_self_depth_fraction() -> f64 {
+    1.0
+}
+fn default_sim_v2_owner_watchdog_interval_ms() -> u64 {
+    100
+}
+fn default_sim_v2_network_outbound_fraction_bps() -> u16 {
+    5000
+}
 fn default_sim_v2_cancel_timing_mode() -> String {
     "legacy_l2_multiplier".into()
 }

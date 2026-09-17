@@ -43,7 +43,65 @@ const MAX_ADMISSION_FEEDBACK: usize = 16_384;
 // ExecutorRejected handler releases the slot without immediately re-quoting.
 const ADMISSION_FEEDBACK_NS: u64 = 1_000_000;
 
+/// Identity stays with a message after it leaves the DES and enters an owner lane.
+#[derive(Debug, Clone, Copy)]
+pub struct RecoveryDeliveryIdentity {
+    sequence: u64,
+    request_id: Option<u64>,
+}
+
+/// A fixed query boundary, not a moving "all private messages" target. Recovery
+/// trade IDs survive early backfill transfer from the fallback map to a new ACK.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecoveryDeliveryWatermark {
+    sequence: u64,
+    request_id: u64,
+    recovery_trade_ids: std::collections::BTreeSet<String>,
+}
+impl RecoveryDeliveryWatermark {
+    pub fn includes(&self, identity: RecoveryDeliveryIdentity, trade_id: Option<&str>) -> bool {
+        identity.sequence < self.sequence
+            || identity.request_id.is_some_and(|id| id < self.request_id)
+            || trade_id.is_some_and(|id| self.recovery_trade_ids.contains(id))
+    }
+}
+fn recovery_delivery_identity(sequence: u64, event: &SimEvent) -> RecoveryDeliveryIdentity {
+    let request_id = match event {
+        SimEvent::HttpReplyToStrategy { request_id, .. }
+        | SimEvent::RequestDeadline { request_id, .. }
+        | SimEvent::CancelAllHttpReply { request_id, .. }
+        | SimEvent::CancelAllDeadline { request_id, .. } => Some(*request_id),
+        _ => None,
+    };
+    RecoveryDeliveryIdentity {
+        sequence,
+        request_id,
+    }
+}
+
+/// Conservative offline delivery barrier, not an authoritative account snapshot.
+#[derive(Default, Debug, Clone, Copy, serde::Serialize)]
+pub struct RecoveryDeliveryBarrier {
+    pub private_messages: usize,
+    pub http_messages: usize,
+    pub ambiguous_owner_messages: usize,
+    pub latest_delivery_ns: u64,
+}
+impl RecoveryDeliveryBarrier {
+    pub fn is_clear(&self) -> bool {
+        self.private_messages == 0 && self.http_messages == 0 && self.ambiguous_owner_messages == 0
+    }
+}
+
 pub struct SimV2Config {
+    pub liquidity_ledger_enabled: bool,
+    pub match_time_liquidity: bool,
+    pub network_outbound_fraction_bps: u16,
+    pub market_rules_path: String,
+    pub arrival_interval_audit: bool,
+    pub historical_self_depth_path: String,
+    pub historical_self_depth_fraction: f64,
+    pub queue_uncertainty_strength: f64,
     pub data_dir: String,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
@@ -243,7 +301,27 @@ struct PendingTakerRace {
     observe_until_ns: u64,
 }
 
+/// Explicit exchange pending state, owned by the server-lane single writer.
+/// A hold blocks cancellation until matching/revalidation, but never applies
+/// economic quantity or publishes an Accepted state to the client early.
+#[derive(Clone, Copy)]
+struct RuleHold {
+    hold_ns: u64,
+    // A short observed success can be valid for a non-marketable order. Its
+    // unchanged RTT cannot reserve this hold; check crossing only at arrival.
+    budget_reserved: bool,
+    effective_until_ns: Option<u64>,
+}
+
 pub struct Simulator {
+    match_time_liquidity: bool,
+    network_outbound_fraction_bps: u16,
+    arrival_intervals: crate::exchange::sim_v2::arrival_interval::ArrivalIntervalAudit,
+    market_rules: crate::exchange::sim_v2::market_rules::MarketRules,
+    rule_holds: HashMap<String, RuleHold>,
+    rule_hold_applied: u64,
+    rule_hold_budget_floors: u64,
+    rule_hold_cancel_rejected: u64,
     /// Matching-engine lane: client requests after L1 plus server lifecycle.
     server_sched: Scheduler,
     /// Client lane: acknowledgements/fills after L2/private-push latency.
@@ -459,6 +537,30 @@ fn dynamic_markout_strength(
 
 impl Simulator {
     pub fn new(cfg: SimV2Config) -> Result<Self> {
+        let market_rules = crate::exchange::sim_v2::market_rules::MarketRules::from_optional_path(
+            &cfg.market_rules_path,
+        )?;
+        anyhow::ensure!(
+            (1..10_000).contains(&cfg.network_outbound_fraction_bps),
+            "network outbound fraction must be in 1..10000 bps"
+        );
+        anyhow::ensure!(
+            !cfg.match_time_liquidity || cfg.causal_matching,
+            "matching-time liquidity requires causal_matching"
+        );
+        anyhow::ensure!(!cfg.liquidity_ledger_enabled || (cfg.fold_outcomes && cfg.fold_canonical_book_only && cfg.exact_maker_trade_level),
+            "v6 shared maker liquidity requires folded canonical books and exact maker trade levels");
+        anyhow::ensure!(
+            cfg.historical_self_depth_fraction.is_finite()
+                && (0.0..=1.0).contains(&cfg.historical_self_depth_fraction)
+                && cfg.queue_uncertainty_strength.is_finite()
+                && (0.0..=1.0).contains(&cfg.queue_uncertainty_strength),
+            "v6 history fraction and queue uncertainty must be finite in [0,1]"
+        );
+        anyhow::ensure!(
+            cfg.market_rules_path.is_empty() || cfg.separate_taker_private_fills,
+            "venue hold rules require independent private fills and HTTP deadlines"
+        );
         anyhow::ensure!(
             cfg.cancel_timing_mode == CancelTimingMode::LegacyL2Multiplier
                 || cfg.separate_taker_private_fills,
@@ -551,6 +653,12 @@ impl Simulator {
         );
         core.configure_dynamic_ahead_frac(cfg.dynamic_ahead_frac_strength);
         core.configure_partial_depletion_queue(cfg.partial_depletion_queue_strength);
+        core.load_historical_self_depth(
+            &cfg.historical_self_depth_path,
+            cfg.historical_self_depth_fraction,
+        )
+        .map_err(anyhow::Error::msg)?;
+        core.configure_queue_uncertainty(cfg.queue_uncertainty_strength);
         core.configure_adverse_sel(cfg.adverse_sel_rate, cfg.adverse_scale_ticks);
         core.configure_book_through(cfg.book_through_rate);
         core.configure_unexplained_depletion_execution(cfg.unexplained_depletion_exec_rate);
@@ -572,9 +680,18 @@ impl Simulator {
         core.configure_maker_toxicity(cfg.maker_toxicity_strength, cfg.maker_toxicity_scale_ticks);
         core.set_fold_outcomes(cfg.fold_outcomes);
         core.configure_fold_canonical_book_only(cfg.fold_canonical_book_only);
+        core.set_liquidity_ledger_enabled(cfg.liquidity_ledger_enabled);
+        core.configure_match_time_liquidity(cfg.match_time_liquidity);
         core.configure_book_stale_gate(cfg.book_stale_after_ns);
         core.configure_stale_resting_exchange_only(cfg.stale_resting_exchange_only);
-        core.configure_taker_comp(cfg.taker_comp_rate, cfg.taker_comp_window_ns);
+        core.configure_taker_comp(
+            if cfg.match_time_liquidity {
+                0.0
+            } else {
+                cfg.taker_comp_rate
+            },
+            cfg.taker_comp_window_ns,
+        );
         core.configure_taker_overlap_dedup(cfg.taker_overlap_dedup);
         core.set_deep_queue_decay(cfg.deep_queue_decay);
         core.set_dynamic_deep_queue(
@@ -583,6 +700,16 @@ impl Simulator {
         );
         let race_enabled = core.race_enabled();
         Ok(Self {
+            match_time_liquidity: cfg.match_time_liquidity,
+            network_outbound_fraction_bps: cfg.network_outbound_fraction_bps,
+            arrival_intervals: crate::exchange::sim_v2::arrival_interval::ArrivalIntervalAudit::new(
+                cfg.arrival_interval_audit,
+            ),
+            market_rules,
+            rule_holds: HashMap::with_capacity(MAX_HTTP_DEADLINES),
+            rule_hold_applied: 0,
+            rule_hold_budget_floors: 0,
+            rule_hold_cancel_rejected: 0,
             server_sched: Scheduler::new(),
             strategy_sched: Scheduler::new(),
             server_clock_ns: 0,
@@ -646,7 +773,11 @@ impl Simulator {
             taker_race_horizon_ns: cfg.taker_race_horizon_ns,
             base_taker_race_horizon_ns: cfg.taker_race_horizon_ns,
             base_taker_comp_window_ns: cfg.taker_comp_window_ns,
-            taker_comp_rate: cfg.taker_comp_rate,
+            taker_comp_rate: if cfg.match_time_liquidity {
+                0.0
+            } else {
+                cfg.taker_comp_rate
+            },
             dynamic_window_rtt_by_event: cfg.dynamic_window_rtt_by_event,
             dynamic_window_rtt_ref_ms: cfg.dynamic_window_rtt_ref_ms,
             dynamic_race_rtt_elasticity: cfg.dynamic_race_rtt_elasticity,
@@ -854,6 +985,33 @@ impl Simulator {
         true
     }
 
+    pub fn configure_selection(&mut self, mode: &str, path: &str, strength: f64, seed: u64, audit: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(mode.is_empty() || mode=="off" || (!self.markout_on && !self.book_markout_on), "selection requires no markout repricing");
+        self.core.selection.configure(mode,path,strength,seed,audit)
+    }
+    pub fn configure_selection_roles(&mut self, maker: Option<f64>, taker: Option<f64>) -> anyhow::Result<()> {
+        self.core.selection.configure_role_strengths(maker, taker)
+    }
+    pub fn configure_maker_trade_through_recovery(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.core.configure_maker_trade_through_recovery(enabled)
+    }
+    pub fn drain_selection_audit(&mut self) -> impl Iterator<Item=super::selection::SelectionAudit> + '_ { self.core.selection.drain() }
+    pub fn selection_stats(&self) -> &super::selection::SelectionStats { &self.core.selection.stats }
+    fn prime_selection_label(&mut self, token: &str, now: u64) {
+        if !self.core.selection.needs_forward() { return; }
+        let canon = arrayvec::ArrayString::<128>::from(self.core.canonical_of(token)).expect("selection token capacity");
+        let at=now.saturating_add(self.core.selection.horizon_ns());
+        let mid=if at / 300_000_000_000 == now / 300_000_000_000 {
+            self.feed.peek_next_book_ref(&canon,at).and_then(|(ts,bids,asks)| {
+                if ts.saturating_sub(at)>self.core.selection.gap_ns() {return None;}
+                let bid=bids.iter().filter(|l|l.quantity>0.0 && l.price>0.0 && l.price<1.0).map(|l|l.price).fold(f64::NEG_INFINITY,f64::max);
+                let ask=asks.iter().filter(|l|l.quantity>0.0 && l.price>0.0 && l.price<1.0).map(|l|l.price).fold(f64::INFINITY,f64::min);
+                (bid.is_finite() && ask.is_finite() && bid<=ask).then_some((bid+ask)*0.5)
+            })
+        } else {None};
+        self.core.selection.set_forward(&canon,now,mid);
+    }
+
     pub fn set_taker_overhead_enabled(&mut self, enabled: bool) {
         self.latency.set_taker_overhead_enabled(enabled);
     }
@@ -928,6 +1086,7 @@ impl Simulator {
 
     /// Immutable preview for command adapters; does not sample or advance RNG.
     pub fn cancel_timing_preview(&self, dispatch: u64, l1: u64, l2: u64) -> Option<CancelTiming> {
+        let (l1, l2) = self.partition_network_legs(l1, l2);
         match self.cancel_timing_mode {
             CancelTimingMode::LegacyL2Multiplier => None,
             CancelTimingMode::StagedRttBudget => Some(self.latency.partition_cancel_budget(
@@ -943,6 +1102,21 @@ impl Simulator {
                 self.cancel_processing_fraction_bps,
             )),
         }
+    }
+
+    fn partition_network_legs(&self, l1: u64, l2: u64) -> (u64, u64) {
+        if self.network_outbound_fraction_bps == 5000 {
+            return (l1, l2);
+        }
+        let total = l1.checked_add(l2).expect("network RTT overflow");
+        let outbound =
+            ((total as u128 * self.network_outbound_fraction_bps as u128) / 10_000) as u64;
+        let outbound = if l1 > 0 && l2 > 0 {
+            outbound.clamp(1, total - 1)
+        } else {
+            outbound
+        };
+        (outbound, total - outbound)
     }
 
     pub fn last_dispatched_request_id(&self) -> Option<u64> {
@@ -1123,6 +1297,10 @@ impl Simulator {
         self.core.fill_audit_rows()
     }
 
+    pub fn v6_fidelity_stats(&self) -> serde_json::Value {
+        self.core.v6_fidelity_stats()
+    }
+
     pub fn configure_maker_order_audit(&mut self, enabled: bool) {
         self.core.configure_maker_order_audit(enabled);
     }
@@ -1137,11 +1315,162 @@ impl Simulator {
         self.core.drain_admission_audit()
     }
 
+    pub fn drain_arrival_interval_audit(
+        &mut self,
+    ) -> std::collections::vec_deque::Drain<
+        '_,
+        crate::exchange::sim_v2::arrival_interval::ArrivalIntervalRow,
+    > {
+        self.arrival_intervals.drain()
+    }
+    pub fn arrival_interval_stats(
+        &self,
+    ) -> crate::exchange::sim_v2::arrival_interval::ArrivalIntervalStats {
+        self.arrival_intervals.stats()
+    }
+    pub fn finish_arrival_interval_audit(&mut self) {
+        self.arrival_intervals.finish();
+    }
+    pub fn market_rule_stats(&self) -> serde_json::Value {
+        serde_json::json!({"historical_rules":self.market_rules.historical_rules,
+            "sensitivity_rules":self.market_rules.sensitivity_rules,
+            "holds_applied":self.rule_hold_applied,"assumed_budget_floors":self.rule_hold_budget_floors,
+            "cancel_rejected_while_pending":self.rule_hold_cancel_rejected,"pending":self.rule_holds.len()})
+    }
+    fn observe_arrival_intervals(&mut self) {
+        if self.arrival_intervals.enabled() {
+            let core = &self.core;
+            self.arrival_intervals
+                .observe(self.server_clock_ns, |order, when| {
+                    core.admission_crossing_observation(order, when)
+                });
+        }
+    }
+
     pub fn admission_audit_stats(&self) -> AdmissionAuditStats {
         self.core.admission_audit_stats()
     }
 
     /// Immutable routing metadata from the simulator's existing bounded evidence.
+    /// Capture after server work through the query boundary has been processed.
+    /// Later-created private messages are normal ongoing trading, not missing
+    /// pre-query state, so they cannot perpetually extend this recovery barrier.
+    pub fn recovery_delivery_watermark(&self) -> RecoveryDeliveryWatermark {
+        RecoveryDeliveryWatermark {
+            sequence: self.strategy_sched.enqueue_watermark(),
+            request_id: self.next_http_request_id,
+            recovery_trade_ids: self.pending_private_fills.keys().cloned().collect(),
+        }
+    }
+
+    /// Read this immediately before a strategy-lane step. No event or lifecycle
+    /// reference is removed until the existing delivery path consumes it.
+    pub fn peek_strategy_delivery_identity(&self) -> Option<RecoveryDeliveryIdentity> {
+        self.strategy_sched
+            .peek_event()
+            .map(|(seq, event)| recovery_delivery_identity(seq, event))
+    }
+
+    pub fn owner_recovery_delivery_barrier(
+        &self,
+        instance: &str,
+        watermark: &RecoveryDeliveryWatermark,
+    ) -> RecoveryDeliveryBarrier {
+        let mut result = RecoveryDeliveryBarrier::default();
+        for (sequence, when, event) in self.strategy_sched.events() {
+            let trade_id = match event {
+                SimEvent::PrivateFillRecovery { trade_id } => Some(trade_id.as_str()),
+                SimEvent::FillToStrategy(update)
+                | SimEvent::AckToStrategy(update)
+                | SimEvent::HttpReplyToStrategy { update, .. } => update.trade_id.as_deref(),
+                _ => None,
+            };
+            if !watermark.includes(recovery_delivery_identity(sequence, event), trade_id) {
+                continue;
+            }
+            let (owner, private) = match event {
+                SimEvent::FillToStrategy(update) => (
+                    self.core
+                        .order_owner(&update.client_order_id)
+                        .map(|(owner, _)| owner),
+                    true,
+                ),
+                SimEvent::PrivateFillRecovery { trade_id } => {
+                    let Some(update) = self.pending_private_fills.get(trade_id) else {
+                        continue;
+                    };
+                    (
+                        self.core
+                            .order_owner(&update.client_order_id)
+                            .map(|(owner, _)| owner),
+                        true,
+                    )
+                }
+                SimEvent::HttpReplyToStrategy { request_id, update } => {
+                    if self.http_deadlines.get(request_id) != Some(&true) {
+                        continue;
+                    }
+                    (
+                        self.core
+                            .order_owner(&update.client_order_id)
+                            .map(|(owner, _)| owner),
+                        false,
+                    )
+                }
+                SimEvent::RequestDeadline {
+                    request_id,
+                    timeout,
+                } => {
+                    if self.http_deadlines.get(request_id) != Some(&true) {
+                        continue;
+                    }
+                    (
+                        self.core
+                            .order_owner(&timeout.client_order_id)
+                            .map(|(owner, _)| owner),
+                        false,
+                    )
+                }
+                SimEvent::CancelAllHttpReply {
+                    request_id,
+                    instance_id,
+                    ..
+                }
+                | SimEvent::CancelAllDeadline {
+                    request_id,
+                    instance_id,
+                } => {
+                    if self.http_deadlines.get(request_id) != Some(&true) {
+                        continue;
+                    }
+                    (Some(instance_id.as_str()), false)
+                }
+                SimEvent::AckToStrategy(update)
+                | SimEvent::QueryTimeout(update)
+                | SimEvent::AdmissionRejected(update) => (
+                    self.core
+                        .order_owner(&update.client_order_id)
+                        .map(|(owner, _)| owner),
+                    update.trade_id.is_some() && update.filled_quantity != 0.0,
+                ),
+                _ => continue,
+            };
+            match owner {
+                Some(owner) if owner == instance => {
+                    if private {
+                        result.private_messages += 1;
+                    } else {
+                        result.http_messages += 1;
+                    }
+                    result.latest_delivery_ns = result.latest_delivery_ns.max(when);
+                }
+                None => result.ambiguous_owner_messages += 1,
+                _ => {}
+            }
+        }
+        result
+    }
+
     pub fn order_owner(&self, coid: &str) -> Option<(&str, OrderSlot)> {
         self.core.order_owner(coid)
     }
@@ -1500,13 +1829,18 @@ impl Simulator {
         if server_when.is_some_and(|server| feed_when.is_some_and(|feed| server == feed))
             && self.server_sched.peek_is_invalidation()
         {
-            return self.step_server_sched();
+            let updates = self.step_server_sched();
+            self.observe_arrival_intervals();
+            return updates;
         }
-        if feed_when.is_some_and(|feed| server_when.is_none_or(|server| feed <= server)) {
-            self.step_feed()
-        } else {
-            self.step_server_sched()
-        }
+        let updates =
+            if feed_when.is_some_and(|feed| server_when.is_none_or(|server| feed <= server)) {
+                self.step_feed()
+            } else {
+                self.step_server_sched()
+            };
+        self.observe_arrival_intervals();
+        updates
     }
 
     /// Publish the engine's independently replayed local clock. This never
@@ -1888,6 +2222,9 @@ impl Simulator {
     }
 
     fn observe_causal_taker_races(&mut self, now_ns: u64) {
+        if self.match_time_liquidity {
+            return;
+        }
         let core = &self.core;
         for pending in self.pending_taker_races.values_mut() {
             if now_ns > pending.observe_until_ns {
@@ -1906,7 +2243,7 @@ impl Simulator {
     /// order reaches the exchange. The outbound transit is the main interval
     /// in which another taker can consume the touch that triggered our order.
     fn begin_causal_taker_race(&mut self, order: &OrderRequest, t_emit: u64) {
-        if !self.causal_matching || !self.core.taker_race_enabled() {
+        if self.match_time_liquidity || !self.causal_matching || !self.core.taker_race_enabled() {
             return;
         }
         let available = self.core.taker_available_qty(order);
@@ -1925,6 +2262,7 @@ impl Simulator {
             self.server_clock_ns = self.server_clock_ns.max(when);
             match ev {
                 SimEvent::ServerBook(ob, timing) => {
+                    self.prime_selection_label(&ob.symbol,when);
                     // Book-through adverse fills (a resting order the contra just
                     // swept through) surface here, delivered like trade fills
                     // after a ws fill-push delay. Empty unless book_through_rate>0.
@@ -1948,6 +2286,7 @@ impl Simulator {
                     }
                 }
                 SimEvent::ServerTrade(t, timing) => {
+                    self.prime_selection_label(&t.symbol,when);
                     // P3: maker fills from queue drain. Each fill is pushed back
                     // to the strategy after a ws fill-push delay (sampled once
                     // per fill), so it surfaces via FillToStrategy later.
@@ -2242,9 +2581,27 @@ impl Simulator {
                             // Genuine taker: defer the actual book-match to the
                             // MIDPOINT of the matching window (reach + overhead/2)
                             // so the book can move in-flight (natural taker miss).
-                            let overhead = self.latency.sample_taker_overhead(when);
-                            let match_at = when.saturating_add(overhead / 2);
-                            if self.causal_matching && self.core.taker_race_enabled() {
+                            let rule_hold = self.rule_holds.get(&o.client_order_id).copied();
+                            assert!(
+                                rule_hold.is_none_or(|hold| hold.budget_reserved),
+                                "historical HTTP budget contradicts configured venue hold for marketable arrival; no match scheduled"
+                            );
+                            let overhead = if rule_hold.is_some() {
+                                0
+                            } else {
+                                self.latency.sample_taker_overhead(when)
+                            };
+                            let match_at = when.saturating_add(
+                                rule_hold.map_or(overhead / 2, |hold| hold.hold_ns),
+                            );
+                            if let Some(hold) = self.rule_holds.get_mut(&o.client_order_id) {
+                                hold.effective_until_ns = Some(match_at);
+                                self.rule_hold_applied += 1;
+                            }
+                            if self.causal_matching
+                                && !self.match_time_liquidity
+                                && self.core.taker_race_enabled()
+                            {
                                 let current = self.core.taker_available_qty(&o);
                                 let pending = self
                                     .pending_taker_races
@@ -2278,6 +2635,14 @@ impl Simulator {
                                 },
                             );
                         } else {
+                            // The reserved processing budget still belongs to
+                            // this observed HTTP attempt even when revalidation
+                            // finds a non-marketable order (no hold state).
+                            let unused_hold = self
+                                .rule_holds
+                                .remove(&o.client_order_id)
+                                .filter(|hold| hold.budget_reserved)
+                                .map_or(0, |hold| hold.hold_ns);
                             self.pending_taker_races.remove(&o.client_order_id);
                             // Maker race: peek the queue `maker_race_horizon` ahead
                             // (the book the resting order faces shortly after entry)
@@ -2292,7 +2657,7 @@ impl Simulator {
                             );
                             self.deliver_ack(
                                 u,
-                                when.saturating_add(l2_ns),
+                                when.saturating_add(unused_hold).saturating_add(l2_ns),
                                 suppress_ack,
                                 request_id,
                             );
@@ -2327,7 +2692,7 @@ impl Simulator {
                             when.saturating_add(l2_ns)
                         };
                         if delay_ns == 0 {
-                            let u = self.core.cancel_order(exchange, &client_order_id, when);
+                            let u = self.cancel_with_rule_hold(exchange, &client_order_id, when);
                             self.audit_transition(
                                 ExecutionStage::CancelEffective,
                                 &client_order_id,
@@ -2402,7 +2767,7 @@ impl Simulator {
                 cancel_timing,
             } => {
                 self.core.release_order_message(&client_order_id);
-                let u = self.core.cancel_order(exchange, &client_order_id, when);
+                let u = self.cancel_with_rule_hold(exchange, &client_order_id, when);
                 if u.status == OrderStatus::Filled {
                     self.cancel_finality_matched += 1;
                 }
@@ -2506,13 +2871,19 @@ impl Simulator {
                 suppress_ack,
                 request_id,
             } => {
+                self.prime_selection_label(&order.symbol,when);
+                self.rule_holds.remove(&order.client_order_id);
                 self.core.release_order_message(&order.client_order_id);
                 // Re-match against the (now possibly moved) book: still crossing
                 // → taker fill; moved away → rests (miss) or cancels per type.
                 // Causal mode consumes the minimum volume observed since this
                 // order was emitted by the client; legacy mode retains its
                 // post-match lookahead for byte-compatible experiments.
-                let causal_race_cap = if self.causal_matching {
+                let causal_race_cap = if self.match_time_liquidity {
+                    self.core.clear_next_books();
+                    self.pending_taker_races.remove(&order.client_order_id);
+                    None
+                } else if self.causal_matching {
                     self.core.clear_next_books();
                     self.pending_taker_races
                         .remove(&order.client_order_id)
@@ -2576,6 +2947,33 @@ impl Simulator {
             // Server feed events never enter the server scheduler heap.
             _ => Vec::new(),
         }
+    }
+
+    fn cancel_with_rule_hold(
+        &mut self,
+        exchange: Exchange,
+        coid: &str,
+        now_ns: u64,
+    ) -> OrderUpdate {
+        let mut update = self.core.cancel_order(exchange, coid, now_ns);
+        if self
+            .rule_holds
+            .get(coid)
+            .and_then(|hold| hold.effective_until_ns)
+            .is_some_and(|end| now_ns < end)
+        {
+            // CancelUncertain keeps worst-case reservation and triggers the
+            // existing query path; an unsuccessful cancel must never delete
+            // the queued matching event or masquerade as successful removal.
+            assert_eq!(
+                update.status,
+                OrderStatus::CancelUncertain,
+                "held order unexpectedly entered resting/terminal state"
+            );
+            update.error = Some("sim_venue_taker_hold_pending_cancel_not_allowed".into());
+            self.rule_hold_cancel_rejected += 1;
+        }
+        update
     }
 
     fn step_strategy_sched(&mut self) -> Vec<OrderUpdate> {
@@ -2808,6 +3206,7 @@ impl Simulator {
         {
             self.reconcile_requests += 1;
             let (l1, l2) = self.latency.sample_cancel_split(t_emit);
+            let (l1, l2) = self.partition_network_legs(l1, l2);
             let inherited = if self.cancel_timeout_ns > 0 {
                 self.cancel_timeout_ns
             } else {
@@ -3018,7 +3417,7 @@ impl Simulator {
         );
         let action = actions.remove(0);
         if !self.reject_observed_admission(&action, t_emit) {
-            self.dispatch_action_with_evidence(action, t_emit, l1, l2, evidence);
+            self.dispatch_action_with_transport(action, t_emit, l1, l2, evidence, true, true);
         }
         Ok(())
     }
@@ -3059,6 +3458,7 @@ impl Simulator {
                 l2,
                 evidence,
                 http_response_observed,
+                true,
             );
         }
         Ok(())
@@ -3131,7 +3531,7 @@ impl Simulator {
         l2: u64,
         arrival_evidence: ArrivalEvidence,
     ) {
-        self.dispatch_action_with_transport(action, t_emit, l1, l2, arrival_evidence, true);
+        self.dispatch_action_with_transport(action, t_emit, l1, l2, arrival_evidence, true, false);
     }
 
     fn dispatch_action_with_transport(
@@ -3142,7 +3542,76 @@ impl Simulator {
         l2: u64,
         arrival_evidence: ArrivalEvidence,
         http_response_observed: bool,
+        recorded_rtt: bool,
     ) {
+        let mut arrival_evidence = arrival_evidence;
+        let (mut l1, mut l2) = self.partition_network_legs(l1, l2);
+        let rule_hold_ns = match &action {
+            ReachAction::Place(order) if !order.post_only => self
+                .market_rules
+                .at(&order.symbol, t_emit)
+                .map_or(0, |rule| rule.taker_hold_ms * 1_000_000),
+            _ => 0,
+        };
+        let mut reserved_rule_hold_ns = 0;
+        if rule_hold_ns > 0 {
+            let base = l1.checked_add(l2).expect("place RTT overflow");
+            // Historical commands already include all processing. Synthetic
+            // requests replace the old midpoint processing approximation with
+            // a known hold, retaining only nonnegative residual overhead.
+            let total = if recorded_rtt && http_response_observed {
+                base
+            } else if recorded_rtt {
+                // A timed-out request supplies only a lower bound; satisfying
+                // a known hold does not manufacture an observed HTTP reply.
+                let floor = rule_hold_ns.saturating_add(2);
+                self.rule_hold_budget_floors += u64::from(base < floor);
+                base.max(floor)
+            } else {
+                let sampled = self.latency.sample_taker_overhead(t_emit);
+                self.rule_hold_budget_floors += u64::from(sampled < rule_hold_ns);
+                base.checked_add(sampled.max(rule_hold_ns))
+                    .expect("place hold budget overflow")
+            };
+            // Marketability is a server-arrival fact, not a dispatch-time fact.
+            // An observed success shorter than the hold may simply be passive.
+            // Keep its ordinary partition and defer the contradiction check to
+            // arrival, without looking ahead or stretching the recorded RTT.
+            let budget_reserved = total >= rule_hold_ns.saturating_add(2);
+            if budget_reserved {
+                (l1, l2) = crate::exchange::sim_v2::market_rules::partition_hold_budget(
+                    total,
+                    rule_hold_ns,
+                    self.network_outbound_fraction_bps,
+                )
+                .expect("validated venue hold budget must have two positive legs");
+                reserved_rule_hold_ns = rule_hold_ns;
+            } else {
+                assert!(
+                    recorded_rtt && http_response_observed,
+                    "unreserved venue hold requires a short observed HTTP success"
+                );
+            }
+            if let ReachAction::Place(order) = &action {
+                assert!(
+                    self.rule_holds.len() < MAX_HTTP_DEADLINES
+                        && !self.rule_holds.contains_key(&order.client_order_id),
+                    "bounded venue hold capacity/identity violation"
+                );
+                self.rule_holds.insert(
+                    order.client_order_id.clone(),
+                    RuleHold {
+                        hold_ns: rule_hold_ns,
+                        budget_reserved,
+                        effective_until_ns: None,
+                    },
+                );
+            }
+        }
+        if self.network_outbound_fraction_bps != 5000 || reserved_rule_hold_ns > 0 {
+            arrival_evidence.selected_ns = t_emit.saturating_add(l1);
+            arrival_evidence.selected_kind = "modeled_budget_partition";
+        }
         if let ReachAction::Place(order) = &action {
             self.core.register_dispatched_order(order);
             self.begin_causal_taker_race(order, t_emit);
@@ -3178,7 +3647,7 @@ impl Simulator {
                 .clamp(0.0, u64::MAX as f64) as u64;
             l2.max(finality)
         } else {
-            l2
+            l2.saturating_add(reserved_rule_hold_ns)
         };
         let rtt = l1.saturating_add(response_l2);
         let forced_uncertain = if rtt <= timeout_ns {
@@ -3216,6 +3685,25 @@ impl Simulator {
         // affect the matching engine. Never rewind an already-advanced server
         // lane even if the two recorded wall clocks have transient skew.
         let reach = t_emit.saturating_add(l1).max(self.server_clock_ns);
+        if let ReachAction::Place(order) = &action {
+            if self.arrival_intervals.enabled() {
+                let upper = t_emit.saturating_add(rtt);
+                self.arrival_intervals.start(
+                    order,
+                    t_emit,
+                    upper.max(reach),
+                    reach,
+                    if reach > upper {
+                        "modeled_clock_clamped"
+                    } else if recorded_rtt {
+                        "client_interval_unaligned"
+                    } else {
+                        "modeled_rtt_budget"
+                    },
+                );
+                self.observe_arrival_intervals();
+            }
+        }
         let request_id = if let ReachAction::CancelAllOwned { instance_id, .. } = &action {
             assert!(
                 self.http_deadlines.len() < MAX_HTTP_DEADLINES,
@@ -3514,6 +4002,16 @@ mod tests {
             1,
         );
         Simulator {
+            match_time_liquidity: false,
+            network_outbound_fraction_bps: 5000,
+            arrival_intervals: crate::exchange::sim_v2::arrival_interval::ArrivalIntervalAudit::new(
+                false,
+            ),
+            market_rules: crate::exchange::sim_v2::market_rules::MarketRules::default(),
+            rule_holds: HashMap::new(),
+            rule_hold_applied: 0,
+            rule_hold_budget_floors: 0,
+            rule_hold_cancel_rejected: 0,
             server_sched: Scheduler::new(),
             strategy_sched: Scheduler::new(),
             server_clock_ns: 0,
@@ -3632,6 +4130,16 @@ mod tests {
             1,
         );
         Simulator {
+            match_time_liquidity: false,
+            network_outbound_fraction_bps: 5000,
+            arrival_intervals: crate::exchange::sim_v2::arrival_interval::ArrivalIntervalAudit::new(
+                false,
+            ),
+            market_rules: crate::exchange::sim_v2::market_rules::MarketRules::default(),
+            rule_holds: HashMap::new(),
+            rule_hold_applied: 0,
+            rule_hold_budget_floors: 0,
+            rule_hold_cancel_rejected: 0,
             server_sched: Scheduler::new(),
             strategy_sched: Scheduler::new(),
             server_clock_ns: 0,
@@ -4114,6 +4622,249 @@ mod tests {
             Some(35.0)
         );
         assert_eq!(sim.peek_when(), Some(emit + 50_000_000));
+    }
+
+    #[test]
+    fn v6_match_time_liquidity_allows_replenishment_before_arrival() {
+        let (mut sim, signal) = separated_taker_sim(10);
+        sim.causal_matching = true;
+        sim.match_time_liquidity = true;
+        sim.core.configure_race(0.0, 1.0);
+        sim.core.set_fold_outcomes(true);
+        sim.core.configure_fold_canonical_book_only(true);
+        sim.core.configure_exact_maker_trade_level(true);
+        sim.core.set_liquidity_ledger_enabled(true);
+        let emit = 1_000_000_000;
+        sim.submit(&signal, emit);
+        for (offset, qty) in [(10_000_000, 0.0), (20_000_000, 10.0)] {
+            sim.core.on_orderbook(&OrderBookSnapshot {
+                exchange: Exchange::Polymarket,
+                symbol: "tok".into(),
+                bids: vec![],
+                asks: vec![PriceLevel {
+                    price: 0.6,
+                    quantity: qty,
+                }],
+                exchange_timestamp_ns: emit + offset,
+                local_timestamp_ns: emit + offset,
+            });
+            sim.observe_causal_taker_races(emit + offset);
+        }
+        assert!(sim.pending_taker_races.is_empty());
+        let mut qty = 0.0;
+        while sim.peek_when().is_some() {
+            for u in sim.step() {
+                qty += u.filled_quantity;
+            }
+        }
+        assert_eq!(qty, 10.0);
+    }
+
+    #[test]
+    fn v6_outbound_partition_changes_arrival_without_stretching_rtt() {
+        let (mut sim, signal) = separated_taker_sim(10);
+        sim.network_outbound_fraction_bps = 3000;
+        sim.submit(&signal, 1_000_000_000);
+        assert_eq!(sim.peek_server_when(), Some(1_030_000_000));
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        let http = updates.iter().find(|u| u.trade_id.is_none()).unwrap();
+        let private = updates.iter().find(|u| u.trade_id.is_some()).unwrap();
+        assert_eq!(http.timestamp_ns, 1_100_000_000);
+        assert_eq!(private.exchange_event_timestamp_ns, Some(1_030_000_000));
+    }
+
+    fn set_fixture_hold(sim: &mut Simulator) {
+        sim.market_rules = crate::exchange::sim_v2::market_rules::MarketRules::from_json(
+            br#"{
+            "schema_version":1,"mode":"sensitivity","rules":[{
+                "token":"tok","valid_from_ns":1,"valid_until_ns":2000000000,
+                "taker_hold_ms":250,"evidence":"modeled_sensitivity","provenance":"unit fixture"}]}
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v6_market_hold_matches_at_expiry_and_preserves_recorded_http_budget() {
+        let (mut sim, signal) = separated_taker_sim(10);
+        set_fixture_hold(&mut sim);
+        let emit = 1_000_000_000;
+        sim.submit_with_latency_split(&signal, emit, 150_000_000, 150_000_000)
+            .unwrap();
+        assert_eq!(sim.peek_server_when(), Some(emit + 25_000_000));
+        assert!(sim.step().is_empty());
+        assert_eq!(sim.peek_server_when(), Some(emit + 275_000_000));
+        sim.submit_with_latency_split(
+            &cancel_signal("taker-private", emit + 30_000_000),
+            emit + 30_000_000,
+            5_000_000,
+            5_000_000,
+        )
+        .unwrap();
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        let cancel = updates
+            .iter()
+            .find(|u| u.status == OrderStatus::CancelUncertain)
+            .unwrap();
+        assert_eq!(
+            cancel.error.as_deref(),
+            Some("sim_venue_taker_hold_pending_cancel_not_allowed")
+        );
+        let private = updates.iter().find(|u| u.trade_id.is_some()).unwrap();
+        assert_eq!(
+            private.exchange_event_timestamp_ns,
+            Some(emit + 275_000_000)
+        );
+        assert_eq!(private.filled_quantity, 10.0);
+        let http = updates
+            .iter()
+            .find(|u| u.status == OrderStatus::Filled && u.trade_id.is_none())
+            .unwrap();
+        assert_eq!(http.timestamp_ns, emit + 300_000_000);
+        assert!(sim.rule_holds.is_empty());
+    }
+
+    #[test]
+    fn v6_market_hold_revalidates_book_at_expiry() {
+        let (mut sim, signal) = separated_taker_sim(10);
+        set_fixture_hold(&mut sim);
+        let emit = 1_000_000_000;
+        sim.submit_with_latency_split(&signal, emit, 150_000_000, 150_000_000)
+            .unwrap();
+        sim.step();
+        sim.core.on_orderbook(&OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            bids: vec![],
+            asks: vec![PriceLevel {
+                price: 0.7,
+                quantity: 100.0,
+            }],
+            exchange_timestamp_ns: emit + 100_000_000,
+            local_timestamp_ns: emit + 100_000_000,
+        });
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, OrderStatus::Cancelled);
+        assert_eq!(updates[0].timestamp_ns, emit + 300_000_000);
+        assert_eq!(updates[0].filled_quantity, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "historical HTTP budget contradicts configured venue hold")]
+    fn v6_market_hold_rejects_impossible_recorded_rtt() {
+        let (mut sim, signal) = separated_taker_sim(10);
+        set_fixture_hold(&mut sim);
+        sim.submit_with_latency_split(&signal, 1_000_000_000, 50_000_000, 50_000_000)
+            .unwrap();
+        // A short RTT alone is not contradictory until the actual arrival
+        // sees a marketable order. Dispatch must not inspect a future book.
+        sim.step();
+    }
+
+    #[test]
+    fn v6_market_hold_short_passive_arrival_preserves_recorded_rtt() {
+        let (mut sim, mut signal) = separated_taker_sim(10);
+        set_fixture_hold(&mut sim);
+        if let Signal::NewOrder(order) = &mut signal {
+            order.order_type = crate::types::OrderType::Limit;
+        }
+        let emit = 1_000_000_000;
+        sim.arrival_intervals =
+            crate::exchange::sim_v2::arrival_interval::ArrivalIntervalAudit::new(true);
+        // Crossing at dispatch must not preempt the actual arrival decision.
+        sim.submit_with_latency_split(&signal, emit, 50_000_000, 50_000_000)
+            .unwrap();
+        assert_eq!(sim.peek_server_when(), Some(emit + 50_000_000));
+        sim.core.on_orderbook(&OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: "tok".into(),
+            bids: vec![],
+            asks: vec![PriceLevel {
+                price: 0.7,
+                quantity: 100.0,
+            }],
+            exchange_timestamp_ns: emit + 30_000_000,
+            local_timestamp_ns: emit + 30_000_000,
+        });
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, OrderStatus::Accepted);
+        assert_eq!(updates[0].timestamp_ns, emit + 100_000_000);
+        assert_eq!(updates[0].filled_quantity, 0.0);
+        assert_eq!(updates[0].trade_id, None);
+        assert_eq!(sim.rule_hold_applied, 0);
+        assert!(sim.rule_holds.is_empty());
+        sim.arrival_intervals.finish();
+        let arrival = sim.drain_arrival_interval_audit().next().unwrap();
+        assert_eq!(arrival.selected_ns, emit + 50_000_000);
+        assert_eq!(arrival.upper_ns, emit + 100_000_000);
+    }
+
+    #[test]
+    fn v6_market_hold_short_crossing_fails_before_matching_or_delivery() {
+        let (mut sim, signal) = separated_taker_sim(10);
+        set_fixture_hold(&mut sim);
+        let Signal::NewOrder(order) = &signal else {
+            unreachable!()
+        };
+        let available_before = sim.core.taker_available_qty(order);
+        sim.submit_with_latency_split(&signal, 1_000_000_000, 50_000_000, 50_000_000)
+            .unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sim.step()));
+        assert!(result.is_err());
+        assert_eq!(sim.core.taker_available_qty(order), available_before);
+        assert_eq!(sim.rule_hold_applied, 0);
+        assert_eq!(sim.peek_server_when(), None, "no TakerMatch was scheduled");
+        assert!(sim.pending_private_fills.is_empty());
+        assert!(sim.strategy_sched.events().all(|(_, _, event)| matches!(
+            event,
+            SimEvent::RequestDeadline { .. }
+        )), "no private fill or HTTP success was scheduled");
+    }
+
+    #[test]
+    fn v6_market_hold_timeout_is_a_lower_bound_without_http_success() {
+        let (mut sim, signal) = separated_taker_sim(10);
+        set_fixture_hold(&mut sim);
+        sim.client_timeout_ns = 100_000_000;
+        let emit = 1_000_000_000;
+        sim.submit_with_latency_split_and_transport_observation(
+            &signal,
+            emit,
+            50_000_000,
+            50_000_000,
+            ArrivalEvidence::modeled(emit + 50_000_000),
+            false,
+        )
+        .unwrap();
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        let private = updates.iter().find(|u| u.trade_id.is_some()).unwrap();
+        assert_eq!(
+            private.exchange_event_timestamp_ns,
+            Some(emit + 250_000_001)
+        );
+        assert_eq!(private.filled_quantity, 10.0);
+        assert!(!updates
+            .iter()
+            .any(|u| u.trade_id.is_none() && u.status == OrderStatus::Filled));
+        assert_eq!(sim.rule_hold_budget_floors, 1);
+        assert!(sim.rule_holds.is_empty());
     }
 
     #[test]
@@ -5195,6 +5946,129 @@ mod tests {
             exchange_timestamp_ns: when,
             local_timestamp_ns: when,
         })
+    }
+
+    #[test]
+    fn v6_recovery_watermark_covers_delayed_normal_private_and_excludes_new_matches() {
+        let mut sim = staged_sim(100, 0);
+        owned_front_order(&mut sim, "normal", "one", "tok");
+        let matched = 1_000_000_000;
+        let fill = trade_front(&mut sim, 4.0, matched).pop().unwrap();
+        let trade_id = fill.trade_id.clone();
+        sim.schedule_private_fill(fill, matched);
+        assert!(
+            sim.pending_private_fills.is_empty(),
+            "normal delivery is not in recovery map"
+        );
+        let watermark = sim.recovery_delivery_watermark();
+        assert_eq!(
+            sim.owner_recovery_delivery_barrier("one", &watermark)
+                .private_messages,
+            1
+        );
+        assert!(sim
+            .owner_recovery_delivery_barrier("two", &watermark)
+            .is_clear());
+        let newer = trade_front(&mut sim, 2.0, matched + 10_000_000)
+            .pop()
+            .unwrap();
+        sim.schedule_private_fill(newer, matched + 10_000_000);
+        let delivery = sim.peek_strategy_delivery_identity().unwrap();
+        let delivered = sim.step_strategy_sched();
+        assert_eq!(delivered[0].trade_id, trade_id);
+        assert!(
+            watermark.includes(delivery, delivered[0].trade_id.as_deref()),
+            "owner lane must retain pre-query provenance"
+        );
+        assert!(
+            sim.owner_recovery_delivery_barrier("one", &watermark)
+                .is_clear(),
+            "new matches cannot extend the captured query boundary"
+        );
+        let newer_identity = sim.peek_strategy_delivery_identity().unwrap();
+        let newer = sim.step_strategy_sched();
+        assert!(!watermark.includes(newer_identity, newer[0].trade_id.as_deref()));
+    }
+
+    #[test]
+    fn v6_recovery_watermark_survives_recovery_map_transfer_without_duplicate_fill() {
+        let mut sim = staged_sim(100, 0);
+        sim.private_fill_reconcile_rate = 1.0;
+        sim.private_fill_reconcile_delay_ns = 750_000_000;
+        owned_front_order(&mut sim, "recovered", "one", "tok");
+        let matched = 1_000_000_000;
+        let fill = trade_front(&mut sim, 4.0, matched).pop().unwrap();
+        let trade_id = fill.trade_id.clone().unwrap();
+        sim.schedule_private_fill(fill, matched);
+        let watermark = sim.recovery_delivery_watermark();
+        assert_eq!(
+            sim.owner_recovery_delivery_barrier("one", &watermark)
+                .private_messages,
+            1
+        );
+        sim.submit(
+            &Signal::ReconcilePolymarket {
+                pending_places: vec![],
+                pending_cancels: vec![],
+                pending_trade_ids: vec![trade_id.clone()],
+                instance_id: "one".into(),
+            },
+            matched + 100_000_000,
+        );
+        assert!(sim.step().is_empty(), "reconciliation reaches the server before its reply");
+        assert!(sim.pending_private_fills.is_empty());
+        assert_eq!(
+            sim.owner_recovery_delivery_barrier("one", &watermark)
+                .private_messages,
+            1,
+            "new-sequence early recovery ACK remains part of original trade watermark"
+        );
+        let identity = sim.peek_strategy_delivery_identity().unwrap();
+        let updates = sim.step_strategy_sched();
+        assert_eq!(updates.len(), 1);
+        assert!(watermark.includes(identity, updates[0].trade_id.as_deref()));
+        assert!(sim
+            .owner_recovery_delivery_barrier("one", &watermark)
+            .is_clear());
+        assert!(
+            sim.step_strategy_sched().is_empty(),
+            "fallback cannot apply the same trade twice"
+        );
+    }
+
+    #[test]
+    fn v6_recovery_http_request_watermark_waits_for_late_created_reply_not_completed_timer() {
+        let mut sim = staged_sim(100, 0);
+        owned_front_order(&mut sim, "cancel", "one", "tok");
+        let at = 1_000_000_000;
+        sim.submit(&owned_cancel_signal("cancel", at), at);
+        let watermark = sim.recovery_delivery_watermark();
+        assert!(
+            sim.owner_recovery_delivery_barrier("one", &watermark)
+                .http_messages
+                > 0
+        );
+        // The reply is created after the query capture, but belongs to its old request.
+        while sim
+            .peek_server_when()
+            .is_some_and(|server| server < sim.peek_strategy_when().unwrap_or(u64::MAX))
+        {
+            assert!(sim.step().is_empty());
+        }
+        let identity = sim.peek_strategy_delivery_identity().unwrap();
+        let updates = sim.step();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, OrderStatus::Cancelled);
+        assert!(watermark.includes(identity, None));
+        assert!(
+            sim.peek_strategy_when().is_some(),
+            "completed request still has a deadline timer"
+        );
+        assert!(
+            sim.owner_recovery_delivery_barrier("one", &watermark)
+                .is_clear(),
+            "completed deadline cannot hold recovery until timeout"
+        );
     }
 
     #[test]

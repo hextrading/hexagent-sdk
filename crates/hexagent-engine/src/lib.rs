@@ -22,3 +22,5 @@ pub mod strategy {
 pub mod engine;
 mod execution_admission;
 mod execution_admission_lane;
+mod virtual_owner;
+mod virtual_recovery;

@@ -43,6 +43,59 @@ const MAX_ORDER_EVIDENCE: usize = 65_536;
 const MAX_ORDER_TRADE_IDS: usize = 256;
 const ADMISSION_AUDIT_CAPACITY: usize = 8_192;
 const ADMISSION_BOOK_CAPACITY: usize = 128;
+const MAX_LIQUIDITY_PRINTS: usize = 4096;
+const MAX_LIQUIDITY_ORDERS: usize = 1024;
+const MAX_HISTORICAL_DEPTH_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_HISTORICAL_DEPTH_LINE_BYTES: usize = 64 * 1024;
+const MAX_HISTORICAL_DEPTH_ROWS: u64 = 1_000_000;
+const MAX_HISTORICAL_DEPTH_TOKENS: usize = 4096;
+const MAX_HISTORICAL_DEPTH_SERIES_PER_TOKEN: usize = 1024;
+
+// Bounded offline evidence owned by the existing exchange simulation thread.
+// Without a venue ID two identical prints remain distinct: timestamp/price/size
+// is not a valid execution identity. Overflow omits inferred fills, fail closed.
+struct LiquidityPrint {
+    symbol: arrayvec::ArrayString<128>,
+    side: Side,
+    price: f64,
+    remaining: f64,
+    allocated: f64,
+    queue_sequence_end: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct HistoricalDepthRow {
+    timestamp_ns: u64,
+    iid: String,
+    token: String,
+    side: String,
+    price: f64,
+    quantity: f64,
+    evidence_class: String,
+    #[serde(default)]
+    reason: String,
+    lower_bound_ns: u64,
+    upper_bound_ns: u64,
+}
+
+struct HistoricalDepthObservation {
+    timestamp_ns: u64,
+    quantity: f64,
+    // Preserve what was observed. Bounds are audit metadata, never a license
+    // to apply a client-observed future quantity before timestamp_ns.
+    _lower_bound_ns: u64,
+    _upper_bound_ns: u64,
+    _evidence_class: String,
+    removal_observed: bool,
+    _reason: String,
+}
+
+struct HistoricalDepthSeries {
+    iid: String,
+    side: Side,
+    price: f64,
+    observations: Vec<HistoricalDepthObservation>,
+}
 
 /// Offline arrival-book evidence. Token identifies the actual recorded book
 /// selected into the canonical frame; BBO here is in that recorded token frame.
@@ -237,6 +290,8 @@ struct RestingOrder {
     /// intentionally retained so disappearance of this depth remains visible
     /// to the unexplained-depletion execution model.
     replay_self_depth_credit: f64,
+    /// Independent historical-own estimate at the previous L2 observation.
+    historical_depth_at_sync: f64,
     /// Visible level depth at the last book snapshot (cancel-attribution ref).
     level_qty_at_sync: f64,
     /// Canonical-frame effective mid at the last snapshot. The signed move
@@ -513,7 +568,22 @@ fn maker_markout_reprice(
 }
 
 pub struct SimExchangeV2 {
+    pub selection: super::selection::Selection,
     books: BookSet,
+    liquidity_ledger_enabled: bool,
+    historical_self_depth: HashMap<String, Vec<HistoricalDepthSeries>>,
+    historical_self_depth_enabled: bool,
+    historical_self_depth_fraction: f64,
+    queue_uncertainty_strength: f64,
+    pub historical_self_depth_rows: u64,
+    liquidity_prints: Vec<LiquidityPrint>,
+    // Exchange-thread owned; allocated once when match-time mode is enabled.
+    unreflected_taker_prints: Vec<LiquidityPrint>,
+    match_time_liquidity: bool,
+    unreflected_high_water: usize,
+    liquidity_trade_ids: VecDeque<(arrayvec::ArrayString<128>, arrayvec::ArrayString<128>)>,
+    pub liquidity_evidence_overflows: u64,
+    pub liquidity_duplicate_trades: u64,
     wallets: WalletBook,
     // BTreeMap (NOT HashMap): `match_trade` / `run_book_through` iterate this to
     // emit maker fills, and the EMISSION ORDER is the order the strategy receives
@@ -530,6 +600,9 @@ pub struct SimExchangeV2 {
     /// enabled, it drains only that exact maker queue rather than every
     /// crossing price-level queue.
     exact_maker_trade_level: bool,
+    maker_trade_through_recovery: bool,
+    trade_through_candidate_qty: f64,
+    trade_through_fill_qty: f64,
     pub exact_cross_level_order_skips: u64,
     pub exact_cross_level_qty_skipped: f64,
     pub own_queue_positioned_orders: u64,
@@ -837,11 +910,27 @@ impl SimExchangeV2 {
         }
         Self {
             books: BookSet::new(),
+            liquidity_ledger_enabled: false,
+            historical_self_depth: HashMap::new(),
+            historical_self_depth_enabled: false,
+            historical_self_depth_fraction: 0.0,
+            queue_uncertainty_strength: 0.0,
+            historical_self_depth_rows: 0,
+            liquidity_prints: Vec::new(),
+            unreflected_taker_prints: Vec::new(),
+            match_time_liquidity: false,
+            unreflected_high_water: 0,
+            liquidity_trade_ids: VecDeque::new(),
+            liquidity_evidence_overflows: 0,
+            liquidity_duplicate_trades: 0,
             wallets,
             orders: BTreeMap::new(),
             next_queue_seq: 0,
             order_queue_position_strength: 0.0,
             exact_maker_trade_level: false,
+            maker_trade_through_recovery: false,
+            trade_through_candidate_qty: 0.0,
+            trade_through_fill_qty: 0.0,
             exact_cross_level_order_skips: 0,
             exact_cross_level_qty_skipped: 0.0,
             own_queue_positioned_orders: 0,
@@ -859,6 +948,7 @@ impl SimExchangeV2 {
             fold_to: HashMap::new(),
             event_slug_by_token: HashMap::new(),
             fill_audit: BTreeMap::new(),
+            selection: super::selection::Selection::default(),
             maker_order_audit_enabled: false,
             maker_order_audit: BTreeMap::new(),
             order_evidence: BTreeMap::new(),
@@ -1279,7 +1369,18 @@ impl SimExchangeV2 {
         self.order_queue_position_strength = strength.clamp(0.0, 1.0);
     }
 
+    pub fn configure_maker_trade_through_recovery(&mut self, enabled: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(!enabled || self.liquidity_ledger_enabled,
+            "maker trade-through recovery requires the canonical quantity ledger");
+        self.maker_trade_through_recovery = enabled;
+        Ok(())
+    }
+
     pub fn configure_exact_maker_trade_level(&mut self, enabled: bool) {
+        assert!(
+            enabled || !self.liquidity_ledger_enabled,
+            "disable v6 liquidity ledger before disabling exact maker trade levels"
+        );
         self.exact_maker_trade_level = enabled;
         if enabled {
             // Exact-level public flow must be conserved across our own orders
@@ -1847,7 +1948,14 @@ impl SimExchangeV2 {
                 continue;
             }
             let depth = books.level_depth(&o.match_symbol, o.match_side, o.match_price, o.tick);
-            o.replay_self_depth_credit = o.replay_self_depth_credit.min(depth).min(o.remaining);
+            o.replay_self_depth_credit =
+                o.replay_self_depth_credit
+                    .min(depth)
+                    .min(if self.historical_self_depth_enabled {
+                        f64::INFINITY
+                    } else {
+                        o.remaining
+                    });
             o.q_ahead = (depth - o.replay_self_depth_credit).max(0.0) + o.own_q_ahead;
             o.level_qty_at_sync = depth;
             let mid = books.eff_mid(&o.match_symbol);
@@ -1906,8 +2014,217 @@ impl SimExchangeV2 {
         self.maker_toxicity_scale_ticks = scale_ticks.max(1e-6);
     }
 
-    /// Configure the book-through adverse fill rate (latency-race fraction in
-    /// [0,1]; 0 = off). See the `book_through_rate` field.
+    /// Startup-only causal absolute-depth journal. All mutable parsing buffers
+    /// are dropped before replay. The immutable archive is indexed by original
+    /// token and owner; observations are never inferred from simulated sizes.
+    pub fn load_historical_self_depth(&mut self, path: &str, fraction: f64) -> Result<(), String> {
+        use std::io::{BufRead, Read};
+        if path.is_empty() {
+            return Ok(());
+        }
+        if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+            return Err("historical self-depth fraction must be in [0,1]".into());
+        }
+        let file =
+            std::fs::File::open(path).map_err(|e| format!("historical self-depth {path}: {e}"))?;
+        if file.metadata().map_err(|e| e.to_string())?.len() > MAX_HISTORICAL_DEPTH_BYTES {
+            return Err("historical self-depth file exceeds 512 MiB bound".into());
+        }
+        let mut archive: HashMap<String, Vec<HistoricalDepthSeries>> = HashMap::new();
+        let mut rows = 0u64;
+        let mut index = 0usize;
+        let mut reader = std::io::BufReader::new(file);
+        let mut line = Vec::with_capacity(4096);
+        loop {
+            line.clear();
+            let count = (&mut reader)
+                .take(MAX_HISTORICAL_DEPTH_LINE_BYTES as u64 + 1)
+                .read_until(b'\n', &mut line)
+                .map_err(|e| e.to_string())?;
+            if count == 0 {
+                break;
+            }
+            if count > MAX_HISTORICAL_DEPTH_LINE_BYTES {
+                return Err(format!(
+                    "historical self-depth line {} exceeds 64 KiB bound",
+                    index + 1
+                ));
+            }
+            if rows >= MAX_HISTORICAL_DEPTH_ROWS {
+                return Err("historical self-depth exceeds 1000000 row bound".into());
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                index += 1;
+                continue;
+            }
+            let row: HistoricalDepthRow = serde_json::from_slice(&line)
+                .map_err(|e| format!("historical self-depth line {}: {e}", index + 1))?;
+            let side = match row.side.to_ascii_uppercase().as_str() {
+                "BUY" => Side::Buy,
+                "SELL" => Side::Sell,
+                _ => {
+                    return Err(format!(
+                        "historical self-depth line {}: invalid side",
+                        index + 1
+                    ))
+                }
+            };
+            if row.iid.is_empty()
+                || row.token.is_empty()
+                || !row.price.is_finite()
+                || row.price <= 0.0
+                || row.price >= 1.0
+                || !row.quantity.is_finite()
+                || row.quantity < 0.0
+                || row.lower_bound_ns > row.upper_bound_ns
+                || row.evidence_class.is_empty()
+            {
+                return Err(format!(
+                    "historical self-depth line {}: invalid evidence",
+                    index + 1
+                ));
+            }
+            if !archive.contains_key(&row.token) && archive.len() >= MAX_HISTORICAL_DEPTH_TOKENS {
+                return Err("historical self-depth exceeds 4096 token bound".into());
+            }
+            let levels = archive.entry(row.token).or_default();
+            let series_index = levels.iter().position(|s| {
+                s.iid == row.iid && s.side == side && (s.price - row.price).abs() < EPS
+            });
+            if series_index.is_none() && levels.len() >= MAX_HISTORICAL_DEPTH_SERIES_PER_TOKEN {
+                return Err(
+                    "historical self-depth exceeds 1024 price/owner series per token bound".into(),
+                );
+            }
+            let series_index = series_index.unwrap_or_else(|| {
+                levels.push(HistoricalDepthSeries {
+                    iid: row.iid,
+                    side,
+                    price: row.price,
+                    observations: Vec::new(),
+                });
+                levels.len() - 1
+            });
+            levels[series_index]
+                .observations
+                .push(HistoricalDepthObservation {
+                    timestamp_ns: row.timestamp_ns,
+                    quantity: row.quantity,
+                    _lower_bound_ns: row.lower_bound_ns,
+                    _upper_bound_ns: row.upper_bound_ns,
+                    _evidence_class: row.evidence_class,
+                    removal_observed: matches!(
+                        row.reason.as_str(),
+                        "observed_terminal" | "observed_active_or_matched"
+                    ),
+                    _reason: row.reason,
+                });
+            rows += 1;
+            index += 1;
+        }
+        for levels in archive.values_mut() {
+            for series in levels {
+                series.observations.sort_by_key(|o| o.timestamp_ns);
+                for pair in series.observations.windows(2) {
+                    if pair[0].timestamp_ns == pair[1].timestamp_ns
+                        && (pair[0].quantity - pair[1].quantity).abs() > EPS
+                    {
+                        return Err("conflicting historical self-depth snapshots at same owner/token/price/time".into());
+                    }
+                }
+                series.observations.dedup_by_key(|o| o.timestamp_ns);
+            }
+        }
+        self.historical_self_depth = archive;
+        self.historical_self_depth_enabled = true;
+        self.historical_self_depth_fraction = fraction;
+        self.historical_self_depth_rows = rows;
+        Ok(())
+    }
+
+    pub fn configure_queue_uncertainty(&mut self, strength: f64) {
+        self.queue_uncertainty_strength = strength.clamp(0.0, 1.0);
+    }
+
+    fn historical_depth_at(
+        &self,
+        iid: &str,
+        token: &str,
+        side: Side,
+        price: f64,
+        tick: f64,
+        now_ns: u64,
+    ) -> f64 {
+        let sibling = if self.fold_outcomes {
+            self.fold_sibling.get(token)
+        } else {
+            self.books.complement(token)
+        };
+        lookup_historical_depth(
+            &self.historical_self_depth,
+            iid,
+            token,
+            sibling.map(String::as_str),
+            side,
+            price,
+            tick,
+            now_ns,
+        ) * self.historical_self_depth_fraction
+    }
+
+    /// Offline final-report snapshot; serialization runs outside quote/replay callbacks.
+    pub fn v6_fidelity_stats(&self) -> serde_json::Value {
+        serde_json::json!({
+            "liquidity_ledger_enabled": self.liquidity_ledger_enabled,
+            "maker_trade_through_recovery": self.maker_trade_through_recovery,
+            "trade_through_candidate_qty": self.trade_through_candidate_qty,
+            "trade_through_fill_qty": self.trade_through_fill_qty,
+            "liquidity_ledger": self.books.liquidity_ledger_stats(),
+            "pending_prints": self.liquidity_prints.len(),
+            "unreflected_taker_prints": self.unreflected_taker_prints.len(),
+            "match_time_liquidity": self.match_time_liquidity,
+            "unreflected_capacity": MAX_LIQUIDITY_PRINTS,
+            "unreflected_high_water": self.unreflected_high_water,
+            "pending_print_capacity": MAX_LIQUIDITY_PRINTS,
+            "recent_trade_ids": self.liquidity_trade_ids.len(),
+            "liquidity_evidence_overflows": self.liquidity_evidence_overflows,
+            "liquidity_duplicate_trades": self.liquidity_duplicate_trades,
+            "historical_self_depth_enabled": self.historical_self_depth_enabled,
+            "historical_self_depth_rows": self.historical_self_depth_rows,
+            "historical_self_depth_fraction": self.historical_self_depth_fraction,
+            "historical_depth_evidence": "client-observed quantity proxy; no exchange FIFO assertion",
+            "historical_depth_clock_mapping": "client observed UTC compared to simulator application UTC; maker/venue offset unmeasured",
+            "queue_uncertainty_strength": self.queue_uncertainty_strength,
+        })
+    }
+
+    /// Startup-only v6 finite liquidity/print budgets; disabled retains V5.
+    pub fn configure_match_time_liquidity(&mut self, enabled: bool) {
+        assert!(!enabled || self.liquidity_ledger_enabled, "match-time liquidity requires quantity ledger");
+        self.match_time_liquidity = enabled;
+        self.unreflected_taker_prints = if enabled { Vec::with_capacity(MAX_LIQUIDITY_PRINTS) } else { Vec::new() };
+    }
+    pub fn liquidity_ledger_enabled(&self) -> bool { self.liquidity_ledger_enabled }
+
+    pub fn set_liquidity_ledger_enabled(&mut self, enabled: bool) {
+        assert!(enabled || !self.maker_trade_through_recovery,
+            "disable trade-through recovery before disabling the quantity ledger");
+        assert!(!enabled || (self.fold_outcomes && self.fold_canonical_book_only && self.exact_maker_trade_level),
+            "v6 liquidity ledger requires folded canonical-only books and exact maker trade levels; unfolded mirror print budgets are unsupported");
+        self.liquidity_ledger_enabled = enabled;
+        self.books.set_liquidity_ledger_enabled(enabled);
+        self.liquidity_prints = if enabled {
+            Vec::with_capacity(MAX_LIQUIDITY_PRINTS)
+        } else {
+            Vec::new()
+        };
+        self.liquidity_trade_ids = if enabled {
+            VecDeque::with_capacity(MAX_LIQUIDITY_PRINTS)
+        } else {
+            VecDeque::new()
+        };
+    }
+
     pub fn configure_book_through(&mut self, rate: f64) {
         self.book_through_rate = rate.clamp(0.0, 1.0);
     }
@@ -1987,6 +2304,10 @@ impl SimExchangeV2 {
 
     /// Enable outcome-folding (single canonical up-frame book; down mapped in).
     pub fn set_fold_outcomes(&mut self, on: bool) {
+        assert!(
+            on || !self.liquidity_ledger_enabled,
+            "disable v6 liquidity ledger before disabling outcome folding"
+        );
         self.fold_outcomes = on;
         // Mirror the flag into the book set so the cross-outcome merge chokepoint
         // (`comp_book`) can debug_assert it stays inert under folding.
@@ -1994,6 +2315,10 @@ impl SimExchangeV2 {
     }
 
     pub fn configure_fold_canonical_book_only(&mut self, enabled: bool) {
+        assert!(
+            enabled || !self.liquidity_ledger_enabled,
+            "disable v6 liquidity ledger before disabling canonical-only books"
+        );
         self.fold_canonical_book_only = enabled;
     }
 
@@ -2159,9 +2484,11 @@ impl SimExchangeV2 {
             self.select_admission_book(&canon, &ob.symbol, observation);
             if ob.symbol == canon {
                 self.canonical_book_seen.insert(canon.clone());
+                self.protect_debt_before_snapshot(&canon,&ob.bids,&ob.asks);
                 self.books.update(&canon, ob.bids.clone(), ob.asks.clone());
             } else {
                 let (b, a) = Self::mirror_levels(&ob.bids, &ob.asks);
+                self.protect_debt_before_snapshot(&canon,&b,&a);
                 self.books.update(&canon, b, a);
             }
             self.maybe_rebase_stale_orders(&canon, now_ns);
@@ -2202,12 +2529,23 @@ impl SimExchangeV2 {
         depletion_fills
     }
 
+    fn protect_debt_before_snapshot(&mut self, token: &str, bids: &[PriceLevel], asks: &[PriceLevel]) {
+        for p in &self.unreflected_taker_prints {
+            if p.symbol.as_str()==token {
+                self.books.protect_debt_from_public_drop(token,flip(p.side),p.price,p.remaining,if p.side==Side::Buy {asks} else {bids});
+            }
+        }
+    }
+
     fn run_book_through_if_fresh(
         &mut self,
         token: &str,
         now_ns: u64,
         fwd_mid: Option<f64>,
     ) -> Vec<OrderUpdate> {
+        // A newly accepted snapshot supersedes prints in the preceding book
+        // interval. Rejected/older snapshots never call this function.
+        self.unreflected_taker_prints.retain(|p| p.symbol.as_str() != token);
         let (exchange_stale, local_stale) = self.book_stale_reasons(token, now_ns);
         if exchange_stale
             || (self.book_continuity_mode == BookContinuityMode::LegacyAge && local_stale)
@@ -2215,10 +2553,15 @@ impl SimExchangeV2 {
             // A trade-confirmation belongs only to the immediately following
             // book interval. Do not let a confirmation suppressed by the stale
             // gate leak forward and fill on a later fresh book.
-            self.pend_cross.clear();
+            if self.liquidity_ledger_enabled {
+                self.pend_cross.remove(token);
+                self.liquidity_prints.retain(|p| p.symbol.as_str() != token);
+            } else {
+                self.pend_cross.clear();
+            }
             Vec::new()
         } else {
-            self.run_book_through(now_ns, fwd_mid)
+            self.run_book_through(token, now_ns, fwd_mid)
         }
     }
 
@@ -2228,11 +2571,23 @@ impl SimExchangeV2 {
     /// — verified 99.9% of crosses), gets picked off. Fill `rate·(through_vol −
     /// q_ahead)` at the order's limit (adverse: mid is now through it). No-op
     /// when `book_through_rate == 0`.
-    fn run_book_through(&mut self, now_ns: u64, fwd_mid: Option<f64>) -> Vec<OrderUpdate> {
+    fn run_book_through(
+        &mut self,
+        changed_token: &str,
+        now_ns: u64,
+        fwd_mid: Option<f64>,
+    ) -> Vec<OrderUpdate> {
         let rate = self.book_through_rate;
         if rate <= 0.0 {
             return Vec::new();
         }
+        if self.liquidity_ledger_enabled && self.orders.len() > MAX_LIQUIDITY_ORDERS {
+            self.liquidity_evidence_overflows += 1;
+            self.liquidity_prints
+                .retain(|p| p.symbol.as_str() != changed_token);
+            return Vec::new();
+        }
+        let selection = &mut self.selection;
         let markout_vn = self.book_fill_markout_vn;
         let audit_enabled = self.maker_order_audit_enabled;
         let mut mfills: Vec<MakerFill> = Vec::new();
@@ -2242,13 +2597,17 @@ impl SimExchangeV2 {
         let mut residual_orders_n = 0u64;
         let mut residual_qty = 0.0;
         {
-            let books = &self.books;
+            let books = &mut self.books;
             let pend = &self.pend_cross;
+            let prints = &mut self.liquidity_prints;
             let slugs = &self.event_slug_by_token;
             let audits = &mut self.fill_audit;
             let order_audits = &mut self.maker_order_audit;
             let mut n = 0u64;
-            for (coid, o) in self.orders.iter_mut() {
+            for (coid, o) in liquidity_order_iter(&mut self.orders, self.liquidity_ledger_enabled) {
+                if self.liquidity_ledger_enabled && o.match_symbol != changed_token {
+                    continue;
+                }
                 if o.remaining <= EPS {
                     continue;
                 }
@@ -2280,11 +2639,65 @@ impl SimExchangeV2 {
                 }
                 // Contra volume marketable at our limit (asks≤p for a buy).
                 let through = books.available_volume(&o.match_symbol, is_buy, Some(p));
+                let available = if self.liquidity_ledger_enabled {
+                    books.executable_volume(&o.match_symbol, o.match_side, p, o.tick)
+                } else {
+                    f64::INFINITY
+                };
                 let fillable = (through - o.q_ahead).max(0.0) * rate;
-                let uncapped_fill = fillable.min(o.remaining);
+                let uncapped_fill = fillable.min(o.remaining).min(available);
                 let inferred_capacity = (o.remaining - o.inferred_residual_floor).max(0.0);
-                let fill = uncapped_fill.min(inferred_capacity);
-                let residual_suppressed = (uncapped_fill - fill).max(0.0);
+                let mut fill = uncapped_fill.min(inferred_capacity);
+                if self.liquidity_ledger_enabled {
+                    let requested = fill;
+                    let observed_cross_qty = prints
+                        .iter()
+                        .filter(|print| {
+                            print.symbol.as_str() == o.match_symbol
+                                && print.side != o.match_side
+                                && o.queue_seq < print.queue_sequence_end
+                                && match o.match_side {
+                                    Side::Buy => print.price <= p + EPS,
+                                    Side::Sell => print.price >= p - EPS,
+                                }
+                        })
+                        .map(|print| print.remaining + print.allocated)
+                        .sum::<f64>();
+                    fill = 0.0;
+                    for print in prints.iter_mut() {
+                        let eligible = print.symbol.as_str() == o.match_symbol
+                            && print.side != o.match_side
+                            && o.queue_seq < print.queue_sequence_end
+                            && match o.match_side {
+                                Side::Buy => print.price <= p + EPS,
+                                Side::Sell => print.price >= p - EPS,
+                            };
+                        if !eligible || print.remaining <= EPS {
+                            continue;
+                        }
+                        let ahead = (o.q_ahead - print.allocated).max(0.0).min(print.remaining);
+                        print.remaining -= ahead;
+                        print.allocated += ahead;
+                        let take = (requested - fill).min(print.remaining * rate);
+                        print.remaining -= take;
+                        print.allocated += take;
+                        fill += take;
+                        if fill + EPS >= requested {
+                            break;
+                        }
+                    }
+                    o.q_ahead = (o.q_ahead - observed_cross_qty).max(0.0);
+                    o.own_q_ahead = o.own_q_ahead.min(o.q_ahead);
+                }
+                let residual_suppressed =
+                    (uncapped_fill - uncapped_fill.min(inferred_capacity)).max(0.0);
+                if selection.mode != super::selection::Mode::Off && fill > EPS {
+                    let mid = books.eff_mid(&o.match_symbol);
+                    let side = if o.match_side == Side::Buy {1.0} else {-1.0};
+                    let spread = (books.eff_best_ask(&o.match_symbol).unwrap_or(mid)-books.eff_best_bid(&o.match_symbol).unwrap_or(mid)).max(0.0);
+                    let x = super::selection::features(side,p,mid,spread,o.tick,o.q_ahead,now_ns.saturating_sub(o.placed_ns),fill,o.request.quantity,o.entry_mid);
+                    fill = selection.select(&o.request.instance_id,coid,&o.match_symbol,now_ns,"maker","book",x,mid,o.tick,side,fill);
+                }
                 if fill <= EPS {
                     continue;
                 }
@@ -2293,9 +2706,16 @@ impl SimExchangeV2 {
                     residual_orders_n += 1;
                     residual_qty += residual_suppressed;
                 }
+                if self.liquidity_ledger_enabled {
+                    let consumed =
+                        books.consume_sweep(&o.match_symbol, o.match_side, p, o.tick, fill);
+                    debug_assert!((consumed - fill).abs() < 1e-7);
+                }
                 // The sweep consumes the queue ahead of us then takes our fill.
-                o.q_ahead = (o.q_ahead - through).max(0.0);
-                o.own_q_ahead = o.own_q_ahead.min(o.q_ahead);
+                if !self.liquidity_ledger_enabled {
+                    o.q_ahead = (o.q_ahead - through).max(0.0);
+                    o.own_q_ahead = o.own_q_ahead.min(o.q_ahead);
+                }
                 o.remaining -= fill;
                 let limit = o.request.price.unwrap_or(0.0);
                 let (effective_price, price_penalty) = maker_markout_reprice(
@@ -2357,7 +2777,13 @@ impl SimExchangeV2 {
         self.inferred_maker_residual_orders_n += residual_orders_n;
         self.inferred_maker_residual_qty += residual_qty;
         // Reset the trade-gate window for the next book interval.
-        self.pend_cross.clear();
+        if self.liquidity_ledger_enabled {
+            self.pend_cross.remove(changed_token);
+            self.liquidity_prints
+                .retain(|p| p.symbol.as_str() != changed_token);
+        } else {
+            self.pend_cross.clear();
+        }
         if mfills.is_empty() {
             return Vec::new();
         }
@@ -2387,6 +2813,11 @@ impl SimExchangeV2 {
             return Vec::new();
         }
         let books = &self.books;
+        let historical = &self.historical_self_depth;
+        let historical_fraction = self.historical_self_depth_fraction;
+        let historical_enabled = self.historical_self_depth_enabled;
+        let fold_sibling = &self.fold_sibling;
+        let fold_outcomes = self.fold_outcomes;
         let af_override = self.ahead_frac_override;
         let dynamic_af_strength = self.dynamic_ahead_frac_strength;
         let partial_queue_strength = self.partial_depletion_queue_strength;
@@ -2397,7 +2828,11 @@ impl SimExchangeV2 {
         let no_evidence_prior = self.depletion_no_evidence_exec_frac;
         let evidence_min_shrink = self.depletion_evidence_min_shrink_frac;
         let markout_vn = self.book_fill_markout_vn;
-        let own_fifo_strength = self.order_queue_position_strength;
+        let own_fifo_strength = if self.liquidity_ledger_enabled {
+            1.0
+        } else {
+            self.order_queue_position_strength
+        };
         let audit_enabled = self.maker_order_audit_enabled;
         let mut advanced = 0u64;
         let mut dynamic_n = 0u64;
@@ -2416,13 +2851,68 @@ impl SimExchangeV2 {
         let mut evidence_capped_n = 0u64;
         let mut evidence_capped_qty = 0.0;
         for (coid, o) in self.orders.iter_mut() {
+            if (self.liquidity_ledger_enabled
+                || historical_enabled
+                || self.queue_uncertainty_strength > 0.0)
+                && o.match_symbol != changed_token
+            {
+                continue;
+            }
             if continuity_enabled && o.await_fresh_book {
                 continue;
             }
             // Queue depth tracked in the canonical matching frame.
             let l_now = books.level_depth(&o.match_symbol, o.match_side, o.match_price, o.tick);
             let l_prev = o.level_qty_at_sync;
-            let unexplained = (l_prev - o.traded_since_sync - l_now).max(0.0);
+            let historical_now = if historical_enabled {
+                let sibling = if fold_outcomes {
+                    fold_sibling.get(&o.match_symbol)
+                } else {
+                    books.complement(&o.match_symbol)
+                };
+                (lookup_historical_depth(
+                    historical,
+                    &o.request.instance_id,
+                    &o.match_symbol,
+                    sibling.map(String::as_str),
+                    o.match_side,
+                    o.match_price,
+                    o.tick,
+                    now_ns,
+                ) * historical_fraction)
+                    .min(l_now)
+            } else {
+                0.0
+            };
+            // Removal of an observed historical own order is not cancellation
+            // ahead of our independent simulated order. Overlap with already
+            // applied public prints is reconciled once, never subtracted twice.
+            let historical_removed = if historical_enabled {
+                let sibling = if fold_outcomes {
+                    fold_sibling.get(&o.match_symbol)
+                } else {
+                    books.complement(&o.match_symbol)
+                };
+                let observed = historical_removal_observed(
+                    historical,
+                    &o.request.instance_id,
+                    &o.match_symbol,
+                    sibling.map(String::as_str),
+                    o.match_side,
+                    o.match_price,
+                    o.tick,
+                    now_ns,
+                );
+                if observed {
+                    (o.historical_depth_at_sync - historical_now).max(0.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            let explained = o.traded_since_sync.max(historical_removed);
+            let unexplained = (l_prev - explained - l_now).max(0.0);
             let shrink_frac = if l_prev > EPS {
                 (unexplained / l_prev).clamp(0.0, 1.0)
             } else {
@@ -2521,7 +3011,24 @@ impl SimExchangeV2 {
                 raw_execution
             };
             let cancels = unexplained - execution;
-            let raw_cancel_advance = cancels * ahead_frac;
+            let raw_cancel_advance = if self.queue_uncertainty_strength > 0.0 {
+                let public_ahead = (q_before - o.own_q_ahead).max(0.0);
+                let public_total =
+                    (l_prev - o.traded_since_sync - o.replay_self_depth_credit).max(public_ahead);
+                bounded_cancel_advance(
+                    public_ahead,
+                    public_total,
+                    cancels,
+                    stable_queue_level_sample(
+                        &o.match_symbol,
+                        o.match_side,
+                        price_to_ticks(o.match_price, o.tick),
+                    ),
+                    self.queue_uncertainty_strength,
+                )
+            } else {
+                cancels * ahead_frac
+            };
             // Public cancellations can remove only the public portion of our
             // queue. Earlier simulated orders remain ahead until they fill or
             // cancel explicitly; treating public L2 shrinkage as their cancel
@@ -2589,7 +3096,18 @@ impl SimExchangeV2 {
             // Own depth cannot survive after it disappears from the replayed
             // level. Capping here prevents a later, unrelated level re-entry
             // from receiving the same leave-one-out credit a second time.
-            o.replay_self_depth_credit = o.replay_self_depth_credit.min(l_now).min(o.remaining);
+            o.replay_self_depth_credit =
+                o.replay_self_depth_credit
+                    .min(l_now)
+                    .min(if self.historical_self_depth_enabled {
+                        f64::INFINITY
+                    } else {
+                        o.remaining
+                    });
+            if historical_enabled {
+                o.replay_self_depth_credit = o.replay_self_depth_credit.min(historical_now);
+                o.historical_depth_at_sync = historical_now;
+            }
             o.level_qty_at_sync = l_now;
             if mid_now > 0.0 {
                 o.mid_at_sync = mid_now;
@@ -2652,7 +3170,8 @@ impl SimExchangeV2 {
                 let uncapped_fill = actual.min(o.remaining);
                 let inferred_capacity = (o.remaining - o.inferred_residual_floor).max(0.0);
                 let fill = uncapped_fill.min(inferred_capacity);
-                let residual_suppressed = (uncapped_fill - fill).max(0.0);
+                let residual_suppressed =
+                    (uncapped_fill - uncapped_fill.min(inferred_capacity)).max(0.0);
                 if fill <= EPS {
                     continue;
                 }
@@ -2768,6 +3287,30 @@ impl SimExchangeV2 {
         ts: u64,
     ) -> Vec<OrderUpdate> {
         let mut fills: Vec<MakerFill> = Vec::new();
+        if self.liquidity_ledger_enabled {
+            if let Some(id) = t.exchange_trade_id.as_deref().filter(|id| !id.is_empty()) {
+                let token = self.canonical_of(&t.symbol);
+                let (Ok(token), Ok(id)) = (
+                    arrayvec::ArrayString::<128>::from(token),
+                    arrayvec::ArrayString::<128>::from(id),
+                ) else {
+                    self.liquidity_evidence_overflows += 1;
+                    return Vec::new();
+                };
+                if self
+                    .liquidity_trade_ids
+                    .iter()
+                    .any(|key| key.0 == token && key.1 == id)
+                {
+                    self.liquidity_duplicate_trades += 1;
+                    return Vec::new();
+                }
+                if self.liquidity_trade_ids.len() == MAX_LIQUIDITY_PRINTS {
+                    self.liquidity_trade_ids.pop_front();
+                }
+                self.liquidity_trade_ids.push_back((token, id));
+            }
+        }
         self.audit_clock_ns = self.audit_clock_ns.max(ts);
         if self.fold_outcomes {
             // Fold the trade onto the canonical frame and drain the single
@@ -2837,6 +3380,15 @@ impl SimExchangeV2 {
     /// Append a trade to the rolling competition buffer (canonical frame) and
     /// trim to `taker_comp_window_ns`. No-op when taker competition is off.
     fn record_trade(&mut self, sym: &str, side: Side, price: f64, qty: f64, ts: u64) {
+        if self.match_time_liquidity && self.last_book_ts.get(sym).is_none_or(|last| ts > *last) {
+            if let Some(p) = self.unreflected_taker_prints.iter_mut().find(|p| p.symbol.as_str()==sym && p.side==side && (p.price-price).abs()<EPS) {
+                p.remaining += qty;
+            } else {
+                assert!(self.unreflected_taker_prints.len() < MAX_LIQUIDITY_PRINTS, "unreflected taker evidence overflow");
+                self.unreflected_taker_prints.push(LiquidityPrint { symbol: arrayvec::ArrayString::from(sym).expect("token capacity"), side, price, remaining: qty, allocated: 0., queue_sequence_end: 0 });
+                self.unreflected_high_water = self.unreflected_high_water.max(self.unreflected_taker_prints.len());
+            }
+        }
         if self.taker_comp_rate <= 0.0 || self.taker_comp_window_ns == 0 {
             return;
         }
@@ -2924,7 +3476,11 @@ impl SimExchangeV2 {
                 .or_default() += qty;
         }
         let vn = self.fill_markout_vn;
-        let toxicity_strength = self.maker_toxicity_strength;
+        let toxicity_strength = if self.queue_uncertainty_strength > 0.0 {
+            0.0
+        } else {
+            self.maker_toxicity_strength
+        };
         let toxicity_scale_ticks = self.maker_toxicity_scale_ticks;
         let mid_now = if toxicity_strength > 0.0 {
             self.books.eff_mid(symbol)
@@ -2939,9 +3495,18 @@ impl SimExchangeV2 {
         let mut exact_cross_level_order_skips = 0u64;
         let mut exact_cross_level_qty_skipped = 0.0;
         let audit_slug = self.event_slug_by_token.get(symbol).cloned();
+        if self.liquidity_ledger_enabled && self.orders.len() > MAX_LIQUIDITY_ORDERS {
+            self.liquidity_evidence_overflows += 1;
+            return;
+        }
+        let selection = &mut self.selection;
+        let selection_mid = self.books.eff_mid(symbol);
+        let selection_spread = (self.books.eff_best_ask(symbol).unwrap_or(selection_mid)-self.books.eff_best_bid(symbol).unwrap_or(selection_mid)).max(0.0);
+        let mut public_drained = 0.0_f64;
+        let mut own_filled = 0.0_f64;
         let audits = &mut self.fill_audit;
         let order_audits = &mut self.maker_order_audit;
-        for (coid, o) in self.orders.iter_mut() {
+        for (coid, o) in liquidity_order_iter(&mut self.orders, self.liquidity_ledger_enabled) {
             // Match in the canonical frame: `symbol`/`aggressor_side`/`price`
             // are canonical (the caller already folded the trade). Fills settle
             // in the ORIGINAL frame via `o.request.*`.
@@ -2957,7 +3522,9 @@ impl SimExchangeV2 {
                 Side::Buy => trade_ticks <= order_ticks,
                 Side::Sell => trade_ticks >= order_ticks,
             };
-            if self.exact_maker_trade_level
+            let through = self.maker_trade_through_recovery && side_matches
+                && legacy_price_matches && trade_ticks != order_ticks;
+            if self.exact_maker_trade_level && !through
                 && side_matches
                 && legacy_price_matches
                 && trade_ticks != order_ticks
@@ -2967,7 +3534,7 @@ impl SimExchangeV2 {
                 continue;
             }
             let price_matches = if self.exact_maker_trade_level {
-                trade_ticks == order_ticks
+                trade_ticks == order_ticks || through
             } else {
                 match o.match_side {
                     Side::Buy => trade_ticks <= order_ticks,
@@ -2981,7 +3548,15 @@ impl SimExchangeV2 {
             if !matches {
                 continue;
             }
-            let q_before = o.q_ahead;
+            // A strictly worse public execution witnesses that public queues
+            // at our better price have cleared. Counterfactual own orders still
+            // share only this print's observed quantity, in price-time order.
+            // The ledger deduplicates venue IDs and prevents later book-through
+            // from spending the same evidence twice. No depth-only fill here.
+            let q_before = if through { 0.0 } else { o.q_ahead };
+            if self.liquidity_ledger_enabled {
+                public_drained = public_drained.max((q_before - o.own_q_ahead).max(0.0).min(qty));
+            }
             let over = qty - q_before;
             if let Some(a) = order_audits.get_mut(coid) {
                 a.trade_match_n += 1;
@@ -3004,7 +3579,7 @@ impl SimExchangeV2 {
                 a.maker_queue_drained_qty += qty.min(q_before);
                 a.maker_candidate_qty += over.max(0.0).min(o.remaining);
             }
-            o.q_ahead = (o.q_ahead - qty).max(0.0);
+            o.q_ahead = (q_before - qty).max(0.0);
             o.own_q_ahead = o.own_q_ahead.min(o.q_ahead);
             o.traded_since_sync += qty;
             if over <= EPS {
@@ -3038,8 +3613,23 @@ impl SimExchangeV2 {
             let suppressed = candidate * suppress_frac;
             let uncapped_fill = (candidate - suppressed).max(0.0);
             let inferred_capacity = (o.remaining - o.inferred_residual_floor).max(0.0);
-            let fill = uncapped_fill.min(inferred_capacity);
-            let residual_suppressed = (uncapped_fill - fill).max(0.0);
+            let mut fill = uncapped_fill
+                .min(inferred_capacity)
+                .min(if self.liquidity_ledger_enabled {
+                    (qty - public_drained - own_filled).max(0.0)
+                } else {
+                    f64::INFINITY
+                });
+            if through { self.trade_through_candidate_qty += fill; }
+            if selection.mode != super::selection::Mode::Off && fill > EPS {
+                let side = if o.match_side == Side::Buy {1.0} else {-1.0};
+                let x = super::selection::features(side,o.match_price,selection_mid,selection_spread,tick,q_before,now_ns.saturating_sub(o.placed_ns),fill,o.request.quantity,o.entry_mid);
+                fill = selection.select(&o.request.instance_id,coid,symbol,now_ns,"maker",if through {"trade_through"} else {"trade"},x,selection_mid,tick,side,fill);
+            }
+            if through { self.trade_through_fill_qty += fill; }
+            own_filled += fill;
+            let residual_suppressed =
+                (uncapped_fill - uncapped_fill.min(inferred_capacity)).max(0.0);
             if residual_suppressed > EPS && !o.inferred_residual_realized {
                 o.inferred_residual_realized = true;
                 residual_orders_n += 1;
@@ -3107,6 +3697,25 @@ impl SimExchangeV2 {
                 queue_seq: o.queue_seq,
             });
         }
+        if self.liquidity_ledger_enabled && self.book_through_rate > 0.0 {
+            let remaining = (qty - public_drained - own_filled).max(0.0);
+            if remaining > EPS {
+                if self.liquidity_prints.len() == MAX_LIQUIDITY_PRINTS {
+                    self.liquidity_evidence_overflows += 1;
+                } else if let Ok(symbol) = arrayvec::ArrayString::<128>::from(symbol) {
+                    self.liquidity_prints.push(LiquidityPrint {
+                        symbol,
+                        side: aggressor_side,
+                        price,
+                        remaining,
+                        allocated: 0.0,
+                        queue_sequence_end: self.next_queue_seq,
+                    });
+                } else {
+                    self.liquidity_evidence_overflows += 1;
+                }
+            }
+        }
         self.fill_haircut_n += haircuts;
         self.maker_toxicity_suppressed_n += toxicity_suppressed_n;
         self.maker_toxicity_suppressed_qty += toxicity_suppressed_qty;
@@ -3117,15 +3726,20 @@ impl SimExchangeV2 {
     }
 
     fn apply_maker_fills(&mut self, mut fills: Vec<MakerFill>, now_ns: u64) -> Vec<OrderUpdate> {
-        if self.order_queue_position_strength > 0.0 {
+        if self.liquidity_ledger_enabled || self.order_queue_position_strength > 0.0 {
             fills.sort_unstable_by_key(|fill| fill.queue_seq);
         }
         let mut out = Vec::with_capacity(fills.len());
         for f in fills {
             if let Some(order) = self.orders.get_mut(&f.coid) {
-                order.replay_self_depth_credit = order
-                    .replay_self_depth_credit
-                    .min(f.remaining_after.max(0.0));
+                order.replay_self_depth_credit =
+                    order
+                        .replay_self_depth_credit
+                        .min(if self.historical_self_depth_enabled {
+                            f64::INFINITY
+                        } else {
+                            f.remaining_after.max(0.0)
+                        });
             }
             // Maker fills settle at our limit; Polymarket maker fee = 0.
             match f.side {
@@ -3210,7 +3824,7 @@ impl SimExchangeV2 {
     /// Canonical token for `token` (itself if canonical / unpaired; the
     /// `fold_to` target otherwise). Outcome-folding maps the non-canonical
     /// (down) token onto the canonical (up) frame.
-    fn canonical_of<'a>(&'a self, token: &'a str) -> &'a str {
+    pub(super) fn canonical_of<'a>(&'a self, token: &'a str) -> &'a str {
         self.fold_to.get(token).map(|s| s.as_str()).unwrap_or(token)
     }
 
@@ -3382,6 +3996,9 @@ impl SimExchangeV2 {
             self.book_continuity.remove(t);
             self.recent_trades.remove(t);
             self.pending_level_trade_evidence.remove(t);
+            self.liquidity_prints.retain(|p| p.symbol.as_str() != t);
+            self.unreflected_taker_prints.retain(|p| p.symbol.as_str() != t);
+            self.liquidity_trade_ids.retain(|key| key.0.as_str() != t);
             self.books.retire_token(t);
             self.wallets.retire_token(t);
         }
@@ -3423,7 +4040,14 @@ impl SimExchangeV2 {
                 o.match_price,
                 t.new_tick_size,
             );
-            o.replay_self_depth_credit = o.replay_self_depth_credit.min(d).min(o.remaining);
+            o.replay_self_depth_credit =
+                o.replay_self_depth_credit
+                    .min(d)
+                    .min(if self.historical_self_depth_enabled {
+                        f64::INFINITY
+                    } else {
+                        o.remaining
+                    });
             o.q_ahead = o.q_ahead.min((d - o.replay_self_depth_credit).max(0.0));
             o.level_qty_at_sync = d;
             o.traded_since_sync = 0.0;
@@ -3485,7 +4109,29 @@ impl SimExchangeV2 {
         price: f64,
         public_qty: f64,
         tick: f64,
+        now_ns: u64,
     ) -> f64 {
+        let public_qty = if self.liquidity_ledger_enabled {
+            public_qty.min(self.books.executable_level_qty(
+                match_symbol,
+                flip(taker_side),
+                price,
+                tick,
+            ))
+        } else {
+            public_qty
+        };
+        // Only same-level prints observed since the last accepted snapshot;
+        // never subtract an old in-flight window from an already-updated book.
+        let pending = if self.match_time_liquidity {
+            self.unreflected_taker_prints.iter().filter(|p| p.symbol.as_str()==match_symbol && p.side==taker_side && price_to_ticks(p.price,tick)==price_to_ticks(price,tick)).map(|p| p.remaining).sum::<f64>()
+        } else { 0. };
+        let public_qty = (public_qty - pending).max(0.0);
+        if self.historical_self_depth_enabled {
+            let historical =
+                self.historical_depth_at(iid, match_symbol, flip(taker_side), price, tick, now_ns);
+            return (public_qty - historical).max(0.0);
+        }
         let rate = self.replay_self_taker_depth_rate;
         if rate <= 0.0 || public_qty <= EPS {
             return public_qty;
@@ -3513,6 +4159,7 @@ impl SimExchangeV2 {
         taker_side: Side,
         ladder: &[PriceLevel],
         lim: Option<f64>,
+        now_ns: u64,
     ) -> f64 {
         let tick = self.tick_of(match_symbol);
         ladder
@@ -3530,6 +4177,7 @@ impl SimExchangeV2 {
                     level.price,
                     level.quantity,
                     tick,
+                    now_ns,
                 )
             })
             .sum()
@@ -3541,6 +4189,7 @@ impl SimExchangeV2 {
         match_symbol: &str,
         taker_side: Side,
         ladder: &[PriceLevel],
+        now_ns: u64,
     ) -> Option<f64> {
         let tick = self.tick_of(match_symbol);
         ladder.iter().find_map(|level| {
@@ -3551,6 +4200,7 @@ impl SimExchangeV2 {
                 level.price,
                 level.quantity,
                 tick,
+                now_ns,
             ) > EPS)
                 .then_some(level.price)
         })
@@ -3560,6 +4210,37 @@ impl SimExchangeV2 {
     /// now? (marketable & not post-only). Used to decide whether to defer the
     /// match to the midpoint of the matching window. Post-only / non-marketable
     /// orders take the immediate rest/reject path in `submit_order`.
+    pub fn admission_crossing_observation(&self, o: &OrderRequest, now_ns: u64) -> Option<bool> {
+        let (msym, mside, mprice) = self.match_view(o);
+        let (exchange_stale, local_stale) = self.book_stale_reasons(&o.symbol, now_ns);
+        if !self.last_book_ts.contains_key(&msym)
+            || exchange_stale
+            || (!self.strict_admission && local_stale)
+            || (self.book_continuity_mode != BookContinuityMode::LegacyAge
+                && !self.admission_eligibility(o, now_ns).eligible)
+        {
+            return None;
+        }
+        let ladder = if mside == Side::Buy {
+            self.books.buy_ladder(&msym)
+        } else {
+            self.books.sell_ladder(&msym)
+        };
+        let best =
+            self.replay_clean_best_taker_price(&o.instance_id, &msym, mside, &ladder, now_ns);
+        let lim = if matches!(o.order_type, OrderType::Market) || o.price.is_none() {
+            None
+        } else {
+            mprice
+        };
+        Some(match (best, mside, lim) {
+            (Some(p), Side::Buy, Some(l)) => p <= l + EPS,
+            (Some(p), Side::Sell, Some(l)) => p >= l - EPS,
+            (Some(_), _, None) => true,
+            _ => false,
+        })
+    }
+
     pub fn would_cross(&self, o: &OrderRequest, now_ns: u64) -> bool {
         if o.post_only {
             return false;
@@ -3586,7 +4267,7 @@ impl SimExchangeV2 {
             Side::Sell => self.books.sell_ladder(&msym),
         };
         let best_opposing =
-            self.replay_clean_best_taker_price(&o.instance_id, &msym, mside, &ladder);
+            self.replay_clean_best_taker_price(&o.instance_id, &msym, mside, &ladder, now_ns);
         match (best_opposing, mside, lim) {
             (Some(bp), Side::Buy, Some(l)) => bp <= l + EPS,
             (Some(bp), Side::Sell, Some(l)) => bp >= l - EPS,
@@ -3608,7 +4289,14 @@ impl SimExchangeV2 {
             Side::Buy => self.books.buy_ladder(&msym),
             Side::Sell => self.books.sell_ladder(&msym),
         };
-        self.replay_clean_taker_available(&o.instance_id, &msym, mside, &ladder, lim)
+        self.replay_clean_taker_available(
+            &o.instance_id,
+            &msym,
+            mside,
+            &ladder,
+            lim,
+            self.audit_clock_ns,
+        )
     }
 
     pub fn taker_race_enabled(&self) -> bool {
@@ -3733,7 +4421,7 @@ impl SimExchangeV2 {
             self.books.sell_ladder(&canonical)
         };
         let opposing =
-            self.replay_clean_best_taker_price(&o.instance_id, &canonical, side, &ladder);
+            self.replay_clean_best_taker_price(&o.instance_id, &canonical, side, &ladder, now_ns);
         let is_market = matches!(o.order_type, OrderType::Market) || o.price.is_none();
         let crossing = source.map(|_| match (opposing, side, price, is_market) {
             (Some(_), _, _, true) => true,
@@ -3879,7 +4567,7 @@ impl SimExchangeV2 {
             Side::Sell => self.books.sell_ladder(&msym),
         };
         let best_opposing =
-            self.replay_clean_best_taker_price(&o.instance_id, &msym, mside, &ladder);
+            self.replay_clean_best_taker_price(&o.instance_id, &msym, mside, &ladder, now_ns);
         let marketable = match (best_opposing, mside, lim) {
             (Some(bp), Side::Buy, Some(l)) => bp <= l + EPS,
             (Some(bp), Side::Sell, Some(l)) => bp >= l - EPS,
@@ -3922,7 +4610,7 @@ impl SimExchangeV2 {
         let folded = msym != o.symbol;
         let raw_available = self.books.available_volume(msym, mside == Side::Buy, lim);
         let now_available =
-            self.replay_clean_taker_available(&o.instance_id, msym, mside, ladder, lim);
+            self.replay_clean_taker_available(&o.instance_id, msym, mside, ladder, lim, now_ns);
         let replay_self_depth = (raw_available - now_available).max(0.0);
         if replay_self_depth > EPS {
             self.taker_replay_self_sweeps_n += 1;
@@ -4085,6 +4773,7 @@ impl SimExchangeV2 {
                 l.price,
                 l.quantity,
                 tick,
+                now_ns,
             );
             let take = rem.min(clean_qty);
             if take <= EPS {
@@ -4095,6 +4784,30 @@ impl SimExchangeV2 {
             // Fee is frame-invariant (p·(1−p) symmetric); compute on the original.
             fee += self.fee(&o.symbol, take, l.price);
             rem -= take;
+        }
+
+        if self.selection.mode != super::selection::Mode::Off && filled > EPS {
+            let mid = self.books.eff_mid(msym);
+            let side = if mside == Side::Buy {1.0} else {-1.0};
+            let spread = (self.books.eff_best_ask(msym).unwrap_or(mid)-self.books.eff_best_bid(msym).unwrap_or(mid)).max(0.0);
+            let x = super::selection::features(side,notional/filled,mid,spread,tick,0.0,0,filled,o.quantity,mid);
+            let kept = self.selection.select(&o.instance_id,&o.client_order_id,msym,now_ns,"taker","sweep",x,mid,tick,side,filled);
+            if kept < filled {
+                filled = 0.0; notional = 0.0; fee = 0.0;
+                let mut left = kept;
+                for l in ladder {
+                    if left <= EPS { break; }
+                    let within = match (lim, mside) {
+                        (None, _) => true,
+                        (Some(p), Side::Buy) => l.price <= p + EPS,
+                        (Some(p), Side::Sell) => l.price >= p - EPS,
+                    };
+                    if !within { break; }
+                    let available = self.replay_clean_taker_level_qty(&o.instance_id,msym,mside,l.price,l.quantity,tick,now_ns);
+                    let q = left.min(available);
+                    filled += q; notional += q*l.price; fee += self.fee(&o.symbol,q,l.price); left -= q;
+                }
+            }
         }
 
         // Translate canonical notional → original frame (down: Σ qty·(1−p) =
@@ -4140,6 +4853,39 @@ impl SimExchangeV2 {
                 return self.rest(o, now_ns, o.quantity);
             }
             return self.cancelled(o, now_ns, o.quantity);
+        }
+
+        if self.liquidity_ledger_enabled {
+            let mut to_debit = filled;
+            for level in ladder {
+                if to_debit <= EPS {
+                    break;
+                }
+                let within = match (lim, mside) {
+                    (None, _) => true,
+                    (Some(p), Side::Buy) => level.price <= p + EPS,
+                    (Some(p), Side::Sell) => level.price >= p - EPS,
+                };
+                if !within {
+                    break;
+                }
+                let available = self.replay_clean_taker_level_qty(
+                    &o.instance_id,
+                    msym,
+                    mside,
+                    level.price,
+                    level.quantity,
+                    tick,
+                    now_ns,
+                );
+                let qty = to_debit.min(available);
+                let consumed = self
+                    .books
+                    .consume_level(msym, flip(mside), level.price, tick, qty);
+                debug_assert!((consumed - qty).abs() < 1e-7);
+                to_debit -= consumed;
+            }
+            debug_assert!(to_debit <= 1e-7, "committed taker fill exceeds ledger");
         }
 
         let avg = notional_orig / filled; // original-frame avg fill price
@@ -4221,7 +4967,7 @@ impl SimExchangeV2 {
             .orders
             .values()
             .filter(|prior| {
-                prior.request.instance_id == o.instance_id
+                (self.liquidity_ledger_enabled || prior.request.instance_id == o.instance_id)
                     && Self::same_queue_level(prior, &msym, mside, match_price, tick)
             })
             .map(|prior| prior.remaining.max(0.0))
@@ -4236,12 +4982,21 @@ impl SimExchangeV2 {
         } else {
             remaining
         };
-        let replay_self_depth_credit = if now_depth > EPS {
+        let replay_self_depth_credit = if self.historical_self_depth_enabled {
+            self.historical_depth_at(&o.instance_id, &msym, mside, match_price, tick, now_ns)
+                .min(now_depth)
+        } else if now_depth > EPS {
             (self.replay_self_depth_rate * replay_self_depth_basis).min(now_depth)
         } else {
             0.0
         };
-        let queue_now_depth = (now_depth - replay_self_depth_credit).max(0.0);
+        let executable_depth = if self.liquidity_ledger_enabled {
+            self.books
+                .executable_level_qty(&msym, mside, match_price, tick)
+        } else {
+            now_depth
+        };
+        let queue_now_depth = (executable_depth - replay_self_depth_credit).max(0.0);
         // Maker race: if the queue at our (canonical) level GROWS in the next
         // snapshot, the level is strengthening (price about to move favorably) —
         // init q_ahead higher so we sit further back and DON'T fill on that
@@ -4281,6 +5036,13 @@ impl SimExchangeV2 {
             // The visible level was entirely attributable to the replayed
             // strategy's own original order. It is not queue ahead; do not
             // invoke the missing-level extrapolation fallback.
+            0.0
+        } else if race_q_ahead < EPS
+            && self.liquidity_ledger_enabled
+            && self
+                .books
+                .level_is_observed(&msym, mside, match_price, tick)
+        {
             0.0
         } else if race_q_ahead < EPS {
             if let Some((extra, effective_decay)) =
@@ -4328,7 +5090,9 @@ impl SimExchangeV2 {
         // queue offset turns those repeated observations into one FIFO volume
         // budget: the print must consume public depth, then earlier own size,
         // before it can reach the later order.
-        let simulated_own_ahead_qty = if self.order_queue_position_strength > 0.0 {
+        let simulated_own_ahead_qty = if self.liquidity_ledger_enabled {
+            same_level_own_remaining
+        } else if self.order_queue_position_strength > 0.0 {
             self.order_queue_position_strength * same_level_own_remaining
         } else {
             0.0
@@ -4474,6 +5238,7 @@ impl SimExchangeV2 {
                 own_q_ahead: simulated_own_ahead_qty,
                 queue_seq,
                 replay_self_depth_credit,
+                historical_depth_at_sync: replay_self_depth_credit,
                 level_qty_at_sync: now_depth,
                 mid_at_sync: mid0,
                 entry_mid: mid0,
@@ -4597,7 +5362,11 @@ impl SimExchangeV2 {
             // Cancelling an earlier own order removes only its still-resting
             // contribution from later same-level FIFO positions. Public queue
             // depth and orders at other levels/instances remain untouched.
-            let max_advance = self.order_queue_position_strength * o.remaining.max(0.0);
+            let max_advance = if self.liquidity_ledger_enabled {
+                o.remaining.max(0.0)
+            } else {
+                self.order_queue_position_strength * o.remaining.max(0.0)
+            };
             let mut advanced_n = 0u64;
             let mut advanced_qty = 0.0;
             if max_advance > EPS {
@@ -4606,7 +5375,8 @@ impl SimExchangeV2 {
                 let order_audits = &mut self.maker_order_audit;
                 for (later_coid, later) in self.orders.iter_mut() {
                     if later.queue_seq <= o.queue_seq
-                        || later.request.instance_id != o.request.instance_id
+                        || (!self.liquidity_ledger_enabled
+                            && later.request.instance_id != o.request.instance_id)
                         || !Self::same_queue_level(
                             later,
                             &o.match_symbol,
@@ -4903,6 +5673,133 @@ impl RequestPrice for OrderRequest {
     }
 }
 
+// All orders observing one queue share the cancellation-location sample. Using
+// unrelated per-order draws can invert their FIFO positions after a shrink.
+fn historical_removal_observed(
+    archive: &HashMap<String, Vec<HistoricalDepthSeries>>,
+    iid: &str,
+    token: &str,
+    sibling: Option<&str>,
+    side: Side,
+    price: f64,
+    tick: f64,
+    now_ns: u64,
+) -> bool {
+    let observed = |token: &str, side: Side, price: f64| {
+        archive.get(token).is_none_or(|levels| {
+            levels
+                .iter()
+                .filter(|s| {
+                    s.iid == iid
+                        && s.side == side
+                        && price_to_ticks(s.price, tick) == price_to_ticks(price, tick)
+                })
+                .all(|s| {
+                    let end = s.observations.partition_point(|o| o.timestamp_ns <= now_ns);
+                    end == 0 || s.observations[end - 1].removal_observed
+                })
+        })
+    };
+    observed(token, side, price)
+        && sibling.is_none_or(|other| observed(other, flip(side), 1.0 - price))
+}
+
+fn lookup_historical_depth(
+    archive: &HashMap<String, Vec<HistoricalDepthSeries>>,
+    iid: &str,
+    token: &str,
+    sibling: Option<&str>,
+    side: Side,
+    price: f64,
+    tick: f64,
+    now_ns: u64,
+) -> f64 {
+    let direct = |token: &str, side: Side, price: f64| {
+        archive.get(token).map_or(0.0, |levels| {
+            levels
+                .iter()
+                .filter(|s| {
+                    s.iid == iid
+                        && s.side == side
+                        && price_to_ticks(s.price, tick) == price_to_ticks(price, tick)
+                })
+                .map(|s| {
+                    let end = s.observations.partition_point(|o| o.timestamp_ns <= now_ns);
+                    if end == 0 {
+                        0.0
+                    } else {
+                        s.observations[end - 1].quantity
+                    }
+                })
+                .sum::<f64>()
+        })
+    };
+    direct(token, side, price) + sibling.map_or(0.0, |other| direct(other, flip(side), 1.0 - price))
+}
+
+fn stable_queue_level_sample(token: &str, side: Side, ticks: i64) -> f64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in token
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(ticks.to_le_bytes())
+        .chain([u8::from(side == Side::Sell)])
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= hash >> 31;
+    ((hash >> 11) as f64) / ((1_u64 << 53) as f64)
+}
+
+fn bounded_cancel_advance(
+    public_ahead: f64,
+    public_total: f64,
+    cancels: f64,
+    sample: f64,
+    strength: f64,
+) -> f64 {
+    let front = public_ahead.max(0.0);
+    let behind = (public_total - front).max(0.0);
+    let count = cancels.max(0.0).min(public_total.max(0.0));
+    let lo = (count - behind).max(0.0).min(front);
+    let hi = count.min(front);
+    let location = 0.5 + strength.clamp(0.0, 1.0) * (sample.clamp(0.0, 1.0) - 0.5);
+    lo + (hi - lo).max(0.0) * location
+}
+
+fn liquidity_order_iter(
+    orders: &mut BTreeMap<String, RestingOrder>,
+    enabled: bool,
+) -> impl Iterator<Item = (&String, &mut RestingOrder)> {
+    let mut legacy = orders.iter_mut();
+    let mut fifo = arrayvec::ArrayVec::<(&String, &mut RestingOrder), MAX_LIQUIDITY_ORDERS>::new();
+    if enabled {
+        debug_assert!(legacy.len() <= MAX_LIQUIDITY_ORDERS);
+        fifo.extend(legacy.by_ref());
+        fifo.sort_unstable_by(|a, b| {
+            a.1.match_symbol
+                .cmp(&b.1.match_symbol)
+                .then_with(|| (a.1.match_side == Side::Sell).cmp(&(b.1.match_side == Side::Sell)))
+                .then_with(|| {
+                    let price_order = a.1.match_price.total_cmp(&b.1.match_price);
+                    if a.1.match_side == Side::Buy {
+                        price_order.reverse()
+                    } else {
+                        price_order
+                    }
+                })
+                .then(a.1.queue_seq.cmp(&b.1.queue_seq))
+        });
+    }
+    legacy.chain(fifo)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5027,6 +5924,606 @@ mod tests {
         let mut c = SimExchangeV2::new(500_000_000, HashMap::new(), HashMap::new());
         c.on_instrument(&binary_instrument());
         c
+    }
+
+    fn liquidity_core() -> SimExchangeV2 {
+        let mut c = SimExchangeV2::new(500_000_000, HashMap::new(), HashMap::new());
+        c.set_fold_outcomes(true);
+        c.on_instrument(&binary_instrument());
+        c.configure_fold_canonical_book_only(true);
+        c.configure_exact_maker_trade_level(true);
+        c.set_liquidity_ledger_enabled(true);
+        c
+    }
+
+    fn half_taker_selection(c: &mut SimExchangeV2) {
+        use super::super::selection::{SelectionModel,RoleModel,ChannelModel,Mode,N};
+        let mut b=[0.;N];b[0]=40.;
+        let r=RoleModel { markout:[0.;N],retention:b,markout_weight:0. };
+        c.selection.configure("collect","",1.,42,false).unwrap();
+        c.selection.mode=Mode::Causal;
+        c.selection.model=Some(SelectionModel { schema_version:2,horizon_ms:1000,max_label_gap_ms:250,training_end_ns:0,
+            maker:r.clone(),taker:r.clone(),maker_trade:None,maker_book:None,
+            taker_sweep:Some(ChannelModel { fill:r,quantity:Some([0.;N]),quantity_markout_weight:0. }) });
+    }
+    #[test]
+    fn calibrated_partial_taker_resweeps_prices_and_fok_does_not_spend() {
+        for ot in [OrderType::Fak,OrderType::Fok] {
+            let mut c=liquidity_core();half_taker_selection(&mut c);
+            c.on_orderbook(&book_ts("up",vec![(0.49,100.)],vec![(0.51,2.),(0.52,8.)],1));
+            let u=c.submit_order(&order("a","up",Side::Buy,0.52,10.,false,ot),2);
+            if matches!(ot,OrderType::Fok) {
+                assert_eq!(u.filled_quantity,0.);
+                assert_eq!(c.books.executable_level_qty("up",Side::Sell,0.51,0.01),2.);
+            } else {
+                assert_eq!(u.filled_quantity,5.);
+                assert!((u.avg_fill_price-0.516).abs()<1e-10);
+                assert_eq!(c.books.executable_level_qty("up",Side::Sell,0.51,0.01),0.);
+                assert_eq!(c.books.executable_level_qty("up",Side::Sell,0.52,0.01),5.);
+            }
+        }
+    }
+    #[test]
+    fn match_time_competition_uses_only_unreflected_unique_prints() {
+        let mut c=liquidity_core();c.configure_match_time_liquidity(true);
+        c.on_orderbook(&book_ts("up",vec![(0.49,100.)],vec![(0.51,10.)],1));
+        let mut t=trade_ts("up",Side::Buy,0.51,6.,2);t.exchange_trade_id=Some("unique".into());
+        c.on_trade_tick(&t);c.on_trade_tick(&t);
+        assert_eq!(c.replay_clean_taker_level_qty("iid","up",Side::Buy,0.51,10.,0.01,3),4.);
+        c.on_orderbook(&book_ts("unrelated",vec![(0.49,100.)],vec![(0.51,10.)],3));
+        assert_eq!(c.replay_clean_taker_level_qty("other","up",Side::Buy,0.51,10.,0.01,3),4.);
+        c.on_orderbook(&book_ts("up",vec![(0.49,100.)],vec![(0.51,4.)],4));
+        assert_eq!(c.replay_clean_taker_level_qty("iid","up",Side::Buy,0.51,4.,0.01,5),4.);
+        c.on_orderbook(&book_ts("up",vec![(0.49,100.)],vec![(0.51,10.)],6));
+        assert_eq!(c.replay_clean_taker_level_qty("iid","up",Side::Buy,0.51,10.,0.01,7),10.);
+        assert_eq!(c.unreflected_high_water,1);
+    }
+    #[test]
+    fn public_trade_snapshot_cannot_replenish_simulated_consumption() {
+        let mut c=liquidity_core();c.configure_match_time_liquidity(true);
+        c.on_orderbook(&book_ts("up",vec![(0.49,100.)],vec![(0.51,10.)],1));
+        c.on_trade_tick(&trade_ts("up",Side::Buy,0.51,6.,2));
+        let u=c.submit_order(&order("a","up",Side::Buy,0.51,4.,false,OrderType::Fak),3);
+        assert_eq!(u.filled_quantity,4.);
+        c.on_orderbook(&book_ts("up",vec![(0.49,100.)],vec![(0.51,4.)],4));
+        assert_eq!(c.replay_clean_taker_level_qty("iid","up",Side::Buy,0.51,4.,0.01,5),0.);
+        c.on_orderbook(&book_ts("up",vec![(0.49,100.)],vec![(0.51,10.)],6));
+        assert_eq!(c.replay_clean_taker_level_qty("iid","up",Side::Buy,0.51,10.,0.01,7),6.);
+    }
+
+    #[test]
+    #[should_panic(expected="unreflected taker evidence overflow")]
+    fn unreflected_print_overflow_aborts_without_growth() {
+        let mut c=liquidity_core();c.configure_match_time_liquidity(true);
+        for n in 0..=MAX_LIQUIDITY_PRINTS {c.record_trade("up",Side::Buy,n as f64,1.,n as u64);}
+    }
+    #[test]
+    #[ignore]
+    fn benchmark_match_time_level_availability() {
+        use std::time::Instant;
+        for enabled in [false,true] {
+            let mut c=liquidity_core();c.configure_match_time_liquidity(enabled);
+            c.on_orderbook(&book_ts("up",vec![(0.49,100.)],vec![(0.51,100.)],1));
+            for i in 0..10 {c.record_trade("up",Side::Buy,0.51+i as f64*0.01,1.,2);}
+            let mut t=Vec::with_capacity(100000);
+            for _ in 0..100000 {
+                let now=Instant::now();
+                std::hint::black_box(c.replay_clean_taker_level_qty("iid","up",Side::Buy,0.51,100.,0.01,3));
+                t.push(now.elapsed().as_nanos());
+            }
+            t.sort_unstable();
+            println!("match_time={enabled} n=100000 clean_level_query_ns median={} p99={} p999={} max={} evidence_high_water={} capacity={} overflow=0",t[50000],t[99000],t[99900],t[99999],c.unreflected_high_water,MAX_LIQUIDITY_PRINTS);
+        }
+    }
+
+    #[test]
+    fn recovery_trade_through_conserves_print_and_price_time_priority() {
+        let mut c = liquidity_core();
+        c.configure_maker_trade_through_recovery(true).unwrap();
+        c.configure_book_through(1.0);
+        c.on_orderbook(&book("up", vec![(0.48, 100.)], vec![(0.55, 100.)]));
+        // Different owners must still share one finite public print budget.
+        let mut low = order("a-low", "up", Side::Buy, 0.49, 7., true, OrderType::Limit);
+        low.instance_id = "other".into();
+        c.submit_order(&low, 1);
+        c.submit_order(&order("z-high", "up", Side::Buy, 0.50, 7., true, OrderType::Limit), 2);
+        let mut t = trade_ts("up", Side::Sell, 0.48, 10., 3);
+        t.exchange_trade_id = Some("print1".into());
+        let fills = c.on_trade_tick(&t);
+        assert_eq!(fills.iter().map(|x| x.filled_quantity).sum::<f64>(), 10.);
+        assert_eq!(fills.iter().find(|x|x.client_order_id=="z-high").unwrap().filled_quantity,7.);
+        assert_eq!(fills.iter().find(|x|x.client_order_id=="a-low").unwrap().filled_quantity,3.);
+        assert!(fills.iter().all(|x| x.avg_fill_price==if x.client_order_id=="z-high" {0.50} else {0.49}));
+        assert!(c.on_trade_tick(&t).is_empty());
+        // No residual evidence may be spent again on a crossing book update.
+        assert!(c.on_orderbook(&book_ts("up", vec![(0.46,100.)], vec![(0.47,100.)],4)).is_empty());
+        assert_eq!(c.trade_through_fill_qty, 10.);
+        c.cancel_order(Exchange::Polymarket,"a-low",5);
+        let mut next=t.clone(); next.exchange_trade_id=Some("print2".into()); next.exchange_timestamp_ns=6;
+        assert!(c.on_trade_tick(&next).is_empty());
+    }
+
+    #[test]
+    fn recovery_is_opt_in_and_does_not_fill_wrong_side_or_new_orders() {
+        assert!(core().configure_maker_trade_through_recovery(true).is_err());
+        for enabled in [false,true] {
+            let mut c=liquidity_core();
+            c.configure_maker_trade_through_recovery(enabled).unwrap();
+            c.on_orderbook(&book("up",vec![(0.48,100.)],vec![(0.55,100.)]));
+            let t=trade_ts("up",Side::Sell,0.48,10.,1);
+            assert!(c.on_trade_tick(&t).is_empty());
+            c.submit_order(&order("o","up",Side::Buy,0.50,7.,true,OrderType::Limit),2);
+            assert!(c.on_trade_tick(&trade_ts("up",Side::Buy,0.52,10.,3)).is_empty());
+            assert!(c.on_trade_tick(&trade_ts("up",Side::Sell,0.51,10.,4)).is_empty());
+            let u=c.on_trade_tick(&trade_ts("up",Side::Sell,0.48,10.,5));
+            assert_eq!(u.iter().map(|x|x.filled_quantity).sum::<f64>(),if enabled {7.} else {0.});
+        }
+    }
+
+    #[test]
+    fn recovery_can_be_rejected_by_role_selection_without_creating_quantity() {
+        let mut c=liquidity_core(); c.configure_maker_trade_through_recovery(true).unwrap();
+        c.selection.configure("collect","",0.,42,true).unwrap();
+        c.on_orderbook(&book("up",vec![(0.48,100.)],vec![(0.55,100.)]));
+        c.submit_order(&order("o","up",Side::Buy,0.50,7.,true,OrderType::Limit),2);
+        c.on_trade_tick(&trade_ts("up",Side::Sell,0.48,3.,3));
+        let rows:Vec<_>=c.selection.drain().collect();
+        assert_eq!(rows.len(),1); assert_eq!(rows[0].channel,"trade_through");
+        assert_eq!(rows[0].candidate_qty,3.); assert_eq!(rows[0].kept_qty,3.);
+    }
+
+    #[test]
+    fn v6_liquidity_two_takers_share_ten_shares_and_new_depth_recovers() {
+        let mut c = liquidity_core();
+        c.on_orderbook(&book("up", vec![(0.49, 20.0)], vec![(0.51, 10.0)]));
+        let first = c.submit_order(
+            &order("a", "up", Side::Buy, 0.51, 10.0, false, OrderType::Fak),
+            1,
+        );
+        let second = c.submit_order(
+            &order("b", "up", Side::Buy, 0.51, 10.0, false, OrderType::Fak),
+            2,
+        );
+        assert_eq!(first.filled_quantity, 10.0);
+        assert_eq!(second.filled_quantity, 0.0);
+        c.on_orderbook(&book_ts("up", vec![(0.49, 20.0)], vec![], 3));
+        c.on_orderbook(&book_ts("up", vec![(0.49, 20.0)], vec![(0.51, 10.0)], 4));
+        let third = c.submit_order(
+            &order("c", "up", Side::Buy, 0.51, 10.0, false, OrderType::Fak),
+            5,
+        );
+        assert_eq!(third.filled_quantity, 10.0);
+    }
+
+    #[test]
+    fn v6_liquidity_maker_queue_excludes_previously_consumed_external_depth() {
+        let mut c = liquidity_core();
+        c.on_orderbook(&book("up", vec![(0.49, 20.0)], vec![(0.51, 10.0)]));
+        let buy = c.submit_order(
+            &order("take", "up", Side::Buy, 0.51, 10.0, false, OrderType::Fak),
+            1,
+        );
+        assert_eq!(buy.filled_quantity, 10.0);
+        let rest = c.submit_order(
+            &order("rest", "up", Side::Sell, 0.51, 5.0, true, OrderType::Limit),
+            2,
+        );
+        assert_eq!(rest.status, OrderStatus::Accepted);
+        assert_eq!(c.orders["rest"].q_ahead, 0.0);
+    }
+
+    #[test]
+    fn v6_liquidity_failed_fok_and_separate_simulator_do_not_consume() {
+        let mut c = liquidity_core();
+        let mut other = liquidity_core();
+        for core in [&mut c, &mut other] {
+            core.on_orderbook(&book("up", vec![(0.49, 20.0)], vec![(0.51, 10.0)]));
+        }
+        let failed = c.submit_order(
+            &order("fail", "up", Side::Buy, 0.51, 11.0, false, OrderType::Fok),
+            1,
+        );
+        assert_eq!(failed.filled_quantity, 0.0);
+        assert_eq!(
+            c.submit_order(
+                &order("ok", "up", Side::Buy, 0.51, 10.0, false, OrderType::Fak),
+                2
+            )
+            .filled_quantity,
+            10.0
+        );
+        assert_eq!(
+            other
+                .submit_order(
+                    &order("ok", "up", Side::Buy, 0.51, 10.0, false, OrderType::Fak),
+                    2
+                )
+                .filled_quantity,
+            10.0
+        );
+    }
+
+    #[test]
+    fn v6_liquidity_empty_inside_spread_has_zero_public_queue_and_fifo() {
+        let mut c = liquidity_core();
+        c.on_orderbook(&book("up", vec![(0.49, 100.0)], vec![(0.51, 100.0)]));
+        c.submit_order(
+            &order(
+                "z-first",
+                "up",
+                Side::Buy,
+                0.50,
+                5.0,
+                true,
+                OrderType::Limit,
+            ),
+            1,
+        );
+        c.submit_order(
+            &order(
+                "a-second",
+                "up",
+                Side::Buy,
+                0.50,
+                5.0,
+                true,
+                OrderType::Limit,
+            ),
+            2,
+        );
+        assert_eq!(c.orders["z-first"].q_ahead, 0.0);
+        assert_eq!(c.orders["a-second"].q_ahead, 5.0);
+        let fills = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.50, 7.0, 3));
+        assert_eq!(fills.iter().map(|f| f.filled_quantity).sum::<f64>(), 7.0);
+        assert_eq!(fills[0].client_order_id, "z-first");
+        assert_eq!(fills[0].filled_quantity, 5.0);
+        assert_eq!(fills[1].filled_quantity, 2.0);
+    }
+
+    #[test]
+    fn v6_liquidity_stable_trade_identity_is_idempotent_but_equal_anonymous_prints_are_distinct() {
+        let mut c = liquidity_core();
+        c.on_orderbook(&book("up", vec![(0.49, 100.0)], vec![(0.51, 100.0)]));
+        c.submit_order(
+            &order("rest", "up", Side::Buy, 0.50, 20.0, true, OrderType::Limit),
+            1,
+        );
+        let mut t = trade_ts("up", Side::Sell, 0.50, 5.0, 2);
+        t.exchange_trade_id = Some("venue-trade-1".into());
+        assert_eq!(c.on_trade_tick(&t)[0].filled_quantity, 5.0);
+        assert!(c.on_trade_tick(&t).is_empty());
+        assert_eq!(c.liquidity_duplicate_trades, 1);
+        t.exchange_trade_id = None;
+        assert_eq!(c.on_trade_tick(&t)[0].filled_quantity, 5.0);
+        assert_eq!(c.on_trade_tick(&t)[0].filled_quantity, 5.0);
+    }
+
+    #[test]
+    fn v6_liquidity_book_through_cannot_reuse_direct_fill_print_or_fill_new_order() {
+        let mut c = liquidity_core();
+        c.configure_book_through(1.0);
+        c.on_orderbook(&book("up", vec![(0.49, 100.0)], vec![(0.51, 100.0)]));
+        c.submit_order(
+            &order("old", "up", Side::Buy, 0.50, 10.0, true, OrderType::Limit),
+            1,
+        );
+        let direct = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.50, 5.0, 2));
+        assert_eq!(direct[0].filled_quantity, 5.0);
+        let through = c.on_orderbook(&book_ts("up", vec![(0.48, 100.0)], vec![(0.50, 100.0)], 3));
+        assert!(through.is_empty());
+        assert_eq!(c.orders["old"].remaining, 5.0);
+        c.cancel_order(Exchange::Polymarket, "old", 4);
+        c.on_orderbook(&book_ts("up", vec![(0.49, 100.0)], vec![(0.51, 100.0)], 5));
+        c.on_trade_tick(&trade_ts("up", Side::Sell, 0.49, 20.0, 6));
+        c.submit_order(
+            &order("new", "up", Side::Buy, 0.50, 5.0, true, OrderType::Limit),
+            7,
+        );
+        assert!(c
+            .on_orderbook(&book_ts("up", vec![(0.48, 100.0)], vec![(0.50, 100.0)], 8))
+            .is_empty());
+    }
+
+    #[test]
+    fn v6_liquidity_book_through_shared_print_budget_is_bounded_and_fifo() {
+        let mut c = liquidity_core();
+        c.configure_book_through(1.0);
+        c.on_orderbook(&book("up", vec![(0.49, 100.0)], vec![(0.51, 100.0)]));
+        c.submit_order(
+            &order(
+                "z-first",
+                "up",
+                Side::Buy,
+                0.50,
+                5.0,
+                true,
+                OrderType::Limit,
+            ),
+            1,
+        );
+        c.submit_order(
+            &order(
+                "a-second",
+                "up",
+                Side::Buy,
+                0.50,
+                5.0,
+                true,
+                OrderType::Limit,
+            ),
+            2,
+        );
+        assert!(c
+            .on_trade_tick(&trade_ts("up", Side::Sell, 0.49, 7.0, 3))
+            .is_empty());
+        let fills = c.on_orderbook(&book_ts("up", vec![(0.48, 100.0)], vec![(0.50, 7.0)], 4));
+        assert_eq!(fills.iter().map(|f| f.filled_quantity).sum::<f64>(), 7.0);
+        assert_eq!(fills[0].client_order_id, "z-first");
+        assert_eq!(fills[0].filled_quantity, 5.0);
+        assert_eq!(fills[1].filled_quantity, 2.0);
+        assert!(c.liquidity_prints.is_empty());
+    }
+
+    #[test]
+    fn v6_liquidity_print_capacity_fails_closed_without_growth() {
+        let mut c = liquidity_core();
+        c.configure_book_through(1.0);
+        c.on_orderbook(&book("up", vec![(0.49, 100.0)], vec![(0.51, 100.0)]));
+        for n in 0..MAX_LIQUIDITY_PRINTS + 1 {
+            c.on_trade_tick(&trade_ts("up", Side::Sell, 0.49, 1.0, n as u64 + 1));
+        }
+        assert_eq!(c.liquidity_prints.len(), MAX_LIQUIDITY_PRINTS);
+        assert_eq!(c.liquidity_prints.capacity(), MAX_LIQUIDITY_PRINTS);
+        assert_eq!(c.liquidity_evidence_overflows, 1);
+    }
+
+    #[test]
+    fn v6_liquidity_unrelated_book_keeps_trade_depletion_attribution() {
+        let mut c = liquidity_core();
+        c.configure(Some(1.0), 0);
+        c.on_orderbook(&book("up", vec![(0.49, 100.0)], vec![(0.51, 100.0)]));
+        c.submit_order(
+            &order("rest", "up", Side::Buy, 0.49, 5.0, true, OrderType::Limit),
+            1,
+        );
+        assert!(c
+            .on_trade_tick(&trade_ts("up", Side::Sell, 0.49, 20.0, 2))
+            .is_empty());
+        assert_eq!(c.orders["rest"].q_ahead, 80.0);
+        c.on_orderbook(&book_ts(
+            "unrelated",
+            vec![(0.49, 100.0)],
+            vec![(0.51, 100.0)],
+            3,
+        ));
+        c.on_orderbook(&book_ts("up", vec![(0.49, 80.0)], vec![(0.51, 100.0)], 4));
+        assert_eq!(c.orders["rest"].q_ahead, 80.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires folded canonical-only")]
+    fn v6_liquidity_rejects_unsupported_unfolded_print_budget() {
+        let mut c = core();
+        c.set_liquidity_ledger_enabled(true);
+    }
+
+    #[test]
+    fn v6_empty_historical_path_preserves_legacy_credit() {
+        let mut c = core();
+        c.load_historical_self_depth("", 1.0).unwrap();
+        assert!(!c.historical_self_depth_enabled);
+    }
+
+    fn historical_depth_fixture() -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for (timestamp, iid, qty) in [(10, "iid", 30.0), (20, "iid", 0.0), (5, "other", 70.0)] {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "timestamp_ns": timestamp, "iid": iid, "token": "up", "side": "BUY",
+                    "price": 0.49, "quantity": qty, "evidence_class": "client_observed_proxy",
+                    "reason": if qty > 0.0 { "observed_active_or_matched" } else { "observed_terminal" },
+                    "lower_bound_ns": timestamp-1, "upper_bound_ns": timestamp+1,
+                })
+            )
+            .unwrap();
+        }
+        file
+    }
+
+    #[test]
+    fn v6_historical_depth_is_independent_of_sim_size_time_and_owner() {
+        let file = historical_depth_fixture();
+        let probe = |size, now, iid: &str, fraction| {
+            let mut c = liquidity_core();
+            c.load_historical_self_depth(file.path().to_str().unwrap(), fraction)
+                .unwrap();
+            c.on_orderbook(&book("up", vec![(0.49, 100.0)], vec![(0.51, 100.0)]));
+            let mut request = order("rest", "up", Side::Buy, 0.49, size, true, OrderType::Limit);
+            request.instance_id = iid.into();
+            c.submit_order(&request, now);
+            let before = c.orders["rest"].q_ahead;
+            c.on_orderbook(&book_ts(
+                "up",
+                vec![(0.49, 100.0)],
+                vec![(0.51, 100.0)],
+                now + 1,
+            ));
+            assert_eq!(c.orders["rest"].replay_self_depth_credit, 100.0 - before);
+            before
+        };
+        assert_eq!(probe(5.0, 10, "iid", 1.0), 70.0);
+        assert_eq!(probe(50.0, 10, "iid", 1.0), 70.0);
+        assert_eq!(probe(5.0, 9, "iid", 1.0), 100.0);
+        assert_eq!(probe(5.0, 20, "iid", 1.0), 100.0);
+        assert_eq!(probe(5.0, 10, "unknown", 1.0), 100.0);
+        assert_eq!(probe(5.0, 10, "iid", 0.5), 85.0);
+        assert_eq!(probe(5.0, 10, "iid", 0.0), 100.0);
+    }
+
+    #[test]
+    fn v6_historical_depth_loader_rejects_oversized_file_and_line() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file()
+            .set_len(MAX_HISTORICAL_DEPTH_BYTES + 1)
+            .unwrap();
+        let mut c = liquidity_core();
+        assert!(c
+            .load_historical_self_depth(file.path().to_str().unwrap(), 1.0)
+            .unwrap_err()
+            .contains("512 MiB"));
+        file.as_file().set_len(0).unwrap();
+        file.write_all(&vec![b' '; MAX_HISTORICAL_DEPTH_LINE_BYTES + 1])
+            .unwrap();
+        assert!(c
+            .load_historical_self_depth(file.path().to_str().unwrap(), 1.0)
+            .unwrap_err()
+            .contains("64 KiB"));
+        assert!(!c.historical_self_depth_enabled);
+    }
+
+    #[test]
+    #[ignore = "requires V6_HISTORICAL_DEPTH_JOURNAL path to external replay evidence"]
+    fn v6_historical_depth_external_journal_loads() {
+        let path =
+            std::env::var("V6_HISTORICAL_DEPTH_JOURNAL").expect("set V6_HISTORICAL_DEPTH_JOURNAL");
+        let mut c = liquidity_core();
+        c.load_historical_self_depth(&path, 1.0).unwrap();
+        assert!(c.historical_self_depth_rows > 0);
+        println!(
+            "loaded historical depth rows={} tokens={}",
+            c.historical_self_depth_rows,
+            c.historical_self_depth.len()
+        );
+    }
+
+    #[test]
+    fn v6_historical_proxy_reset_is_not_observed_venue_removal() {
+        use std::io::Write;
+        let mut file = historical_depth_fixture();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "timestamp_ns":30,"iid":"iid","token":"up","side":"BUY","price":0.49,"quantity":0.0,
+                "evidence_class":"client_observed_proxy","reason":"restart_proxy_reset",
+                "lower_bound_ns":29,"upper_bound_ns":30,
+            })
+        )
+        .unwrap();
+        let mut c = liquidity_core();
+        c.load_historical_self_depth(file.path().to_str().unwrap(), 1.0)
+            .unwrap();
+        assert!(historical_removal_observed(
+            &c.historical_self_depth,
+            "iid",
+            "up",
+            None,
+            Side::Buy,
+            0.49,
+            0.01,
+            20
+        ));
+        assert!(!historical_removal_observed(
+            &c.historical_self_depth,
+            "iid",
+            "up",
+            None,
+            Side::Buy,
+            0.49,
+            0.01,
+            30
+        ));
+    }
+
+    #[test]
+    fn v6_historical_own_removal_does_not_advance_external_queue() {
+        let file = historical_depth_fixture();
+        let mut c = liquidity_core();
+        c.load_historical_self_depth(file.path().to_str().unwrap(), 1.0)
+            .unwrap();
+        c.on_orderbook(&book("up", vec![(0.49, 100.0)], vec![(0.51, 100.0)]));
+        c.submit_order(
+            &order("rest", "up", Side::Buy, 0.49, 5.0, true, OrderType::Limit),
+            10,
+        );
+        assert_eq!(c.orders["rest"].q_ahead, 70.0);
+        c.on_orderbook(&book_ts("up", vec![(0.49, 70.0)], vec![(0.51, 100.0)], 20));
+        assert_eq!(c.orders["rest"].q_ahead, 70.0);
+        assert_eq!(c.orders["rest"].replay_self_depth_credit, 0.0);
+    }
+
+    #[test]
+    fn v6_historical_depth_duplicate_snapshot_is_idempotent_and_conflict_rejected() {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let row = serde_json::json!({"timestamp_ns":10,"iid":"iid","token":"up","side":"BUY","price":0.49,"quantity":30.0,"evidence_class":"client_observed_proxy","lower_bound_ns":9,"upper_bound_ns":11});
+        writeln!(file, "{row}\n{row}").unwrap();
+        let mut c = liquidity_core();
+        c.load_historical_self_depth(file.path().to_str().unwrap(), 1.0)
+            .unwrap();
+        assert_eq!(
+            c.historical_depth_at("iid", "up", Side::Buy, 0.49, 0.01, 10),
+            30.0
+        );
+        let mut row = row;
+        row["quantity"] = serde_json::json!(31.0);
+        writeln!(file, "{row}").unwrap();
+        assert!(c
+            .load_historical_self_depth(file.path().to_str().unwrap(), 1.0)
+            .is_err());
+        assert_eq!(
+            c.historical_depth_at("iid", "up", Side::Buy, 0.49, 0.01, 10),
+            30.0
+        );
+    }
+
+    #[test]
+    fn v6_queue_uncertainty_cancel_location_stays_within_physical_bounds() {
+        for front in [0.0, 20.0, 90.0, 100.0] {
+            for cancels in [0.0, 10.0, 50.0, 100.0] {
+                let lower = (cancels - (100.0_f64 - front)).max(0.0).min(front);
+                let upper = cancels.min(front);
+                for sample in [0.0, 0.2, 0.5, 1.0] {
+                    let advance = bounded_cancel_advance(front, 100.0, cancels, sample, 1.0);
+                    assert!(advance + EPS >= lower && advance <= upper + EPS);
+                }
+            }
+        }
+        assert_eq!(bounded_cancel_advance(20.0, 100.0, 100.0, 0.0, 1.0), 20.0);
+        assert_eq!(bounded_cancel_advance(20.0, 100.0, 100.0, 1.0, 1.0), 20.0);
+    }
+
+    #[test]
+    fn v6_queue_uncertainty_is_stable_and_independent_of_mid_direction() {
+        let probe = |ask_price| {
+            let mut c = liquidity_core();
+            c.configure_queue_uncertainty(1.0);
+            c.configure_adverse_sel(1.0, 1.0);
+            c.on_orderbook(&book("up", vec![(0.49, 100.0)], vec![(0.51, 100.0)]));
+            c.submit_order(
+                &order("rest", "up", Side::Buy, 0.49, 5.0, true, OrderType::Limit),
+                1,
+            );
+            assert!(c
+                .on_trade_tick(&trade_ts("up", Side::Sell, 0.49, 80.0, 2))
+                .is_empty());
+            c.on_orderbook(&book_ts("up", vec![(0.49, 100.0)], vec![(0.51, 100.0)], 3));
+            c.on_orderbook(&book_ts(
+                "up",
+                vec![(0.49, 50.0)],
+                vec![(ask_price, 100.0)],
+                4,
+            ));
+            c.orders["rest"].q_ahead
+        };
+        let a = probe(0.60);
+        let b = probe(0.50);
+        assert_eq!(a, b);
+        assert!((0.0..=20.0).contains(&a));
     }
 
     fn continuity_core(mode: BookContinuityMode) -> SimExchangeV2 {
@@ -8288,6 +9785,137 @@ mod tests {
         assert_eq!(newer.depletion_candidate_qty, 5.0);
         assert_eq!(newer.depletion_budget_suppressed_qty, 5.0);
         assert_eq!(newer.depletion_fill_qty, 0.0);
+    }
+
+    /// Paired offline debug/release CPU-cost evidence. Setup, book/order
+    /// construction, cache warming, checks and histogram work are excluded.
+    /// This is not a live latency benchmark and has no cross-thread queue.
+    #[test]
+    #[ignore = "focused offline ledger off/on microbenchmark"]
+    fn benchmark_v6_liquidity_ledger_paired() {
+        const N: usize = 20_000;
+        const WARMUP: usize = 1_000;
+        let instrument = binary_instrument();
+        for scenario in ["same_snapshot_two_takers", "one_print_two_fifo_makers"] {
+            let mut samples: [Vec<u64>; 2] = std::array::from_fn(|_| Vec::with_capacity(N));
+            let mut last_stats = [serde_json::Value::Null, serde_json::Value::Null];
+            let mut max_active_orders = [0usize; 2];
+            let mut max_evidence_orders = [0usize; 2];
+            let mut max_pending_prints = [0usize; 2];
+            let mut overflows = [0u64; 2];
+            let mut total_filled = [0.0_f64; 2];
+            for iteration in 0..N + WARMUP {
+                // Alternate which arm is measured first to avoid a fixed
+                // first/second warming or concurrent-load advantage.
+                for arm in [iteration % 2, 1 - iteration % 2] {
+                    let enabled = arm == 1;
+                    let mut core = SimExchangeV2::new(500_000_000, HashMap::new(), HashMap::new());
+                    core.set_fold_outcomes(true);
+                    core.configure_fold_canonical_book_only(true);
+                    core.configure_exact_maker_trade_level(true);
+                    core.on_instrument(&instrument);
+                    core.set_liquidity_ledger_enabled(enabled);
+                    core.configure_book_through(1.0);
+                    let (elapsed, filled) = if scenario == "same_snapshot_two_takers" {
+                        let snapshot = book("up", vec![(0.49, 20.0)], vec![(0.51, 10.0)]);
+                        let first =
+                            order("first", "up", Side::Buy, 0.51, 6.0, false, OrderType::Fak);
+                        let second =
+                            order("second", "up", Side::Buy, 0.51, 6.0, false, OrderType::Fak);
+                        core.on_orderbook(&snapshot);
+                        assert!(core.would_cross(&first, 1));
+                        let started = std::time::Instant::now();
+                        let a = core.submit_order(&first, 1);
+                        let b = core.submit_order(&second, 2);
+                        let elapsed = started.elapsed().as_nanos() as u64;
+                        let quantity = a.filled_quantity + b.filled_quantity;
+                        std::hint::black_box((a, b));
+                        assert!((quantity - if enabled { 10.0 } else { 12.0 }).abs() < EPS);
+                        (elapsed, quantity)
+                    } else {
+                        let snapshot = book("up", vec![(0.49, 5.0)], vec![(0.51, 100.0)]);
+                        let first = order(
+                            "z-first",
+                            "up",
+                            Side::Buy,
+                            0.49,
+                            5.0,
+                            true,
+                            OrderType::Limit,
+                        );
+                        let second = order(
+                            "a-second",
+                            "up",
+                            Side::Buy,
+                            0.49,
+                            5.0,
+                            true,
+                            OrderType::Limit,
+                        );
+                        let print = trade_ts("up", Side::Sell, 0.49, 12.0, 3);
+                        core.on_orderbook(&snapshot);
+                        core.submit_order(&first, 1);
+                        core.submit_order(&second, 2);
+                        max_active_orders[arm] = max_active_orders[arm].max(core.orders.len());
+                        let started = std::time::Instant::now();
+                        let updates = core.on_trade_tick(&print);
+                        let elapsed = started.elapsed().as_nanos() as u64;
+                        let quantity = updates.iter().map(|u| u.filled_quantity).sum::<f64>();
+                        assert!((quantity - 7.0).abs() < EPS);
+                        assert_eq!(updates.len(), 2);
+                        std::hint::black_box(updates);
+                        (elapsed, quantity)
+                    };
+                    max_active_orders[arm] = max_active_orders[arm].max(core.orders.len());
+                    max_evidence_orders[arm] =
+                        max_evidence_orders[arm].max(core.order_evidence_high_water);
+                    max_pending_prints[arm] =
+                        max_pending_prints[arm].max(core.liquidity_prints.len());
+                    overflows[arm] += core.liquidity_evidence_overflows;
+                    if iteration >= WARMUP {
+                        samples[arm].push(elapsed);
+                        total_filled[arm] += filled;
+                    }
+                    if iteration + 1 == N + WARMUP {
+                        last_stats[arm] = core.v6_fidelity_stats();
+                    }
+                }
+            }
+            for arm in 0..2 {
+                samples[arm].sort_unstable();
+                let at = |numerator: usize, denominator: usize| {
+                    samples[arm][(N - 1) * numerator / denominator]
+                };
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "benchmark": "v6_liquidity_ledger_paired", "scenario": scenario,
+                        "ledger_enabled": arm == 1,
+                        "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+                        "samples": N, "warmup_per_arm": WARMUP,
+                        "arm_order": "alternating off/on then on/off; fresh core per sample",
+                        "boundary": if scenario == "same_snapshot_two_takers" {
+                            "two sequential submit_order calls through returned updates on one snapshot"
+                        } else { "one on_trade_tick call through returned updates for two same-level FIFO orders" },
+                        "excluded": "core/book/order setup, cache warmup, assertions, destruction, result aggregation and serialization",
+                        "scope": "offline simulator CPU cost; not live end-to-end or network latency",
+                        "median_ns": at(1, 2), "p99_ns": at(99, 100),
+                        "p999_ns": at(999, 1000), "max_ns": samples[arm][N - 1],
+                        "total_filled_qty": total_filled[arm],
+                        "quantity_note": if scenario == "same_snapshot_two_takers" {
+                            "identical inputs; off fills 12, on correctly caps at 10, so workloads differ in final quantity/status"
+                        } else { "identical inputs and economic outputs; both arms fill 7 shares in two updates" },
+                        "message_queue_high_water": 0, "message_queue_note": "direct core calls; no cross-thread/message scheduler queue",
+                        "active_order_high_water": max_active_orders[arm],
+                        "order_evidence_high_water": max_evidence_orders[arm],
+                        "pending_print_high_water": max_pending_prints[arm],
+                        "pending_print_capacity": if arm == 1 { MAX_LIQUIDITY_PRINTS } else { 0 },
+                        "fifo_order_capacity": if arm == 1 { MAX_LIQUIDITY_ORDERS } else { 0 },
+                        "overflow": overflows[arm], "last_core_stats": last_stats[arm],
+                    })
+                );
+            }
+        }
     }
 
     /// Focused hot-section evidence for changes to `resync_queues`. Run with:

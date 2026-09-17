@@ -30,12 +30,126 @@ use crate::exchange::polymarket::{
     PolymarketFeedPhase, PolymarketLiveness, PolymarketLivenessSnapshot, PolymarketMarket,
     PolymarketTrade,
 };
+use crate::exchange::sim_v2::simulator::RecoveryDeliveryIdentity;
 use crate::exchange::{ExchangeMarket, ExchangeTrade, PublicMarketPublisher, PublicMarketReceiver};
 use crate::recorder::{configure_replay_cache, MarketRecorder, MarketReplayer, ReplayCacheMode};
 use crate::strategy::{LifecycleEnvelope, LifecycleSource, Strategy};
 use crate::types::*;
+use crate::virtual_owner::{OwnerScheduleConfig, OwnerWork, VirtualOwnerScheduler};
+use crate::virtual_recovery::{
+    OracleHistoryQueryAudit, RecoveryAction, RecoveryMetadata, RecoveryOracleHistory,
+    RecoveryReplay,
+};
 use hexagent_runtime::shutdown::ShutdownToken;
 use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
+
+// Only the offline replay coordinator creates these values. Each payload is
+// delivered to exactly one virtual owner; Arc is immutable market fan-out.
+enum BacktestOwnerEvent {
+    Market(Arc<MarketEvent>),
+    Private {
+        update: OrderUpdate,
+        delivery: RecoveryDeliveryIdentity,
+    },
+    RecoveryOracleHistory {
+        query_cutoff_ns: u64,
+    },
+    Historical {
+        generation: u64,
+        target_ns: u64,
+        requests: Vec<HistDataRequest>,
+    },
+}
+
+// Same symbol/series ownership contract as the live router. Dynamic tokens are
+// registered at instrument ingress, before subsequent market snapshots arrive.
+fn backtest_market_targets(
+    event: &MarketEvent,
+    subscriptions: &HashMap<SymbolId, u64>,
+    tokens: &mut HashMap<SymbolId, u64>,
+    owner_count: usize,
+) -> u64 {
+    if let MarketEvent::Instrument(Instrument::BinaryOption(bo)) = event {
+        let key = if bo.series_slug.trim().is_empty() {
+            &bo.slug
+        } else {
+            &bo.series_slug
+        };
+        let owners = subscriptions
+            .get(&SymbolId::of(key))
+            .copied()
+            .unwrap_or_default();
+        for token in &bo.clob_token_ids {
+            tokens.insert(SymbolId::of(token), owners);
+        }
+        return owners;
+    }
+    if let MarketEvent::EventEnd {
+        exchange: Exchange::Polymarket,
+        retired_symbols,
+        ..
+    } = event
+    {
+        for token in retired_symbols {
+            tokens.remove(&SymbolId::of(token));
+        }
+        return 0;
+    }
+    let all = if owner_count == 64 {
+        u64::MAX
+    } else {
+        (1u64 << owner_count) - 1
+    };
+    let (symbol, dynamic) = match event {
+        MarketEvent::Connected { .. } | MarketEvent::Disconnected { .. } => return all,
+        MarketEvent::Instrument(Instrument::Spot(s)) => (&s.symbol, false),
+        MarketEvent::OrderBook(s) => (&s.symbol, s.exchange == Exchange::Polymarket),
+        MarketEvent::Trade(s) => (&s.symbol, s.exchange == Exchange::Polymarket),
+        MarketEvent::Quote(s) => (&s.symbol, s.exchange == Exchange::Polymarket),
+        MarketEvent::TickSizeChange(s) => (&s.symbol, true),
+        MarketEvent::MarketDataHealth(s) => (&s.symbol, true),
+        MarketEvent::Bar(s) => (&s.symbol, false),
+        MarketEvent::SpotPrice(s) => (&s.symbol, false),
+        MarketEvent::AssetCtx(s) => (&s.symbol, false),
+        MarketEvent::EventStart { symbol, .. } => (symbol, false),
+        MarketEvent::EventEnd { .. } | MarketEvent::Exit => return 0,
+        MarketEvent::Instrument(Instrument::BinaryOption(_)) => unreachable!(),
+    };
+    let id = SymbolId::of(symbol);
+    if dynamic {
+        tokens
+            .get(&id)
+            .copied()
+            .or_else(|| {
+                matches!(
+                    event,
+                    MarketEvent::TickSizeChange(_) | MarketEvent::MarketDataHealth(_)
+                )
+                .then(|| subscriptions.get(&id).copied())
+                .flatten()
+            })
+            .unwrap_or_default()
+    } else {
+        subscriptions.get(&id).copied().unwrap_or_default()
+    }
+}
+
+fn ensure_recovery_signal_allowed(
+    recovery: &RecoveryReplay,
+    owner: usize,
+    signal: &Signal,
+) -> Result<()> {
+    let places = match signal {
+        Signal::NewOrder(_) => true,
+        Signal::BatchNewOrders { orders, .. } => !orders.is_empty(),
+        Signal::BatchUpdateOrders { place_orders, .. }
+        | Signal::ReplaceOrder { place_orders, .. } => !place_orders.is_empty(),
+        _ => false,
+    };
+    anyhow::ensure!(!places || recovery.quote_allowed(owner),
+        "virtual owner {owner} emitted a new place while recovery gate was closed; strategy must honor set_backtest_recovery_gate");
+    Ok(())
+}
 
 const CHANNEL_CAPACITY: usize = 10_000;
 const POLY_FAST_OWNER_QUEUE_CAPACITY: usize = 1;
@@ -5795,6 +5909,14 @@ impl Engine {
             replay_arrival_time_strict: bt.sim_replay_arrival_time_strict,
             raw_server_clock: bt.sim_v2_raw_server_clock,
             strict_admission: bt.sim_v2_strict_admission,
+            liquidity_ledger_enabled: bt.sim_v2_liquidity_ledger,
+            match_time_liquidity: bt.sim_v2_match_time_liquidity,
+            network_outbound_fraction_bps: bt.sim_v2_network_outbound_fraction_bps,
+            market_rules_path: bt.sim_v2_market_rules_path.clone(),
+            arrival_interval_audit: bt.sim_v2_arrival_interval_audit,
+            historical_self_depth_path: bt.sim_v2_historical_self_depth_path.clone(),
+            historical_self_depth_fraction: bt.sim_v2_historical_self_depth_fraction,
+            queue_uncertainty_strength: bt.sim_v2_queue_uncertainty_strength,
             admission_unknown_reject: bt.sim_v2_admission_unknown_reject,
             admission_audit: bt.sim_v2_admission_audit,
             book_continuity_mode: bt
@@ -5921,8 +6043,35 @@ impl Engine {
             place_profile,
             cancel_profile,
         })?;
+        let fidelity_profile = serde_json::json!({
+            "schema": "sim_fidelity_profile_v6", "resolved": {
+                "sim_v2_liquidity_ledger": bt.sim_v2_liquidity_ledger,
+                "sim_v2_match_time_liquidity": bt.sim_v2_match_time_liquidity,
+                "sim_v2_owner_scheduler": bt.sim_v2_owner_scheduler,
+                "sim_v2_owner_apply_delay_us": bt.sim_v2_owner_apply_delay_us,
+                "sim_v2_owner_service_time_us": bt.sim_v2_owner_service_time_us,
+                "sim_v2_owner_queue_capacity": bt.sim_v2_owner_queue_capacity,
+                "sim_v2_owner_watchdog_interval_ms": bt.sim_v2_owner_watchdog_interval_ms,
+                "sim_v2_owner_history_delay_ms": bt.sim_v2_owner_history_delay_ms,
+                "sim_v2_owner_recovery_path": bt.sim_v2_owner_recovery_path,
+                "sim_v2_owner_recovery_reconcile_ms": bt.sim_v2_owner_recovery_reconcile_ms,
+                "sim_v2_historical_self_depth_path": bt.sim_v2_historical_self_depth_path,
+                "sim_v2_historical_self_depth_fraction": bt.sim_v2_historical_self_depth_fraction,
+                "sim_v2_queue_uncertainty_strength": bt.sim_v2_queue_uncertainty_strength,
+                "sim_v2_network_outbound_fraction_bps": bt.sim_v2_network_outbound_fraction_bps,
+                "sim_v2_market_rules_path": bt.sim_v2_market_rules_path,
+                "sim_v2_arrival_interval_audit": bt.sim_v2_arrival_interval_audit,
+            }
+        });
+        std::fs::write(
+            "sim_fidelity_profile.json",
+            serde_json::to_vec_pretty(&fidelity_profile)?,
+        )?;
         sim.configure_maker_order_audit(bt.sim_v2_fill_audit);
         sim.set_taker_overhead_enabled(bt.sim_v2_taker_overhead_enabled);
+        sim.configure_selection(&bt.sim_v2_selection_mode,&bt.sim_v2_selection_model_path,bt.sim_v2_selection_strength,bt.sim_latency_seed,bt.sim_v2_selection_audit)?;
+        sim.configure_selection_roles(bt.sim_v2_selection_maker_strength, bt.sim_v2_selection_taker_strength)?;
+        sim.configure_maker_trade_through_recovery(bt.sim_v2_maker_trade_through_recovery)?;
         if let Some(iid) = continuity_owner {
             let replay = crate::exchange::sim_v2::BookContinuityReplay::from_path(
                 &bt.sim_v2_book_continuity_evidence_path,
@@ -5952,10 +6101,17 @@ impl Engine {
         struct HeapEntry {
             ts: u64,
             idx: usize,
+            stable_ties: bool,
         }
         impl Ord for HeapEntry {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                other.ts.cmp(&self.ts)
+                other.ts.cmp(&self.ts).then_with(|| {
+                    if self.stable_ties {
+                        other.idx.cmp(&self.idx)
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
             }
         }
         impl PartialOrd for HeapEntry {
@@ -5966,13 +6122,87 @@ impl Engine {
         let mut strat_heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
         for (i, p) in strat_peeked.iter().enumerate() {
             if let Some((ts, _)) = p {
-                strat_heap.push(HeapEntry { ts: *ts, idx: i });
+                strat_heap.push(HeapEntry {
+                    ts: *ts,
+                    idx: i,
+                    stable_ties: bt.sim_v2_owner_scheduler,
+                });
             }
         }
 
         let mut replay_clocks = SimV2ReplayClocks::default();
 
         let mut lifecycle_router = SimLifecycleRouter::new(&strategies)?;
+        anyhow::ensure!(
+            !bt.sim_v2_owner_scheduler || strategies.len() <= 64,
+            "virtual owner routing supports at most 64 strategies"
+        );
+        anyhow::ensure!(
+            !bt.sim_v2_owner_scheduler
+                || (!bt.start_date.trim().is_empty() && !bt.end_date.trim().is_empty()),
+            "virtual owner scheduler requires explicit backtest start_date and end_date for bounded timers"
+        );
+        let mut owner_scheduler = if bt.sim_v2_owner_scheduler {
+            Some(
+                VirtualOwnerScheduler::<LatestMarketKey, BacktestOwnerEvent>::new(
+                    strategies.len(),
+                    OwnerScheduleConfig {
+                        apply_delay_ns: bt
+                            .sim_v2_owner_apply_delay_us
+                            .checked_mul(1_000)
+                            .ok_or_else(|| anyhow::anyhow!("owner apply delay overflow"))?,
+                        service_time_ns: bt
+                            .sim_v2_owner_service_time_us
+                            .checked_mul(1_000)
+                            .ok_or_else(|| anyhow::anyhow!("owner service time overflow"))?,
+                        capacity: bt.sim_v2_owner_queue_capacity,
+                        watchdog_interval_ns: bt
+                            .sim_v2_owner_watchdog_interval_ms
+                            .checked_mul(1_000_000)
+                            .ok_or_else(|| anyhow::anyhow!("owner watchdog interval overflow"))?,
+                        start_ns,
+                        end_ns,
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        let mut owner_subscriptions = HashMap::<SymbolId, u64>::new();
+        let mut owner_tokens = HashMap::<SymbolId, u64>::new();
+        let mut history_generations = vec![0u64; strategies.len()];
+        if owner_scheduler.is_some() {
+            for (owner, strategy) in strategies.iter_mut().enumerate() {
+                strategy.set_backtest_owner_scheduler(true);
+                for symbol in strategy.subscribed_symbols() {
+                    *owner_subscriptions
+                        .entry(SymbolId::of(&symbol))
+                        .or_default() |= 1u64 << owner;
+                }
+            }
+            info!("[Backtest v2] virtual owners enabled: modeled apply={}us service={}us history={}ms, queue capacity={}, timer={}ms; private priority; ingress before equal-time owner work",
+                bt.sim_v2_owner_apply_delay_us, bt.sim_v2_owner_service_time_us,
+                bt.sim_v2_owner_history_delay_ms, bt.sim_v2_owner_queue_capacity,
+                bt.sim_v2_owner_watchdog_interval_ms);
+        }
+        anyhow::ensure!(
+            bt.sim_v2_owner_recovery_path.trim().is_empty() || owner_scheduler.is_some(),
+            "owner recovery requires sim_v2_owner_scheduler=true"
+        );
+        let mut owner_recovery = RecoveryReplay::from_path(
+            &bt.sim_v2_owner_recovery_path,
+            &lifecycle_router.owners,
+            bt.sim_v2_owner_recovery_reconcile_ms
+                .checked_mul(1_000_000)
+                .ok_or_else(|| anyhow::anyhow!("owner recovery delay overflow"))?,
+            start_ns,
+            end_ns,
+        )?;
+        let mut recovery_metadata = (!bt.sim_v2_owner_recovery_path.trim().is_empty())
+            .then(|| RecoveryMetadata::new(strategies.len()));
+        let mut recovery_oracle_history = recovery_metadata
+            .as_ref()
+            .map(|_| RecoveryOracleHistory::new(strategies.len()));
         let mut lifecycle_signals = SignalBatch::new();
         // Offline simulator evidence is serialized outside strategy callbacks.
         // The live execution/quote lanes never enter this backtest loop.
@@ -5985,10 +6215,23 @@ impl Engine {
             None
         };
 
+        // Offline simulator coordinator, outside strategy callback/quote processing.
+        let mut selection_writer = if bt.sim_v2_selection_audit {
+            Some(std::io::BufWriter::with_capacity(256*1024,std::fs::File::create("sim_selection_audit.jsonl")?))
+        } else {None};
         let mut execution_timing_writer = if bt.sim_v2_execution_timing_audit {
             Some(std::io::BufWriter::with_capacity(
                 256 * 1024,
                 std::fs::File::create("sim_execution_timing_audit.jsonl")?,
+            ))
+        } else {
+            None
+        };
+
+        let mut arrival_interval_writer = if bt.sim_v2_arrival_interval_audit {
+            Some(std::io::BufWriter::with_capacity(
+                256 * 1024,
+                std::fs::File::create("sim_arrival_interval_audit.jsonl")?,
             ))
         } else {
             None
@@ -6006,18 +6249,116 @@ impl Engine {
             let server_ts = sim.peek_server_when().unwrap_or(u64::MAX);
             let strategy_delivery_ts = sim.peek_strategy_when().unwrap_or(u64::MAX);
             let sim_ts = server_ts.min(strategy_delivery_ts);
-            let min_ts = strat_min.min(sim_ts);
+            let owner_ts = owner_scheduler
+                .as_ref()
+                .and_then(|s| s.peek_when())
+                .unwrap_or(u64::MAX);
+            let recovery_ts = owner_recovery.peek_when().unwrap_or(u64::MAX);
+            let min_ts = strat_min.min(sim_ts).min(owner_ts).min(recovery_ts);
+            let mut market_to_apply: Option<(u64, Arc<MarketEvent>, Option<usize>)> = None;
             if min_ts == u64::MAX {
                 break;
             }
 
-            if min_ts == sim_ts {
+            if min_ts == recovery_ts
+                && (owner_recovery.peek_action() == Some(RecoveryAction::Stop)
+                    || (sim_ts > recovery_ts && strat_min > recovery_ts))
+            {
+                // Stop precedes callbacks. Query return follows all same-time
+                // server work and ingress, so the watermark covers that boundary.
+                // Server work remains in its own DES and is never canceled by
+                // a client process outage.
+                let edge = owner_recovery.step(recovery_ts).unwrap();
+                let strategy_now = replay_clocks.advance_strategy(edge.when_ns);
+                sim.observe_strategy_clock(strategy_now);
+                set_sim_clock(strategy_now);
+                match edge.action {
+                    RecoveryAction::Stop => {
+                        if let Some(history) = recovery_oracle_history.as_mut() {
+                            owner_scheduler.as_ref().unwrap().visit_unapplied_market(
+                                edge.owner,
+                                |payload| {
+                                    if let BacktestOwnerEvent::Market(event) = payload {
+                                        if let MarketEvent::SpotPrice(report) = event.as_ref() {
+                                            history.observe(edge.owner, report)?;
+                                        }
+                                    }
+                                    Ok(())
+                                },
+                            )?;
+                        }
+                        owner_scheduler
+                            .as_mut()
+                            .unwrap()
+                            .suspend_owner(edge.owner, strategy_now)?;
+                        strategies[edge.owner].set_backtest_recovery_gate(true);
+                        strategies[edge.owner].on_disconnected(
+                            Exchange::Polymarket,
+                            "observed replay process stop; warm checkpoint assumption",
+                        );
+                    }
+                    RecoveryAction::Restart => {
+                        // The socket has restarted, but no account callback
+                        // runs until the modeled reconciliation query returns.
+                    }
+                    RecoveryAction::ReconcileComplete => {
+                        owner_recovery
+                            .capture_watermark(edge.owner, sim.recovery_delivery_watermark());
+                        if let Some(metadata) = recovery_metadata.as_ref() {
+                            let scheduler = owner_scheduler.as_mut().unwrap();
+                            scheduler.prepend_market(
+                                edge.owner,
+                                strategy_now,
+                                BacktestOwnerEvent::RecoveryOracleHistory {
+                                    query_cutoff_ns: strategy_now,
+                                },
+                            )?;
+                            scheduler.retire_owner_market(edge.owner, |payload| matches!(payload,
+                                BacktestOwnerEvent::Market(event) if matches!(event.as_ref(), MarketEvent::Instrument(_))));
+                            // Reverse insertion preserves original discovery order.
+                            for event in metadata.pending(edge.owner).iter().rev() {
+                                scheduler.prepend_market(
+                                    edge.owner,
+                                    strategy_now,
+                                    BacktestOwnerEvent::Market(Arc::clone(event)),
+                                )?;
+                            }
+                        }
+                        owner_scheduler
+                            .as_mut()
+                            .unwrap()
+                            .rebase_private_recovery_receive(
+                                edge.owner,
+                                strategy_now,
+                                |payload, received_ns| {
+                                    if let BacktestOwnerEvent::Private { update, .. } = payload {
+                                        update.timestamp_ns = received_ns;
+                                    }
+                                },
+                            );
+                        owner_scheduler
+                            .as_mut()
+                            .unwrap()
+                            .resume_owner(edge.owner, strategy_now);
+                        strategies[edge.owner].on_connected(Exchange::Polymarket);
+                    }
+                }
+            } else if min_ts == sim_ts {
                 // Pure server work advances only the server lane. Acks/fills
                 // cross back as explicit inbound messages below.
                 if server_ts <= strategy_delivery_ts {
                     replay_clocks.advance_server(server_ts);
                 }
+                let delivery_identity = (strategy_delivery_ts < server_ts)
+                    .then(|| sim.peek_strategy_delivery_identity())
+                    .flatten();
                 let updates = sim.step();
+                if let Some(writer)=selection_writer.as_mut() {
+                    for row in sim.drain_selection_audit() {
+                        serde_json::to_writer(&mut *writer,&row)?;
+                        std::io::Write::write_all(writer,b"\n")?;
+                    }
+                }
                 if let Some(writer) = admission_writer.as_mut() {
                     for row in sim.drain_admission_audit() {
                         serde_json::to_writer(&mut *writer, &row)?;
@@ -6025,6 +6366,35 @@ impl Engine {
                     }
                 }
                 for mut update in updates {
+                    if let Some(scheduler) = owner_scheduler.as_mut() {
+                        let (instance, slot) =
+                            sim.order_owner(&update.client_order_id).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing simulated lifecycle ownership for {}",
+                                    update.client_order_id
+                                )
+                            })?;
+                        anyhow::ensure!(
+                            slot == update.order_slot,
+                            "simulated lifecycle slot mismatch for {}",
+                            update.client_order_id
+                        );
+                        let owner = *lifecycle_router.owners.get(instance).ok_or_else(|| {
+                            anyhow::anyhow!("unknown simulated lifecycle owner {instance}")
+                        })?;
+                        scheduler.enqueue_private(
+                            owner,
+                            update.timestamp_ns,
+                            BacktestOwnerEvent::Private {
+                                update,
+                                delivery: delivery_identity.ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                    "simulator emitted a private update outside its delivery lane")
+                                })?,
+                            },
+                        )?;
+                        continue;
+                    }
                     let strategy_now = replay_clocks.advance_strategy(update.timestamp_ns);
                     update.timestamp_ns = strategy_now;
                     sim.observe_strategy_clock(strategy_now);
@@ -6051,6 +6421,128 @@ impl Engine {
                         sim.submit(&signal, strategy_now);
                     }
                 }
+            } else if owner_ts < strat_min {
+                // Strict inequality lets all market and private ingress at an
+                // equal timestamp arrive before choosing the next owner lane.
+                if let Some(completion) = owner_scheduler.as_mut().unwrap().step(owner_ts) {
+                    let strategy_now = replay_clocks.advance_strategy(completion.completed_ns);
+                    sim.observe_strategy_clock(strategy_now);
+                    set_sim_clock(strategy_now);
+                    let owner = completion.owner;
+                    match completion.work {
+                        OwnerWork::Event(BacktestOwnerEvent::Market(event)) => {
+                            market_to_apply = Some((strategy_now, event, Some(owner)));
+                        }
+                        OwnerWork::Event(BacktestOwnerEvent::Private { update, .. }) => {
+                            // Keep HTTP/private receive time distinct from owner
+                            // application time. RTT sampling must not absorb the
+                            // owner queue/service delay a second time.
+                            debug_assert_eq!(update.timestamp_ns, completion.received_ns);
+                            let instance = strategies[owner].instance_id().to_owned();
+                            lifecycle_router.dispatch(
+                                &instance,
+                                &mut strategies,
+                                update,
+                                &mut lifecycle_signals,
+                            )?;
+                            for signal in lifecycle_signals.drain(..) {
+                                ensure_recovery_signal_allowed(&owner_recovery, owner, &signal)?;
+                                sim.submit(&signal, strategy_now);
+                            }
+                        }
+                        OwnerWork::Event(BacktestOwnerEvent::RecoveryOracleHistory {
+                            query_cutoff_ns,
+                        }) => {
+                            let history = recovery_oracle_history.as_mut().unwrap();
+                            let rows = history.reports(owner).len();
+                            let reports = history.causal_reports(owner, query_cutoff_ns);
+                            let result = strategies[owner].on_backtest_recovery_oracle_history(
+                                &reports,
+                                query_cutoff_ns,
+                                strategy_now,
+                            );
+                            owner_recovery.complete_oracle_history(OracleHistoryQueryAudit {
+                                owner,
+                                cutoff_ns: query_cutoff_ns,
+                                applied_ns: strategy_now,
+                                input_rows: rows,
+                                applied_rows: reports.len(),
+                                excluded_unavailable_rows: rows - reports.len(),
+                                max_observation_ns: reports
+                                    .iter()
+                                    .map(|r| r.timestamp_ns)
+                                    .max()
+                                    .unwrap_or(0),
+                                max_receive_ns: reports
+                                    .iter()
+                                    .map(|r| r.local_timestamp_ns)
+                                    .max()
+                                    .unwrap_or(0),
+                                boundary_prices_restored: result.as_ref().copied().unwrap_or(0),
+                                required_prices_ready: result.is_ok(),
+                            });
+                            if let Err(reason) = result {
+                                let mut report = owner_recovery.summary();
+                                report["oracle_archive"] = history.summary();
+                                report["metadata"] = recovery_metadata
+                                    .as_ref()
+                                    .map(RecoveryMetadata::summary)
+                                    .unwrap_or_default();
+                                report["failure"] =
+                                    serde_json::json!({"owner": owner, "reason": reason});
+                                std::fs::write(
+                                    "sim_owner_recovery.json",
+                                    serde_json::to_vec_pretty(&report)?,
+                                )?;
+                                anyhow::bail!(
+                                    "virtual owner {} oracle history recovery failed closed: {}",
+                                    strategies[owner].instance_id(),
+                                    reason
+                                );
+                            }
+                            history.clear_applied(owner);
+                        }
+                        OwnerWork::Event(BacktestOwnerEvent::Historical {
+                            generation,
+                            target_ns,
+                            requests,
+                        }) => {
+                            if history_generations[owner] == generation {
+                                // Recorded files are immutable; loading at this
+                                // virtual completion avoids materializing large
+                                // histories while preserving the request cutoff.
+                                for request in requests {
+                                    if let Err(error) = crate::recorder::load_hist_bars_streamed(
+                                        &hist_data_dir,
+                                        &request,
+                                        &mut |bar| strategies[owner].on_hist_bar(bar),
+                                    ) {
+                                        warn!(
+                                            "[Strategy v2] deferred history load failed: {}",
+                                            error
+                                        );
+                                    }
+                                }
+                                strategies[owner].on_hist_data_loaded(target_ns);
+                            }
+                        }
+                        OwnerWork::Watchdog => {
+                            lifecycle_signals.clear();
+                            strategies[owner]
+                                .on_backtest_watchdog_into(strategy_now, &mut lifecycle_signals)
+                                .map_err(|_| {
+                                    anyhow::anyhow!(
+                                        "virtual owner watchdog signal overflow for {}",
+                                        strategies[owner].instance_id()
+                                    )
+                                })?;
+                            for signal in lifecycle_signals.drain(..) {
+                                ensure_recovery_signal_allowed(&owner_recovery, owner, &signal)?;
+                                sim.submit(&signal, strategy_now);
+                            }
+                        }
+                    }
+                }
             } else {
                 // Strategy market event (by local_timestamp) — replayer or bars.
                 let (ts, event) = if min_ts == bar_ts && bar_cursor < bar_rows.len() {
@@ -6071,21 +6563,97 @@ impl Engine {
                         strat_heap.push(HeapEntry {
                             ts: *ts,
                             idx: best_idx,
+                            stable_ties: bt.sim_v2_owner_scheduler,
                         });
                     }
                     pair
                 };
+                if let Some(scheduler) = owner_scheduler.as_mut() {
+                    if let MarketEvent::EventEnd {
+                        exchange: Exchange::Polymarket,
+                        retired_symbols,
+                        ..
+                    } = &event
+                    {
+                        if let Some(metadata) = recovery_metadata.as_mut() {
+                            metadata.retire(retired_symbols);
+                        }
+                        scheduler.retire_market(|payload| {
+                            let BacktestOwnerEvent::Market(event) = payload else {
+                                return false;
+                            };
+                            match event.as_ref() {
+                                MarketEvent::Instrument(Instrument::BinaryOption(bo)) => {
+                                    bo.exchange == Exchange::Polymarket
+                                        && bo
+                                            .clob_token_ids
+                                            .iter()
+                                            .any(|token| retired_symbols.contains(token))
+                                }
+                                MarketEvent::OrderBook(book) => {
+                                    book.exchange == Exchange::Polymarket
+                                        && retired_symbols.contains(&book.symbol)
+                                }
+                                MarketEvent::Quote(quote) => {
+                                    quote.exchange == Exchange::Polymarket
+                                        && retired_symbols.contains(&quote.symbol)
+                                }
+                                _ => false,
+                            }
+                        });
+                    }
+                    let mut owners = backtest_market_targets(
+                        &event,
+                        &owner_subscriptions,
+                        &mut owner_tokens,
+                        strategies.len(),
+                    );
+                    let key = latest_market_key(&event);
+                    let event = Arc::new(event);
+                    while owners != 0 {
+                        let owner = owners.trailing_zeros() as usize;
+                        owners &= owners - 1;
+                        if let Some(metadata) = recovery_metadata.as_mut() {
+                            metadata.observe(owner, &event)?;
+                        }
+                        if owner_recovery.collecting_oracle_history(owner) {
+                            if let (Some(history), MarketEvent::SpotPrice(report)) =
+                                (recovery_oracle_history.as_mut(), event.as_ref())
+                            {
+                                history.observe(owner, report)?;
+                            }
+                        }
+                        if owner_recovery.discard_market(owner) {
+                            scheduler.discard_offline_market(owner);
+                        } else {
+                            scheduler.enqueue_market(
+                                owner,
+                                ts,
+                                key,
+                                BacktestOwnerEvent::Market(Arc::clone(&event)),
+                            )?;
+                        }
+                    }
+                } else {
+                    market_to_apply = Some((ts, Arc::new(event), None));
+                }
+            }
+            if let Some((ts, event, target_owner)) = market_to_apply {
                 let strategy_now = replay_clocks.advance_strategy(ts);
                 sim.observe_strategy_clock(strategy_now);
                 set_sim_clock(strategy_now);
-
-                if let MarketEvent::OrderBook(ob) = &event {
+                let event_arc = event;
+                let event = event_arc.as_ref();
+                if let MarketEvent::OrderBook(ob) = event {
                     sim.observe_local_orderbook(ob, strategy_now);
                     sim.observe_dynamic_markout_spot_book(ob, strategy_now);
                 }
 
                 for (i, strategy) in strategies.iter_mut().enumerate() {
-                    let signals = match &event {
+                    if target_owner.is_some_and(|owner| owner != i) {
+                        continue;
+                    }
+                    let signals = match event {
                         MarketEvent::OrderBook(ob) => {
                             strategy.on_orderbook(ob);
                             Vec::new()
@@ -6110,8 +6678,14 @@ impl Engine {
                             Vec::new()
                         }
                         MarketEvent::Instrument(inst) => {
-                            // Hist gap-fill BEFORE on_instrument (matches v1).
-                            let hist_reqs = strategy.load_hist_data(strategy_now);
+                            // V5's synchronous ordering is retained when the
+                            // owner scheduler is disabled. Scheduled mode uses
+                            // live's Instrument -> asynchronous history order.
+                            let hist_reqs = if owner_scheduler.is_none() {
+                                strategy.load_hist_data(strategy_now)
+                            } else {
+                                Vec::new()
+                            };
                             for req in &hist_reqs {
                                 // Streamed (2026-07-26): identical bar sequence to
                                 // the former collect-then-feed, but a 29d 1s
@@ -6147,6 +6721,45 @@ impl Engine {
                                 strategy.set_per_event_prev_p_override(override_ms);
                             }
                             strategy.on_instrument(inst);
+                            if let Some(metadata) = recovery_metadata.as_mut() {
+                                metadata.applied(i, &event_arc);
+                            }
+                            if let Some(scheduler) = owner_scheduler.as_mut() {
+                                // Instrument.timestamp_ns() is real wall time,
+                                // so use this virtual callback's wall analogue.
+                                let history_target_ns = strategy_now;
+                                let requests = strategy.load_hist_data(history_target_ns);
+                                history_generations[i] =
+                                    history_generations[i].checked_add(1).ok_or_else(|| {
+                                        anyhow::anyhow!("virtual history generation exhausted")
+                                    })?;
+                                if !requests.is_empty() {
+                                    let ready_ns = strategy_now
+                                        .checked_add(
+                                            bt.sim_v2_owner_history_delay_ms
+                                                .checked_mul(1_000_000)
+                                                .ok_or_else(|| {
+                                                    anyhow::anyhow!("history delay overflow")
+                                                })?,
+                                        )
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!("history completion overflow")
+                                        })?;
+                                    scheduler.schedule_history(
+                                        i,
+                                        ready_ns,
+                                        BacktestOwnerEvent::Historical {
+                                            generation: history_generations[i],
+                                            target_ns: history_target_ns,
+                                            requests,
+                                        },
+                                    );
+                                }
+                            }
+                            Vec::new()
+                        }
+                        MarketEvent::AssetCtx(context) if owner_scheduler.is_some() => {
+                            strategy.on_asset_ctx(context);
                             Vec::new()
                         }
                         MarketEvent::TickSizeChange(tsc) => strategy.on_tick_size_change(tsc),
@@ -6163,11 +6776,41 @@ impl Engine {
                         }
                         _ => Vec::new(),
                     };
+                    if let MarketEvent::OrderBook(book) = event {
+                        if book.exchange == Exchange::Polymarket {
+                            let valid = book.bids.first().zip(book.asks.first()).is_some_and(
+                                |(bid, ask)| {
+                                    bid.price.is_finite()
+                                        && ask.price.is_finite()
+                                        && bid.price < ask.price
+                                        && bid.quantity > 0.0
+                                        && ask.quantity > 0.0
+                                },
+                            );
+                            owner_recovery.observe_fresh_book(
+                                i,
+                                book.local_timestamp_ns,
+                                book.exchange_timestamp_ns,
+                                strategy_now,
+                                valid,
+                                bt.sim_v2_book_stale_after_ms
+                                    .max(1)
+                                    .saturating_mul(1_000_000),
+                            );
+                        }
+                    }
                     // OrderBook events are the sole driver of the quote
                     // cadence. Optionally restricted to Binance OBs, and
                     // with a fractional early-trigger tolerance to absorb
                     // local-timestamp jitter on the OB feed.
-                    if let MarketEvent::OrderBook(ob) = &event {
+                    if let MarketEvent::OrderBook(ob) = event {
+                        // Live cadence is keyed to retained market receive
+                        // time; wall decisions/dispatch use completion time.
+                        let quote_event_ns = if owner_scheduler.is_some() {
+                            ob.local_timestamp_ns
+                        } else {
+                            strategy_now
+                        };
                         let venue_ok = !strategy.quote_trigger_binance_ob_only()
                             || ob.exchange == Exchange::Binance;
                         let interval = strategy.quote_interval_ms();
@@ -6176,20 +6819,20 @@ impl Engine {
                         // P(RTT>T) over threshold, decided per-event) — then
                         // fall back to the quote_interval (×N) throttle.
                         let tbt = strategy.quote_tick_by_tick() && !strategy.cadence_rtt_throttle();
-                        if venue_ok && (tbt || interval > 0) {
+                        if owner_recovery.quote_allowed(i) && venue_ok && (tbt || interval > 0) {
                             let fire = if tbt {
                                 true
                             } else {
                                 let frac = strategy.quote_interval_tolerance_frac().clamp(0.0, 1.0);
                                 let threshold_ns =
                                     ((interval as f64) * 1_000_000.0 * (1.0 - frac)) as u64;
-                                strategy_now.saturating_sub(last_quote_ns[i]) >= threshold_ns
+                                quote_event_ns.saturating_sub(last_quote_ns[i]) >= threshold_ns
                             };
                             if fire {
-                                last_quote_ns[i] = strategy_now;
+                                last_quote_ns[i] = quote_event_ns;
                                 quote_signal_batch.clear();
                                 if let Err(overflow) =
-                                    strategy.on_quote_into(strategy_now, &mut quote_signal_batch)
+                                    strategy.on_quote_into(quote_event_ns, &mut quote_signal_batch)
                                 {
                                     quote_signal_batch.clear();
                                     let emergency = emergency_cancel_for_signal(
@@ -6202,19 +6845,55 @@ impl Engine {
                                 }
                                 stamp_quote_trigger(&mut quote_signal_batch, ob, false);
                                 for sig in quote_signal_batch.drain(..) {
+                                    ensure_recovery_signal_allowed(&owner_recovery, i, &sig)?;
                                     sim.submit(&sig, strategy_now);
                                 }
                             }
                         }
                     }
                     for sig in signals {
+                        ensure_recovery_signal_allowed(&owner_recovery, i, &sig)?;
                         sim.submit(&sig, strategy_now);
+                    }
+                }
+            }
+
+            if let Some(scheduler) = owner_scheduler.as_ref() {
+                for (owner, strategy) in strategies.iter_mut().enumerate() {
+                    let Some(watermark) = owner_recovery.watermark(owner) else {
+                        continue;
+                    };
+                    let server_clear = sim
+                        .owner_recovery_delivery_barrier(strategy.instance_id(), watermark)
+                        .is_clear();
+                    let owner_clear = !scheduler.private_matches(owner, |payload| match payload {
+                        BacktestOwnerEvent::Private { update, delivery } => {
+                            watermark.includes(*delivery, update.trade_id.as_deref())
+                        }
+                        _ => false,
+                    });
+                    let metadata_clear = recovery_metadata
+                        .as_ref()
+                        .is_none_or(|metadata| metadata.pending(owner).is_empty());
+                    if owner_recovery.try_ready(
+                        owner,
+                        server_clear && owner_clear && metadata_clear,
+                        replay_clocks.strategy_ns.max(min_ts),
+                    ) {
+                        strategy.set_backtest_recovery_gate(false);
                     }
                 }
             }
 
             if let Some(writer) = execution_timing_writer.as_mut() {
                 for row in sim.drain_execution_timing_audit() {
+                    serde_json::to_writer(&mut *writer, &row)?;
+                    std::io::Write::write_all(writer, b"\n")?;
+                }
+            }
+
+            if let Some(writer) = arrival_interval_writer.as_mut() {
+                for row in sim.drain_arrival_interval_audit() {
                     serde_json::to_writer(&mut *writer, &row)?;
                     std::io::Write::write_all(writer, b"\n")?;
                 }
@@ -6230,8 +6909,69 @@ impl Engine {
                 last_bt_probe_emit_sim_ns = now_for_probe;
             }
         }
+        if let Some(writer)=selection_writer.as_mut() { std::io::Write::flush(writer)?; }
+        std::fs::write("sim_selection_summary.json",serde_json::to_vec_pretty(sim.selection_stats())?)?;
+        if bt.sim_v2_arrival_interval_audit {
+            sim.finish_arrival_interval_audit();
+            if let Some(writer) = arrival_interval_writer.as_mut() {
+                for row in sim.drain_arrival_interval_audit() {
+                    serde_json::to_writer(&mut *writer, &row)?;
+                    std::io::Write::write_all(writer, b"\n")?;
+                }
+            }
+            std::fs::write(
+                "sim_arrival_interval_summary.json",
+                serde_json::to_vec_pretty(&sim.arrival_interval_stats())?,
+            )?;
+        }
+        if let Some(scheduler) = owner_scheduler.as_ref() {
+            let owners = strategies.iter().zip(scheduler.stats()).map(|(strategy, stats)| {
+                serde_json::json!({ "instance_id": strategy.instance_id(), "stats": stats })
+            }).collect::<Vec<_>>();
+            let report = serde_json::json!({
+                "schema": "sim_owner_schedule_v1", "timing_evidence": "modeled_not_measured",
+                "receive_to_apply_boundary": "latest retained ingress to callback service start",
+                "apply_to_completion_boundary": "input frozen at service start to callback completion / signal dispatch",
+                "quantiles": "fixed histogram upper bounds; maximum exact", "owners": owners,
+                "apply_delay_us": bt.sim_v2_owner_apply_delay_us,
+                "service_time_us": bt.sim_v2_owner_service_time_us,
+                "history_delay_ms": bt.sim_v2_owner_history_delay_ms,
+            });
+            std::fs::write(
+                "sim_owner_schedule.json",
+                serde_json::to_vec_pretty(&report)?,
+            )?;
+        }
+        if !bt.sim_v2_owner_recovery_path.trim().is_empty() {
+            let mut report = owner_recovery.summary();
+            report["oracle_archive"] = recovery_oracle_history
+                .as_ref()
+                .map(RecoveryOracleHistory::summary)
+                .unwrap_or_default();
+            report["metadata"] = recovery_metadata
+                .as_ref()
+                .map(RecoveryMetadata::summary)
+                .unwrap_or_default();
+            std::fs::write(
+                "sim_owner_recovery.json",
+                serde_json::to_vec_pretty(&report)?,
+            )?;
+        }
+        if !bt.sim_v2_market_rules_path.trim().is_empty() {
+            std::fs::write(
+                "sim_market_rule_summary.json",
+                serde_json::to_vec_pretty(&sim.market_rule_stats())?,
+            )?;
+        }
+        std::fs::write(
+            "sim_fidelity_summary.json",
+            serde_json::to_vec_pretty(&sim.v6_fidelity_stats())?,
+        )?;
         let perf_event_loop_ns = elapsed_nanos(perf_event_loop_started);
         if let Some(writer) = admission_writer.as_mut() {
+            std::io::Write::flush(writer)?;
+        }
+        if let Some(writer) = arrival_interval_writer.as_mut() {
             std::io::Write::flush(writer)?;
         }
         if let Some(writer) = execution_timing_writer.as_mut() {
@@ -16311,6 +17051,196 @@ mod market_router_tests {
             retired_symbols: tokens.iter().map(|token| (*token).to_string()).collect(),
             event_end_ns: 1,
         }
+    }
+
+    #[test]
+    fn virtual_recovery_cross_rotation_metadata_precedes_fresh_book_and_tracks_actual_apply() {
+        let mut metadata = RecoveryMetadata::new(2);
+        let make_instrument = |condition: &str, token: &str| {
+            let mut instrument = binary_option("btc-updown-5m", &[token]);
+            if let Instrument::BinaryOption(bo) = &mut instrument {
+                bo.condition_id = condition.into();
+            }
+            Arc::new(MarketEvent::Instrument(instrument))
+        };
+        let previous = make_instrument("previous", "old-token");
+        metadata.observe(0, &previous).unwrap();
+        metadata.applied(0, &previous);
+        let mut scheduler = VirtualOwnerScheduler::<LatestMarketKey, BacktestOwnerEvent>::new(
+            2,
+            OwnerScheduleConfig {
+                apply_delay_ns: 0,
+                service_time_ns: 0,
+                capacity: 8,
+                watchdog_interval_ns: 0,
+                start_ns: 0,
+                end_ns: 100,
+            },
+        )
+        .unwrap();
+        scheduler.suspend_owner(0, 10).unwrap();
+        let offline_version = make_instrument("next", "new-token");
+        metadata.observe(0, &offline_version).unwrap();
+        // Metadata arrives during outage, so no strategy callback applies it.
+        assert_eq!(metadata.pending(0).len(), 1);
+        assert!(metadata.pending(1).is_empty());
+        let latest_version = make_instrument("next", "new-token");
+        metadata.observe(0, &latest_version).unwrap();
+        metadata.applied(0, &offline_version);
+        assert_eq!(
+            metadata.pending(0).len(),
+            1,
+            "old callback cannot ACK a newer Instrument version"
+        );
+        scheduler
+            .enqueue_market(
+                0,
+                20,
+                None,
+                BacktestOwnerEvent::Market(Arc::new(ob(Exchange::Polymarket, "new-token"))),
+            )
+            .unwrap();
+        scheduler
+            .prepend_market(
+                0,
+                20,
+                BacktestOwnerEvent::RecoveryOracleHistory {
+                    query_cutoff_ns: 20,
+                },
+            )
+            .unwrap();
+        for instrument in metadata.pending(0).iter().rev() {
+            scheduler
+                .prepend_market(0, 20, BacktestOwnerEvent::Market(Arc::clone(instrument)))
+                .unwrap();
+        }
+        scheduler.resume_owner(0, 20);
+        let completion = scheduler.step(20).unwrap();
+        let OwnerWork::Event(BacktestOwnerEvent::Market(applied)) = completion.work else {
+            panic!()
+        };
+        assert!(Arc::ptr_eq(&applied, &latest_version));
+        metadata.applied(0, &applied);
+        assert!(metadata.pending(0).is_empty());
+        assert!(matches!(
+            scheduler.step(20).unwrap().work,
+            OwnerWork::Event(BacktestOwnerEvent::RecoveryOracleHistory {
+                query_cutoff_ns: 20
+            })
+        ));
+        let OwnerWork::Event(BacktestOwnerEvent::Market(book)) = scheduler.step(20).unwrap().work
+        else {
+            panic!()
+        };
+        assert!(matches!(book.as_ref(), MarketEvent::OrderBook(_)));
+        // EventEnd retires metadata even while stopped; applied historical
+        // instruments need no EventEnd record to free directory capacity.
+        let retired = make_instrument("retired", "retired-token");
+        metadata.observe(0, &retired).unwrap();
+        metadata.retire(&["retired-token".into()]);
+        assert!(metadata.pending(0).is_empty());
+        for i in 0..1000 {
+            let instrument = make_instrument(&format!("event-{i}"), "token");
+            metadata.observe(0, &instrument).unwrap();
+            metadata.applied(0, &instrument);
+        }
+        for i in 0..64 {
+            metadata
+                .observe(0, &make_instrument(&format!("pending-{i}"), "token"))
+                .unwrap();
+        }
+        assert!(metadata
+            .observe(0, &make_instrument("overflow", "token"))
+            .is_err());
+        assert!(metadata.pending(1).is_empty());
+    }
+
+    #[test]
+    fn virtual_owner_market_routes_match_live_subscription_and_retirement_contract() {
+        let subscriptions = two_instance_map();
+        let mut tokens = HashMap::new();
+        assert_eq!(
+            backtest_market_targets(
+                &ob(Exchange::Binance, "BTCUSDT"),
+                &subscriptions,
+                &mut tokens,
+                2
+            ),
+            1
+        );
+        assert_eq!(
+            backtest_market_targets(&spot("eth/usd"), &subscriptions, &mut tokens, 2),
+            2
+        );
+        assert_eq!(
+            backtest_market_targets(
+                &ob(Exchange::Polymarket, "btc-up"),
+                &subscriptions,
+                &mut tokens,
+                2
+            ),
+            0
+        );
+        assert_eq!(
+            backtest_market_targets(
+                &MarketEvent::Instrument(binary_option(
+                    "btc-up-or-down-5m",
+                    &["btc-up", "btc-down"]
+                )),
+                &subscriptions,
+                &mut tokens,
+                2
+            ),
+            1
+        );
+        assert_eq!(
+            backtest_market_targets(
+                &ob(Exchange::Polymarket, "btc-up"),
+                &subscriptions,
+                &mut tokens,
+                2
+            ),
+            1
+        );
+        assert_eq!(
+            backtest_market_targets(
+                &MarketEvent::Disconnected {
+                    exchange: Exchange::Polymarket,
+                    reason: "reconnect".into()
+                },
+                &subscriptions,
+                &mut tokens,
+                2
+            ),
+            3
+        );
+        assert_eq!(
+            backtest_market_targets(
+                &event_end("old", &["btc-up", "btc-down"]),
+                &subscriptions,
+                &mut tokens,
+                2
+            ),
+            0
+        );
+        assert_eq!(
+            backtest_market_targets(
+                &ob(Exchange::Polymarket, "btc-up"),
+                &subscriptions,
+                &mut tokens,
+                2
+            ),
+            0
+        );
+        assert_eq!(
+            backtest_market_targets(
+                &MarketEvent::Instrument(binary_option("unsubscribed", &["x", "y"])),
+                &subscriptions,
+                &mut tokens,
+                2
+            ),
+            0
+        );
     }
 
     /// Drain a receiver into a count (non-blocking).
