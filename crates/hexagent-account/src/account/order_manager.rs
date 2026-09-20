@@ -707,6 +707,21 @@ impl OrderManager {
         ts_event: u64,
         mut emit: impl FnMut(Signal) -> Result<(), E>,
     ) -> Result<(), E> {
+        // Sustained cancel-only gates revisit Submitted orders until ACK.
+        // Preserve the index in place when every matching order already has
+        // an intent: moving/reinserting the BTree would allocate even without
+        // an emitted DELETE. Only this strategy owner reads these structures.
+        let needs_cancel = self.cancelable_order_ids.iter().any(|coid| {
+            self.orders.get(coid).is_some_and(|order| {
+                order.side == side
+                    && (order.status == LocalOrderStatus::Active
+                        || (order.status == LocalOrderStatus::Submitted
+                            && !self.cancel_intents.contains(coid)))
+            })
+        });
+        if !needs_cancel {
+            return Ok(());
+        }
         let mut pending = std::mem::take(&mut self.cancelable_order_ids);
         while let Some(coid) = pending.pop_first() {
             let status = self
@@ -722,7 +737,8 @@ impl OrderManager {
             }
             match status {
                 LocalOrderStatus::Submitted => {
-                    if self.cancel_intents.insert(coid.clone()) {
+                    if !self.cancel_intents.contains(&coid) {
+                        self.cancel_intents.insert(coid.clone());
                         self.cancel_before_ack_count =
                             self.cancel_before_ack_count.saturating_add(1);
                     }
@@ -1178,6 +1194,38 @@ mod tests {
         assert_eq!(manager.active_count(), 0);
         assert_eq!(manager.live_count(Side::Buy), 257);
         assert_eq!(manager.live_count(Side::Sell), 257);
+    }
+
+    #[test]
+    fn repeated_cancel_pause_waits_for_ack_and_preserves_instance_isolation() {
+        let mut manager = om();
+        let buy = place(&mut manager, Side::Buy, 0.4, 5.0);
+        let sell = place(&mut manager, Side::Sell, 0.6, 5.0);
+        let mut other = om();
+        other.inject_open_order("independent".into(), Side::Buy, 0.4, 5.0);
+        for now in 2..130 {
+            manager.cancel_all_with(now, |_| -> Result<(), ()> {
+                panic!("DELETE must wait for authoritative POST acknowledgement")
+            }).unwrap();
+            assert_eq!(manager.cancel_before_ack_count(), 2);
+            assert_eq!(manager.live_count(Side::Buy), 1);
+            assert_eq!(manager.live_count(Side::Sell), 1);
+        }
+        assert_eq!(other.active_count(), 1);
+        for (coid, side) in [(&buy, Side::Buy), (&sell, Side::Sell)] {
+            let ack = upd(coid, side, OrderStatus::Accepted);
+            assert!(matches!(manager.on_order_update(&ack), Some(Signal::CancelOrder { client_order_id, .. }) if &client_order_id == coid));
+            assert!(manager.on_order_update(&ack).is_none());
+            manager.on_order_update(&upd(coid, side, OrderStatus::Cancelled));
+        }
+        assert_eq!(manager.active_count(), 0);
+        assert_eq!(manager.live_count(Side::Buy), 0);
+        assert_eq!(manager.live_count(Side::Sell), 0);
+        // A newly discovered/recovered Active order must still be cancelled
+        // after an arbitrarily long no-op pause; no latched "already paused" flag.
+        manager.inject_open_order("recovered".into(), Side::Buy, 0.4, 5.0);
+        assert_eq!(manager.cancel_all(131).len(), 1);
+        assert!(manager.cancel_all(132).is_empty());
     }
 
     #[test]
