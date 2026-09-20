@@ -524,6 +524,7 @@ enum ExecutionDiagnostic {
         snapshot: ExecutionAdmission,
         paused_total_ns: u64,
         replaced_snapshots: u64,
+        cancel_outbox: CancelOutboxSnapshot,
     },
     VenueFailure {
         exchange: Exchange,
@@ -553,10 +554,12 @@ fn spawn_execution_diagnostics(
             crate::os_tune::pin_background("execution-diagnostics");
             while let Ok(diagnostic) = receiver.recv() {
                 match diagnostic {
-                    ExecutionDiagnostic::Admission { account, snapshot, paused_total_ns, replaced_snapshots } => info!(
-                        "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0",
+                    ExecutionDiagnostic::Admission { account, snapshot, paused_total_ns, replaced_snapshots, cancel_outbox } => info!(
+                        "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0 cancel_outbox_depth={} cancel_outbox_high_water={} cancel_outbox_oldest_ns={} cancel_coalesced={} cancel_outbox_overflow={}",
                         account, snapshot.state, snapshot.epoch, snapshot.available_place_slots,
                         paused_total_ns / 1_000_000, replaced_snapshots,
+                        cancel_outbox.depth, cancel_outbox.high_water, cancel_outbox.oldest_ns,
+                        cancel_outbox.coalesced, cancel_outbox.overflow,
                     ),
                     ExecutionDiagnostic::VenueFailure {
                         exchange,
@@ -4165,6 +4168,9 @@ impl Engine {
 
         // Startup binds one replaceable health lane to each exact strategy owner.
         let (probe_transport, probe_http_rx) = probe_http_lane(64);
+        for state in poly_states.values() {
+            state.bind_recovery_http_transport(probe_transport.clone());
+        }
         let mut admission_publishers = HashMap::new();
         let mut admission_receivers = HashMap::new();
         for instance_id in poly_states.keys() {
@@ -12297,7 +12303,10 @@ impl Engine {
                         match role {
                             Role::Fast => routes.fast.push(lane),
                             Role::Cancel if safety_cancel_slot => routes.safety_cancel.push(lane),
-                            Role::Cancel => routes.cancel.push(lane),
+                            Role::Cancel => {
+                                routes.cancel.push(lane);
+                                routes.cancel_lane_keys.push(None);
+                            }
                             Role::Reconcile => routes.reconcile.push(lane),
                             Role::Query | Role::GapReplay => unreachable!(),
                         }
@@ -14244,6 +14253,46 @@ enum PolyConnectionCommand {
     },
 }
 
+/// Exact identity, never a hash-only match. Oversize identities take the
+/// ordinary lossless path. Sole writer: execution dispatcher; no heap growth
+/// or cross-thread account access when coalescing an idempotent cancel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct CancelKey {
+    owner: u16,
+    iid_len: u8,
+    coid_len: u8,
+    iid: [u8; 64],
+    coid: [u8; 128],
+}
+
+impl PolyConnectionCommand {
+    fn cancel_key(&self) -> Option<CancelKey> {
+        let Self::Cancel { instance_id, client_order_id, update_tx, .. } = self else { return None; };
+        if instance_id.len() > 64 || client_order_id.len() > 128 { return None; }
+        let mut key = CancelKey { owner: update_tx.owner, iid_len: instance_id.len() as u8,
+            coid_len: client_order_id.len() as u8, iid: [0; 64], coid: [0; 128] };
+        key.iid[..instance_id.len()].copy_from_slice(instance_id.as_bytes());
+        key.coid[..client_order_id.len()].copy_from_slice(client_order_id.as_bytes());
+        Some(key)
+    }
+
+    fn cancel_age_ns(&self) -> u64 {
+        match self {
+            Self::Cancel { enqueued_at, .. } => enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CancelOutboxSnapshot {
+    depth: usize,
+    high_water: usize,
+    oldest_ns: u64,
+    coalesced: u64,
+    overflow: u64,
+}
+
 /// A fired request remains a concrete enum value on the same owner stack.
 /// This replaces the heap-allocated `FnOnce` completion and makes permit,
 /// order and pending-reply ownership statically visible.
@@ -14274,6 +14323,10 @@ struct PolyConnectionLaneMetrics {
     role: hexagent_runtime::http1_pool::Role,
     slot: usize,
     occupied: AtomicBool,
+    // Command ownership handshake: dispatcher sets before send, owner clears
+    // BEFORE publishing the result, so a retry caused by that result cannot
+    // be mistaken for a duplicate of the completed request.
+    cancel_reply_pending: AtomicBool,
     enqueued_ns: AtomicU64,
     queue_depth: AtomicUsize,
     queue_high_water: AtomicUsize,
@@ -14297,6 +14350,7 @@ impl PolyConnectionLaneMetrics {
             role,
             slot,
             occupied: AtomicBool::new(false),
+            cancel_reply_pending: AtomicBool::new(false),
             enqueued_ns: AtomicU64::new(0),
             queue_depth: AtomicUsize::new(0),
             queue_high_water: AtomicUsize::new(0),
@@ -14349,6 +14403,7 @@ impl PolyConnectionLaneMetrics {
             self.cooldown_until_ns.store(0, Ordering::Release);
         }
         let enqueued_ns = self.enqueued_ns.swap(0, Ordering::AcqRel);
+        self.cancel_reply_pending.store(false, Ordering::Release);
         self.queue_depth.store(0, Ordering::Release);
         if enqueued_ns > 0 {
             self.request_age_max_ns
@@ -14400,6 +14455,8 @@ impl PolyConnectionLane {
             return Err(crossbeam_channel::TrySendError::Full(command));
         }
         self.metrics.enqueued_ns.store(now_ns(), Ordering::Release);
+        self.metrics.cancel_reply_pending.store(
+            matches!(command, PolyConnectionCommand::Cancel { .. }), Ordering::Release);
         match self.tx.try_send(command) {
             Ok(()) => {
                 self.metrics.queue_depth.store(1, Ordering::Release);
@@ -14409,6 +14466,7 @@ impl PolyConnectionLane {
                 Ok(())
             }
             Err(error) => {
+                self.metrics.cancel_reply_pending.store(false, Ordering::Release);
                 self.metrics.send_failures.fetch_add(1, Ordering::Relaxed);
                 self.metrics.enqueued_ns.store(0, Ordering::Release);
                 self.metrics.queue_depth.store(0, Ordering::Release);
@@ -14478,6 +14536,9 @@ struct PolyAccountConnectionRoutes {
     /// appends/flushes this fixed-capacity outbox; it never waits for a
     /// connection-owner permit lane.
     cancel_outbox: VecDeque<PolyConnectionCommand>,
+    cancel_outbox_keys: HashSet<CancelKey>,
+    cancel_lane_keys: Vec<Option<CancelKey>>,
+    cancel_outbox_stats: CancelOutboxSnapshot,
     /// Independent lossless retention for emergency cancels. Saturation is
     /// reported as typed CancelUncertain feedback so retry/fail-closed state is
     /// visible to the owning strategy; it is never silently discarded.
@@ -14507,6 +14568,9 @@ impl Default for PolyAccountConnectionRoutes {
             safety_cancel_rr: 0,
             reconcile_rr: 0,
             cancel_outbox: VecDeque::with_capacity(POLY_CANCEL_OUTBOX_CAPACITY),
+            cancel_outbox_keys: HashSet::with_capacity(POLY_CANCEL_OUTBOX_CAPACITY),
+            cancel_lane_keys: Vec::new(),
+            cancel_outbox_stats: CancelOutboxSnapshot::default(),
             safety_cancel_outbox: VecDeque::with_capacity(POLY_SAFETY_CANCEL_OUTBOX_CAPACITY),
         }
     }
@@ -14556,6 +14620,11 @@ impl PolyAccountConnectionRoutes {
                     paused_total_ns: self.paused_total_ns.saturating_add(
                         self.paused_since_ns.map_or(0, |started| now.saturating_sub(started))),
                     replaced_snapshots: self.admission_publishers.iter().map(|publisher| publisher.replaced).sum(),
+                    cancel_outbox: CancelOutboxSnapshot {
+                        depth: self.cancel_outbox.len(),
+                        oldest_ns: self.cancel_outbox.front().map_or(0, PolyConnectionCommand::cancel_age_ns),
+                        ..self.cancel_outbox_stats
+                    },
                 });
             }
             self.admission_last_diagnostic_ns = now;
@@ -14578,8 +14647,13 @@ impl PolyAccountConnectionRoutes {
 
 fn flush_poly_cancel_outbox(routes: &mut PolyAccountConnectionRoutes) {
     while let Some(command) = routes.cancel_outbox.pop_front() {
+        let key = command.cancel_key();
+        let age = command.cancel_age_ns();
         match try_send_poly_owner(routes, hexagent_runtime::http1_pool::Role::Cancel, command) {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Some(key) = key { routes.cancel_outbox_keys.remove(&key); }
+                crate::latency::record_ns("polymarket.cancel.account_outbox_wait", age);
+            }
             Err(command) => {
                 routes.cancel_outbox.push_front(command);
                 break;
@@ -14662,6 +14736,7 @@ fn drain_poly_cancel_outbox_for_shutdown(
         routes.safety_cancel_rr = routes.safety_cancel_rr.wrapping_add(1);
     }
     while let Some(command) = routes.cancel_outbox.pop_front() {
+        let key = command.cancel_key();
         let (lanes, rr) = routes.lanes_mut(Role::Cancel);
         let Some(lane) = lanes.get(*rr % lanes.len().max(1)) else {
             routes.cancel_outbox.push_front(command);
@@ -14672,6 +14747,7 @@ fn drain_poly_cancel_outbox_for_shutdown(
             return Err(routes.cancel_outbox.len());
         }
         *rr = rr.wrapping_add(1);
+        if let Some(key) = key { routes.cancel_outbox_keys.remove(&key); }
     }
     Ok(())
 }
@@ -14681,11 +14757,15 @@ fn try_send_poly_owner(
     role: hexagent_runtime::http1_pool::Role,
     mut command: PolyConnectionCommand,
 ) -> Result<(), PolyConnectionCommand> {
+    // Production initializes these alongside the lanes before dispatch starts.
+    #[cfg(test)]
+    routes.cancel_lane_keys.resize(routes.cancel.len(), None);
+    let cancel_key = command.cancel_key();
     let now = now_ns();
     routes.refresh_health(now);
     let now = now_ns();
     let PolyAccountConnectionRoutes { fast, cancel, reconcile, fast_rr, cancel_rr,
-        reconcile_rr, health, .. } = routes;
+        reconcile_rr, health, cancel_lane_keys, .. } = routes;
     let (lanes, rr) = match role {
         hexagent_runtime::http1_pool::Role::Fast => (&*fast, fast_rr),
         hexagent_runtime::http1_pool::Role::Cancel => (&*cancel, cancel_rr),
@@ -14733,6 +14813,9 @@ fn try_send_poly_owner(
         match lanes[index].try_send(command) {
             Ok(()) => {
                 *rr = index.wrapping_add(1);
+                if role == hexagent_runtime::http1_pool::Role::Cancel {
+                    cancel_lane_keys[index] = cancel_key;
+                }
                 if role == hexagent_runtime::http1_pool::Role::Fast {
                     if let Some(health) = health.as_mut() {
                         health.place_dispatched(lanes[index].metrics.slot, now_ns());
@@ -14769,6 +14852,9 @@ fn try_send_poly_owner(
             match lanes[index].try_send(command) {
                 Ok(()) => {
                     *rr = index.wrapping_add(1);
+                    if role == hexagent_runtime::http1_pool::Role::Cancel {
+                        cancel_lane_keys[index] = cancel_key;
+                    }
                     return Ok(());
                 }
                 Err(crossbeam_channel::TrySendError::Full(returned)) => command = returned,
@@ -14788,6 +14874,19 @@ fn send_poly_owner_lossless(
     if role != Role::Cancel {
         return try_send_poly_owner(routes, role, command);
     }
+    if let Some(key) = command.cancel_key() {
+        if routes.cancel_outbox_keys.contains(&key)
+            || routes.cancel_lane_keys.iter().zip(&routes.cancel).any(|(pending, lane)|
+                *pending == Some(key) && lane.metrics.occupied.load(Ordering::Acquire)
+                    && lane.metrics.cancel_reply_pending.load(Ordering::Acquire))
+        {
+            // The original request retains its reply destination and delivers
+            // finality before releasing occupancy. This coalesces a repeated
+            // intent, never a private event or an order lifecycle update.
+            routes.cancel_outbox_stats.coalesced += 1;
+            return Ok(());
+        }
+    }
     flush_poly_cancel_outbox(routes);
     let command = if routes.cancel_outbox.is_empty() {
         match try_send_poly_owner(routes, Role::Cancel, command) {
@@ -14798,14 +14897,18 @@ fn send_poly_owner_lossless(
         command
     };
     if routes.cancel_outbox.len() >= POLY_CANCEL_OUTBOX_CAPACITY {
+        routes.cancel_outbox_stats.overflow += 1;
         return Err(command);
     }
+    if let Some(key) = command.cancel_key() { routes.cancel_outbox_keys.insert(key); }
     routes.cancel_outbox.push_back(command);
+    routes.cancel_outbox_stats.high_water = routes.cancel_outbox_stats.high_water.max(routes.cancel_outbox.len());
     hexagent_runtime::latency::record_ns("polymarket.cancel.account_outbox", 1);
     Ok(())
 }
 
-fn finish_poly_typed_completion(router: &mut LiveRouter, completion: PolyTypedCompletion) {
+fn finish_poly_typed_completion(router: &mut LiveRouter, completion: PolyTypedCompletion,
+    lane_metrics: &PolyConnectionLaneMetrics) {
     match completion {
         PolyTypedCompletion::Place {
             instance_id,
@@ -14836,6 +14939,7 @@ fn finish_poly_typed_completion(router: &mut LiveRouter, completion: PolyTypedCo
                     exec_rejected_cancel(client_order_id, exchange)
                 }
             };
+            lane_metrics.cancel_reply_pending.store(false, Ordering::Release);
             let _ = send_executor_update(&update_tx, update);
         }
     }
@@ -14951,6 +15055,7 @@ fn run_poly_connection_owner(
                             pending,
                             update_tx,
                         },
+                        &lane_metrics,
                     ),
                     Err(update) => {
                         let _ = send_executor_update(&update_tx, update);
@@ -14978,6 +15083,7 @@ fn run_poly_connection_owner(
                     }
                     Err(error) => {
                         error!("[Executor] Polymarket cancel owner route error: {error}");
+                        lane_metrics.cancel_reply_pending.store(false, Ordering::Release);
                         let _ = send_executor_update(
                             &update_tx,
                             exec_rejected_cancel(client_order_id, exchange),
@@ -14994,6 +15100,7 @@ fn run_poly_connection_owner(
                         pending,
                         update_tx,
                     },
+                    &lane_metrics,
                 );
             }
             PolyConnectionCommand::Reconcile {
@@ -19715,3 +19822,7 @@ mod market_router_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cancel_coalescing_tests.rs"]
+mod cancel_coalescing_tests;

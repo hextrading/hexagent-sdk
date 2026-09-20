@@ -3215,6 +3215,9 @@ pub struct SharedState {
     /// Startup-published message endpoint. Terminal REST backfill must pass
     /// through the same private owner that freezes live execution economics.
     private_apply_lane: OnceLock<super::user_feed::PrivateApplyLane>,
+    // Startup-bound immutable handle to the existing bounded execution-owner
+    // mailbox. Only the cold user-feed recovery job waits on these replies.
+    recovery_http: OnceLock<super::rtt_probe::ProbeHttpTransport>,
     /// client_order_id → token_id (outcome asset). Written alongside the
     /// coid↔oid maps at registration and kept for the SAME lifetime, so the
     /// event-expiry sweep can purge an event's mappings by its outcome
@@ -3747,6 +3750,11 @@ fn reclaim_token_mappings(
 }
 
 impl SharedState {
+    pub fn bind_recovery_http_transport(&self, transport: super::rtt_probe::ProbeHttpTransport) {
+        // Multiple instance IDs may reference the same account SharedState.
+        let _ = self.recovery_http.set(transport);
+    }
+
     /// Fail-closed admission for every fresh place, including synthetic RTT
     /// probes. Cancel and reconcile callers deliberately do not consult this
     /// method so they retain a path to authoritative terminal evidence.
@@ -6909,6 +6917,7 @@ impl PolymarketTrade {
             strategy_owner_by_instance: ArcSwap::from_pointee(HashMap::new()),
             strategy_private_routes: ArcSwap::from_pointee(HashMap::new()),
             private_apply_lane: OnceLock::new(),
+            recovery_http: OnceLock::new(),
             probe_order_ids: ProbeOrderIdRing::default(),
             probe_orphan_owner,
             auth,
@@ -8162,7 +8171,7 @@ impl PolymarketTrade {
     /// Audit every locally live or cancellation-pending order after a user
     /// feed reconnect, including associated trades missed by the stream.
     pub(crate) fn reconcile_runtime_open_orders_with_updates(&self) -> RuntimeOrderRecovery {
-        let pass = self.reconcile_runtime_open_orders_pass();
+        let pass = self.reconcile_runtime_orders_pass(None, true);
         RuntimeOrderRecovery {
             updates: pass.updates,
             errors: pass.errors,
@@ -8173,7 +8182,7 @@ impl PolymarketTrade {
     /// when one sibling order is temporarily unavailable. Shutdown uses the
     /// partial updates to converge accounting on every retry.
     fn reconcile_runtime_open_orders_pass(&self) -> RuntimeOrderAuditPass {
-        self.reconcile_runtime_orders_pass(None)
+        self.reconcile_runtime_orders_pass(None, false)
     }
 
     /// Event-expiry counterpart of the account-wide audit. Only orders whose
@@ -8184,7 +8193,7 @@ impl PolymarketTrade {
         &self,
         tokens: &HashSet<String>,
     ) -> RuntimeOrderAuditPass {
-        self.reconcile_runtime_orders_pass(Some(tokens))
+        self.reconcile_runtime_orders_pass(Some(tokens), false)
     }
 
     /// The venue has retired the event, so the residual cannot still rest.
@@ -8237,6 +8246,7 @@ impl PolymarketTrade {
     fn reconcile_runtime_orders_pass(
         &self,
         token_filter: Option<&HashSet<String>>,
+        use_recovery_owner_transport: bool,
     ) -> RuntimeOrderAuditPass {
         let tracked: Vec<(String, TrackedOrder, String)> = {
             let execution = self.shared.execution_snapshot();
@@ -8301,7 +8311,12 @@ impl PolymarketTrade {
                     .shared
                     .account_state
                     .token_event_has_ended(&ownership.token_id);
-            let fetched = match self.fetch_order_by_id(&coid, &order_id, None, parallel_evidence) {
+            let lookup = if use_recovery_owner_transport && self.shared.recovery_http.get().is_some() {
+                self.fetch_recovery_order_via_owners(&ownership, &order_id)
+            } else {
+                self.fetch_order_by_id(&coid, &order_id, None, parallel_evidence)
+            };
+            let fetched = match lookup {
                 FetchOrderResult::Found(order) => order,
                 FetchOrderResult::NotFound(evidence) => {
                     errors.push(format!(
@@ -10579,6 +10594,35 @@ impl PolymarketTrade {
             },
         );
         self.classify_order_lookup_reply(coid, order_id, reply)
+    }
+
+    /// The live Reconcile permits belong permanently to execution actors.
+    /// Recovery must send them requests, not try to borrow those permits and
+    /// silently fall back to one global socket. An unavailable first read gets
+    /// one distinct owner read; positive audited evidence may converge now.
+    /// Two absent/null replies still do not authorize releasing an active order.
+    fn fetch_recovery_order_via_owners(
+        &self,
+        ownership: &OrderOwnership,
+        order_id: &str,
+    ) -> FetchOrderResult {
+        let transport = self.shared.recovery_http.get().expect("startup-bound recovery transport");
+        let path = format!("/data/order/{order_id}");
+        let primary = transport.request(&self.shared, &ownership.instance_id,
+            "GET", &path, "", None, None);
+        let primary_result = self.classify_order_lookup_reply(
+            &ownership.client_order_id, order_id, primary.reply);
+        if matches!(primary_result, FetchOrderResult::Found(_)) { return primary_result; }
+        let Some(primary_location @ (crate::http1_pool::Role::Reconcile, primary_slot)) = primary.location
+            else { return primary_result; };
+        let secondary = transport.request(&self.shared, &ownership.instance_id,
+            "GET", &path, "", None, Some(primary_slot));
+        let Some(secondary_location @ (crate::http1_pool::Role::Reconcile, secondary_slot)) = secondary.location
+            else { return primary_result; };
+        if secondary_slot == primary_slot { return primary_result; }
+        let secondary_result = self.classify_order_lookup_reply(
+            &ownership.client_order_id, order_id, secondary.reply);
+        combine_parallel_order_lookups(primary_result, secondary_result, primary_location, secondary_location)
     }
 
     /// Reconcile an ambiguous synthetic probe without touching strategy order
@@ -15777,3 +15821,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "trade_recovery_owner_tests.rs"]
+mod recovery_owner_tests;

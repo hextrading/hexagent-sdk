@@ -198,6 +198,7 @@ impl TradeSum {
 struct SymbolTradeTotals {
     quantity: TradeSum,
     available_quantity: TradeSum,
+    locked_sell_quantity: TradeSum,
 }
 
 /// One entry per traded symbol, not per historical trade. The ledger remains
@@ -206,10 +207,28 @@ struct SymbolTradeTotals {
 struct IncrementalQueries {
     cash: TradeSum,
     available_cash: TradeSum,
+    locked_buy_cash: TradeSum,
     symbols: HashMap<String, SymbolTradeTotals>,
 }
 
 impl IncrementalQueries {
+    // Same strategy owner as the canonical pending map. Updates touch one
+    // order/symbol; live queries never scan historical zero-residual orders.
+    fn reservation(&mut self, order: &PendingOrder, sign: f64) {
+        match order.side {
+            Side::Buy => self.locked_buy_cash.add(
+                sign * (order.price + order.cash_fee_per_share) * order.remaining_quantity),
+            Side::Sell => {
+                let totals = if let Some(totals) = self.symbols.get_mut(&order.symbol) {
+                    totals
+                } else {
+                    self.symbols.entry(order.symbol.clone()).or_default()
+                };
+                totals.locked_sell_quantity.add(sign * order.remaining_quantity);
+            }
+        }
+    }
+
     fn transition(&mut self, trade: &TradeRecord, previous: Option<TradeStatus>) {
         let live = |status: Option<TradeStatus>| {
             u8::from(status.is_some_and(|s| s != TradeStatus::Failed)) as f64
@@ -303,8 +322,16 @@ impl PositionManager {
             return;
         }
         let mut queries = IncrementalQueries::default();
+        // Inventory supplied by startup/split needs its reservation entry
+        // before the first quote can emit a SELL for that symbol.
+        for symbol in self.init_positions.keys() {
+            queries.symbols.entry(symbol.clone()).or_default();
+        }
         for trade in self.trades.values() {
             queries.transition(trade, None);
+        }
+        for order in self.pending_orders.values() {
+            queries.reservation(order, 1.0);
         }
         self.incremental_queries = Some(queries);
     }
@@ -936,8 +963,14 @@ impl PositionManager {
         match update.status {
             OrderStatus::PartiallyFilled => {
                 if let Some(po) = self.pending_orders.get_mut(coid) {
+                    if let Some(queries) = &mut self.incremental_queries {
+                        queries.reservation(po, -1.0);
+                    }
                     po.remaining_quantity =
                         (po.remaining_quantity - update.filled_quantity).max(0.0);
+                    if let Some(queries) = &mut self.incremental_queries {
+                        queries.reservation(po, 1.0);
+                    }
                     if po.remaining_quantity <= 0.0 {
                         self.pending_orders.remove(coid);
                     }
@@ -957,7 +990,7 @@ impl PositionManager {
             | OrderStatus::Failed
             | OrderStatus::Cancelled
             | OrderStatus::Rejected => {
-                self.pending_orders.remove(coid);
+                self.remove_pending_order(coid);
             }
             OrderStatus::Accepted => {
                 // RESURRECTION re-lock: normally the lock is already present
@@ -982,15 +1015,8 @@ impl PositionManager {
                         update.remaining_quantity,
                     )
                 {
-                    self.pending_orders.insert(coid.clone(), PendingOrder {
-                        client_order_id: coid.clone(),
-                        symbol: update.symbol.clone(),
-                        side: update.side,
-                        price: update.avg_fill_price,
-                        original_quantity: update.remaining_quantity,
-                        remaining_quantity: update.remaining_quantity,
-                        cash_fee_per_share: 0.0,
-                    });
+                    self.register_pending_order(coid, &update.symbol, update.side,
+                        update.avg_fill_price, update.remaining_quantity);
                 }
             }
             _ => {}
@@ -1007,6 +1033,11 @@ impl PositionManager {
     /// Leaves the trade ledger untouched. Used for in-kind adjustments that
     /// shouldn't be modelled as a fill (e.g. manual rebalancing in tests).
     pub fn adjust_quantity(&mut self, symbol: &str, delta: f64) {
+        if let Some(queries) = &mut self.incremental_queries {
+            if !queries.symbols.contains_key(symbol) {
+                queries.symbols.entry(symbol.to_string()).or_default();
+            }
+        }
         let entry = self.init_positions.entry(symbol.to_string()).or_insert(0.0);
         *entry += delta;
     }
@@ -1083,6 +1114,9 @@ impl PositionManager {
 
     /// Sum of (price × remaining_quantity) across all pending BUY orders.
     pub fn locked_buy_cost(&self) -> f64 {
+        if let Some(queries) = &self.incremental_queries {
+            return queries.locked_buy_cash.value().max(0.0);
+        }
         self.pending_orders.values()
             .filter(|o| o.side == Side::Buy)
             .map(|o| (o.price + o.cash_fee_per_share) * o.remaining_quantity)
@@ -1091,6 +1125,10 @@ impl PositionManager {
 
     /// Sum of remaining_quantity across pending SELL orders for `symbol`.
     pub fn locked_sell_qty(&self, symbol: &str) -> f64 {
+        if let Some(queries) = &self.incremental_queries {
+            return queries.symbols.get(symbol)
+                .map_or(0.0, |totals| totals.locked_sell_quantity.value().max(0.0));
+        }
         self.pending_orders.values()
             .filter(|o| o.side == Side::Sell && o.symbol == symbol)
             .map(|o| o.remaining_quantity)
@@ -1190,7 +1228,8 @@ impl PositionManager {
             || !(price + cash_fee_per_share).is_finite()
             || (side == Side::Sell && cash_fee_per_share != 0.0) { return; }
         if !valid_pending_order_fields(client_order_id, symbol, price, quantity) { return; }
-        self.pending_orders.insert(client_order_id.to_string(), PendingOrder {
+        self.remove_pending_order(client_order_id);
+        let order = PendingOrder {
             client_order_id: client_order_id.to_string(),
             symbol: symbol.to_string(),
             side,
@@ -1198,7 +1237,11 @@ impl PositionManager {
             original_quantity: quantity,
             remaining_quantity: quantity,
             cash_fee_per_share,
-        });
+        };
+        if let Some(queries) = &mut self.incremental_queries {
+            queries.reservation(&order, 1.0);
+        }
+        self.pending_orders.insert(client_order_id.to_string(), order);
     }
 
     pub fn apply_private_trade_reservation(
@@ -1207,21 +1250,32 @@ impl PositionManager {
         quantity: f64,
         sign: i8,
     ) -> bool {
-        if client_order_id.is_empty() || !quantity.is_finite() || quantity <= 0.0 {
+        if client_order_id.is_empty() || !quantity.is_finite() || quantity <= 0.0
+            || !matches!(sign, 1 | -1) {
             return false;
         }
         let Some(pending) = self.pending_orders.get_mut(client_order_id) else { return false; };
+        if let Some(queries) = &mut self.incremental_queries {
+            queries.reservation(pending, -1.0);
+        }
         match sign {
             1 => pending.remaining_quantity = (pending.remaining_quantity - quantity).max(0.0),
             -1 => pending.remaining_quantity =
                 (pending.remaining_quantity + quantity).min(pending.original_quantity),
             _ => return false,
         }
+        if let Some(queries) = &mut self.incremental_queries {
+            queries.reservation(pending, 1.0);
+        }
         true
     }
 
     pub fn remove_pending_order(&mut self, client_order_id: &str) {
-        self.pending_orders.remove(client_order_id);
+        if let Some(order) = self.pending_orders.remove(client_order_id) {
+            if let Some(queries) = &mut self.incremental_queries {
+                queries.reservation(&order, -1.0);
+            }
+        }
     }
 
     pub fn pending_orders(&self) -> &std::collections::BTreeMap<String, PendingOrder> {
@@ -1286,6 +1340,10 @@ impl PositionManager {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "position_reservation_index_tests.rs"]
+mod reservation_index_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1484,7 +1542,7 @@ mod tests {
         pm.upsert_trade(id, "TOKEN", Side::Buy, 5.0, 0.4, status, true, 0.0, 0.0, None)
     }
 
-    fn ou(coid: &str, side: Side, status: OrderStatus, price: f64, qty: f64) -> OrderUpdate {
+    pub(super) fn ou(coid: &str, side: Side, status: OrderStatus, price: f64, qty: f64) -> OrderUpdate {
         OrderUpdate {
             client_order_id: coid.into(),
             exchange: crate::types::Exchange::Polymarket,
