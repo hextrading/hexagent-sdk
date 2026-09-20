@@ -500,11 +500,13 @@ const LEGACY_ORPHAN_COMPACTION_FINALITY_MS: u64 = 6 * 60 * 60 * 1_000;
 #[derive(Debug)]
 enum HistoricalOrderTradeAudit {
     CompleteNoFill { pages: usize, after_secs: u64 },
+    CompleteFailed { pages: usize, after_secs: u64, trade_ids: Vec<String> },
     FoundFill { records: usize },
     Incomplete { pages: usize },
     Unavailable(String),
 }
 
+#[cfg(test)]
 fn fetch_historical_order_trade_audit(
     order_id: &str,
     submitted_at_ms: u64,
@@ -523,6 +525,8 @@ fn fetch_historical_order_trade_audit_in_market(
     let mut cursor = String::new();
     let mut seen_cursors = HashSet::new();
     let mut matching_records = 0usize;
+    let mut failed_trade_ids = HashSet::new();
+    let mut all_matching_failed = true;
     for page in 1..=ORPHAN_TRADE_AUDIT_MAX_PAGES {
         let mut url = reqwest::Url::parse("https://clob.polymarket.com/data/trades")
             .expect("constant authenticated history URL");
@@ -553,18 +557,26 @@ fn fetch_historical_order_trade_audit_in_market(
                 ));
             }
         };
-        matching_records = matching_records.saturating_add(
-            records
-                .iter()
-                .filter(|record| trade_record_references_order(record, order_id))
-                .count(),
-        );
+        for record in records.iter().filter(|record| trade_record_references_order(record, order_id)) {
+            matching_records = matching_records.saturating_add(1);
+            match (record.get("status").and_then(serde_json::Value::as_str),
+                   record.get("id").and_then(serde_json::Value::as_str)) {
+                (Some("FAILED"), Some(id)) if !id.trim().is_empty() => {
+                    failed_trade_ids.insert(id.to_string());
+                }
+                _ => all_matching_failed = false,
+            }
+        }
         if next.is_empty() || next == "LTE=" {
             return if matching_records == 0 {
                 HistoricalOrderTradeAudit::CompleteNoFill {
                     pages: page,
                     after_secs,
                 }
+            } else if all_matching_failed {
+                let mut trade_ids: Vec<_> = failed_trade_ids.into_iter().collect();
+                trade_ids.sort();
+                HistoricalOrderTradeAudit::CompleteFailed { pages: page, after_secs, trade_ids }
             } else {
                 HistoricalOrderTradeAudit::FoundFill {
                     records: matching_records,
@@ -579,6 +591,17 @@ fn fetch_historical_order_trade_audit_in_market(
     HistoricalOrderTradeAudit::Incomplete {
         pages: ORPHAN_TRADE_AUDIT_MAX_PAGES,
     }
+}
+
+/// Public CLOB metadata is only event-end evidence, never order finality.
+/// Require exact durable market/token identity and an explicit closed market.
+fn recovered_market_closed_for_token(json: &serde_json::Value, market: &str, token: &str) -> bool {
+    json.get("condition_id").and_then(serde_json::Value::as_str) == Some(market)
+        && json.get("closed").and_then(serde_json::Value::as_bool) == Some(true)
+        && json.get("accepting_orders").and_then(serde_json::Value::as_bool) == Some(false)
+        && json.get("tokens").and_then(serde_json::Value::as_array).is_some_and(|tokens| {
+            tokens.iter().filter(|entry| entry.get("token_id").and_then(serde_json::Value::as_str) == Some(token)).count() == 1
+        })
 }
 
 fn coid_wall_clock_ms(coid: &str) -> Option<u64> {
@@ -7200,7 +7223,9 @@ impl PolymarketTrade {
         order_id: &str,
         submitted_at_ms: u64,
     ) -> HistoricalOrderTradeAudit {
-        fetch_historical_order_trade_audit(order_id, submitted_at_ms, |path| {
+        let market = self.shared.lookup_order_ownership(order_id)
+            .and_then(|order| self.shared.account_state.recovery_market_for_token(&order.token_id));
+        fetch_historical_order_trade_audit_in_market(order_id, submitted_at_ms, market.as_deref(), |path| {
             self.shared
                 .http_call_sync("GET", path, "")
                 .map_err(|error| error.to_string())
@@ -7337,6 +7362,11 @@ impl PolymarketTrade {
                             "[PolymarketTrade] startup orphan oid={} coid={} trade fallback found {} matching record(s); ownership rebuild remains required",
                             anomaly.order_id, coid, records,
                         );
+                        summary.unresolved(OrphanOrderRepairFailure::TradeAuditFoundFill);
+                    }
+                    HistoricalOrderTradeAudit::CompleteFailed { .. } => {
+                        // An orphan has no exact order root against which to
+                        // prove local failure reconciliation and ownership.
                         summary.unresolved(OrphanOrderRepairFailure::TradeAuditFoundFill);
                     }
                     HistoricalOrderTradeAudit::Incomplete { pages } => {
@@ -7606,8 +7636,20 @@ impl PolymarketTrade {
             return None;
         }
         let submitted_at_ms = coid_wall_clock_ms(&ownership.client_order_id)?;
-        match audit_history(order_id, submitted_at_ms) {
-            HistoricalOrderTradeAudit::CompleteNoFill { pages, after_secs } => {
+        let history = audit_history(order_id, submitted_at_ms);
+        let failed_count = match &history {
+            HistoricalOrderTradeAudit::CompleteFailed { trade_ids, .. } => {
+                if !self.shared.account_state.recovery_failed_history_reconciled(ownership, trade_ids) {
+                    warn!("[PolymarketTrade] failed-only historical audit is not locally reconciled coid={}; retaining reservation", ownership.client_order_id);
+                    return None;
+                }
+                trade_ids.len()
+            }
+            _ => 0,
+        };
+        match history {
+            HistoricalOrderTradeAudit::CompleteNoFill { pages, after_secs }
+            | HistoricalOrderTradeAudit::CompleteFailed { pages, after_secs, .. } => {
                 let audit = AuthoritativeOrderAudit {
                     original_size: Some(ownership.quantity.to_string()),
                     size_matched: Some("0".to_string()),
@@ -7628,8 +7670,8 @@ impl PolymarketTrade {
                     &ownership.client_order_id,
                     OrderStatus::Cancelled,
                 );
-                info!("[PolymarketTrade] recovered order no-fill proof coid={} orderID={} event_ended=true absence={} trade_pages={} after_secs={} oid_matches=0 terminal=Cancelled reservation_released=true",
-                    ownership.client_order_id, order_id, absence, pages, after_secs);
+                info!("[PolymarketTrade] recovered order no-successful-fill proof coid={} orderID={} event_ended=true absence={} trade_pages={} after_secs={} reconciled_failed_trades={} terminal=Cancelled reservation_released=true",
+                    ownership.client_order_id, order_id, absence, pages, after_secs, failed_count);
                 Some(Self::authoritative_recovery_update(
                     ownership,
                     order_id,
@@ -7756,10 +7798,21 @@ impl PolymarketTrade {
             for (coid, order_id, ownership, is_recovered, requires_query_repair) in pending {
                 let event_has_ended = if should_lookup_recovered_event_end(is_recovered) {
                     let event_end_started = crate::latency::Instant::now();
-                    let ended = self
+                    let mut ended = self
                         .shared
                         .account_state
                         .token_event_has_ended(&ownership.token_id);
+                    if !ended {
+                        if let Some(market) = self.shared.account_state.recovery_market_for_token(&ownership.token_id) {
+                            // Startup/background recovery only; never on the strategy quote owner.
+                            if let Ok(metadata) = self.shared.http_call_sync("GET", &format!("/markets/{market}"), "") {
+                                ended = recovered_market_closed_for_token(&metadata, &market, &ownership.token_id);
+                                if ended {
+                                    info!("[PolymarketTrade] recovered event end proved by CLOB metadata coid={} market={}", coid, market);
+                                }
+                            }
+                        }
+                    }
                     crate::latency::record(
                         "polymarket.recovery.event_end_lookup",
                         event_end_started,
