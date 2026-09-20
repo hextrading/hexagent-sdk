@@ -40,3 +40,6 @@ again after the script-based restart. No production ledger is edited manually.
 All new work is startup/cold-path only. Critical-path latency and queue evidence
 will be collected in the deployment's final 30-minute observation; this change
 does not claim an end-to-end latency improvement.
+
+Final validation: account 323 passed / 13 ignored; engine 134 passed /
+7 ignored; exchange 900 passed / 35 ignored. Migration-focused tests: 5 passed.
