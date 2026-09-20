@@ -24329,6 +24329,30 @@ mod tests {
     }
 
     #[test]
+    fn cash_migration_waits_for_recovered_order_and_keeps_historical_owner() {
+        let account = SharedAccount::new("reactivation");
+        account.register_instance("eth02", 1.0);
+        account.register_token_interest("eth02", "old-event", "ETH-UP", "ETH-DOWN").unwrap();
+        account.apply_physical_snapshot(100.0, HashMap::from([("ETH-UP".into(), 20.0)])).unwrap();
+        account.record_order_without_admission("eth02", "old-sell", "old-oid", "ETH-UP", Side::Sell, 10.0, 0.4, 0).unwrap();
+        account.register_instance("btc02", 1.0);
+        let weights = BTreeMap::from([("btc02".to_string(), 1.0)]);
+        assert!(account.migrate_cash_allocation("reactivate-btc02", &weights).is_err());
+        assert_eq!(account.instance_snapshot("eth02").unwrap().cash, 100.0);
+        assert_eq!(account.instance_snapshot("btc02").unwrap().cash, 0.0);
+        // Startup authoritative order recovery must complete before migration.
+        account.release_order("old-sell", OrderStatus::Cancelled);
+        let migrated = account.migrate_cash_allocation("reactivate-btc02", &weights).unwrap();
+        assert_eq!(account.migrate_cash_allocation("reactivate-btc02", &weights).unwrap(), migrated);
+        assert_eq!(account.instance_snapshot("btc02").unwrap().cash, 100.0);
+        assert_eq!(account.instance_snapshot("eth02").unwrap().cash, 0.0);
+        assert_eq!(account.instance_snapshot("eth02").unwrap().positions["ETH-UP"], 20.0);
+        assert!(account.instance_snapshot("btc02").unwrap().positions.is_empty());
+        assert_eq!(account.order_owner_by_coid("old-sell").as_deref(), Some("eth02"));
+        assert!(!account.is_uncertain());
+    }
+
+    #[test]
     fn ownership_recording_bypasses_shared_cash_limit() {
         let account = seeded_account();
         let ownership = account

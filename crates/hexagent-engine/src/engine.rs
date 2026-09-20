@@ -11410,28 +11410,6 @@ impl Engine {
             let every_member_acknowledged = configured_strategies
                 .iter()
                 .all(|strategy| !strategy.account_allocation_migration_id.trim().is_empty());
-            if shared.account_state.is_seeded() && !migration_ids.is_empty() {
-                if migration_ids.len() != 1 || !every_member_acknowledged {
-                    error!(
-                        "[Engine] account={} cash allocation migration rejected: every configured sibling must supply the same non-empty account_allocation_migration_id",
-                        account_id,
-                    );
-                } else if let Some(migration_id) = migration_ids.iter().next() {
-                    match shared
-                        .account_state
-                        .migrate_cash_allocation(migration_id, &target_weights)
-                    {
-                        Ok(migration) => info!(
-                            "[Engine] account={} applied/idempotently recovered cash allocation migration={} targets={:?}",
-                            account_id, migration.operation_id, migration.target_weights,
-                        ),
-                        Err(error) => error!(
-                            "[Engine] account={} cash allocation migration={} rejected: {}",
-                            account_id, migration_id, error,
-                        ),
-                    }
-                }
-            }
             shared
                 .account_state
                 .reconcile_configured_instances(&configured_instances);
@@ -11493,6 +11471,36 @@ impl Engine {
                     "[Engine] Polymarket account={} startup recovery pending for {} order(s); quoting continues under retained reservations while owner maintenance waits for authoritative metadata",
                     account_id, unresolved,
                 );
+            }
+            // Recovered orders can retain legitimate cash/token reservations.
+            // Resolve them through the existing authoritative startup query path
+            // before redistributing virtual cash. A failed explicit migration
+            // must stop startup, not leave a reactivated owner with zero cash.
+            if shared.account_state.is_seeded() && !migration_ids.is_empty() {
+                if migration_ids.len() != 1 || !every_member_acknowledged {
+                    error!(
+                        "[Engine] account={} cash allocation migration rejected: every configured sibling must supply the same non-empty account_allocation_migration_id",
+                        account_id,
+                    );
+                    return HashMap::new();
+                } else if let Some(migration_id) = migration_ids.iter().next() {
+                    match shared
+                        .account_state
+                        .migrate_cash_allocation(migration_id, &target_weights)
+                    {
+                        Ok(migration) => info!(
+                            "[Engine] account={} applied/idempotently recovered cash allocation migration={} targets={:?}",
+                            account_id, migration.operation_id, migration.target_weights,
+                        ),
+                        Err(error) => {
+                            error!(
+                                "[Engine] refusing Polymarket startup: account={} cash allocation migration={} rejected after authoritative order recovery: {}",
+                                account_id, migration_id, error,
+                            );
+                            return HashMap::new();
+                        }
+                    }
+                }
             }
         }
 
