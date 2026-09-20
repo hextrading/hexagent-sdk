@@ -96,7 +96,7 @@ benchmark does not estimate a new live maximum or simulate exchange latency.
 ## Validation and reproduction
 
 After rebasing onto SDK main 0835fc6 (retired-order recovery), full
-account/engine libraries: 319 + 134 passed, 13 + 7 ignored; full exchange library:
+account/engine libraries: 321 + 134 passed, 13 + 7 ignored; full exchange library:
 897 passed, 35 ignored. Earlier recovery-focused tests: 57 passed, 2 ignored. New tests cover FIFO,
 coalescing, result-before-slot-release retry ordering, capacity overflow, owner
 isolation, replay/reversal/restore, alternate-owner evidence, null evidence,
