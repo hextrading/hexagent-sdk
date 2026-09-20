@@ -4680,7 +4680,7 @@ async fn user_feed_loop(
                                     warn!(
                                     "[PolyUserFeed] Periodic gap replay DEGRADED after {} \
                                      consecutive failures; after={} remains pinned; live WS \
-                                     inventory stays authoritative and quoting continues while \
+                                     remains active; new placements stay paused while \
                                      background catch-up retries in {}ms; error={}; \
                                      account={} GapReplay pool slots={:?} acquires={} skips={} busy={}",
                                     consecutive_failures,

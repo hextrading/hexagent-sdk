@@ -46,8 +46,9 @@ const RECOVERY_PENDING_CAPACITY: usize = 16_384;
 /// - `gap_replay_degraded`: the periodic REST safety net has failed repeatedly.
 ///   The WebSocket may still be connected, but until the pinned replay window
 ///   catches up we cannot prove that the REST safety net is current. This is
-///   diagnostic/degraded state only while the private WS remains connected;
-///   it does not by itself make inventory unknown or require quote pauses.
+///   independent of inventory uncertainty while the private WS remains
+///   connected. New placements still pause until catch-up; private events,
+///   cancellations and recovery continue.
 #[derive(Debug)]
 pub struct UserFeedHealth {
     /// Low bit is the gate; upper bits advance on every recovery assertion.
@@ -494,6 +495,12 @@ impl UserFeedHealth {
     }
     pub fn gap_replay_degraded(&self) -> bool {
         self.gap_replay_degraded.load(Ordering::Relaxed)
+    }
+    /// Shared policy for strategy emission and adapter preflight. A periodic
+    /// REST failure must not create an emit/reject loop while the WS is live.
+    #[inline]
+    pub fn new_orders_ready(&self) -> bool {
+        !self.is_recovering() && !self.gap_replay_degraded() && !self.inventory_uncertain()
     }
     pub fn set_gap_replay_degraded(&self, v: bool) {
         self.gap_replay_degraded.store(v, Ordering::Relaxed);
@@ -1150,13 +1157,19 @@ mod user_feed_health_tests {
     #[test]
     fn gap_replay_degraded_is_independent_and_recoverable() {
         let h = UserFeedHealth::new();
+        assert!(!h.new_orders_ready());
         h.set_recovering(false);
+        assert!(h.new_orders_ready());
         h.set_gap_replay_degraded(true);
+        assert!(!h.new_orders_ready());
         assert!(h.gap_replay_degraded());
         assert!(!h.is_recovering());
         assert!(!h.inventory_uncertain());
         h.set_gap_replay_degraded(false);
         assert!(!h.gap_replay_degraded());
+        assert!(h.new_orders_ready());
+        h.set_inventory_uncertain(true);
+        assert!(!h.new_orders_ready());
     }
 
     #[test]
