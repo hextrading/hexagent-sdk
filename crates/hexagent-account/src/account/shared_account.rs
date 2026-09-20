@@ -5848,6 +5848,141 @@ fn repair_retired_trade_replays_from_wal(
     true
 }
 
+/// A fresh migration frame proves the operator's cash-only transfer intent.
+/// Require both the exact before balances and all changed after balances in
+/// that same checksummed WAL frame; a snapshot record alone is insufficient.
+fn cash_migration_wal_evidence(
+    record: &PersistenceWalRecord,
+    before: &serde_json::Value,
+) -> Vec<CashAllocationMigration> {
+    let mut evidence = Vec::new();
+    for change in &record.changes {
+        let PersistenceWalChange::Set { path, value } = change else {
+            continue;
+        };
+        if path.len() != 2
+            || path[0] != "cash_allocation_migrations"
+            || json_value_at_path(before, path).is_some()
+        {
+            continue;
+        }
+        let Ok(migration) = serde_json::from_value::<CashAllocationMigration>(value.clone()) else {
+            continue;
+        };
+        let Some(instances) = before
+            .get("instances")
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        if migration.operation_id != path[1]
+            || migration.cash_before.len() != instances.len()
+            || migration.cash_before.keys().ne(migration.cash_after.keys())
+        {
+            continue;
+        }
+        let total_before: f64 = migration.cash_before.values().sum();
+        let total_after: f64 = migration.cash_after.values().sum();
+        let total_weight: f64 = migration.target_weights.values().sum();
+        if !total_before.is_finite()
+            || !total_after.is_finite()
+            || !total_weight.is_finite()
+            || total_weight <= 0.0
+            || (total_before - total_after).abs()
+                > reconciliation_tolerance(total_before, total_after)
+            || migration.target_weights.iter().any(|(iid, weight)| {
+                !instances.contains_key(iid) || !weight.is_finite() || *weight <= 0.0
+            })
+            || !migration
+                .cash_before
+                .iter()
+                .any(|(iid, before)| (migration.cash_after[iid] - before).abs() > EPS)
+        {
+            continue;
+        }
+        let valid = migration.cash_before.iter().all(|(iid, cash_before)| {
+            let cash_after = migration.cash_after[iid];
+            let expected_after = total_before
+                * migration.target_weights.get(iid).copied().unwrap_or(0.0)
+                / total_weight;
+            if !cash_before.is_finite()
+                || !cash_after.is_finite()
+                || (cash_after - expected_after).abs()
+                    > reconciliation_tolerance(cash_after, expected_after)
+                || instances
+                    .get(iid)
+                    .and_then(|v| v.get("cash"))
+                    .and_then(serde_json::Value::as_f64)
+                    != Some(*cash_before)
+            {
+                return false;
+            }
+            if cash_after == *cash_before {
+                return true;
+            }
+            let cash_path = vec!["instances".to_owned(), iid.clone(), "cash".to_owned()];
+            record.changes.iter().rev().find_map(|change| match change {
+                PersistenceWalChange::Set { path, value } if path == &cash_path => value.as_f64(),
+                _ => None,
+            }) == Some(cash_after)
+        });
+        if valid {
+            evidence.push(migration);
+        }
+    }
+    evidence
+}
+
+/// Repair one unpublished migration only when its exact transfer vector fully
+/// explains the immutable-root mismatch. Unrelated economics or reservation
+/// errors are never repaired by this path; ordinary validation stays closed.
+fn repair_unpublished_cash_migration_from_wal(
+    account_id: &str,
+    state: &mut SharedAccountState,
+    evidence: &[CashAllocationMigration],
+) -> bool {
+    if evidence.is_empty() || validate_persisted_state(account_id, state).is_ok() {
+        return false;
+    }
+    let mut repaired = None;
+    for migration in evidence {
+        if state
+            .cash_allocation_migrations
+            .get(&migration.operation_id)
+            != Some(migration)
+        {
+            continue;
+        }
+        let mut candidate = state.clone();
+        let mut valid = true;
+        for (iid, after) in &migration.cash_after {
+            let Some(instance) = candidate.instances.get_mut(iid) else {
+                valid = false;
+                break;
+            };
+            instance.cash += after - migration.cash_before[iid];
+        }
+        if !valid {
+            continue;
+        }
+        recompute_reconciliation(&mut candidate, "WAL-proven unpublished cash migration");
+        if validate_persisted_state(account_id, &candidate).is_err() {
+            continue;
+        }
+        // Multiple explanations are ambiguous. Never choose an arbitrary one.
+        if repaired.is_some() {
+            return false;
+        }
+        repaired = Some((candidate, migration.operation_id.clone()));
+    }
+    let Some((candidate, operation_id)) = repaired else {
+        return false;
+    };
+    *state = candidate;
+    log::warn!("[shared_account] account={} repaired WAL-proven unpublished cash migration={} before startup; positions and ownership unchanged", account_id, operation_id);
+    true
+}
+
 fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Result<(), String> {
     use std::io::BufRead as _;
 
@@ -5875,6 +6010,7 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
     let mut stale_virtual_trade_snapshots = Vec::new();
     let mut retired_trade_replays = Vec::new();
     let mut ledger_generation_regressions = Vec::new();
+    let mut cash_migrations = Vec::new();
     let mut reader = std::io::BufReader::new(wal);
     let mut line_number = 0usize;
     loop {
@@ -5992,6 +6128,7 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
         }
         platform_redeem_antecedents
             .extend(platform_redeem_antecedent_wal_evidence(&record, &state)?);
+        cash_migrations.extend(cash_migration_wal_evidence(&record, &state));
         stale_virtual_trade_snapshots
             .extend(stale_virtual_trade_snapshot_wal_evidence(&record, &state)?);
         retired_trade_replays.extend(retired_trade_replay_wal_evidence(&record, &state)?);
@@ -6052,6 +6189,11 @@ fn replay_persistence_wal(path: &Path, persisted: &mut PersistedAccount) -> Resu
         &persisted.account_id,
         &mut persisted.state,
         &ledger_generation_regressions,
+    );
+    repair_unpublished_cash_migration_from_wal(
+        &persisted.account_id,
+        &mut persisted.state,
+        &cash_migrations,
     );
     Ok(())
 }
@@ -10132,6 +10274,25 @@ impl SharedAccount {
         state.allocation_migration_required = None;
         recompute_reconciliation(&mut state, "explicit cash allocation migration");
         self.schedule_persist(&state);
+        // Startup recovery can already have bound the lifecycle lane. Its
+        // general control guard must not replace owner-local lifecycle maps.
+        // Publish only this cold transaction's economic delta, matching the
+        // existing EconomicStateGuard cash publication. Strategy accounts have
+        // not been seeded yet; positions and order/trade ownership never move.
+        if self.account_lifecycle_lane_bound.load(Ordering::Acquire)
+            && !self.is_account_lifecycle_thread()
+        {
+            let accounts = self.virtual_accounts.read().unwrap();
+            for (instance_id, after) in &migration.cash_after {
+                if let Some(account) = accounts.get(instance_id) {
+                    let before = migration.cash_before.get(instance_id).copied().unwrap_or(0.0);
+                    account.cash.add(*after - before);
+                    if let Some(weight) = target_weights.get(instance_id) {
+                        account.weight.store(*weight);
+                    }
+                }
+            }
+        }
         drop(state);
         self.flush_admission_persistence()?;
         Ok(migration)
@@ -24380,6 +24541,154 @@ mod tests {
             1_490.390_728,
         );
         assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn wal_proven_unpublished_migration_repairs_only_exact_cash_vector() {
+        let _persistence_guard = persistence_test_guard();
+        for distortion in [100.0, 99.0] {
+            let path = std::env::temp_dir().join(format!(
+                "hexagent-migration-wal-{}-{}-{}.json",
+                std::process::id(),
+                wall_clock_ms(),
+                distortion,
+            ));
+            {
+                let account = SharedAccount::new_persistent("migration-wal", &path).unwrap();
+                account.register_instance("old", 1.0);
+                account
+                    .apply_physical_snapshot(100.0, HashMap::new())
+                    .unwrap();
+                account.register_instance("new", 1.0);
+                // Establish the complete pre-migration frame, as in the
+                // production snapshot. Ambiguous coalesced bootstrap frames
+                // deliberately do not qualify as migration repair proof.
+                account.flush_persistence(Duration::from_secs(2)).unwrap();
+                account
+                    .migrate_cash_allocation("intent", &BTreeMap::from([("new".into(), 1.0)]))
+                    .unwrap();
+                account.flush_persistence(Duration::from_secs(2)).unwrap();
+            }
+            // Model a legacy cold snapshot overwriting the migration with
+            // old owner cash. A one-unit unrelated discrepancy must not pass.
+            let record = PersistenceWalRecord {
+                version: PERSISTENCE_WAL_VERSION,
+                account_id: "migration-wal".into(),
+                generation: 1_000_000,
+                changes: vec![
+                    // A wallet cold transaction carries an economic root;
+                    // the older generic stale-lifecycle repair excludes it.
+                    PersistenceWalChange::Set {
+                        path: vec!["external_adjustments".into(), "snapshot-noop".into()],
+                        value: serde_json::json!({
+                            "operation_id": "snapshot-noop", "instance_id": "new",
+                            "cash_delta": 0.0, "position_deltas": {}, "recorded_at_ms": wall_clock_ms()
+                        }),
+                    },
+                    PersistenceWalChange::Set {
+                        path: vec!["instances".into(), "old".into(), "cash".into()],
+                        value: serde_json::json!(distortion),
+                    },
+                    PersistenceWalChange::Set {
+                        path: vec!["instances".into(), "new".into(), "cash".into()],
+                        value: serde_json::json!(100.0 - distortion),
+                    },
+                ],
+            };
+            let mut length = std::fs::metadata(persistence_wal_path(&path))
+                .unwrap()
+                .len();
+            append_persistence_wal(&path, &record, &mut length).unwrap();
+            if distortion == 100.0 {
+                for _ in 0..2 {
+                    let restored = SharedAccount::new_persistent("migration-wal", &path).unwrap();
+                    assert_eq!(restored.instance_snapshot("new").unwrap().cash, 100.0);
+                    assert_eq!(restored.instance_snapshot("old").unwrap().cash, 0.0);
+                    assert_eq!(restored.monitoring_snapshot().physical_cash, 100.0);
+                    restored
+                        .migrate_cash_allocation("intent", &BTreeMap::from([("new".into(), 1.0)]))
+                        .unwrap();
+                    assert_eq!(restored.instance_snapshot("new").unwrap().cash, 100.0);
+                }
+                // Once folded into a snapshot, an arbitrary unjournaled
+                // transfer cannot borrow the old intent as new repair proof.
+                let mut snapshot: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                snapshot["state"]["instances"]["new"]["cash"] = serde_json::json!(0.0);
+                snapshot["state"]["instances"]["old"]["cash"] = serde_json::json!(100.0);
+                std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+            }
+            assert!(
+                SharedAccount::new_persistent("migration-wal", &path).is_err(),
+                "distortion={distortion}"
+            );
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(persistence_wal_path(&path));
+            let _ = std::fs::remove_file(PathBuf::from(format!("{}.lock", path.display())));
+        }
+    }
+
+    #[test]
+    fn cash_migration_after_lifecycle_bind_survives_wallet_refresh_and_restart() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-bound-migration-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        {
+            let account = Arc::new(SharedAccount::new_persistent("bound-migration", &path).unwrap());
+            account.register_instance("old", 1.0);
+            account
+                .register_token_interest("old", "old-event", "OLD-UP", "OLD-DOWN")
+                .unwrap();
+            let positions = HashMap::from([("OLD-UP".into(), 20.0)]);
+            account
+                .apply_physical_snapshot(100.0, positions.clone())
+                .unwrap();
+            account.register_instance("new", 1.0);
+            let _lifecycle_owner = account.bind_account_lifecycle_owner().unwrap();
+            let weights = BTreeMap::from([("new".to_owned(), 2.0)]);
+            let migration = account
+                .migrate_cash_allocation("move-after-bind", &weights)
+                .unwrap();
+            assert_eq!(account.instance_snapshot("new").unwrap().cash, 100.0);
+            assert_eq!(account.instance_snapshot("new").unwrap().weight, 2.0);
+            assert_eq!(account.instance_snapshot("old").unwrap().cash, 0.0);
+            account.apply_physical_snapshot(100.0, positions).unwrap();
+            assert_eq!(
+                account
+                    .capture_instance_startup_seed("new")
+                    .unwrap()
+                    .snapshot
+                    .cash,
+                100.0
+            );
+            assert_eq!(
+                account.instance_snapshot("old").unwrap().positions["OLD-UP"],
+                20.0
+            );
+            assert!(account
+                .instance_snapshot("new")
+                .unwrap()
+                .positions
+                .is_empty());
+            assert_eq!(
+                account
+                    .migrate_cash_allocation("move-after-bind", &weights)
+                    .unwrap(),
+                migration
+            );
+            assert!(!account.is_uncertain());
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+        let restored = SharedAccount::new_persistent("bound-migration", &path).unwrap();
+        assert_eq!(restored.instance_snapshot("new").unwrap().cash, 100.0);
+        assert_eq!(restored.instance_snapshot("old").unwrap().cash, 0.0);
+        drop(restored);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(persistence_wal_path(&path));
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}.lock", path.display())));
     }
 
     #[test]
