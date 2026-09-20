@@ -39,3 +39,7 @@ compacted failures, owner isolation, idempotence, and private fills racing histo
 The existing parser allocation tests also had competing process-global counters;
 a test-only guard serializes their measurement intervals without adding a
 production lock or changing parser behavior.
+
+Validation: account 319 passed / 12 ignored; exchange 895 passed / 35 ignored
+(both serial and default parallel runs); engine 131 passed / 6 ignored. No test
+failures remain. The two allocation cases also pass in isolation.
