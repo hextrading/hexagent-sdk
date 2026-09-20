@@ -3767,10 +3767,7 @@ impl SharedState {
         if self.auth_failure_blocked.load(Ordering::Acquire) {
             return Some("authenticated CLOB credential safety gate");
         }
-        if self.user_feed_health.is_recovering()
-            || self.user_feed_health.gap_replay_degraded()
-            || self.user_feed_health.inventory_uncertain()
-        {
+        if !self.user_feed_health.new_orders_ready() {
             return Some("private gap replay safety gate");
         }
         None
