@@ -243,6 +243,11 @@ enum GapReplayOutcome {
 #[derive(Debug, Clone)]
 struct GapReplayCheckpoint {
     after_secs: u64,
+    // Owned by the same cold replay task as the cursor. A long inactive
+    // account must not issue one month-wide REST query: the venue can return
+    // HTTP 500 even when each day's complete history is available.
+    window_after_secs: u64,
+    window_horizon_secs: u64,
     cursor: String,
     seen_cursors: HashSet<String>,
     /// Decoded remainder of the current REST page. It is retained across a
@@ -259,8 +264,18 @@ struct GapReplayCheckpoint {
 
 impl GapReplayCheckpoint {
     fn new(after_secs: u64) -> Self {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self::at_time(after_secs, now_secs)
+    }
+
+    fn at_time(after_secs: u64, now_secs: u64) -> Self {
         Self {
             after_secs,
+            window_after_secs: after_secs,
+            window_horizon_secs: now_secs,
             cursor: String::new(),
             seen_cursors: HashSet::new(),
             pending_page: VecDeque::new(),
@@ -271,6 +286,43 @@ impl GapReplayCheckpoint {
             cursor_resets: 0,
             durable_fast_skips: 0,
         }
+    }
+
+    fn window_end(&self) -> Option<u64> {
+        let end = self.window_after_secs.checked_add(86_400)?;
+        (end < self.window_horizon_secs).then_some(end)
+    }
+
+    fn request_url(&self) -> String {
+        let mut url = format!(
+            "{}/data/trades?after={}",
+            CLOB_BASE_URL,
+            self.window_after_secs.saturating_sub(1),
+        );
+        if let Some(end) = self.window_end() {
+            // Strict before/after bounds overlap at the exact boundary second.
+            // Existing durable trade dedup makes that overlap idempotent.
+            url.push_str(&format!("&before={}", end.saturating_add(1)));
+        }
+        if !self.cursor.is_empty() {
+            url.push_str(&format!("&next_cursor={}", self.cursor));
+        }
+        url
+    }
+
+    fn advance_window(&mut self) -> bool {
+        // Only a fully acknowledged terminal page may advance the time bound.
+        if self.pending_next_cursor.is_some() || !self.pending_page.is_empty() {
+            return false;
+        }
+        let Some(end) = self.window_end() else {
+            return false;
+        };
+        self.window_after_secs = end;
+        self.cursor.clear();
+        self.seen_cursors.clear();
+        self.cursor_resets = 0;
+        true
     }
 }
 
@@ -3885,8 +3937,6 @@ async fn replay_missed_trades_inner(
     // semantics on `?after=T`. The overlap is harmless — `trade_id`
     // dedup in `PositionManager::upsert_trade` short-circuits any trade
     // already in the ledger (terminal-state guard, position.rs:171).
-    let after_param = checkpoint.after_secs.saturating_sub(1);
-
     // Never abandon a valid next_cursor merely because a fixed page budget
     // was reached. Long disconnects are replayed to completion through the
     // same account-level connection slot. Yield periodically so the runtime
@@ -3954,6 +4004,10 @@ async fn replay_missed_trades_inner(
             attempt_pages += 1;
             if !has_next {
                 drop(apply_stage);
+                if checkpoint.advance_window() {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 break;
             }
             drop(apply_stage);
@@ -3964,14 +4018,7 @@ async fn replay_missed_trades_inner(
         }
 
         let page_stage = crate::latency::TimedStage::new("polymarket.gap_replay.page_total");
-        let url = if checkpoint.cursor.is_empty() {
-            format!("{}/data/trades?after={}", CLOB_BASE_URL, after_param)
-        } else {
-            format!(
-                "{}/data/trades?after={}&next_cursor={}",
-                CLOB_BASE_URL, after_param, checkpoint.cursor
-            )
-        };
+        let url = checkpoint.request_url();
         let gap_response = match transport.get(shared, &url).await {
             Ok(response) => response,
             Err(error) => {
@@ -4016,7 +4063,7 @@ async fn replay_missed_trades_inner(
                 warn!(
                     "[PolyUserFeed] GapReplay cursor rejected with HTTP {}; restarting pinned after={} once",
                     code,
-                    checkpoint.after_secs,
+                    checkpoint.window_after_secs,
                 );
                 checkpoint.cursor.clear();
                 checkpoint.seen_cursors.clear();
@@ -6643,6 +6690,70 @@ mod tests {
         assert_eq!(cursor, "cursor-75");
         assert!(advance_gap_cursor(&mut cursor, &mut seen, "cursor-75".to_string(),).is_err());
         assert!(!advance_gap_cursor(&mut cursor, &mut seen, "LTE=".to_string(),).unwrap());
+    }
+
+    #[test]
+    fn long_gap_windows_cover_every_boundary_and_finish_with_unbounded_tail() {
+        let mut checkpoint = GapReplayCheckpoint::at_time(1_000, 200_000);
+        assert_eq!(
+            checkpoint.request_url(),
+            format!("{CLOB_BASE_URL}/data/trades?after=999&before=87401")
+        );
+        checkpoint.cursor = "page-2".into();
+        checkpoint.seen_cursors.insert("page-2".into());
+        checkpoint.cursor_resets = 1;
+        assert!(checkpoint.request_url().ends_with("&next_cursor=page-2"));
+        assert!(checkpoint.advance_window());
+        assert_eq!(checkpoint.after_secs, 1_000);
+        assert_eq!(checkpoint.window_after_secs, 87_400);
+        assert_eq!(checkpoint.cursor_resets, 0);
+        assert!(checkpoint.cursor.is_empty());
+        assert!(checkpoint.seen_cursors.is_empty());
+        assert_eq!(
+            checkpoint.request_url(),
+            format!("{CLOB_BASE_URL}/data/trades?after=87399&before=173801")
+        );
+        assert!(checkpoint.advance_window());
+        assert_eq!(
+            checkpoint.request_url(),
+            format!("{CLOB_BASE_URL}/data/trades?after=173799")
+        );
+        assert!(!checkpoint.advance_window());
+    }
+
+    #[test]
+    fn long_gap_failed_page_keeps_window_until_owner_acknowledgement() {
+        let mut checkpoint = GapReplayCheckpoint::at_time(1_000, 200_000);
+        checkpoint.cursor = "page-2".into();
+        checkpoint.pending_next_cursor = Some("LTE=".into());
+        checkpoint.pending_page.push_back(
+            PrivateEventDelta::classify(serde_json::json!({
+                "event_type": "trade", "id": "failed-record"
+            }))
+            .unwrap(),
+        );
+        let request = checkpoint.request_url();
+        assert!(!checkpoint.advance_window());
+        assert_eq!(checkpoint.request_url(), request);
+        checkpoint.pending_page.clear();
+        assert!(!checkpoint.advance_window());
+        checkpoint.pending_next_cursor = None;
+        assert!(checkpoint.advance_window());
+    }
+
+    #[test]
+    fn recent_gap_and_future_clock_keep_existing_unbounded_query() {
+        for (after, now) in [(1_000, 87_400), (1_000, 999), (u64::MAX, u64::MAX)] {
+            let mut checkpoint = GapReplayCheckpoint::at_time(after, now);
+            assert_eq!(
+                checkpoint.request_url(),
+                format!(
+                    "{CLOB_BASE_URL}/data/trades?after={}",
+                    after.saturating_sub(1)
+                )
+            );
+            assert!(!checkpoint.advance_window());
+        }
     }
 
     #[test]
