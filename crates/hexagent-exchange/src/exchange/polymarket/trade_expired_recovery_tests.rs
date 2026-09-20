@@ -264,3 +264,124 @@ fn expired_recovery_keeps_incomplete_sibling_and_rejects_wrong_instance() {
     );
     finish(trade, shutdown);
 }
+
+#[test]
+fn recovered_market_end_requires_exact_closed_market_and_token() {
+    let valid = serde_json::json!({"condition_id":"market", "closed":true, "accepting_orders":false,"tokens":[{"token_id":"UP"},{"token_id":"DOWN"}]});
+    assert!(recovered_market_closed_for_token(&valid, "market", "UP"));
+    assert!(!recovered_market_closed_for_token(&valid, "other", "UP"));
+    assert!(!recovered_market_closed_for_token(
+        &valid, "market", "unknown"
+    ));
+    for (key, value) in [
+        ("closed", serde_json::json!(false)),
+        ("accepting_orders", serde_json::json!(true)),
+        ("closed", serde_json::Value::Null),
+        (
+            "tokens",
+            serde_json::json!([{"token_id":"UP"},{"token_id":"UP"}]),
+        ),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[key] = value;
+        assert!(!recovered_market_closed_for_token(&invalid, "market", "UP"));
+    }
+}
+
+#[test]
+fn failed_only_history_requires_all_pages_and_rejects_mixed_or_unknown_statuses() {
+    let failed = serde_json::json!({"id":"failed-one","taker_order_id":"target","status":"FAILED","maker_orders":[]});
+    let result = fetch_historical_order_trade_audit("target", 1_789_584_642_112, |path| {
+        Ok(if path.contains("next_cursor=") {
+            serde_json::json!({"data":[failed.clone()],"next_cursor":"LTE="})
+        } else {
+            serde_json::json!({"data":[failed.clone()],"next_cursor":"page2"})
+        })
+    });
+    assert!(
+        matches!(result, HistoricalOrderTradeAudit::CompleteFailed { pages:2, trade_ids, .. } if trade_ids == ["failed-one"])
+    );
+    for status in ["CONFIRMED", "MATCHED", "MINED", "RETRYING", "unknown"] {
+        let result = fetch_historical_order_trade_audit("target", 1_789_584_642_112, |_| {
+            Ok(
+                serde_json::json!({"data":[failed.clone(),{"id":"other","taker_order_id":"target","status":status,"maker_orders":[]}],"next_cursor":"LTE="}),
+            )
+        });
+        assert!(matches!(
+            result,
+            HistoricalOrderTradeAudit::FoundFill { records: 2 }
+        ));
+    }
+    let incomplete = fetch_historical_order_trade_audit("target", 1_789_584_642_112, |_| {
+        Ok(serde_json::json!({"data":[failed.clone()],"next_cursor":"repeated"}))
+    });
+    assert!(matches!(
+        incomplete,
+        HistoricalOrderTradeAudit::Incomplete { .. }
+    ));
+}
+
+#[test]
+fn expired_failed_history_waits_for_local_reconciliation_then_closes_idempotently() {
+    let shutdown = ShutdownToken::new();
+    let trade = super::tests::shutdown_test_trade(shutdown.clone());
+    let shared = trade.shared_state();
+    let order = ownership(Side::Buy, "btc01-1789584642112", "0xfailed", "btc01");
+    install(&shared, &order);
+    let proof = || HistoricalOrderTradeAudit::CompleteFailed {
+        pages: 1,
+        after_secs: 1_789_584_342,
+        trade_ids: vec!["failed-id".into()],
+    };
+    let recover = |candidate: &OrderOwnership| {
+        trade.recover_absent_order_after_trade_audit_with(
+            candidate,
+            &candidate.order_id,
+            true,
+            true,
+            "test_absent",
+            |_, _| proof(),
+        )
+    };
+    assert!(recover(&order).is_none());
+    for status in ["MATCHED", "FAILED"] {
+        shared.account_state.apply_trade_transition_with_context(
+            "failed-id",
+            status,
+            &order.client_order_id,
+            &order.order_id,
+            &order.token_id,
+            Side::Buy,
+            16.0,
+            0.58,
+            true,
+            0,
+        );
+    }
+    // Private lifecycle application and its cold mirror are asynchronous.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !shared
+        .account_state
+        .recovery_failed_history_reconciled(&order, &["failed-id".into()])
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cold failure proof did not converge"
+        );
+        std::thread::yield_now();
+    }
+    let candidate = shared.account_state.order(&order.client_order_id).unwrap();
+    assert_eq!(candidate.filled_quantity, 0.0);
+    let update = recover(&candidate).expect("complete failed history and reconciled owner");
+    assert_eq!(update.status, OrderStatus::Cancelled);
+    assert_eq!(
+        shared
+            .account_state
+            .order(&order.client_order_id)
+            .unwrap()
+            .reserved_cash,
+        0.0
+    );
+    assert!(recover(&candidate).is_some());
+    finish(trade, shutdown);
+}

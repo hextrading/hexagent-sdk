@@ -9735,6 +9735,9 @@ mod clob_test_allocator {
     static TRACKED_THREAD: AtomicUsize = AtomicUsize::new(0);
     static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
     static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+    // These counters are process-wide even though allocation tracking selects
+    // one thread. Parallel tests must not replace each other's tracked owner.
+    static MEASUREMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn tracks_current_thread() -> bool {
         let tracked = TRACKED_THREAD.load(Ordering::Relaxed);
@@ -9764,6 +9767,7 @@ mod clob_test_allocator {
     }
 
     pub(super) fn count<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
+        let _measurement = MEASUREMENT_LOCK.lock().unwrap();
         ALLOCATIONS.store(0, Ordering::Relaxed);
         ALLOCATED_BYTES.store(0, Ordering::Relaxed);
         TRACKED_THREAD.store(unsafe { libc::pthread_self() as usize }, Ordering::Release);

@@ -10371,6 +10371,60 @@ impl SharedAccount {
         self.ended_token_ids_fast.load().contains(token_id)
     }
 
+    /// Cold recovery lookup only. Conflicting durable token/market bindings
+    /// are never used to narrow an authenticated history scan.
+    pub fn recovery_market_for_token(&self, token_id: &str) -> Option<String> {
+        self.read_cold_state(|state| {
+            let mut found: Option<&str> = None;
+            let interests = state.instances.values().flat_map(|instance| {
+                instance.token_interests.values().filter_map(|interest| {
+                    (interest.up_token_id == token_id || interest.down_token_id == token_id)
+                        .then_some(interest.condition_id.as_str())
+                })
+            });
+            let settled = state.settled_audit_references.values().filter_map(|reference| {
+                reference.asset_ids.iter().any(|token| token == token_id)
+                    .then_some(reference.condition_id.as_str())
+            });
+            for market in interests.chain(settled) {
+                if market.is_empty() || found.is_some_and(|prior| prior != market) {
+                    return None;
+                }
+                found = Some(market);
+            }
+            found.map(str::to_string)
+        })
+    }
+
+    /// A complete authenticated history containing only FAILED trades may
+    /// close an expired unmatched order only after each failure is already
+    /// reconciled locally. Compacted terminal roots retain this evidence.
+    /// This read is cold; the final zero-fill commit rechecks the live order
+    /// identity and matched quantity on its sole lifecycle writer.
+    pub fn recovery_failed_history_reconciled(
+        &self,
+        order: &OrderOwnership,
+        trade_ids: &[String],
+    ) -> bool {
+        !trade_ids.is_empty() && self.read_cold_state(|state| {
+            trade_ids.iter().all(|id| {
+                if id.is_empty() { return false; }
+                let matching = |ownership: &TradeOwnership| {
+                    trade_ownership_matches_order_root(ownership, order)
+                        && terminal_trade_id_matches(&ownership.trade_key, id)
+                        && ownership.status == "FAILED"
+                        && ownership.quantity.is_finite()
+                        && ownership.quantity > EPS
+                };
+                state.trades.values().any(|trade| {
+                    matching(&trade.ownership) && trade.failed && trade.failure_reconciled
+                }) || state.retired_trade_ownership_tombstones.values().any(|trade| {
+                    matching(&trade.ownership)
+                })
+            })
+        })
+    }
+
     /// Retire a finished/abandoned event after a ten-minute reconciliation
     /// grace. Existing virtual positions retain their direct instance ownership;
     /// their on-chain/settlement query scope expires only after inventory is
@@ -24350,6 +24404,54 @@ mod tests {
         assert!(account.instance_snapshot("btc02").unwrap().positions.is_empty());
         assert_eq!(account.order_owner_by_coid("old-sell").as_deref(), Some("eth02"));
         assert!(!account.is_uncertain());
+    }
+
+    #[test]
+    fn recovery_market_binding_rejects_missing_and_conflicting_roots() {
+        let account = seeded_account();
+        assert_eq!(account.recovery_market_for_token("unknown"), None);
+        account.register_token_interest("a", "market-one", "legacy-up", "legacy-down").unwrap();
+        assert_eq!(account.recovery_market_for_token("legacy-up").as_deref(), Some("market-one"));
+        assert!(!account.token_event_has_ended("legacy-up"));
+        // A second owner of the same event is valid; a conflicting market is not.
+        account.register_token_interest("b", "market-one", "legacy-up", "legacy-down").unwrap();
+        assert_eq!(account.recovery_market_for_token("legacy-up").as_deref(), Some("market-one"));
+        account.state.lock().unwrap().instances.get_mut("b").unwrap()
+            .token_interests.get_mut("market-one").unwrap().condition_id = "wrong-market".into();
+        assert_eq!(account.recovery_market_for_token("legacy-up"), None);
+    }
+
+    #[test]
+    fn recovery_failed_history_requires_exact_reconciled_live_or_compacted_owner() {
+        let account = seeded_account();
+        account.reserve_order("a", "a-proof", "oid-proof", "UP", Side::Buy, 10.0, 0.5, 0).unwrap();
+        for status in ["MATCHED", "FAILED"] {
+            account.apply_trade_transition_with_context("failed-proof", status, "a-proof", "oid-proof", "UP", Side::Buy, 10.0, 0.5, true, 0);
+        }
+        let order = account.order("a-proof").unwrap();
+        let ids = vec!["failed-proof".to_string()];
+        let _ = account.monitoring_snapshot();
+        assert!(account.recovery_failed_history_reconciled(&order, &ids));
+        assert!(!account.recovery_failed_history_reconciled(&order, &[]));
+        assert!(!account.recovery_failed_history_reconciled(&order, &["missing".into()]));
+        {
+            let mut state = account.state.lock().unwrap();
+            state.trades.get_mut("failed-proof").unwrap().failure_reconciled = false;
+        }
+        assert!(!account.recovery_failed_history_reconciled(&order, &ids));
+        {
+            let mut state = account.state.lock().unwrap();
+            let trade = state.trades.remove("failed-proof").unwrap();
+            state.retired_trade_ownership_tombstones.insert("failed-proof".into(), RetiredTradeOwnershipTombstone {
+                ownership: trade.ownership, execution_pricing: trade.execution_pricing,
+                is_maker: trade.is_maker, authenticated_terminal_noop: false, retired_at_ms: wall_clock_ms(),
+            });
+        }
+        assert!(account.recovery_failed_history_reconciled(&order, &ids));
+        let mut other = order.clone(); other.instance_id = "b".into();
+        assert!(!account.recovery_failed_history_reconciled(&other, &ids));
+        account.state.lock().unwrap().retired_trade_ownership_tombstones.get_mut("failed-proof").unwrap().ownership.status = "CONFIRMED".into();
+        assert!(!account.recovery_failed_history_reconciled(&order, &ids));
     }
 
     #[test]
