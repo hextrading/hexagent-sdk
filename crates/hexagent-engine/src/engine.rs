@@ -875,6 +875,7 @@ fn spawn_polymarket_supervisor(
             while !shutdown.load(Ordering::Acquire) {
                 let epoch = worker_slot.current();
                 let snapshot = epoch.liveness.snapshot();
+                let consumer = market_tx.consumer_progress();
                 if last_log.elapsed() >= POLY_SUPERVISOR_LOG_INTERVAL {
                     info!(
                         "[feed_phase] polymarket generation={} phase={} phase_age_ms={} active={} recovery_age_ms={} raw_age_ms={} market_data_age_ms={} feed_loop_age_ms={} recovery=Connecting:{} Subscribed:{} first_raw_frame:{} READY:{} event_end_ns={}",
@@ -891,6 +892,12 @@ fn spawn_polymarket_supervisor(
                         snapshot.first_raw_frame_seen,
                         snapshot.ready_seen,
                         snapshot.current_event_end_ns,
+                    );
+                    info!(
+                        "[market_dispatch_health] polls={} poll_age_us={} pending={} capacity_per_lane={} contention_drops={} alive={}",
+                        consumer.polls, consumer.poll_age_ns / 1_000,
+                        consumer.pending, consumer.capacity_per_lane,
+                        consumer.contention_drops, consumer.alive,
                     );
                     last_log = std::time::Instant::now();
                 }
@@ -8449,11 +8456,11 @@ impl Engine {
 
                 let mut last_quote_ns: Vec<u64> = vec![0; strategies.len()];
                 let mut quote_signal_batch = SignalBatch::new();
-                let market_ready_rx = market_rx.ready_receiver().clone();
 
                 loop {
+                    let market_poll_interval = market_rx.poll_interval();
                     crossbeam_channel::select! {
-                        recv(market_ready_rx) -> _ready => {
+                        default(market_poll_interval) => {
                             let msg = market_rx.try_recv();
                             match msg {
                                 Ok(MarketEvent::Exit) => {
@@ -8849,8 +8856,8 @@ impl Engine {
                 let never_lifecycle_retry_rx =
                     crossbeam_channel::never::<std::time::Instant>();
                 let mut lifecycle_outboxes = LifecycleOwnerOutboxes::new(instance_ids.len());
-                let market_ready_rx = market_rx.ready_receiver().clone();
                 'router: loop {
+                    let market_poll_interval = market_rx.poll_interval();
                     if let Err(failure) = lifecycle_outboxes.try_flush_one(&update_txs) {
                         if handle_lifecycle_route_failure(
                             &failure,
@@ -8921,7 +8928,7 @@ impl Engine {
                             }
                             Err(_) => break,
                         },
-                        recv(market_ready_rx) -> _ready => match market_rx.try_recv() {
+                        default(market_poll_interval) => match market_rx.try_recv() {
                             Ok(MarketEvent::Exit) => {
                                 if shutdown_in_progress { continue; }
                                 forward_recorder_event(

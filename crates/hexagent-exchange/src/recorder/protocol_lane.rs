@@ -446,9 +446,8 @@ impl BookProtocolConsumer {
             return Err(crossbeam_channel::RecvTimeoutError::Timeout);
         }
         crossbeam_channel::select! {
-            recv(rx.ready_receiver()) -> _ => receive(),
             recv(self.wake_rx) -> _ => Err(crossbeam_channel::RecvTimeoutError::Timeout),
-            default(timeout) => Err(crossbeam_channel::RecvTimeoutError::Timeout),
+            default(timeout.min(rx.poll_interval())) => receive(),
         }
     }
     pub fn drain(&mut self, recorder: &mut MarketRecorder, limit: usize) -> Result<()> {

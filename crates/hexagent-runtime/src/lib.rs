@@ -20,3 +20,4 @@ pub mod latency_record;
 pub mod memory;
 pub mod os_tune;
 pub mod shutdown;
+pub mod try_queue;

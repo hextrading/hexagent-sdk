@@ -9679,10 +9679,10 @@ impl ExchangeMarket for PolymarketMarket {
             return Ok(Some(event));
         }
 
-        // Wait for one event from the async WS task. A short blocking receive
-        // is wake-driven (the sender unparks us immediately) and avoids the
-        // old 100 µs SCHED_FIFO polling loop burning this shared CLOB core.
-        // The timeout keeps rotation/readiness watchdogs responsive.
+        // Wait for one event from the async WS task. The mailbox parks in
+        // bounded idle slices without a producer-owned readiness reservation,
+        // so preempted lower-priority publishers can resume on this core.
+        // The outer timeout keeps rotation/readiness watchdogs responsive.
         if let Some(rx) = &mut self.event_rx {
             match rx.recv_timeout(Duration::from_millis(1)) {
                 Ok(mut event) => {
