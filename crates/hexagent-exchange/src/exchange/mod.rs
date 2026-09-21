@@ -47,80 +47,100 @@ fn replaceable_market_event(event: &MarketEvent) -> bool {
     )
 }
 
-/// Multi-producer half of one venue adapter's public-data mailbox.
-///
-/// Ordered events use a bounded FIFO and fail the feed generation when full.
-/// Replaceable observations use a fixed lock-free overwrite-oldest queue, so
-/// parser tasks preserve freshness without blocking or growing the heap.
+/// Public data only. Ordered records are FIFO/fail-closed at capacity or
+/// contention. Replaceable observations evict at most one old observation;
+/// if a peer owns the needed slot, the new observation is dropped and counted.
+/// Every try operation has a fixed attempt budget, including preempted peers.
 #[derive(Clone)]
 pub struct PublicMarketPublisher {
-    ordered: crossbeam_channel::Sender<MarketEvent>,
-    latest: Arc<crossbeam_queue::ArrayQueue<MarketEvent>>,
-    ready: Option<crossbeam_channel::Sender<()>>,
-    consumer_alive: Arc<AtomicBool>,
+    ordered: Arc<hexagent_runtime::try_queue::TryQueue<MarketEvent>>,
+    latest: Arc<hexagent_runtime::try_queue::TryQueue<MarketEvent>>,
+    progress: Arc<PublicMarketProgress>,
 }
 
-/// Single-consumer half owned by the synchronous venue feed thread. Ordered
-/// traffic has priority, bounded to a short burst so current snapshots cannot
-/// starve during a sustained public-trade stream.
+struct PublicMarketProgress {
+    alive: AtomicBool,
+    origin: Instant,
+    contention_drops: AtomicU64,
+    clock: PublicMarketConsumerClock,
+}
+
+// The sole consumer writes this line; publishing only reads `alive` above.
+// Keep heartbeat writes from invalidating the producers' admission cache line.
+#[repr(align(128))]
+struct PublicMarketConsumerClock {
+    last_poll_ns: AtomicU64,
+    polls: AtomicU64,
+}
+
+/// Immutable scalar diagnostics, read by the existing background supervisor.
+#[derive(Debug, Clone, Copy)]
+pub struct PublicMarketConsumerProgress {
+    pub alive: bool,
+    pub poll_age_ns: u64,
+    pub polls: u64,
+    pub pending: usize,
+    pub capacity_per_lane: usize,
+    pub contention_drops: u64,
+}
+
+/// Sole consumer is the feed owner (adapter lane) or root strategy router.
+/// Readiness has NO producer-side channel/reservation. Consumers use a zero
+/// select timeout for a committed head, or a 10us timeout for idle arrivals.
+/// This also avoids AtomicCell<Instant> timer channels, whose fallback locks
+/// can themselves suffer FIFO priority inversion. Queue stamps transfer data.
 pub struct PublicMarketReceiver {
-    ordered: crossbeam_channel::Receiver<MarketEvent>,
-    latest: Arc<crossbeam_queue::ArrayQueue<MarketEvent>>,
-    ready_tx: Option<crossbeam_channel::Sender<()>>,
-    ready_rx: crossbeam_channel::Receiver<()>,
-    consumer_alive: Arc<AtomicBool>,
+    ordered: Arc<hexagent_runtime::try_queue::TryQueue<MarketEvent>>,
+    latest: Arc<hexagent_runtime::try_queue::TryQueue<MarketEvent>>,
+    progress: Arc<PublicMarketProgress>,
     ordered_burst: AtomicU8,
 }
 
 impl PublicMarketReceiver {
-    #[inline]
-    fn finish_recv(&self, event: MarketEvent) -> MarketEvent {
-        if !self.is_empty() {
-            if let Some(ready) = self.ready_tx.as_ref() {
-                let _ = ready.try_send(());
-            }
-        }
-        event
-    }
-
     pub fn try_recv(&self) -> std::result::Result<MarketEvent, crossbeam_channel::TryRecvError> {
+        self.progress.clock.last_poll_ns.store(
+            self.progress
+                .origin
+                .elapsed()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64,
+            Ordering::Release,
+        );
+        self.progress.clock.polls.fetch_add(1, Ordering::Relaxed);
         if self.ordered_burst.load(Ordering::Relaxed) >= PUBLIC_MARKET_ORDERED_BURST {
-            if let Some(event) = self.latest.pop() {
+            if let Some(event) = self.latest.try_pop() {
                 self.ordered_burst.store(0, Ordering::Relaxed);
-                return Ok(self.finish_recv(event));
+                return Ok(event);
             }
         }
-        match self.ordered.try_recv() {
-            Ok(event) => {
-                if self.ordered_burst.load(Ordering::Relaxed) < PUBLIC_MARKET_ORDERED_BURST {
-                    self.ordered_burst.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(self.finish_recv(event))
+        if let Some(event) = self.ordered.try_pop() {
+            if self.ordered_burst.load(Ordering::Relaxed) < PUBLIC_MARKET_ORDERED_BURST {
+                self.ordered_burst.fetch_add(1, Ordering::Relaxed);
             }
-            Err(crossbeam_channel::TryRecvError::Empty) => {
-                if let Some(event) = self.latest.pop() {
-                    self.ordered_burst.store(0, Ordering::Relaxed);
-                    Ok(self.finish_recv(event))
-                } else {
-                    Err(crossbeam_channel::TryRecvError::Empty)
-                }
-            }
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                if let Some(event) = self.latest.pop() {
-                    self.ordered_burst.store(0, Ordering::Relaxed);
-                    Ok(self.finish_recv(event))
-                } else {
-                    Err(crossbeam_channel::TryRecvError::Disconnected)
-                }
-            }
+            return Ok(event);
+        }
+        if let Some(event) = self.latest.try_pop() {
+            self.ordered_burst.store(0, Ordering::Relaxed);
+            return Ok(event);
+        }
+        if Arc::strong_count(&self.ordered) == 1 && self.is_empty() {
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        } else {
+            Err(crossbeam_channel::TryRecvError::Empty)
         }
     }
 
-    /// Single-slot readiness notification used to compose this two-lane
-    /// mailbox with other crossbeam channels in a `select!` loop. Consumers
-    /// drain exactly one notification, call [`Self::try_recv`], and repeat.
-    pub fn ready_receiver(&self) -> &crossbeam_channel::Receiver<()> {
-        &self.ready_rx
+    /// Re-evaluate on every consumer loop iteration. An unfinished publication
+    /// must permit a timed idle wait so its preempted producer can run.
+    pub fn poll_interval(&self) -> Duration {
+        if self.ordered.front_ready()
+            || self.latest.front_ready()
+            || Arc::strong_count(&self.ordered) == 1
+        {
+            Duration::ZERO
+        } else {
+            Duration::from_micros(10)
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -136,7 +156,7 @@ impl PublicMarketReceiver {
             match self.try_recv() {
                 Ok(event) => return Ok(event),
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    return Err(crossbeam_channel::RecvTimeoutError::Disconnected);
+                    return Err(crossbeam_channel::RecvTimeoutError::Disconnected)
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {}
             }
@@ -144,85 +164,88 @@ impl PublicMarketReceiver {
             if remaining.is_zero() {
                 return Err(crossbeam_channel::RecvTimeoutError::Timeout);
             }
-            match self.ready_rx.recv_timeout(remaining) {
-                Ok(()) => {}
-                Err(error) => return Err(error),
-            }
+            std::thread::sleep(remaining.min(self.poll_interval()));
         }
     }
 }
 
 impl Drop for PublicMarketReceiver {
     fn drop(&mut self) {
-        self.consumer_alive.store(false, Ordering::Release);
+        self.progress.alive.store(false, Ordering::Release);
     }
 }
 
 pub fn market_event_channel(capacity: usize) -> (PublicMarketPublisher, PublicMarketReceiver) {
-    market_event_channel_inner(capacity, true)
-}
-
-fn market_event_channel_inner(
-    capacity: usize,
-    notify: bool,
-) -> (PublicMarketPublisher, PublicMarketReceiver) {
     let capacity = capacity.max(1);
-    let (ordered_tx, ordered_rx) = crossbeam_channel::bounded(capacity);
-    let latest = Arc::new(crossbeam_queue::ArrayQueue::new(capacity));
-    let (ready_tx, ready_rx) = if notify {
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        (Some(tx), rx)
-    } else {
-        (None, crossbeam_channel::never())
-    };
-    let consumer_alive = Arc::new(AtomicBool::new(true));
+    let ordered = Arc::new(hexagent_runtime::try_queue::TryQueue::new(capacity));
+    let latest = Arc::new(hexagent_runtime::try_queue::TryQueue::new(capacity));
+    let progress = Arc::new(PublicMarketProgress {
+        alive: AtomicBool::new(true),
+        origin: Instant::now(),
+        contention_drops: AtomicU64::new(0),
+        clock: PublicMarketConsumerClock {
+            last_poll_ns: AtomicU64::new(0),
+            polls: AtomicU64::new(0),
+        },
+    });
     (
         PublicMarketPublisher {
-            ordered: ordered_tx,
-            latest: Arc::clone(&latest),
-            ready: ready_tx.clone(),
-            consumer_alive: Arc::clone(&consumer_alive),
+            ordered: ordered.clone(),
+            latest: latest.clone(),
+            progress: progress.clone(),
         },
         PublicMarketReceiver {
-            ordered: ordered_rx,
+            ordered,
             latest,
-            ready_tx,
-            ready_rx,
-            consumer_alive,
+            progress,
             ordered_burst: AtomicU8::new(0),
         },
     )
 }
 
 pub(crate) fn public_market_channel() -> (PublicMarketPublisher, PublicMarketReceiver) {
-    // Venue adapters already poll `next_event`; avoid an extra readiness CAS
-    // on their parser hot path. The root mailbox enables notifications so it
-    // can participate in the engine's private/control `select_biased!` loop.
-    market_event_channel_inner(PUBLIC_MARKET_ADAPTER_LANE_CAPACITY, false)
+    market_event_channel(PUBLIC_MARKET_ADAPTER_LANE_CAPACITY)
 }
 
 impl PublicMarketPublisher {
-    #[inline]
-    fn notify(&self) {
-        if let Some(ready) = self.ready.as_ref() {
-            let _ = ready.try_send(());
+    pub fn consumer_progress(&self) -> PublicMarketConsumerProgress {
+        let now = self
+            .progress
+            .origin
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        PublicMarketConsumerProgress {
+            alive: self.progress.alive.load(Ordering::Acquire),
+            poll_age_ns: now
+                .saturating_sub(self.progress.clock.last_poll_ns.load(Ordering::Acquire)),
+            polls: self.progress.clock.polls.load(Ordering::Relaxed),
+            pending: self.ordered.len() + self.latest.len(),
+            capacity_per_lane: self.ordered.capacity(),
+            contention_drops: self.progress.contention_drops.load(Ordering::Relaxed),
         }
     }
 
-    /// Lossless shutdown/control admission for non-hot callers. Public parser
-    /// tasks use `try_publish`; this bounded wait is reserved for coordinated
-    /// teardown where dropping `Exit` would strand owner threads.
+    /// Cold shutdown/control path only: retain the exact ordered event while
+    /// waiting for space, with a deadline. Never used by a quote/parser loop.
     pub fn send_ordered_timeout(
         &self,
-        event: MarketEvent,
+        mut event: MarketEvent,
         timeout: Duration,
     ) -> std::result::Result<(), crossbeam_channel::SendTimeoutError<MarketEvent>> {
-        match self.ordered.send_timeout(event, timeout) {
-            Ok(()) => {
-                self.notify();
-                Ok(())
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.progress.alive.load(Ordering::Acquire) {
+                return Err(crossbeam_channel::SendTimeoutError::Disconnected(event));
             }
-            Err(error) => Err(error),
+            match self.ordered.try_push(event) {
+                Ok(()) => return Ok(()),
+                Err(retained) => event = retained,
+            }
+            if Instant::now() >= deadline {
+                return Err(crossbeam_channel::SendTimeoutError::Timeout(event));
+            }
+            std::thread::sleep(Duration::from_micros(50));
         }
     }
 }
@@ -386,29 +409,23 @@ impl MarketEventPublisher for crossbeam_channel::Sender<MarketEvent> {
 }
 
 impl MarketEventPublisher for PublicMarketPublisher {
-    fn try_publish(
-        &self,
-        event: MarketEvent,
-    ) -> std::result::Result<(), crossbeam_channel::SendError<MarketEvent>> {
-        if !self.consumer_alive.load(Ordering::Acquire) {
+    fn try_publish(&self, event: MarketEvent) -> std::result::Result<(), crossbeam_channel::SendError<MarketEvent>> {
+        if !self.progress.alive.load(Ordering::Acquire) {
             return Err(crossbeam_channel::SendError(event));
         }
         if replaceable_market_event(&event) {
-            if self.latest.force_push(event).is_some() {
-                PUBLIC_MARKET_OVERFLOW_REPLACEMENTS.fetch_add(1, Ordering::Relaxed);
+            if let Err(event) = self.latest.try_push(event) {
+                if self.latest.try_pop().is_some() {
+                    PUBLIC_MARKET_OVERFLOW_REPLACEMENTS.fetch_add(1, Ordering::Relaxed);
+                }
+                if self.latest.try_push(event).is_err() {
+                    self.progress.contention_drops.fetch_add(1, Ordering::Relaxed);
+                    PUBLIC_MARKET_OVERFLOW_DROPS.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            self.notify();
             return Ok(());
         }
-        self.ordered
-            .try_send(event)
-            .map(|()| self.notify())
-            .map_err(|error| match error {
-                crossbeam_channel::TrySendError::Full(event)
-                | crossbeam_channel::TrySendError::Disconnected(event) => {
-                    crossbeam_channel::SendError(event)
-                }
-            })
+        self.ordered.try_push(event).map_err(crossbeam_channel::SendError)
     }
 }
 
@@ -1123,15 +1140,48 @@ mod tests {
             )
             .unwrap();
         }
-        receiver
-            .ready_receiver()
-            .recv_timeout(Duration::from_millis(50))
-            .unwrap();
+        assert_eq!(receiver.poll_interval(), Duration::ZERO);
         let mut timestamps = Vec::new();
         while let Ok(MarketEvent::SpotPrice(spot)) = receiver.try_recv() {
             timestamps.push(spot.timestamp_ns);
         }
         assert_eq!(timestamps, vec![2, 3]);
+    }
+
+    #[test]
+    fn root_mailbox_disconnect_drains_and_idle_select_observes_later_publication() {
+        let (publisher, receiver) = market_event_channel(1);
+        let idle_interval = receiver.poll_interval();
+        publish_market_event(&publisher, MarketEvent::Exit).unwrap();
+        // A publication after select chose the idle timer is still observed.
+        std::thread::sleep(idle_interval);
+        drop(publisher);
+        assert!(matches!(receiver.try_recv(), Ok(MarketEvent::Exit)));
+        assert!(matches!(receiver.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn root_mailbox_retains_exact_ordered_event_at_deadline_and_isolates_receivers() {
+        let (publisher, receiver) = market_event_channel(1);
+        let (other, other_receiver) = market_event_channel(1);
+        publish_market_event(&publisher, MarketEvent::Exit).unwrap();
+        let event = MarketEvent::Disconnected {
+            exchange: Exchange::Polymarket, reason: "generation=7".into(),
+        };
+        let retained = match publisher.send_ordered_timeout(event, Duration::ZERO) {
+            Err(crossbeam_channel::SendTimeoutError::Timeout(event)) => event,
+            _ => panic!("full ordered lane must retain the exact event"),
+        };
+        assert!(matches!(other_receiver.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+        assert!(matches!(receiver.try_recv(), Ok(MarketEvent::Exit)));
+        publisher.send_ordered_timeout(retained, Duration::ZERO).unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(MarketEvent::Disconnected { reason, .. }) if reason == "generation=7"));
+        assert!(matches!(receiver.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+        assert!(publisher.consumer_progress().polls >= 3);
+        drop(receiver);
+        assert!(!publisher.consumer_progress().alive);
+        assert!(publish_market_event(&publisher, MarketEvent::Exit).is_err());
+        assert!(publish_market_event(&other, MarketEvent::Exit).is_ok());
     }
 
     #[test]
