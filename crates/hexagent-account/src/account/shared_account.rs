@@ -1404,6 +1404,8 @@ pub struct InstanceStartupSeed {
     pub snapshot: InstanceAccountSnapshot,
     pub restored_trades: Vec<RestoredTrade>,
     pub orders: Vec<OrderOwnership>,
+    /// Split replay identities from the same economic cut as balances.
+    pub confirmed_split_conditions: HashSet<String>,
     pub passive_admission_allowed: bool,
     pub fee_degraded_only: bool,
     pub uncertain: bool,
@@ -12959,6 +12961,11 @@ impl SharedAccount {
                     .filter(|order| order.instance_id == instance_id)
                     .cloned()
                     .collect(),
+                confirmed_split_conditions: state.maintenance_ops.values()
+                    .filter(|operation| operation.kind == MaintenanceOperationKind::Split
+                        && operation.status == MaintenanceOperationStatus::Confirmed
+                        && operation.allocations.contains_key(instance_id))
+                    .map(|operation| operation.condition_id.clone()).collect(),
                 passive_admission_allowed: !failed
                     && state.seeded
                     && (!state.uncertain || fee_only),
@@ -15641,6 +15648,19 @@ impl SharedAccount {
                 .cloned()
                 .collect()
         })
+    }
+
+    /// Cold wallet recovery only: immutable condition-scoped journal rows.
+    /// Includes confirmed rows so a replayed seed request cannot split twice.
+    pub fn maintenance_operations_for_condition(&self, condition_id: &str) -> Vec<MaintenanceOperation> {
+        if self.must_dispatch_to_account_owner() {
+            return self.economic_snapshot_fast.load().maintenance_operations.values()
+                .filter(|operation| operation.condition_id == condition_id)
+                .cloned().collect();
+        }
+        self.read_cold_state(|state| state.maintenance_ops.values()
+            .filter(|operation| operation.condition_id == condition_id)
+            .cloned().collect())
     }
 
     pub fn maintenance_operation(&self, operation_id: &str) -> Option<MaintenanceOperation> {

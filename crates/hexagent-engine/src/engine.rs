@@ -894,10 +894,10 @@ fn spawn_polymarket_supervisor(
                         snapshot.current_event_end_ns,
                     );
                     info!(
-                        "[market_dispatch_health] polls={} poll_age_us={} pending={} capacity_per_lane={} contention_drops={} alive={}",
+                        "[market_dispatch_health] polls={} poll_age_us={} pending={} capacity_per_lane={} contention_drops={} alive={} phase={} phase_key=0:unknown,1:supervisor,2:lifecycle,3:select,4:market,5:recorder",
                         consumer.polls, consumer.poll_age_ns / 1_000,
                         consumer.pending, consumer.capacity_per_lane,
-                        consumer.contention_drops, consumer.alive,
+                        consumer.contention_drops, consumer.alive, consumer.phase,
                     );
                     last_log = std::time::Instant::now();
                 }
@@ -2651,10 +2651,6 @@ impl LifecycleOwnerOutboxes {
                 .collect(),
             next_owner: 0,
         }
-    }
-
-    fn has_pending(&self) -> bool {
-        self.queues.iter().any(|queue| !queue.is_empty())
     }
 
     fn push(&mut self, owner: usize, queued: QueuedOrderUpdate) -> LifecycleRouteResult {
@@ -8840,7 +8836,9 @@ impl Engine {
                 let mut market_overflow_log_at = std::time::Instant::now();
                 let mut latest_capacity_fallbacks_reported = 0u64;
                 let mut last_emergency_cancel_attempt_ns = vec![0u64; instance_ids.len()];
-                let supervisor_tick = crossbeam_channel::tick(std::time::Duration::from_millis(100));
+                let mut supervisor_timer = hexagent_runtime::owner_timer::OwnerTimer::new(
+                    std::time::Duration::from_millis(100), std::time::Instant::now(),
+                );
                 // instance_id → numeric worker owner. Coids are minted as
                 // "{instance_id}-{counter}" in live/paper, so the prefix names
                 // the placing instance.
@@ -8851,13 +8849,56 @@ impl Engine {
                 let executor_update_rx = executor_update_rx
                     .unwrap_or_else(crossbeam_channel::never);
                 let mut shutdown_in_progress = false;
-                let lifecycle_retry_tick =
-                    crossbeam_channel::tick(std::time::Duration::from_micros(50));
-                let never_lifecycle_retry_rx =
-                    crossbeam_channel::never::<std::time::Instant>();
                 let mut lifecycle_outboxes = LifecycleOwnerOutboxes::new(instance_ids.len());
                 'router: loop {
+                    // Owner-local timers cannot be held by a preempted FIFO
+                    // peer through AtomicCell's hashed global locks. The loop
+                    // also flushes lifecycle outboxes before every select, so
+                    // the <=10us idle poll replaces the old 50us retry ticker.
+                    if supervisor_timer.take_due(std::time::Instant::now()) {
+                        market_rx.mark_phase(1);
+                        if latest_key_ids.capacity_fallbacks
+                            != latest_capacity_fallbacks_reported
+                        {
+                            warn!(
+                                "[market_queue_metric] latest_key_capacity_fallbacks={} active_keys={} capacity={}",
+                                latest_key_ids.capacity_fallbacks,
+                                latest_key_ids.key_to_handle.len(),
+                                MAX_LATEST_MARKET_KEYS,
+                            );
+                            latest_capacity_fallbacks_reported =
+                                latest_key_ids.capacity_fallbacks;
+                        }
+                        let now = elapsed_ns(&supervisor_origin);
+                        for idx in 0..worker_heartbeats.len() {
+                            if worker_quarantined[idx].load(Ordering::Acquire) {
+                                if now.saturating_sub(last_emergency_cancel_attempt_ns[idx])
+                                    >= 1_000_000_000
+                                {
+                                    let _ = enqueue_emergency_instance_cancel(
+                                        idx,
+                                        &instance_ids[idx],
+                                        "periodic quarantine cancel retry",
+                                        &signal_tx,
+                                    );
+                                    last_emergency_cancel_attempt_ns[idx] = now;
+                                }
+                                continue;
+                            }
+                            let last = worker_heartbeats[idx].load(Ordering::Acquire);
+                            if now.saturating_sub(last) >= STRATEGY_WORKER_STALL_NS {
+                                quarantine_strategy_worker(
+                                    idx,
+                                    "strategy worker heartbeat stalled for at least 5s",
+                                    &instance_ids,
+                                    &worker_quarantined,
+                                    &signal_tx,
+                                );
+                            }
+                        }
+                    }
                     let market_poll_interval = market_rx.poll_interval();
+                    market_rx.mark_phase(2);
                     if let Err(failure) = lifecycle_outboxes.try_flush_one(&update_txs) {
                         if handle_lifecycle_route_failure(
                             &failure,
@@ -8869,11 +8910,6 @@ impl Engine {
                             break 'router;
                         }
                     }
-                    let selectable_lifecycle_retry_rx = if lifecycle_outboxes.has_pending() {
-                        &lifecycle_retry_tick
-                    } else {
-                        &never_lifecycle_retry_rx
-                    };
                     // Private/order lifecycle is lossless and strictly higher
                     // priority than replaceable market data. The previous
                     // four-message budget deliberately scheduled a market
@@ -8881,11 +8917,13 @@ impl Engine {
                     // 10–27 ms apply tails. A continuously-ready lifecycle
                     // lane now drains before quote work; bounded per-owner
                     // queues and quarantine retain explicit backpressure.
+                    market_rx.mark_phase(3);
                     crossbeam_channel::select_biased! {
                         recv(update_rx) -> msg => match msg {
                             // Cold compatibility route. Once admitted, the
                             // numeric owner is carried in the queue envelope.
                             Ok(u) => {
+                                market_rx.mark_phase(2);
                                 match Self::route_private_update(
                                     u,
                                     &iid_to_idx,
@@ -8908,6 +8946,7 @@ impl Engine {
                         },
                         recv(executor_update_rx) -> msg => match msg {
                             Ok(routed) => {
+                                market_rx.mark_phase(2);
                                 match Self::route_executor_update(
                                     routed,
                                     &iid_to_idx,
@@ -8970,6 +9009,7 @@ impl Engine {
                                 }
                             }
                             Ok(event) => {
+                                market_rx.mark_phase(4);
                                 if shutdown_in_progress { continue; }
                                 let event = Arc::new(event);
                                 let mut dropped_mask = Self::route_market_event(
@@ -8993,6 +9033,7 @@ impl Engine {
                                         &signal_tx,
                                     );
                                 }
+                                market_rx.mark_phase(5);
                                 forward_recorder_shared(recorder_tx.as_ref(), event);
                                 if market_overflow_drops.iter().any(|drops| *drops > 0)
                                     && market_overflow_log_at.elapsed()
@@ -9066,7 +9107,6 @@ impl Engine {
                                 break 'router;
                             }
                         },
-                        recv(selectable_lifecycle_retry_rx) -> _ => {},
                         recv(worker_status_rx) -> msg => {
                             if let Ok((idx, panicked)) = msg {
                                 let reason = if panicked {
@@ -9079,47 +9119,7 @@ impl Engine {
                                 );
                             }
                         },
-                        recv(supervisor_tick) -> _ => {
-                            if latest_key_ids.capacity_fallbacks
-                                != latest_capacity_fallbacks_reported
-                            {
-                                warn!(
-                                    "[market_queue_metric] latest_key_capacity_fallbacks={} active_keys={} capacity={}",
-                                    latest_key_ids.capacity_fallbacks,
-                                    latest_key_ids.key_to_handle.len(),
-                                    MAX_LATEST_MARKET_KEYS,
-                                );
-                                latest_capacity_fallbacks_reported =
-                                    latest_key_ids.capacity_fallbacks;
-                            }
-                            let now = elapsed_ns(&supervisor_origin);
-                            for idx in 0..worker_heartbeats.len() {
-                                if worker_quarantined[idx].load(Ordering::Acquire) {
-                                    if now.saturating_sub(last_emergency_cancel_attempt_ns[idx])
-                                        >= 1_000_000_000
-                                    {
-                                        let _ = enqueue_emergency_instance_cancel(
-                                            idx,
-                                            &instance_ids[idx],
-                                            "periodic quarantine cancel retry",
-                                            &signal_tx,
-                                        );
-                                        last_emergency_cancel_attempt_ns[idx] = now;
-                                    }
-                                    continue;
-                                }
-                                let last = worker_heartbeats[idx].load(Ordering::Acquire);
-                                if now.saturating_sub(last) >= STRATEGY_WORKER_STALL_NS {
-                                    quarantine_strategy_worker(
-                                        idx,
-                                        "strategy worker heartbeat stalled for at least 5s",
-                                        &instance_ids,
-                                        &worker_quarantined,
-                                        &signal_tx,
-                                    );
-                                }
-                            }
-                        },
+
                     }
                 }
 
@@ -9513,7 +9513,9 @@ impl Engine {
         let mut lifecycle_sequence = 0u64;
         let mut historical_epoch = 0u64;
         let mut shutdown_started = false;
-        let watchdog_rx = crossbeam_channel::tick(std::time::Duration::from_millis(100));
+        let mut watchdog_timer = hexagent_runtime::owner_timer::OwnerTimer::new(
+            Duration::from_millis(100), std::time::Instant::now(),
+        );
         let never_private_update_rx = crossbeam_channel::never::<OrderUpdate>();
         let never_direct_private_rx = crossbeam_channel::never::<RoutedOrderUpdate>();
         let never_compat_update_rx = crossbeam_channel::never::<QueuedOrderUpdate>();
@@ -9522,7 +9524,6 @@ impl Engine {
         let mut lifecycle_intake_paused = strategy.startup_lifecycle_intake_paused();
         let never_private_control_rx =
             crossbeam_channel::never::<crate::exchange::PrivateFeedControl>();
-        let never_watchdog_rx = crossbeam_channel::never::<std::time::Instant>();
         let mut last_watchdog_run = std::time::Instant::now();
         let mut admission = AdmissionConsumer::new(admission_rx);
         let never_admission_rx = crossbeam_channel::never::<ExecutionAdmission>();
@@ -9560,14 +9561,88 @@ impl Engine {
             } else {
                 &never_private_control_rx
             };
-            let selectable_watchdog_rx = if !lifecycle_intake_paused
-                && !market_rx.is_empty()
-                && last_watchdog_run.elapsed() < WATCHDOG_MAX_DEFERRAL
-            {
-                &never_watchdog_rx
-            } else {
-                &watchdog_rx
-            };
+            // No timer receiver: AtomicCell<Instant> can fall back to global
+            // hashed locks shared with lower-priority FIFO peers. Check an
+            // owner-local deadline only after all lifecycle lanes are empty.
+            let watchdog_now = std::time::Instant::now();
+            let watchdog_allowed = (lifecycle_intake_paused || market_rx.is_empty()
+                || last_watchdog_run.elapsed() >= WATCHDOG_MAX_DEFERRAL)
+                && selectable_private_update_rx.is_empty()
+                && selectable_direct_private_rx.is_empty()
+                && selectable_compat_update_rx.is_empty()
+                && selectable_private_control_rx.is_empty()
+                && hist_result_rx.is_empty();
+            if watchdog_allowed && watchdog_timer.take_due(watchdog_now) {
+                if quarantined.load(Ordering::Acquire) { break 'worker; }
+                heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
+                if shutdown_started { continue; }
+                let callback_started = crate::latency::Instant::now();
+                callback_signal_batch.clear();
+                if let Err(overflow) = strategy.on_watchdog_into(
+                    crate::types::now_ns(),
+                    &mut callback_signal_batch,
+                ) {
+                    callback_signal_batch.clear();
+                    handle_signal_batch_overflow(
+                        overflow,
+                        &signal_tx,
+                        &quarantined,
+                        instance_id,
+                    );
+                    break 'worker;
+                }
+                lifecycle_intake_paused = strategy.startup_lifecycle_intake_paused();
+                if let Some(reason) = strategy.startup_lifecycle_failure() {
+                    // Startup-only terminal path: retain strategy/FIFO and
+                    // upstream lifecycle ownership until explicit shutdown.
+                    // Restart/replay is required; no partial signal batch
+                    // or recovery ACK can turn this into successful startup.
+                    callback_signal_batch.clear();
+                    lifecycle_intake_paused = true;
+                    quarantined.store(true, Ordering::Release);
+                    error!(
+                        "[strategy_worker] instance={} startup lifecycle handoff failed: {}; quarantined pending controlled restart/replay",
+                        instance_id, reason,
+                    );
+                    let _ = enqueue_emergency_instance_cancel(
+                        idx, instance_id, reason, &signal_tx,
+                    );
+                    loop {
+                        if shutdown_requested.load(Ordering::Acquire) {
+                            if !shutdown_started {
+                                strategy.on_exit();
+                                shutdown_started = true;
+                                let _ = shutdown_ack_tx.send(idx);
+                            }
+                            break;
+                        }
+                        match market_rx.recv_timeout(Duration::from_millis(100)) {
+                            Ok(queued) => {
+                                if resolve_market_event(queued, &latest_market)
+                                    .is_some_and(|event| matches!(event.event.as_ref(), MarketEvent::Exit))
+                                {
+                                    if !shutdown_started {
+                                        strategy.on_exit();
+                                        shutdown_started = true;
+                                    }
+                                    break;
+                                }
+                            }
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                    break 'worker;
+                }
+                for sig in callback_signal_batch.drain(..) {
+                    if !emit(sig) { break 'worker; }
+                }
+                crate::latency::record("strategy.watchdog.callback", callback_started);
+                last_watchdog_run = std::time::Instant::now();
+                continue;
+            }
+            // Ready market/private receivers still win over this timeout.
+            let watchdog_wait = watchdog_timer.remaining(watchdog_now);
             let selectable_admission_rx = admission.receiver().unwrap_or(&never_admission_rx);
             crossbeam_channel::select_biased! {
                 recv(selectable_admission_rx) -> message => {
@@ -9764,74 +9839,6 @@ impl Engine {
                     }
                     Err(_) => break,
                 },
-                recv(selectable_watchdog_rx) -> _ => {
-                    if quarantined.load(Ordering::Acquire) { break 'worker; }
-                    heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
-                    if shutdown_started { continue; }
-                    let callback_started = crate::latency::Instant::now();
-                    callback_signal_batch.clear();
-                    if let Err(overflow) = strategy.on_watchdog_into(
-                        crate::types::now_ns(),
-                        &mut callback_signal_batch,
-                    ) {
-                        callback_signal_batch.clear();
-                        handle_signal_batch_overflow(
-                            overflow,
-                            &signal_tx,
-                            &quarantined,
-                            instance_id,
-                        );
-                        break 'worker;
-                    }
-                    lifecycle_intake_paused = strategy.startup_lifecycle_intake_paused();
-                    if let Some(reason) = strategy.startup_lifecycle_failure() {
-                        // Startup-only terminal path: retain strategy/FIFO and
-                        // upstream lifecycle ownership until explicit shutdown.
-                        // Restart/replay is required; no partial signal batch
-                        // or recovery ACK can turn this into successful startup.
-                        callback_signal_batch.clear();
-                        lifecycle_intake_paused = true;
-                        quarantined.store(true, Ordering::Release);
-                        error!(
-                            "[strategy_worker] instance={} startup lifecycle handoff failed: {}; quarantined pending controlled restart/replay",
-                            instance_id, reason,
-                        );
-                        let _ = enqueue_emergency_instance_cancel(
-                            idx, instance_id, reason, &signal_tx,
-                        );
-                        loop {
-                            if shutdown_requested.load(Ordering::Acquire) {
-                                if !shutdown_started {
-                                    strategy.on_exit();
-                                    shutdown_started = true;
-                                    let _ = shutdown_ack_tx.send(idx);
-                                }
-                                break;
-                            }
-                            match market_rx.recv_timeout(Duration::from_millis(100)) {
-                                Ok(queued) => {
-                                    if resolve_market_event(queued, &latest_market)
-                                        .is_some_and(|event| matches!(event.event.as_ref(), MarketEvent::Exit))
-                                    {
-                                        if !shutdown_started {
-                                            strategy.on_exit();
-                                            shutdown_started = true;
-                                        }
-                                        break;
-                                    }
-                                }
-                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                            }
-                        }
-                        break 'worker;
-                    }
-                    for sig in callback_signal_batch.drain(..) {
-                        if !emit(sig) { break 'worker; }
-                    }
-                    crate::latency::record("strategy.watchdog.callback", callback_started);
-                    last_watchdog_run = std::time::Instant::now();
-                },
                 recv(market_rx) -> msg => match msg {
                     Ok(queued) => {
                         let Some(queued) = resolve_market_event(queued, &latest_market) else {
@@ -9999,6 +10006,7 @@ impl Engine {
                     }
                     Err(_) => break,
                 },
+                default(watchdog_wait) => {},
             }
         }
         drop(hist_result_rx);

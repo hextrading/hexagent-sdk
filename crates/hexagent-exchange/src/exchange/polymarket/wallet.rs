@@ -5896,6 +5896,41 @@ pub(crate) fn ctf_outcome_token_ids(condition_id: &str) -> Result<(String, Strin
     Ok((derive(1)?, derive(2)?))
 }
 
+/// Seed retries replay the confirmed condition/owner allocation, never a new
+/// split. Partial or mismatched proof remains closed for an explicit audit.
+fn confirmed_seed_replay(
+    operations: &[hexagent_account::account::shared_account::MaintenanceOperation],
+    tokens: &[String],
+    allocations: &std::collections::HashMap<String, f64>,
+) -> std::result::Result<bool, String> {
+    use hexagent_account::account::shared_account::{MaintenanceOperationKind, MaintenanceOperationStatus};
+    if allocations.is_empty() { return Ok(false); }
+    let mut funded = std::collections::HashMap::<&str, f64>::new();
+    for operation in operations.iter().filter(|operation|
+        operation.kind == MaintenanceOperationKind::Split
+            && operation.status == MaintenanceOperationStatus::Confirmed)
+    {
+        if !operation.allocations.keys().any(|owner| allocations.contains_key(owner)) { continue; }
+        if tokens.len() != 2 || operation.up_token_id != tokens[0] || operation.down_token_id != tokens[1] {
+            return Err("confirmed seed token identity mismatch".into());
+        }
+        for (owner, amount) in &operation.allocations {
+            if allocations.contains_key(owner) {
+                if !amount.is_finite() || *amount <= 0.0 { return Err("invalid confirmed seed allocation".into()); }
+                *funded.entry(owner.as_str()).or_default() += amount;
+            }
+        }
+    }
+    if funded.is_empty() { return Ok(false); }
+    if allocations.iter().all(|(owner, amount)| amount.is_finite() && *amount > 0.0
+        && funded.get(owner.as_str()).is_some_and(|value| (value - amount).abs() < 1e-9))
+    {
+        Ok(true)
+    } else {
+        Err("partial or mismatched confirmed seed allocation; refusing duplicate split".into())
+    }
+}
+
 fn run_maintenance_job(
     job: MaintenanceJob,
     split_allocations: std::collections::HashMap<String, f64>,
@@ -5927,18 +5962,6 @@ fn run_maintenance_job(
             s.store(MaintenanceStatus::Running);
         }
 
-        if let Err(reason) = validate_maintenance_split_target(
-            split_target_condition_id.as_deref(),
-            &split_target_token_ids,
-            split_execute_before_secs,
-            unix_now_secs(),
-        ) {
-            log::warn!("[Maintenance] Split rejected before execution: {}", reason);
-            if let Some(s) = status {
-                s.store(MaintenanceStatus::SplitFailedOrPending { reason });
-            }
-            return;
-        }
 
         log::info!(
                 "[Maintenance] Starting: series_id={:?} split_amount_usdc={} gas_via_signer={} redeem_enabled={}",
@@ -5971,6 +5994,47 @@ fn run_maintenance_job(
                 return;
             }
         }
+
+        // Prior finality may have committed this exact seed after the first
+        // attempt timed out. Re-emit its positive proof through the original
+        // per-instance channel instead of generating another operation ID.
+        if let (Some(account), Some(cid)) = (account_state.as_ref(), split_target_condition_id.as_deref()) {
+            match confirmed_seed_replay(
+                &account.maintenance_operations_for_condition(cid),
+                &split_target_token_ids, &split_allocations,
+            ) {
+                Ok(true) => {
+                    if let Err(reason) = account.flush_persistence(std::time::Duration::from_secs(2)) {
+                        if let Some(s) = status { s.store(MaintenanceStatus::SplitFailedOrPending { reason }); }
+                    } else {
+                        log::info!("[Maintenance] replaying confirmed seed inventory account={} cid={}", account_id, cid);
+                        if let Some(s) = status { s.store(MaintenanceStatus::Succeeded); }
+                    }
+                    return;
+                }
+                Err(reason) => {
+                    if let Some(s) = status { s.store(MaintenanceStatus::SplitFailedOrPending { reason }); }
+                    return;
+                }
+                Ok(false) => {}
+            }
+        }
+
+        // A late retry may still recover/replay the original operation above,
+        // but it must not submit new chain work after the seed deadline.
+        if let Err(reason) = validate_maintenance_split_target(
+            split_target_condition_id.as_deref(),
+            &split_target_token_ids,
+            split_execute_before_secs,
+            unix_now_secs(),
+        ) {
+            log::warn!("[Maintenance] Split rejected before execution: {}", reason);
+            if let Some(s) = status {
+                s.store(MaintenanceStatus::SplitFailedOrPending { reason });
+            }
+            return;
+        }
+
 
         // ── Step 1: redeem matured positions ──
         // Gated by `redeem_enabled`. When off, redeem is skipped (no
@@ -6357,6 +6421,30 @@ pub fn run_split() -> Result<()> {
 #[cfg(test)]
 mod maintenance_status_tests {
     use super::*;
+
+    #[test]
+    fn recovered_seed_replay_requires_exact_owner_tokens_and_confirmed_amount() {
+        use hexagent_account::account::shared_account::{MaintenanceOperation, MaintenanceOperationKind, MaintenanceOperationStatus};
+        let mut operation = MaintenanceOperation {
+            operation_id: "original".into(), kind: MaintenanceOperationKind::Split,
+            condition_id: "event".into(), up_token_id: "UP".into(), down_token_id: "DOWN".into(),
+            allocations: [("btc01".into(), 40.0)].into(), tx_id: Some("tx".into()),
+            status: MaintenanceOperationStatus::Uncertain, created_at_ms: 1, updated_at_ms: 2, detail: None,
+        };
+        let tokens = vec!["UP".into(), "DOWN".into()];
+        let allocations = [("btc01".into(), 40.0)].into();
+        assert_eq!(confirmed_seed_replay(&[operation.clone()], &tokens, &allocations), Ok(false));
+        operation.status = MaintenanceOperationStatus::Confirmed;
+        for _ in 0..2 { // Retry/replay must reuse the same positive evidence.
+            assert_eq!(confirmed_seed_replay(&[operation.clone()], &tokens, &allocations), Ok(true));
+        }
+        assert_eq!(confirmed_seed_replay(&[operation.clone()], &tokens,
+            &[("btc02".into(), 40.0)].into()), Ok(false));
+        assert!(confirmed_seed_replay(&[operation.clone()], &["OTHER".into(), "DOWN".into()], &allocations).is_err());
+        assert!(confirmed_seed_replay(&[operation.clone()], &tokens, &[("btc01".into(), 80.0)].into()).is_err());
+        operation.status = MaintenanceOperationStatus::Failed;
+        assert_eq!(confirmed_seed_replay(&[operation], &tokens, &allocations), Ok(false));
+    }
 
     fn maintenance_job(target: Option<&str>, end_date_min_secs: u64) -> MaintenanceJob {
         MaintenanceJob {

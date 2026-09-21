@@ -1,0 +1,10 @@
+   Compiling hexagent-runtime v0.1.0 (/Users/Admin1/projects/hexagent-sdk-postrestart-20260921/crates/hexagent-runtime)
+    Finished `release` profile [optimized] target(s) in 50.99s
+     Running unittests src/lib.rs (/Users/Admin1/projects/hexagent-sdk/target/release/deps/hexagent_runtime-c8193195ef0ef5f9)
+
+running 1 test
+timer_select_pop before=true n=200000 p50_ns=519 p99_ns=897 p999_ns=1003 max_ns=49578 queue_high_water=1 overflow=0
+timer_select_pop before=false n=200000 p50_ns=324 p99_ns=334 p999_ns=339 max_ns=27382 queue_high_water=1 overflow=0
+test owner_timer::tests::owner_timer_router_turn_benchmark ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 70 filtered out; finished in 0.19s

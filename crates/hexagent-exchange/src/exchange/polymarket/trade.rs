@@ -1260,6 +1260,9 @@ pub(crate) enum HttpErr {
     /// server may still have accepted the signed order, so submit callers
     /// must reconcile it instead of treating it as a definitive rejection.
     Transport(String),
+    /// Typed pre-dispatch failure (connect or slot-wait deadline). Never infer this
+    /// from elapsed time, empty lookups, or a generic SendRequest error.
+    NotSent(String),
     /// An HTTP-success response was received, but its body could not be
     /// decoded into the documented JSON representation. Placement callers
     /// must treat this as ambiguous: the server may have committed the order
@@ -1274,6 +1277,7 @@ impl std::fmt::Display for HttpErr {
             HttpErr::Timeout => write!(f, "timeout"),
             HttpErr::Status(code, body) => write!(f, "status {} ({})", code, body),
             HttpErr::Transport(s) => write!(f, "transport: {}", s),
+            HttpErr::NotSent(s) => write!(f, "not sent: {}", s),
             HttpErr::InvalidResponse(s) => write!(f, "invalid response: {}", s),
             HttpErr::Other(s) => write!(f, "{}", s),
         }
@@ -1298,7 +1302,7 @@ impl HttpErr {
     fn fetch_unavailable(&self) -> FetchUnavailable {
         match self {
             HttpErr::Timeout => FetchUnavailable::Timeout,
-            HttpErr::Transport(_) => FetchUnavailable::Transport,
+            HttpErr::Transport(_) | HttpErr::NotSent(_) => FetchUnavailable::Transport,
             HttpErr::Status(code, _) => FetchUnavailable::Http(*code),
             HttpErr::InvalidResponse(message) | HttpErr::Other(message) => {
                 FetchUnavailable::InvalidResponse(compact_order_lookup_evidence_text(message))
@@ -1330,7 +1334,7 @@ impl HttpErr {
         match self {
             HttpErr::Timeout => true,
             HttpErr::Status(code, _) => *code >= 500 || *code == 425,
-            HttpErr::Transport(_) => false,
+            HttpErr::Transport(_) | HttpErr::NotSent(_) => false,
             HttpErr::InvalidResponse(_) => false,
             HttpErr::Other(_) => false,
         }
@@ -2647,7 +2651,7 @@ fn latency_record_status(reply: &HttpReply) -> crate::latency_record::RequestSta
         Ok(_) => RequestStatus::Ok,
         Err(HttpErr::Timeout) => RequestStatus::Timeout,
         Err(HttpErr::Status(code, _)) => RequestStatus::Http(*code),
-        Err(HttpErr::Transport(_)) => RequestStatus::TransportError,
+        Err(HttpErr::Transport(_) | HttpErr::NotSent(_)) => RequestStatus::TransportError,
         Err(HttpErr::InvalidResponse(_)) => RequestStatus::InvalidResponse,
         Err(HttpErr::Other(_)) => RequestStatus::Error,
     }
@@ -2838,7 +2842,9 @@ async fn execute_http_on(
             let timings = error.timings;
             let elapsed_ns = error.timings.total_ns;
             let attempted =
-                error.kind != crate::instrumented_http1::InstrumentedHttp1ErrorKind::InvalidRequest;
+                !matches!(error.kind,
+                    crate::instrumented_http1::InstrumentedHttp1ErrorKind::InvalidRequest
+                    | crate::instrumented_http1::InstrumentedHttp1ErrorKind::QueueTimeout);
             if attempted {
                 client.note_instrumented_transport_failure(instrumented_prewarm_url(url.as_ref()));
             }
@@ -2846,6 +2852,10 @@ async fn execute_http_on(
                 crate::instrumented_http1::InstrumentedHttp1ErrorKind::Timeout => HttpErr::Timeout,
                 crate::instrumented_http1::InstrumentedHttp1ErrorKind::Transport => {
                     HttpErr::Transport(error.message)
+                }
+                crate::instrumented_http1::InstrumentedHttp1ErrorKind::Connect
+                | crate::instrumented_http1::InstrumentedHttp1ErrorKind::QueueTimeout => {
+                    HttpErr::NotSent(error.message)
                 }
                 crate::instrumented_http1::InstrumentedHttp1ErrorKind::InvalidRequest => {
                     HttpErr::Other(error.message)
@@ -2877,6 +2887,8 @@ async fn execute_http_on(
                     crate::instrumented_http1::InstrumentedHttp1ErrorKind::Transport => {
                         "transport_error"
                     }
+                    crate::instrumented_http1::InstrumentedHttp1ErrorKind::Connect => "not_sent",
+                    crate::instrumented_http1::InstrumentedHttp1ErrorKind::QueueTimeout => "slot_wait_timeout",
                     crate::instrumented_http1::InstrumentedHttp1ErrorKind::InvalidRequest => {
                         "invalid_request"
                     }
@@ -2959,6 +2971,9 @@ fn record_http1_phase_timings(
             crate::instrumented_http1::Http1IncompletePhase::Tls => {
                 "polymarket.http.incomplete.tls"
             }
+            crate::instrumented_http1::Http1IncompletePhase::SlotWait => {
+                "polymarket.http.incomplete.slot_wait"
+            }
             crate::instrumented_http1::Http1IncompletePhase::Ttfb => {
                 "polymarket.http.incomplete.ttfb"
             }
@@ -3040,7 +3055,7 @@ fn record_http1_phase_timings(
 /// depleted account cannot bypass its capacity by using a global fallback.
 fn cancel_connection_failure_hedge_allowed(method: &reqwest::Method, reply: &HttpReply) -> bool {
     *method == reqwest::Method::DELETE
-        && matches!(reply, Err(HttpErr::Timeout | HttpErr::Transport(_)))
+        && matches!(reply, Err(HttpErr::Timeout | HttpErr::Transport(_) | HttpErr::NotSent(_)))
 }
 
 async fn execute_http_with_cancel_connection_failure_hedge(
@@ -15618,6 +15633,13 @@ mod tests {
     /// classifier.
     #[test]
     fn transport_error_is_unknown_for_submit_only() {
+        let not_sent = HttpErr::NotSent("connect: connection refused".into());
+        assert!(!not_sent.is_submit_unknown_state());
+        assert!(!not_sent.is_unknown_state());
+        assert!(!cancel_connection_failure_hedge_allowed(&reqwest::Method::POST, &Err(not_sent)));
+        assert!(cancel_connection_failure_hedge_allowed(&reqwest::Method::DELETE,
+            &Err(HttpErr::NotSent("connect: connection refused".into()))));
+
         let transport = HttpErr::Transport(
             "error sending request for url (https://clob.polymarket.com/order)".to_string(),
         );
