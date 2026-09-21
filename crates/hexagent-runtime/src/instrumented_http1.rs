@@ -247,6 +247,7 @@ pub enum Http1IncompletePhase {
     Dns,
     Tcp,
     Tls,
+    SlotWait,
     Ttfb,
     Body,
 }
@@ -258,6 +259,7 @@ impl Http1IncompletePhase {
             Self::Dns => "dns",
             Self::Tcp => "tcp",
             Self::Tls => "tls",
+            Self::SlotWait => "slot_wait",
             Self::Ttfb => "ttfb",
             Self::Body => "body",
         }
@@ -285,6 +287,10 @@ pub struct InstrumentedHttp1Response {
 pub enum InstrumentedHttp1ErrorKind {
     Timeout,
     Transport,
+    /// Connector failed before HTTP dispatch; the signed order was not sent.
+    Connect,
+    /// Deadline elapsed while another request still owned this slot.
+    QueueTimeout,
     InvalidRequest,
 }
 
@@ -293,6 +299,19 @@ pub struct InstrumentedHttp1Error {
     pub kind: InstrumentedHttp1ErrorKind,
     pub message: String,
     pub timings: Http1PhaseTimings,
+}
+
+// Cold error path only. Display on hyper-util drops the cause (e.g. reset,
+// broken pipe, EOF); retain it without printing the request or auth headers.
+fn http_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        use std::fmt::Write as _;
+        let _ = write!(message, ": {cause}");
+        source = cause.source();
+    }
+    message
 }
 
 impl InstrumentedHttp1Client {
@@ -349,11 +368,21 @@ impl InstrumentedHttp1Client {
         timeout: Duration,
     ) -> Result<InstrumentedHttp1Response, InstrumentedHttp1Error> {
         let gate_started = Instant::now();
-        let _request_guard = self
-            .request_gate
-            .acquire()
-            .await
-            .expect("instrumented HTTP/1 request gate is never closed");
+        let deadline = tokio::time::Instant::now() + timeout;
+        let _request_guard = match tokio::time::timeout_at(deadline, self.request_gate.acquire()).await {
+            Ok(guard) => guard.expect("instrumented HTTP/1 request gate is never closed"),
+            Err(_) => return Err(InstrumentedHttp1Error {
+                kind: InstrumentedHttp1ErrorKind::QueueTimeout,
+                message: format!("HTTP/1 slot wait exceeded {}ms; request not sent", timeout.as_millis()),
+                // Do not read the active request's connect trace or retire its
+                // healthy socket for a request that never acquired ownership.
+                timings: Http1PhaseTimings {
+                    slot_wait_ns: duration_ns(gate_started.elapsed()),
+                    incomplete_phase: Http1IncompletePhase::SlotWait,
+                    ..Http1PhaseTimings::default()
+                },
+            }),
+        };
         let slot_wait_ns = duration_ns(gate_started.elapsed());
         let attempts_before = self.trace.attempts.load(Ordering::Acquire);
         let generation_before = self.trace.generation.load(Ordering::Acquire);
@@ -383,7 +412,14 @@ impl InstrumentedHttp1Client {
                 .client
                 .request(request)
                 .await
-                .map_err(|error| (InstrumentedHttp1ErrorKind::Transport, error.to_string()))?;
+                .map_err(|error| {
+                    let kind = if error.is_connect() {
+                        InstrumentedHttp1ErrorKind::Connect
+                    } else {
+                        InstrumentedHttp1ErrorKind::Transport
+                    };
+                    (kind, http_error_chain(&error))
+                })?;
             let headers_ns = duration_ns(headers_started.elapsed());
             headers_completed_ns.store(headers_ns, Ordering::Release);
             if let Some(info) = response.extensions().get::<HttpInfo>() {
@@ -396,12 +432,12 @@ impl InstrumentedHttp1Client {
                 .into_body()
                 .collect()
                 .await
-                .map_err(|error| (InstrumentedHttp1ErrorKind::Transport, error.to_string()))?
+                .map_err(|error| (InstrumentedHttp1ErrorKind::Transport, http_error_chain(&error)))?
                 .to_bytes();
             let body_ns = duration_ns(body_started.elapsed());
             Ok::<_, (InstrumentedHttp1ErrorKind, String)>((status, body, headers_ns, body_ns))
         };
-        match tokio::time::timeout(timeout, operation).await {
+        match tokio::time::timeout_at(deadline, operation).await {
             Ok(Ok((status, body, headers_ns, body_ns))) => {
                 let timings = self.snapshot(
                     attempts_before,
@@ -547,6 +583,53 @@ fn duration_ns(duration: Duration) -> u64 {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refused_connection_is_not_sent_but_lost_response_stays_ambiguous() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let n = stream.read(&mut request).await.unwrap();
+            assert!(n > 0); // Server saw the POST, then lost its response.
+            assert!(request[..n].starts_with(b"POST "));
+        });
+        let client = InstrumentedHttp1Client::new(Duration::from_secs(1)).unwrap();
+        let url = format!("http://{addr}/order");
+        let error = client.request(reqwest::Method::POST, &url,
+            reqwest::header::HeaderMap::new(), Bytes::from_static(b"signed-order"),
+            Duration::from_secs(1)).await.unwrap_err();
+        server.await.unwrap();
+        assert_eq!(error.kind, InstrumentedHttp1ErrorKind::Transport);
+        assert!(error.message.contains(": "), "underlying cause is retained: {}", error.message);
+        // Listener is now gone; the connector can prove this second request
+        // never reached an HTTP connection. No inferred elapsed-time cutoff.
+        let error = client.request(reqwest::Method::POST, &url,
+            reqwest::header::HeaderMap::new(), Bytes::from_static(b"signed-order"),
+            Duration::from_secs(1)).await.unwrap_err();
+        assert_eq!(error.kind, InstrumentedHttp1ErrorKind::Connect);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_request_deadline_expires_without_sending_or_touching_active_trace() {
+        let client = InstrumentedHttp1Client::new(Duration::from_secs(1)).unwrap();
+        let guard = client.request_gate.acquire().await.unwrap();
+        client.trace.generation.store(7, Ordering::Relaxed);
+        client.trace.phase.store(PHASE_BODY, Ordering::Relaxed);
+        let error = client.request(reqwest::Method::POST, "http://127.0.0.1:1/order",
+            reqwest::header::HeaderMap::new(), Bytes::from_static(b"must-not-send"),
+            Duration::from_millis(10)).await.unwrap_err();
+        assert_eq!(error.kind, InstrumentedHttp1ErrorKind::QueueTimeout);
+        assert_eq!(error.timings.incomplete_phase, Http1IncompletePhase::SlotWait);
+        assert_eq!(error.timings.total_ns, 0);
+        assert!(error.timings.slot_wait_ns >= 10_000_000);
+        assert_eq!(client.trace.attempts.load(Ordering::Relaxed), 0);
+        assert_eq!(client.trace.phase.load(Ordering::Relaxed), PHASE_BODY);
+        assert_eq!(client.trace.generation.load(Ordering::Relaxed), 7);
+        drop(guard);
+        assert_eq!(client.request_gate.available_permits(), 1);
+    }
 
     async fn serve_one_request(
         listener: &tokio::net::TcpListener,

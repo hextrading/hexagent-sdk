@@ -111,3 +111,19 @@ fn startup_seed_requires_snapshot_and_keeps_mirror_fault_fail_closed() {
     assert!(!seed.fee_degraded_only);
     assert!(seed.uncertain_reason.unwrap().contains("mirror"));
 }
+
+#[test]
+fn startup_seed_pairs_confirmed_split_identity_with_its_owner_balance() {
+    let account = setup();
+    account.reserve_maintenance_operation("seed-split", MaintenanceOperationKind::Split,
+        "condition", "UP", "DOWN", &[("owner".into(), 40.0)].into()).unwrap();
+    let pending = account.capture_instance_startup_seed("owner").unwrap();
+    assert!(pending.confirmed_split_conditions.is_empty());
+    account.mark_maintenance_operation_submitted("seed-split", "relayer-job").unwrap();
+    account.confirm_maintenance_operation("seed-split").unwrap();
+    let confirmed = account.capture_instance_startup_seed("owner").unwrap();
+    assert!(confirmed.confirmed_split_conditions.contains("condition"));
+    assert_eq!(confirmed.snapshot.positions["UP"], 40.0);
+    assert_eq!(confirmed.snapshot.cash, 60.0);
+    assert!(account.capture_instance_startup_seed("sibling").unwrap().confirmed_split_conditions.is_empty());
+}

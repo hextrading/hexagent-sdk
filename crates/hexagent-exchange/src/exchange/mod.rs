@@ -71,6 +71,7 @@ struct PublicMarketProgress {
 struct PublicMarketConsumerClock {
     last_poll_ns: AtomicU64,
     polls: AtomicU64,
+    phase: AtomicU8,
 }
 
 /// Immutable scalar diagnostics, read by the existing background supervisor.
@@ -82,6 +83,7 @@ pub struct PublicMarketConsumerProgress {
     pub pending: usize,
     pub capacity_per_lane: usize,
     pub contention_drops: u64,
+    pub phase: u8,
 }
 
 /// Sole consumer is the feed owner (adapter lane) or root strategy router.
@@ -97,6 +99,13 @@ pub struct PublicMarketReceiver {
 }
 
 impl PublicMarketReceiver {
+    /// Sole-consumer breadcrumb; a background reader formats it. A relaxed
+    /// scalar store adds no clock read, allocation, lock, or producer wakeup.
+    /// 0=unclassified, 1=supervisor, 2=lifecycle, 3=select, 4=market, 5=recorder.
+    pub fn mark_phase(&self, phase: u8) {
+        self.progress.clock.phase.store(phase, Ordering::Relaxed);
+    }
+
     pub fn try_recv(&self) -> std::result::Result<MarketEvent, crossbeam_channel::TryRecvError> {
         self.progress.clock.last_poll_ns.store(
             self.progress
@@ -186,6 +195,7 @@ pub fn market_event_channel(capacity: usize) -> (PublicMarketPublisher, PublicMa
         clock: PublicMarketConsumerClock {
             last_poll_ns: AtomicU64::new(0),
             polls: AtomicU64::new(0),
+            phase: AtomicU8::new(0),
         },
     });
     (
@@ -223,6 +233,7 @@ impl PublicMarketPublisher {
             pending: self.ordered.len() + self.latest.len(),
             capacity_per_lane: self.ordered.capacity(),
             contention_drops: self.progress.contention_drops.load(Ordering::Relaxed),
+            phase: self.progress.clock.phase.load(Ordering::Relaxed),
         }
     }
 

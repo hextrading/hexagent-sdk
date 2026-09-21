@@ -1,0 +1,4 @@
+test result: ok. 324 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 12.23s
+test result: ok. 134 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 1.33s
+test result: ok. 903 passed; 0 failed; 35 ignored; 0 measured; 0 filtered out; finished in 8.98s
+test result: ok. 70 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.31s

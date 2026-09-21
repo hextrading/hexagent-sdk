@@ -973,7 +973,7 @@ fn fire_full_probe(
             let _ = orphan_owner.resolve(&signed.order_hash);
             (None, true)
         }
-        Err(e @ HttpErr::Other(_)) => {
+        Err(e @ (HttpErr::Other(_) | HttpErr::NotSent(_))) => {
             warn!("[RttProbe] probe place transport error (skip): {:?}", e);
             let _ = orphan_owner.resolve(&signed.order_hash);
             (None, false)
