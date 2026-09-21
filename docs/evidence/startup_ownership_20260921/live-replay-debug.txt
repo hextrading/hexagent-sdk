@@ -1,0 +1,9 @@
+running 1 test
+ownership_replay account=zhu02 mode=before recovered=26251 admitted=26251 capacity=65536 n=200000 boundary=find_entry_to_owned_arc p50_ns=3528 p99_ns=7941 p999_ns=31631 max_ns=116108 queue_depth=0 insertion_overflow=0 probe_budget=128
+ownership_replay account=zhu02 mode=after recovered=26251 admitted=26251 capacity=131072 n=200000 boundary=find_entry_to_owned_arc p50_ns=3534 p99_ns=5720 p999_ns=30542 max_ns=152380 queue_depth=0 insertion_overflow=0 probe_budget=128
+ownership_replay account=zhu03 mode=before recovered=53295 admitted=53288 capacity=65536 n=200000 boundary=find_entry_to_owned_arc p50_ns=3772 p99_ns=24870 p999_ns=50459 max_ns=148778 queue_depth=0 insertion_overflow=7 probe_budget=128
+ownership_replay account=zhu03 mode=after recovered=53295 admitted=53295 capacity=262144 n=200000 boundary=find_entry_to_owned_arc p50_ns=3610 p99_ns=5690 p999_ns=29776 max_ns=241178 queue_depth=0 insertion_overflow=0 probe_budget=128
+test exchange::polymarket::trade::tests::runtime_ownership_live_history_replay_profile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 940 filtered out; finished in 6.13s
+

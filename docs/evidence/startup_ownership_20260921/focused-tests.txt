@@ -1,0 +1,13 @@
+running 8 tests
+test exchange::polymarket::trade::tests::benchmark_runtime_ownership_bulk_retirement ... ignored, focused before/after benchmark of production runtime ownership retirement
+test exchange::polymarket::trade::tests::runtime_ownership_live_history_replay_profile ... ignored, requires HEXAGENT_OWNERSHIP_REPLAY_FIXTURE with sanitized recovered order identities
+runtime-ownership lookup: boundary=normalized_oid_view_to_fixed_table_match n=20000 p50_ns=1932 p99_ns=3399 p999_ns=19924 max_ns=38036 table_capacity=65536 probe_budget=128 queue_depth=0 overflow=0
+test exchange::polymarket::trade::tests::runtime_ownership_snapshot_publishes_insert_and_remove ... ok
+test exchange::polymarket::trade::tests::runtime_ownership_reader_never_waits_for_writer_serialization ... ok
+test exchange::polymarket::trade::tests::runtime_ownership_bulk_retirement_preserves_unrelated_and_replayed_routes ... ok
+test exchange::polymarket::trade::tests::runtime_ownership_numeric_lookup_latency_profile ... ok
+test exchange::polymarket::trade::tests::runtime_ownership_startup_capacity_and_runtime_overflow_fail_closed ... ok
+test exchange::polymarket::trade::tests::runtime_ownership_recovery_keeps_large_terminal_history_and_instance_routes ... ok
+
+test result: ok. 6 passed; 0 failed; 2 ignored; 0 measured; 933 filtered out; finished in 4.10s
+

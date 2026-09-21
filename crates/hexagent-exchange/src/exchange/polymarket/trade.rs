@@ -77,6 +77,9 @@ const REQUEST_BUFFER_SLOTS: usize = 64;
 const REQUEST_BUFFER_BYTES: usize = 2_048;
 const RUNTIME_OWNERSHIP_CAPACITY: usize = 65_536;
 const RUNTIME_OWNERSHIP_MAX_PROBES: usize = 128;
+// Startup-only sizing: keep recovered occupancy <= 25% and leave room for
+// new routes. Never resize a published table or extend the private read budget.
+const RUNTIME_OWNERSHIP_MAX_CAPACITY: usize = 4_194_304;
 
 fn new_request_buffer_pool() -> Arc<ArrayQueue<BytesMut>> {
     let pool = Arc::new(ArrayQueue::new(REQUEST_BUFFER_SLOTS));
@@ -102,21 +105,38 @@ struct RuntimeOwnershipEntry {
 }
 
 impl RuntimeOwnershipIndex {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_capacity(RUNTIME_OWNERSHIP_CAPACITY)
+    }
+
+    fn for_recovery(recovered_routes: usize) -> Result<Self, String> {
+        let capacity = recovered_routes
+            .checked_mul(4)
+            .and_then(usize::checked_next_power_of_two)
+            .map(|capacity| capacity.max(RUNTIME_OWNERSHIP_CAPACITY))
+            .filter(|capacity| *capacity <= RUNTIME_OWNERSHIP_MAX_CAPACITY)
+            .ok_or_else(|| format!(
+                "runtime ownership recovery exceeds bounded startup capacity: routes={recovered_routes} max_capacity={RUNTIME_OWNERSHIP_MAX_CAPACITY} max_load_percent=25"
+            ))?;
+        Ok(Self::with_capacity(capacity))
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
         Self {
-            slots: (0..RUNTIME_OWNERSHIP_CAPACITY)
+            slots: (0..capacity)
                 .map(|_| ArcSwapOption::empty())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         }
     }
 
-    fn start_index(order_id: &str) -> usize {
+    fn start_index(&self, order_id: &str) -> usize {
         let mut hasher = DefaultHasher::new();
         for byte in runtime_order_id_view(order_id).bytes() {
             hasher.write_u8(byte.to_ascii_lowercase());
         }
-        hasher.finish() as usize % RUNTIME_OWNERSHIP_CAPACITY
+        hasher.finish() as usize % self.slots.len()
     }
 
     fn insert(&self, order_id: &str, ownership: OrderOwnership) -> Result<(), String> {
@@ -125,7 +145,7 @@ impl RuntimeOwnershipIndex {
             normalized_order_id: Arc::clone(&normalized),
             ownership,
         });
-        let start = Self::start_index(&normalized);
+        let start = self.start_index(&normalized);
         for offset in 0..RUNTIME_OWNERSHIP_MAX_PROBES {
             let slot = &self.slots[(start + offset) % self.slots.len()];
             slot.rcu(|current| match current {
@@ -142,13 +162,13 @@ impl RuntimeOwnershipIndex {
         }
         Err(format!(
             "fixed runtime ownership table probe budget exhausted capacity={} probes={}",
-            RUNTIME_OWNERSHIP_CAPACITY, RUNTIME_OWNERSHIP_MAX_PROBES,
+            self.slots.len(), RUNTIME_OWNERSHIP_MAX_PROBES,
         ))
     }
 
     fn find_entry(&self, order_id: &str) -> Option<Arc<RuntimeOwnershipEntry>> {
         let normalized = runtime_order_id_view(order_id);
-        let start = Self::start_index(order_id);
+        let start = self.start_index(order_id);
         (0..RUNTIME_OWNERSHIP_MAX_PROBES).find_map(|offset| {
             let entry = self.slots[(start + offset) % self.slots.len()].load();
             entry
@@ -170,7 +190,7 @@ impl RuntimeOwnershipIndex {
 
     fn contains(&self, order_id: &str) -> bool {
         let normalized = runtime_order_id_view(order_id);
-        let start = Self::start_index(order_id);
+        let start = self.start_index(order_id);
         (0..RUNTIME_OWNERSHIP_MAX_PROBES).any(|offset| {
             self.slots[(start + offset) % self.slots.len()]
                 .load()
@@ -191,7 +211,7 @@ impl RuntimeOwnershipIndex {
 
     fn remove(&self, order_id: &str) {
         let normalized = runtime_order_id_view(order_id);
-        let start = Self::start_index(order_id);
+        let start = self.start_index(order_id);
         for offset in 0..RUNTIME_OWNERSHIP_MAX_PROBES {
             let slot = &self.slots[(start + offset) % self.slots.len()];
             if slot.load().as_ref().is_some_and(|entry| {
@@ -6836,7 +6856,20 @@ impl PolymarketTrade {
         let mut recovered_coid_to_oid = HashMap::new();
         let mut recovered_oid_to_coid = HashMap::new();
         let mut recovered_coid_to_token = HashMap::new();
-        let recovered_runtime_ownership = RuntimeOwnershipIndex::new();
+        let recovered_route_count = recovered_orders
+            .iter()
+            .filter(|order| !order.client_order_id.is_empty() && !order.order_id.is_empty())
+            .count();
+        let recovered_runtime_ownership =
+            RuntimeOwnershipIndex::for_recovery(recovered_route_count)
+                .map_err(anyhow::Error::msg)?;
+        info!(
+            "[PolymarketTrade] account={} startup ownership routes={} capacity={} probe_budget={}",
+            instance_id,
+            recovered_route_count,
+            recovered_runtime_ownership.slots.len(),
+            RUNTIME_OWNERSHIP_MAX_PROBES,
+        );
         for order in &recovered_orders {
             // Restore terminal mappings too: a late private trade lifecycle
             // must still resolve to the placing instance after restart.
@@ -14154,6 +14187,131 @@ mod tests {
             reserved_cash: 5.0,
             reserved_quantity: 0.0,
             status: OrderStatus::Pending,
+        }
+    }
+
+    #[test]
+    fn runtime_ownership_recovery_keeps_large_terminal_history_and_instance_routes() {
+        const ROUTES: usize = 80_000;
+        let index = RuntimeOwnershipIndex::for_recovery(ROUTES).unwrap();
+        assert_eq!(index.slots.len(), 524_288);
+        let sibling = RuntimeOwnershipIndex::for_recovery(0).unwrap();
+        for n in 0..ROUTES {
+            let oid = format!("0x{n:064x}");
+            let mut order = runtime_ownership(&oid, &format!("maker-{n}"));
+            order.status = OrderStatus::Cancelled;
+            order.reserved_cash = 0.0;
+            order.instance_id = format!("instance-{}", n % 2);
+            index.insert(&oid, order).unwrap();
+        }
+        for n in 0..ROUTES {
+            let oid = format!("  0X{n:064X} ");
+            let restored = index.get(&oid).unwrap();
+            assert_eq!(restored.client_order_id, format!("maker-{n}"));
+            assert_eq!(restored.instance_id, format!("instance-{}", n % 2));
+            assert!(!sibling.contains(&oid));
+        }
+        let oid = format!("0x{:064x}", ROUTES - 1);
+        let replay = index.get(&oid).unwrap();
+        index.insert(&oid, replay).unwrap();
+        index.remove(&oid);
+        assert!(!index.contains(&oid));
+        assert!(index.contains(&format!("0x{:064x}", ROUTES - 2)));
+        // Startup headroom also admits new live routes without resizing.
+        let capacity = index.slots.len();
+        index
+            .insert("0xnew", runtime_ownership("0xnew", "new"))
+            .unwrap();
+        assert_eq!(index.slots.len(), capacity);
+    }
+
+    #[test]
+    fn runtime_ownership_startup_capacity_and_runtime_overflow_fail_closed() {
+        assert_eq!(
+            RuntimeOwnershipIndex::for_recovery(0).unwrap().slots.len(),
+            65_536
+        );
+        assert_eq!(
+            RuntimeOwnershipIndex::for_recovery(53_295)
+                .unwrap()
+                .slots
+                .len(),
+            262_144
+        );
+        assert!(
+            RuntimeOwnershipIndex::for_recovery(RUNTIME_OWNERSHIP_MAX_CAPACITY / 4 + 1).is_err()
+        );
+        assert!(RuntimeOwnershipIndex::for_recovery(usize::MAX).is_err());
+        let index = RuntimeOwnershipIndex::with_capacity(RUNTIME_OWNERSHIP_MAX_PROBES);
+        for n in 0..RUNTIME_OWNERSHIP_MAX_PROBES {
+            let oid = format!("{n:064x}");
+            index
+                .insert(&oid, runtime_ownership(&oid, &format!("owner-{n}")))
+                .unwrap();
+        }
+        let error = index
+            .insert("new", runtime_ownership("new", "overflow"))
+            .unwrap_err();
+        assert!(error.contains("capacity=128 probes=128"));
+        assert!(!index.contains("new"));
+        for n in 0..RUNTIME_OWNERSHIP_MAX_PROBES {
+            assert_eq!(
+                index.client_order_id(&format!("{n:064x}")).unwrap(),
+                format!("owner-{n}")
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires HEXAGENT_OWNERSHIP_REPLAY_FIXTURE with sanitized recovered order identities"]
+    fn runtime_ownership_live_history_replay_profile() {
+        let fixture = std::env::var("HEXAGENT_OWNERSHIP_REPLAY_FIXTURE").unwrap();
+        let accounts: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+            serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
+        for (account, orders) in accounts {
+            for baseline in [true, false] {
+                let index = if baseline {
+                    RuntimeOwnershipIndex::new()
+                } else {
+                    RuntimeOwnershipIndex::for_recovery(orders.len()).unwrap()
+                };
+                let mut admitted = Vec::with_capacity(orders.len());
+                let mut overflow = 0;
+                for order in &orders {
+                    let oid = order["order_id"].as_str().unwrap();
+                    let mut ownership =
+                        runtime_ownership(oid, order["client_order_id"].as_str().unwrap());
+                    ownership.instance_id = order["instance_id"].as_str().unwrap().into();
+                    if index.insert(oid, ownership).is_ok() {
+                        admitted.push(order);
+                    } else {
+                        overflow += 1;
+                    }
+                }
+                if !baseline {
+                    assert_eq!(overflow, 0);
+                }
+                let mut samples = Vec::with_capacity(200_000);
+                for n in 0..200_000 {
+                    let order = admitted[n % admitted.len()];
+                    let oid = order["order_id"].as_str().unwrap();
+                    let started = std::time::Instant::now();
+                    let entry = index.find_entry(oid).unwrap();
+                    samples.push(started.elapsed().as_nanos() as u64);
+                    assert_eq!(
+                        entry.ownership.instance_id,
+                        order["instance_id"].as_str().unwrap()
+                    );
+                    assert_eq!(
+                        entry.ownership.client_order_id,
+                        order["client_order_id"].as_str().unwrap()
+                    );
+                }
+                samples.sort_unstable();
+                let q = |p: usize| samples[(samples.len() * p).div_ceil(1000) - 1];
+                eprintln!("ownership_replay account={account} mode={} recovered={} admitted={} capacity={} n={} boundary=find_entry_to_owned_arc p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 insertion_overflow={overflow} probe_budget={}",
+                    if baseline {"before"} else {"after"}, orders.len(), admitted.len(), index.slots.len(), samples.len(), q(500), q(990), q(999), q(1000), RUNTIME_OWNERSHIP_MAX_PROBES);
+            }
         }
     }
 
