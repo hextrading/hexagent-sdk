@@ -38,6 +38,9 @@ non-power-of-two capacities and cursor wrap retain distinct empty/full stamps.
   heads. The idle deadline parks the high-priority consumer, permitting lower
   priority producers to complete. OS wakeup delay may exceed 10 microseconds.
   Existing private/lifecycle select branches have priority over public data.
+  Previously adapter channels disabled readiness publication but recv_timeout
+  waited on a never-ready receiver, leaving idle arrivals until the outer 1 ms
+  timeout. The bounded idle slices also remove that adapter wakeup gap.
 - `ready_receiver()` is replaced by `poll_interval()`; consumers must re-evaluate
   it each select iteration. Recorder composition follows the same deadline.
   No timer `AtomicCell<Instant>` is added (its fallback can use a shared lock).
