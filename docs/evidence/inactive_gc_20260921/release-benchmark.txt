@@ -1,0 +1,5 @@
+Local macOS release; lifecycle executed inline in the fixture, no simulated worker queue wait.
+inactive_gc_all_turns n=1000 deferred_turns=0 p50_ns=13787 p99_ns=17918 p999_ns=35843 max_ns=48811
+inactive_gc_turn n=1000 retired_orders_per_turn=8 p50_ns=13787 p99_ns=17918 p999_ns=35843 max_ns=48811 request_high=1 request_overflow=0 completion_high=2 completion_overflow=0 boundary=cold_poll_entry_to_certificate single_thread_lifecycle_no_queue_wait=true
+test account::shared_account::tests::benchmark_inactive_settled_gc_owner_turn ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 341 filtered out; finished in 0.27s

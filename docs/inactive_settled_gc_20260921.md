@@ -46,3 +46,12 @@ Evidence: [test summary](evidence/inactive_gc_20260921/test-summary.txt),
 Production improvement must be assessed from candidate/certificate progress,
 private-event latency and queue overflow after deployment; a functional GC fix
 is not evidence that upstream HTTP latency has improved.
+
+Focused release measurement covers cold poll entry through the certificate, with
+setup outside the clock: 1,000 turns, 8 retired orders per turn, no deferred turns.
+P50 13,787 ns, P99 17,918 ns, P999 35,843 ns, maximum 48,811 ns. Request queue
+high-water 1, completion high-water 2, both overflow 0. This local macOS fixture
+executes lifecycle requests inline and excludes worker queue wait, so it is not
+a production end-to-end latency claim. The previous behavior never completed
+inactive-owner retirement, making its completion latency unbounded rather than
+a meaningful finite baseline. [Release output](evidence/inactive_gc_20260921/release-benchmark.txt).
