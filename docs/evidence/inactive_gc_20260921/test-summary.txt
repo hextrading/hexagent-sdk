@@ -1,0 +1,10 @@
+running 342 tests
+test account::shared_account::tests::inactive_settled_gc_preserves_reservations_and_revokes_a_replaced_owner ... ok
+test account::shared_account::tests::inactive_settled_gc_round_robin_handles_one_owner_per_turn ... ok
+test account::shared_account::tests::inactive_settled_gc_unblocks_history_without_changing_economics_or_active_owner ... ok
+test account::shared_account::tests::inactive_settled_gc_configuration_is_bounded_and_cannot_steal_registered_owners ... ok
+test result: ok. 328 passed; 0 failed; 14 ignored; 0 measured; 0 filtered out; finished in 11.53s
+running 141 tests
+test result: ok. 134 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 1.33s
+running 941 tests
+test result: ok. 905 passed; 0 failed; 36 ignored; 0 measured; 0 filtered out; finished in 37.28s
