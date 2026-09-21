@@ -1,0 +1,8 @@
+zhu03 generation 501331
+instances dict ['btc02', 'eth02']
+instance_registry_issue NoneType scalar
+order_owners {'btc02': 50007, 'eth02': 3288}
+zhu02 generation 6031057
+instances dict ['btc01']
+instance_registry_issue NoneType scalar
+order_owners {'btc01': 26251}

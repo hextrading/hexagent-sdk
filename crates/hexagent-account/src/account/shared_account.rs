@@ -56,6 +56,7 @@ const RECENT_VIRTUAL_TRADE_MUTATIONS: usize = 65_536;
 /// owner, so reaching this bound means a stale/rebound mailbox is applying
 /// backpressure and must be retried rather than expanded.
 const SETTLED_GC_OWNER_QUEUE_CAPACITY: usize = 2;
+const MAX_INACTIVE_SETTLED_GC_OWNERS: usize = 256;
 const SETTLED_GC_COMPLETION_QUEUE_CAPACITY: usize = 1_024;
 const SETTLED_GC_ORDERS_PER_OWNER_TURN: usize = 8;
 const SETTLED_GC_TRADES_PER_OWNER_TURN: usize = 8;
@@ -268,6 +269,14 @@ pub struct SharedAccountOwnerState {
     lifecycle_mirror_rx: crossbeam_channel::Receiver<LifecycleMirrorDelta>,
     lifecycle_mirror_wake_rx: crossbeam_channel::Receiver<()>,
     route_retirement_pending: std::cell::RefCell<Option<RetiredRouteBatch>>,
+    // Startup-installed capabilities; only this cold account thread polls them.
+    inactive_settled_gc: std::cell::RefCell<Option<InactiveSettledGcOwners>>,
+}
+
+struct InactiveSettledGcOwners {
+    active_instances: HashSet<String>,
+    owners: Vec<SettledGcOwnerState>,
+    cursor: usize,
 }
 
 /// Receiving half of the lossless account-lifecycle lane. The exchange moves
@@ -315,7 +324,91 @@ impl SharedAccountOwnerState {
     }
 
     pub fn execute(&self, command: AccountOwnerCommand) {
-        command.execute(&self.account);
+        match command.0 {
+            AccountOwnerOperation::ConfigureInactiveSettledGc {
+                active_instances,
+                reply,
+            } => {
+                let _ = reply.send(self.install_inactive_settled_gc(active_instances));
+            }
+            operation => AccountOwnerCommand(operation).execute(&self.account),
+        }
+    }
+
+    fn install_inactive_settled_gc(
+        &self,
+        active_instances: HashSet<String>,
+    ) -> Result<Vec<String>, String> {
+        let mut state = self.inactive_settled_gc.borrow_mut();
+        if let Some(installed) = state.as_ref() {
+            if installed.active_instances != active_instances {
+                return Err("inactive settled GC ownership is fixed at startup".into());
+            }
+            return Ok(installed
+                .owners
+                .iter()
+                .map(|owner| owner.instance_id().to_owned())
+                .collect());
+        }
+        let known: HashSet<_> = self
+            .account
+            .virtual_accounts
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        if !active_instances.is_subset(&known) {
+            return Err(
+                "inactive settled GC configuration contains an unknown active instance".into(),
+            );
+        }
+        let mut inactive: Vec<_> = known.difference(&active_instances).cloned().collect();
+        inactive.sort();
+        if inactive.len() > MAX_INACTIVE_SETTLED_GC_OWNERS {
+            return Err(format!(
+                "inactive settled GC owner capacity exceeded: {} > {}",
+                inactive.len(),
+                MAX_INACTIVE_SETTLED_GC_OWNERS
+            ));
+        }
+        {
+            let routes = self.account.settled_gc_owner_routes.read().unwrap();
+            if inactive
+                .iter()
+                .any(|instance| routes.contains_key(instance))
+            {
+                return Err("inactive settled GC would replace an already registered owner".into());
+            }
+        }
+        let owners = inactive
+            .iter()
+            .map(|instance| self.account.register_settled_gc_cold_owner(instance))
+            .collect::<Result<Vec<_>, _>>()?;
+        *state = Some(InactiveSettledGcOwners {
+            active_instances,
+            owners,
+            cursor: 0,
+        });
+        Ok(inactive)
+    }
+
+    /// One existing bounded mailbox turn per low-priority cold-owner timer.
+    /// Active strategy owners keep their own capability; inactive histories
+    /// use the same epoch/terminal/reservation proofs and durable tombstones.
+    pub fn poll_inactive_settled_gc(
+        &self,
+    ) -> Result<Option<SettledGcCompletionCertificate>, String> {
+        let mut state = self.inactive_settled_gc.borrow_mut();
+        let Some(installed) = state.as_mut() else {
+            return Ok(None);
+        };
+        if installed.owners.is_empty() {
+            return Ok(None);
+        }
+        let index = installed.cursor;
+        installed.cursor = (index + 1) % installed.owners.len();
+        installed.owners[index].poll_once()
     }
 
     pub fn execute_wallet_calibration(&self) {
@@ -337,6 +430,10 @@ impl SharedAccountOwnerState {
 }
 
 enum AccountOwnerOperation {
+    ConfigureInactiveSettledGc {
+        active_instances: HashSet<String>,
+        reply: crossbeam_channel::Sender<Result<Vec<String>, String>>,
+    },
     #[cfg(test)]
     Barrier(crossbeam_channel::Sender<()>),
     TokenInterests(crossbeam_channel::Sender<Vec<TokenInterest>>),
@@ -540,6 +637,9 @@ impl AccountOwnerCommand {
     pub fn execute(self, account: &SharedAccount) {
         use AccountOwnerOperation::*;
         match self.0 {
+            ConfigureInactiveSettledGc { reply, .. } => {
+                let _ = reply.send(Err("inactive settled GC configuration requires the cold owner state".into()));
+            }
             #[cfg(test)]
             Barrier(reply) => {
                 let _ = reply.send(());
@@ -6723,8 +6823,34 @@ impl SharedAccount {
             lifecycle_mirror_rx,
             lifecycle_mirror_wake_rx,
             route_retirement_pending: std::cell::RefCell::new(None),
+            inactive_settled_gc: std::cell::RefCell::new(None),
         };
         Ok((handle, owner))
+    }
+
+    /// Startup-only message: retain historical disabled owners and give their
+    /// settled GC mailboxes to the existing cold account worker. The engine
+    /// waits for this acknowledgement before starting feeds or strategies.
+    pub fn configure_inactive_settled_gc_owners(
+        &self,
+        active_instances: HashSet<String>,
+    ) -> Result<crossbeam_channel::Receiver<Result<Vec<String>, String>>, String> {
+        let (reply, completion) = crossbeam_channel::bounded(1);
+        if !self.account_owner_lane_bound.load(Ordering::Acquire) {
+            return Err("inactive settled GC requires a bound cold account owner".into());
+        }
+        // The capability lives in SharedAccountOwnerState, so even a caller
+        // on that thread must transfer the command rather than inline it on
+        // the shared aggregate object.
+        self.account_owner_task_tx
+            .try_send(AccountOwnerCommand(
+                AccountOwnerOperation::ConfigureInactiveSettledGc {
+                    active_instances,
+                    reply,
+                },
+            ))
+            .map_err(|error| format!("inactive settled GC startup enqueue failed: {error}"))?;
+        Ok(completion)
     }
 
     /// Bind the high-priority lossless lifecycle lane to the exchange's
@@ -27228,6 +27354,273 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             owner_turn.3,
         );
         assert!(owner_turn.1 < aggregate.1);
+    }
+
+    #[test]
+    fn inactive_settled_gc_unblocks_history_without_changing_economics_or_active_owner() {
+        let account = Arc::new(seeded_account());
+        for instance in ["a", "b"] {
+            account
+                .reserve_order(
+                    instance,
+                    &format!("{instance}-old"),
+                    &format!("oid-{instance}"),
+                    "UP",
+                    Side::Buy,
+                    1.0,
+                    0.5,
+                    0,
+                )
+                .unwrap();
+            account.release_order(&format!("{instance}-old"), OrderStatus::Rejected);
+        }
+        account
+            .reserve_order(
+                "b",
+                "b-unrelated",
+                "oid-unrelated",
+                "DOWN",
+                Side::Buy,
+                1.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        let before_a = account.instance_snapshot("a").unwrap();
+        let before_b = account.instance_snapshot("b").unwrap();
+        let mut active = account.register_settled_gc_cold_owner("a").unwrap();
+        let active_registration = active.mailbox.registration_id;
+        let (_, cold) = account.bind_account_owner().unwrap();
+        cold.mark_current_thread().unwrap();
+        let ready = account
+            .configure_inactive_settled_gc_owners(HashSet::from(["a".into()]))
+            .unwrap();
+        cold.execute(cold.receiver().try_recv().unwrap());
+        assert_eq!(ready.try_recv().unwrap().unwrap(), vec!["b"]);
+        assert_eq!(active.mailbox.registration_id, active_registration);
+        install_test_settled_gc_candidate(&account, "ended", &HashSet::from(["UP".into()]));
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+        assert_eq!(active.poll_once().unwrap().unwrap().retired_orders, 1);
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+        assert!(
+            account.order("b-old").is_some(),
+            "disabled history still requires its own proof"
+        );
+        // Exact duplicate startup configuration must not replace a queued route.
+        let ready = account
+            .configure_inactive_settled_gc_owners(HashSet::from(["a".into()]))
+            .unwrap();
+        cold.execute(cold.receiver().try_recv().unwrap());
+        assert_eq!(ready.try_recv().unwrap().unwrap(), vec!["b"]);
+        let certificate = cold.poll_inactive_settled_gc().unwrap().unwrap();
+        assert_eq!(certificate.instance_id, "b");
+        assert_eq!(certificate.retired_orders, 1);
+        assert_eq!(
+            account.finalize_ready_settled_audit_retirements(),
+            vec![HashSet::from(["UP".into()])]
+        );
+        assert!(!account.has_settled_gc_candidates());
+        assert!(account.order("b-old").is_none());
+        assert!(account.order("b-unrelated").is_some());
+        assert_eq!(account.instance_snapshot("a").unwrap(), before_a);
+        assert_eq!(account.instance_snapshot("b").unwrap(), before_b);
+        assert!(cold.poll_inactive_settled_gc().unwrap().is_none());
+    }
+
+    #[test]
+    fn inactive_settled_gc_preserves_reservations_and_revokes_a_replaced_owner() {
+        let account = Arc::new(seeded_account());
+        account
+            .reserve_order("b", "b-live", "oid-live", "UP", Side::Buy, 1.0, 0.5, 0)
+            .unwrap();
+        let before = account.instance_snapshot("b").unwrap();
+        let mut active = account.register_settled_gc_cold_owner("a").unwrap();
+        let (_, cold) = account.bind_account_owner().unwrap();
+        cold.mark_current_thread().unwrap();
+        cold.install_inactive_settled_gc(HashSet::from(["a".into()]))
+            .unwrap();
+        install_test_settled_gc_candidate(&account, "ended", &HashSet::from(["UP".into()]));
+        account.finalize_ready_settled_audit_retirements();
+        active.poll_once().unwrap().unwrap();
+        let blocked = cold.poll_inactive_settled_gc().unwrap().unwrap();
+        assert!(blocked.remaining_rows);
+        assert_eq!(blocked.retired_orders, 0);
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+        assert_eq!(account.instance_snapshot("b").unwrap(), before);
+        assert!(account.order("b-live").is_some());
+        account.release_order("b-live", OrderStatus::Rejected);
+        account.note_settled_gc_activity();
+        account.finalize_ready_settled_audit_retirements();
+        let mut replacement = account.register_settled_gc_cold_owner("b").unwrap();
+        assert!(cold
+            .poll_inactive_settled_gc()
+            .unwrap_err()
+            .contains("stale owner registration"));
+        assert!(account.order("b-live").is_some());
+        account.finalize_ready_settled_audit_retirements();
+        active.poll_once().unwrap().unwrap();
+        assert_eq!(replacement.poll_once().unwrap().unwrap().retired_orders, 1);
+        assert_eq!(account.finalize_ready_settled_audit_retirements().len(), 1);
+    }
+
+    #[test]
+    fn inactive_settled_gc_configuration_is_bounded_and_cannot_steal_registered_owners() {
+        let account = Arc::new(seeded_account());
+        assert!(account
+            .configure_inactive_settled_gc_owners(HashSet::new())
+            .is_err());
+        let (_, cold) = account.bind_account_owner().unwrap();
+        let (reply, _) = crossbeam_channel::bounded(1);
+        for _ in 0..ACCOUNT_OWNER_TASK_QUEUE_CAPACITY {
+            account
+                .account_owner_task_tx
+                .try_send(AccountOwnerCommand::barrier(reply.clone()))
+                .unwrap();
+        }
+        assert!(account
+            .configure_inactive_settled_gc_owners(HashSet::from(["a".into()]))
+            .is_err());
+        assert!(account.settled_gc_owner_routes.read().unwrap().is_empty());
+        while cold.receiver().try_recv().is_ok() {}
+        cold.mark_current_thread().unwrap();
+        assert!(cold
+            .install_inactive_settled_gc(HashSet::from(["unknown".into()]))
+            .is_err());
+        let owner_b = account.register_settled_gc_cold_owner("b").unwrap();
+        assert!(cold
+            .install_inactive_settled_gc(HashSet::from(["a".into()]))
+            .unwrap_err()
+            .contains("already registered"));
+        assert_eq!(
+            account.settled_gc_owner_routes.read().unwrap()["b"].registration_id,
+            owner_b.mailbox.registration_id
+        );
+        assert!(cold
+            .install_inactive_settled_gc(HashSet::from(["a".into(), "b".into()]))
+            .unwrap()
+            .is_empty());
+        assert!(cold
+            .install_inactive_settled_gc(HashSet::from(["a".into()]))
+            .unwrap_err()
+            .contains("fixed at startup"));
+        let account = Arc::new(SharedAccount::new("too-many-inactive"));
+        for n in 0..=MAX_INACTIVE_SETTLED_GC_OWNERS {
+            account.register_instance(&format!("inactive-{n}"), 1.0);
+        }
+        let (_, cold) = account.bind_account_owner().unwrap();
+        assert!(cold
+            .install_inactive_settled_gc(HashSet::new())
+            .unwrap_err()
+            .contains("capacity exceeded"));
+        assert!(account.settled_gc_owner_routes.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn inactive_settled_gc_round_robin_handles_one_owner_per_turn() {
+        let account = Arc::new(seeded_account());
+        account.register_instance("c", 1.0);
+        let mut active = account.register_settled_gc_cold_owner("a").unwrap();
+        let (_, cold) = account.bind_account_owner().unwrap();
+        cold.mark_current_thread().unwrap();
+        assert_eq!(
+            cold.install_inactive_settled_gc(HashSet::from(["a".into()]))
+                .unwrap(),
+            vec!["b", "c"]
+        );
+        install_test_settled_gc_candidate(&account, "ended", &HashSet::from(["UP".into()]));
+        account.finalize_ready_settled_audit_retirements();
+        active.poll_once().unwrap().unwrap();
+        assert_eq!(
+            cold.poll_inactive_settled_gc()
+                .unwrap()
+                .unwrap()
+                .instance_id,
+            "b"
+        );
+        assert!(account
+            .finalize_ready_settled_audit_retirements()
+            .is_empty());
+        assert_eq!(
+            cold.poll_inactive_settled_gc()
+                .unwrap()
+                .unwrap()
+                .instance_id,
+            "c"
+        );
+        assert_eq!(account.finalize_ready_settled_audit_retirements().len(), 1);
+    }
+
+    #[test]
+    #[ignore = "focused existing cold-owner inactive GC mailbox turn benchmark"]
+    fn benchmark_inactive_settled_gc_owner_turn() {
+        const N: usize = 1000;
+        let account = Arc::new(seeded_account());
+        let mut active = account.register_settled_gc_cold_owner("a").unwrap();
+        let (_, cold) = account.bind_account_owner().unwrap();
+        cold.mark_current_thread().unwrap();
+        cold.install_inactive_settled_gc(HashSet::from(["a".into()]))
+            .unwrap();
+        let mut samples = Vec::with_capacity(N);
+        let mut all_turns = Vec::with_capacity(N * 2);
+        let mut deferred_turns = 0;
+        for n in 0..N {
+            for j in 0..SETTLED_GC_ORDERS_PER_OWNER_TURN {
+                let coid = format!("b-{n}-{j}");
+                account
+                    .reserve_order(
+                        "b",
+                        &coid,
+                        &format!("oid-{n}-{j}"),
+                        "UP",
+                        Side::Buy,
+                        1.0,
+                        0.5,
+                        0,
+                    )
+                    .unwrap();
+                account.release_order(&coid, OrderStatus::Rejected);
+            }
+            install_test_settled_gc_candidate(&account, "ended", &HashSet::from(["UP".into()]));
+            let mut retired = 0;
+            let mut completed = false;
+            for _ in 0..10_000 {
+                // Match the real cold worker and the coordinator's retryable
+                // try-lock protocol; a busy turn is not a certificate.
+                cold.reclaim_retired_routes();
+                if !account.finalize_ready_settled_audit_retirements().is_empty() {
+                    completed = true;
+                    break;
+                }
+                active.poll_once().unwrap();
+                let start = Instant::now();
+                let result = cold.poll_inactive_settled_gc().unwrap();
+                let elapsed = start.elapsed().as_nanos() as u64;
+                all_turns.push(elapsed);
+                if let Some(result) = result {
+                    assert!(result.retired_orders <= SETTLED_GC_ORDERS_PER_OWNER_TURN);
+                    retired += result.retired_orders;
+                    if result.retired_orders > 0 { samples.push(elapsed); }
+                } else {
+                    deferred_turns += 1;
+                    std::thread::yield_now();
+                }
+            }
+            assert!(completed, "coordinator failed to converge iteration={n}");
+            assert_eq!(retired, SETTLED_GC_ORDERS_PER_OWNER_TURN);
+        }
+        let (p50, p99, p999, max) = latency_summary_ns(&mut samples);
+        let all_n = all_turns.len();
+        let all = latency_summary_ns(&mut all_turns);
+        let metrics = account.settled_gc_metrics();
+        eprintln!("inactive_gc_all_turns n={all_n} deferred_turns={deferred_turns} p50_ns={} p99_ns={} p999_ns={} max_ns={}", all.0, all.1, all.2, all.3);
+        eprintln!("inactive_gc_turn n={N} retired_orders_per_turn=8 p50_ns={p50} p99_ns={p99} p999_ns={p999} max_ns={max} request_high={} request_overflow={} completion_high={} completion_overflow={} boundary=cold_poll_entry_to_certificate single_thread_lifecycle_no_queue_wait=true", metrics.3,metrics.4,metrics.6,metrics.7);
+        assert_eq!((metrics.4, metrics.7), (0, 0));
     }
 
     #[test]

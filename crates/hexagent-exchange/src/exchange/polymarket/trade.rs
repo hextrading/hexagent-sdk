@@ -4184,6 +4184,9 @@ impl SharedState {
                         recv(wallet_grace_tick) -> _ => {
                             account_owner.execute_wallet_calibration();
                             account_owner.reclaim_retired_routes();
+                            if let Err(error) = account_owner.poll_inactive_settled_gc() {
+                                log::warn!("[PolymarketTrade] inactive settled GC account={}: {}", account_id, error);
+                            }
                         },
                         recv(cold_shutdown_rx) -> phase => {
                             if matches!(phase, Ok(ShutdownPhase::Finished) | Err(_)) {

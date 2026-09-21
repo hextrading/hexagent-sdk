@@ -11434,6 +11434,29 @@ impl Engine {
             shared
                 .account_state
                 .reconcile_configured_instances(&configured_instances);
+            let active_instances = configured_strategies
+                .iter()
+                .map(|strategy| strategy.instance_id.clone())
+                .collect();
+            let inactive_gc = shared
+                .account_state
+                .configure_inactive_settled_gc_owners(active_instances)
+                .and_then(|completion| {
+                    completion
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .map_err(|error| format!("inactive settled GC startup acknowledgement: {error}"))?
+                });
+            match inactive_gc {
+                Ok(inactive) => {
+                    if !inactive.is_empty() {
+                        info!("[Engine] account={} inactive settled GC owners installed on existing cold account worker: {:?}", account_id, inactive);
+                    }
+                }
+                Err(error) => {
+                    error!("[Engine] refusing Polymarket startup: account={} inactive settled GC owner setup failed: {}", account_id, error);
+                    return HashMap::new();
+                }
+            }
             let orphan_repair = PolymarketTrade::from_shared(shared.clone(), "", "")
                 .reconcile_persisted_orphan_order_anomalies();
             if orphan_repair.examined > 0 {
