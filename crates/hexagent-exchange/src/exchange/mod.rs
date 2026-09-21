@@ -425,7 +425,17 @@ impl MarketEventPublisher for PublicMarketPublisher {
             }
             return Ok(());
         }
-        self.ordered.try_push(event).map_err(crossbeam_channel::SendError)
+        // A producer resumed after preemption can lose its first tail CAS to
+        // a completed peer. Give it a fixed retry budget before failing the
+        // ordered lane; never wait for an unpublished slot or spin indefinitely.
+        let mut retained = event;
+        for _ in 0..8 {
+            match self.ordered.try_push(retained) {
+                Ok(()) => return Ok(()),
+                Err(event) => retained = event,
+            }
+        }
+        Err(crossbeam_channel::SendError(retained))
     }
 }
 

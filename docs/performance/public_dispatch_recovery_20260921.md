@@ -24,7 +24,8 @@ non-power-of-two capacities and cursor wrap retain distinct empty/full stamps.
 
 - Public feed/parser threads publish; the adapter feed owner or root router
   consumes. Existing capacities remain unchanged (adapter: 4,096 per lane).
-- Ordered events retain reservation FIFO order. Capacity or contention returns
+- Ordered events retain reservation FIFO order. At most eight immediate tries
+  tolerate a completed peer winning a CAS; capacity or persistent contention returns
   the exact event/error to the existing fail-closed/reconnect path. Cold
   shutdown/control publication may retain/retry to a deadline.
 - Replaceable snapshots attempt one push, at most one old-item eviction and one
