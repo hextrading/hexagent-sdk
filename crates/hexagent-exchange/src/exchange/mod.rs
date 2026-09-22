@@ -70,6 +70,8 @@ struct PublicMarketProgress {
 #[repr(align(128))]
 struct PublicMarketConsumerClock {
     last_poll_ns: AtomicU64,
+    max_poll_gap_ns: AtomicU64,
+    pending_high_water: AtomicU64,
     polls: AtomicU64,
     phase: AtomicU8,
 }
@@ -79,6 +81,10 @@ struct PublicMarketConsumerClock {
 pub struct PublicMarketConsumerProgress {
     pub alive: bool,
     pub poll_age_ns: u64,
+    /// Lifetime maxima survive a stall that recovers between supervisor samples.
+    /// Poll gaps include intentional idle waits; they are not proof of blocking.
+    pub max_poll_gap_ns: u64,
+    pub pending_high_water: usize,
     pub polls: u64,
     pub pending: usize,
     pub capacity_per_lane: usize,
@@ -99,6 +105,14 @@ pub struct PublicMarketReceiver {
 }
 
 impl PublicMarketReceiver {
+    /// Sole owner calls once after startup/replay drain and before live routing.
+    /// A deliberate model warm-up wait must not dominate live tail diagnostics.
+    pub fn begin_poll_measurement(&self) {
+        self.progress.clock.last_poll_ns.store(0, Ordering::Release);
+        self.progress.clock.max_poll_gap_ns.store(0, Ordering::Relaxed);
+        self.progress.clock.pending_high_water.store(0, Ordering::Relaxed);
+    }
+
     /// Sole-consumer breadcrumb; a background reader formats it. A relaxed
     /// scalar store adds no clock read, allocation, lock, or producer wakeup.
     /// 0=unclassified, 1=supervisor, 2=lifecycle, 3=select, 4=market, 5=recorder.
@@ -107,13 +121,12 @@ impl PublicMarketReceiver {
     }
 
     pub fn try_recv(&self) -> std::result::Result<MarketEvent, crossbeam_channel::TryRecvError> {
-        self.progress.clock.last_poll_ns.store(
+        self.observe_poll(
             self.progress
                 .origin
                 .elapsed()
                 .as_nanos()
                 .min(u64::MAX as u128) as u64,
-            Ordering::Release,
         );
         self.progress.clock.polls.fetch_add(1, Ordering::Relaxed);
         if self.ordered_burst.load(Ordering::Relaxed) >= PUBLIC_MARKET_ORDERED_BURST {
@@ -137,6 +150,23 @@ impl PublicMarketReceiver {
         } else {
             Err(crossbeam_channel::TryRecvError::Empty)
         }
+    }
+
+    fn observe_poll(&self, now_ns: u64) {
+        let clock = &self.progress.clock;
+        let previous = clock.last_poll_ns.load(Ordering::Relaxed);
+        if previous != 0 {
+            let gap = now_ns.saturating_sub(previous);
+            if gap > clock.max_poll_gap_ns.load(Ordering::Relaxed) {
+                // Exactly one consumer writes these maxima; readers never reset.
+                clock.max_poll_gap_ns.store(gap, Ordering::Relaxed);
+            }
+        }
+        let pending = (self.ordered.len() + self.latest.len()) as u64;
+        if pending > clock.pending_high_water.load(Ordering::Relaxed) {
+            clock.pending_high_water.store(pending, Ordering::Relaxed);
+        }
+        clock.last_poll_ns.store(now_ns, Ordering::Release);
     }
 
     /// Re-evaluate on every consumer loop iteration. An unfinished publication
@@ -194,6 +224,8 @@ pub fn market_event_channel(capacity: usize) -> (PublicMarketPublisher, PublicMa
         contention_drops: AtomicU64::new(0),
         clock: PublicMarketConsumerClock {
             last_poll_ns: AtomicU64::new(0),
+            max_poll_gap_ns: AtomicU64::new(0),
+            pending_high_water: AtomicU64::new(0),
             polls: AtomicU64::new(0),
             phase: AtomicU8::new(0),
         },
@@ -229,6 +261,8 @@ impl PublicMarketPublisher {
             alive: self.progress.alive.load(Ordering::Acquire),
             poll_age_ns: now
                 .saturating_sub(self.progress.clock.last_poll_ns.load(Ordering::Acquire)),
+            max_poll_gap_ns: self.progress.clock.max_poll_gap_ns.load(Ordering::Relaxed),
+            pending_high_water: self.progress.clock.pending_high_water.load(Ordering::Relaxed) as usize,
             polls: self.progress.clock.polls.load(Ordering::Relaxed),
             pending: self.ordered.len() + self.latest.len(),
             capacity_per_lane: self.ordered.capacity(),
@@ -1143,6 +1177,50 @@ mod tests {
             timestamps.last(),
             Some(&(PUBLIC_MARKET_ADAPTER_LANE_CAPACITY as u64)),
         );
+    }
+
+    #[test]
+    fn root_mailbox_retains_recovered_gap_and_backlog_without_cross_lane_state() {
+        let (publisher, receiver) = market_event_channel(2);
+        let (other, other_receiver) = market_event_channel(2);
+        receiver.observe_poll(1_000);
+        publish_market_event(&publisher, MarketEvent::Exit).unwrap();
+        publish_market_event(&publisher, MarketEvent::Connected { exchange: Exchange::Binance }).unwrap();
+        receiver.observe_poll(900_001_000);
+        assert!(matches!(receiver.try_recv(), Ok(MarketEvent::Exit)));
+        assert!(matches!(receiver.try_recv(), Ok(MarketEvent::Connected { .. })));
+        receiver.observe_poll(900_002_000);
+        let progress = publisher.consumer_progress();
+        assert_eq!(progress.max_poll_gap_ns, 900_000_000);
+        assert_eq!(progress.pending_high_water, 2);
+        assert_eq!(progress.pending, 0);
+        other_receiver.observe_poll(1_000);
+        other_receiver.observe_poll(2_000);
+        assert_eq!(other.consumer_progress().max_poll_gap_ns, 1_000);
+        assert_eq!(other.consumer_progress().pending_high_water, 0);
+        receiver.begin_poll_measurement();
+        receiver.observe_poll(2_000_000_000);
+        assert_eq!(publisher.consumer_progress().max_poll_gap_ns, 0);
+    }
+
+    #[test]
+    #[ignore = "focused consumer-tail instrumentation benchmark; run with --release --ignored"]
+    fn market_mailbox_consumer_latency_benchmark() {
+        const EVENTS: usize = 100_000;
+        let (publisher, receiver) = market_event_channel(64);
+        let mut samples = Vec::with_capacity(EVENTS);
+        for _ in 0..EVENTS {
+            publish_market_event(&publisher, MarketEvent::Connected { exchange: Exchange::Binance }).unwrap();
+            let started = Instant::now();
+            std::hint::black_box(receiver.try_recv().unwrap());
+            samples.push(started.elapsed().as_nanos() as u64);
+        }
+        samples.sort_unstable();
+        let p = |n| samples[(EVENTS - 1) * n / 1000];
+        let progress = publisher.consumer_progress();
+        println!("consumer events={EVENTS} boundary=try_recv_entry_to_return unit=ns p50={} p99={} p999={} max={} pending={} high_water={} contention_drops={}",
+            p(500), p(990), p(999), samples[EVENTS - 1], progress.pending,
+            progress.pending_high_water, progress.contention_drops);
     }
 
     #[test]
