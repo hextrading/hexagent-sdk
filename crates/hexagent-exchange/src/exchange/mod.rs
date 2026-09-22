@@ -73,6 +73,7 @@ struct PublicMarketConsumerClock {
     max_poll_gap_ns: AtomicU64,
     pending_high_water: AtomicU64,
     executor_pending_high_water: AtomicU64,
+    private_pending_high_water: AtomicU64,
     polls: AtomicU64,
     phase: AtomicU8,
 }
@@ -87,6 +88,7 @@ pub struct PublicMarketConsumerProgress {
     pub max_poll_gap_ns: u64,
     pub pending_high_water: usize,
     pub executor_pending_high_water: usize,
+    pub private_pending_high_water: usize,
     pub polls: u64,
     pub pending: usize,
     pub capacity_per_lane: usize,
@@ -114,6 +116,7 @@ impl PublicMarketReceiver {
         self.progress.clock.max_poll_gap_ns.store(0, Ordering::Relaxed);
         self.progress.clock.pending_high_water.store(0, Ordering::Relaxed);
         self.progress.clock.executor_pending_high_water.store(0, Ordering::Relaxed);
+        self.progress.clock.private_pending_high_water.store(0, Ordering::Relaxed);
     }
 
     /// Router-owned scalar; the existing background supervisor exports it.
@@ -121,6 +124,16 @@ impl PublicMarketReceiver {
     pub fn observe_executor_depth(&self, pending: usize) {
         if pending != 0 {
             let high_water = &self.progress.clock.executor_pending_high_water;
+            if pending as u64 > high_water.load(Ordering::Relaxed) {
+                high_water.store(pending as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Router-owned private/recovery depth, including unfinished publications.
+    pub fn observe_private_depth(&self, pending: usize) {
+        if pending != 0 {
+            let high_water = &self.progress.clock.private_pending_high_water;
             if pending as u64 > high_water.load(Ordering::Relaxed) {
                 high_water.store(pending as u64, Ordering::Relaxed);
             }
@@ -241,6 +254,7 @@ pub fn market_event_channel(capacity: usize) -> (PublicMarketPublisher, PublicMa
             max_poll_gap_ns: AtomicU64::new(0),
             pending_high_water: AtomicU64::new(0),
             executor_pending_high_water: AtomicU64::new(0),
+            private_pending_high_water: AtomicU64::new(0),
             polls: AtomicU64::new(0),
             phase: AtomicU8::new(0),
         },
@@ -279,6 +293,7 @@ impl PublicMarketPublisher {
             max_poll_gap_ns: self.progress.clock.max_poll_gap_ns.load(Ordering::Relaxed),
             pending_high_water: self.progress.clock.pending_high_water.load(Ordering::Relaxed) as usize,
             executor_pending_high_water: self.progress.clock.executor_pending_high_water.load(Ordering::Relaxed) as usize,
+            private_pending_high_water: self.progress.clock.private_pending_high_water.load(Ordering::Relaxed) as usize,
             polls: self.progress.clock.polls.load(Ordering::Relaxed),
             pending: self.ordered.len() + self.latest.len(),
             capacity_per_lane: self.ordered.capacity(),
@@ -1208,20 +1223,25 @@ mod tests {
         receiver.observe_poll(900_002_000);
         receiver.observe_executor_depth(3);
         receiver.observe_executor_depth(1);
+        receiver.observe_private_depth(4);
+        receiver.observe_private_depth(2);
         let progress = publisher.consumer_progress();
         assert_eq!(progress.max_poll_gap_ns, 900_000_000);
         assert_eq!(progress.pending_high_water, 2);
         assert_eq!(progress.pending, 0);
         assert_eq!(progress.executor_pending_high_water, 3);
+        assert_eq!(progress.private_pending_high_water, 4);
         other_receiver.observe_poll(1_000);
         other_receiver.observe_poll(2_000);
         assert_eq!(other.consumer_progress().max_poll_gap_ns, 1_000);
         assert_eq!(other.consumer_progress().pending_high_water, 0);
         assert_eq!(other.consumer_progress().executor_pending_high_water, 0);
+        assert_eq!(other.consumer_progress().private_pending_high_water, 0);
         receiver.begin_poll_measurement();
         receiver.observe_poll(2_000_000_000);
         assert_eq!(publisher.consumer_progress().max_poll_gap_ns, 0);
         assert_eq!(publisher.consumer_progress().executor_pending_high_water, 0);
+        assert_eq!(publisher.consumer_progress().private_pending_high_water, 0);
     }
 
     #[test]

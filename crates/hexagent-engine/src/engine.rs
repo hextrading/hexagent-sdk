@@ -894,12 +894,13 @@ fn spawn_polymarket_supervisor(
                         snapshot.current_event_end_ns,
                     );
                     info!(
-                        "[market_dispatch_health] polls={} poll_age_us={} pending={} capacity_per_lane={} contention_drops={} alive={} phase={} max_poll_gap_us={} pending_high_water={} executor_pending_high_water={} executor_capacity={} phase_key=0:unknown,1:supervisor,2:lifecycle,3:select,4:market,5:recorder",
+                        "[market_dispatch_health] polls={} poll_age_us={} pending={} capacity_per_lane={} contention_drops={} alive={} phase={} max_poll_gap_us={} pending_high_water={} executor_pending_high_water={} executor_capacity={} private_pending_high_water={} private_capacity={} phase_key=0:unknown,1:supervisor,2:lifecycle,3:select,4:market,5:recorder",
                         consumer.polls, consumer.poll_age_ns / 1_000,
                         consumer.pending, consumer.capacity_per_lane,
                         consumer.contention_drops, consumer.alive, consumer.phase,
                         consumer.max_poll_gap_ns / 1_000, consumer.pending_high_water,
                         consumer.executor_pending_high_water, CHANNEL_CAPACITY,
+                        consumer.private_pending_high_water, CHANNEL_CAPACITY,
                     );
                     last_log = std::time::Instant::now();
                 }
@@ -4094,7 +4095,10 @@ impl Engine {
         // Authenticated user feeds are independent producers and may need
         // recovery routing by venue order id. Keep them separate from exact
         // owner-stamped executor feedback.
-        let (private_update_tx, private_update_rx) = bounded::<RoutedOrderUpdate>(CHANNEL_CAPACITY);
+        let (private_update_tx, private_poll_rx) =
+            hexagent_runtime::poll_channel::bounded::<RoutedOrderUpdate>(CHANNEL_CAPACITY);
+        // Live root private/recovery delivery never enters crossbeam array receive.
+        let private_update_rx = crossbeam_channel::never();
         let (shutdown_done_tx, shutdown_done_rx) = bounded::<()>(1);
 
         let shutdown = shutdown_token.requested_flag();
@@ -4338,6 +4342,7 @@ impl Engine {
             market_rx,
             signal_tx,
             private_update_rx,
+            Some(private_poll_rx),
             Some(executor_update_rx),
             false,
             Some(recorder_tx),
@@ -4504,6 +4509,7 @@ impl Engine {
             market_rx,
             signal_tx,
             update_rx,
+            None,
             None,
             false,
             Some(recorder_tx),
@@ -7997,6 +8003,7 @@ impl Engine {
         market_rx: PublicMarketReceiver,
         signal_tx: SignalSender,
         update_rx: Receiver<RoutedOrderUpdate>,
+        mut private_poll_rx: Option<hexagent_runtime::poll_channel::Receiver<RoutedOrderUpdate>>,
         mut executor_update_rx: Option<hexagent_runtime::poll_channel::Receiver<RoutedOrderUpdate>>,
         backtest: bool,
         recorder_tx: Option<Sender<Arc<MarketEvent>>>,
@@ -8480,6 +8487,7 @@ impl Engine {
                 market_rx,
                 signal_tx,
                 update_rx,
+                private_poll_rx.take(),
                 executor_update_rx.take(),
                 recorder_tx,
                 data_dirs,
@@ -8488,6 +8496,7 @@ impl Engine {
                 admission_receivers,
             );
         }
+        drop(private_poll_rx.take());
         drop(executor_update_rx.take());
 
         thread::Builder::new()
@@ -8741,6 +8750,7 @@ impl Engine {
         market_rx: PublicMarketReceiver,
         signal_tx: SignalSender,
         update_rx: Receiver<RoutedOrderUpdate>,
+        private_poll_rx: Option<hexagent_runtime::poll_channel::Receiver<RoutedOrderUpdate>>,
         executor_update_rx: Option<hexagent_runtime::poll_channel::Receiver<RoutedOrderUpdate>>,
         recorder_tx: Option<Sender<Arc<MarketEvent>>>,
         data_dirs: Vec<PathBuf>,
@@ -8947,8 +8957,9 @@ impl Engine {
                             }
                         }
                     }
-                    let market_poll_interval = if executor_update_rx.as_ref()
+                    let market_poll_interval = if private_poll_rx.as_ref()
                         .is_some_and(|rx| rx.front_ready())
+                        || executor_update_rx.as_ref().is_some_and(|rx| rx.front_ready())
                     {
                         std::time::Duration::ZERO
                     } else {
@@ -9001,6 +9012,33 @@ impl Engine {
                             Err(_) => break,
                         },
                         default(market_poll_interval) => {
+                            if let Some(private_rx) = private_poll_rx.as_ref() {
+                                market_rx.observe_private_depth(private_rx.len());
+                                match private_rx.try_recv() {
+                                    Ok(routed) => {
+                                        market_rx.mark_phase(2);
+                                        if let Err(failure) = Self::route_private_update(
+                                            routed, &iid_to_idx, &update_txs,
+                                            &worker_quarantined, &mut lifecycle_outboxes,
+                                        ) {
+                                            if handle_lifecycle_route_failure(
+                                                &failure, &instance_ids, &worker_quarantined,
+                                                &signal_tx, &mut lifecycle_outboxes,
+                                            ) {
+                                                break 'router;
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                                        if private_rx.has_pending() {
+                                            thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
+                                            continue;
+                                        }
+                                    }
+                                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                                }
+                            }
                             if let Some(executor_rx) = executor_update_rx.as_ref() {
                                 market_rx.observe_executor_depth(executor_rx.len());
                                 match executor_rx.try_recv() {
@@ -9151,6 +9189,25 @@ impl Engine {
                                         &mut lifecycle_outboxes,
                                     );
                                     if let Err(failure) = result {
+                                        quarantine_lifecycle_failure(
+                                            &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                                        );
+                                        break 'router;
+                                    }
+                                }
+                                while let Some(private_rx) = private_poll_rx.as_ref() {
+                                    let routed = match private_rx.try_recv() {
+                                        Ok(routed) => routed,
+                                        Err(crossbeam_channel::TryRecvError::Empty) if private_rx.has_pending() => {
+                                            thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
+                                            continue;
+                                        }
+                                        Err(_) => break,
+                                    };
+                                    if let Err(failure) = Self::route_private_update(
+                                        routed, &iid_to_idx, &update_txs,
+                                        &worker_quarantined, &mut lifecycle_outboxes,
+                                    ) {
                                         quarantine_lifecycle_failure(
                                             &failure, &instance_ids, &worker_quarantined, &signal_tx,
                                         );
@@ -10927,7 +10984,7 @@ impl Engine {
     /// Spawn HexMarket user WebSocket feed for real-time fill/cancel notifications.
     pub fn spawn_hex_user_feed(
         &self,
-        update_tx: Sender<RoutedOrderUpdate>,
+        update_tx: impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
         shutdown: Arc<AtomicBool>,
     ) -> Option<thread::JoinHandle<()>> {
         let hex_cfg = self
@@ -11721,7 +11778,7 @@ impl Engine {
     /// which resolves client_order_id ownership to one strategy instance.
     pub fn spawn_poly_user_feeds(
         &self,
-        update_tx: Sender<RoutedOrderUpdate>,
+        update_tx: impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
         shutdown: Arc<AtomicBool>,
         states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
     ) -> Vec<thread::JoinHandle<()>> {
@@ -15512,7 +15569,7 @@ fn send_executor_update(
 }
 
 fn send_root_private_update(
-    tx: &Sender<RoutedOrderUpdate>,
+    tx: &impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     owner: u16,
     mut update: OrderUpdate,
 ) -> Result<(), crossbeam_channel::SendError<RoutedOrderUpdate>> {

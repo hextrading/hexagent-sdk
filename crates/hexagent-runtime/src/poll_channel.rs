@@ -12,6 +12,32 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Transport-neutral cold private/recovery producer. Live uses the polling
+/// sender; compatibility callers keep their existing crossbeam sender. This
+/// trait adds no shared state, allocations, worker or dynamic dispatch.
+pub trait EventSender<T>: Clone + Send + Sync + 'static {
+    fn send(&self, value: T) -> Result<(), SendError<T>>;
+    fn try_send(&self, value: T) -> Result<(), TrySendError<T>>;
+}
+
+impl<T: Send + 'static> EventSender<T> for crossbeam_channel::Sender<T> {
+    fn send(&self, value: T) -> Result<(), SendError<T>> {
+        self.send(value)
+    }
+    fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+        self.try_send(value)
+    }
+}
+
+impl<T: Send + 'static> EventSender<T> for Sender<T> {
+    fn send(&self, value: T) -> Result<(), SendError<T>> {
+        self.send(value)
+    }
+    fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+        self.try_send(value)
+    }
+}
+
 pub const IDLE_POLL: Duration = Duration::from_micros(10);
 
 struct Shared<T> {
