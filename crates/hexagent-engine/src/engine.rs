@@ -894,10 +894,11 @@ fn spawn_polymarket_supervisor(
                         snapshot.current_event_end_ns,
                     );
                     info!(
-                        "[market_dispatch_health] polls={} poll_age_us={} pending={} capacity_per_lane={} contention_drops={} alive={} phase={} phase_key=0:unknown,1:supervisor,2:lifecycle,3:select,4:market,5:recorder",
+                        "[market_dispatch_health] polls={} poll_age_us={} pending={} capacity_per_lane={} contention_drops={} alive={} phase={} max_poll_gap_us={} pending_high_water={} phase_key=0:unknown,1:supervisor,2:lifecycle,3:select,4:market,5:recorder",
                         consumer.polls, consumer.poll_age_ns / 1_000,
                         consumer.pending, consumer.capacity_per_lane,
                         consumer.contention_drops, consumer.alive, consumer.phase,
+                        consumer.max_poll_gap_ns / 1_000, consumer.pending_high_water,
                     );
                     last_log = std::time::Instant::now();
                 }
@@ -1907,6 +1908,21 @@ fn lifecycle_delta_ms(stage_ns: u64, origin_ns: u64) -> f64 {
         return -1.0;
     }
     (stage_ns as i128 - origin_ns as i128) as f64 / 1_000_000.0
+}
+
+/// Parser receive -> current owner entry. Unlike the router->worker queue
+/// timer, this includes adapter/root backlog. Exclude scheduled control events
+/// and historical bars whose timestamps are not live receipt boundaries.
+fn market_receive_age_ns(event: &MarketEvent, now_ns: u64) -> Option<u64> {
+    let received = match event {
+        MarketEvent::OrderBook(event) => event.local_timestamp_ns,
+        MarketEvent::Quote(event) => event.local_timestamp_ns,
+        MarketEvent::SpotPrice(event) => event.local_timestamp_ns,
+        MarketEvent::Trade(event) => event.local_timestamp_ns,
+        MarketEvent::AssetCtx(event) => event.local_timestamp_ns,
+        _ => return None,
+    };
+    (received != 0 && received <= now_ns).then(|| now_ns - received)
 }
 
 const QUOTE_TRIGGER_SLOW_NS: u64 = 10_000_000;
@@ -8823,6 +8839,8 @@ impl Engine {
                 // first use. Pay that cost before the router accepts data.
                 let _ = market_queue_monotonic_ns();
                 crate::latency::prepare_polymarket_private_stages();
+                crate::latency::prepare_thread_stages(&["market.receive_to_router"]);
+                market_rx.begin_poll_measurement();
                 info!(
                     "[Strategy] Per-instance routing active: {} instances {:?}, {} routed symbols",
                     instance_ids.len(), instance_ids, sym_to_instances.len(),
@@ -9011,6 +9029,9 @@ impl Engine {
                             Ok(event) => {
                                 market_rx.mark_phase(4);
                                 if shutdown_in_progress { continue; }
+                                if let Some(age) = market_receive_age_ns(&event, crate::types::now_ns()) {
+                                    crate::latency::record_ns("market.receive_to_router", age);
+                                }
                                 let event = Arc::new(event);
                                 let mut dropped_mask = Self::route_market_event(
                                     Arc::clone(&event),
@@ -9494,6 +9515,7 @@ impl Engine {
         crate::strategy::prepare_strategy_span(instance_id);
         crate::latency::prepare_thread_stages(&[
             "strategy.market.queue",
+            "strategy.market.receive_to_callback",
             "strategy.market.callback",
             "strategy.private_update.queue",
             "strategy.private_update.callback",
@@ -9860,6 +9882,9 @@ impl Engine {
                             market_queue_monotonic_ns().saturating_sub(queued.enqueued_ns),
                         );
                         let event = queued.event;
+                        if let Some(age) = market_receive_age_ns(&event, crate::types::now_ns()) {
+                            crate::latency::record_ns("strategy.market.receive_to_callback", age);
+                        }
                         let callback_started = crate::latency::Instant::now();
                         callback_signal_batch.clear();
                         let callback_result = match event.as_ref() {
@@ -17129,6 +17154,18 @@ mod market_router_tests {
             exchange_timestamp_ns: 1,
             local_timestamp_ns: 1,
         })
+    }
+
+    #[test]
+    fn market_receive_age_includes_backlog_and_excludes_non_receipt_clocks() {
+        let mut event = ob(Exchange::Binance, "BTCUSDT");
+        assert_eq!(market_receive_age_ns(&event, 828_000_001), Some(828_000_000));
+        // Clock corrections/missing source stamps cannot become giant tails.
+        assert_eq!(market_receive_age_ns(&event, 0), None);
+        if let MarketEvent::OrderBook(ob) = &mut event { ob.local_timestamp_ns = 0; }
+        assert_eq!(market_receive_age_ns(&event, 828_000_001), None);
+        assert_eq!(market_receive_age_ns(&MarketEvent::Exit, 828_000_001), None);
+        assert_eq!(market_receive_age_ns(&MarketEvent::Connected { exchange: Exchange::Binance }, 828_000_001), None);
     }
 
     fn trade(exchange: Exchange, symbol: &str) -> MarketEvent {

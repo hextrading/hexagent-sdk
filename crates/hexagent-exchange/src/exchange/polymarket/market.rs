@@ -4279,7 +4279,7 @@ fn announce_clob_not_ready(
 }
 
 fn forward_clob_events(
-    events: Vec<MarketEvent>,
+    events: impl AsRef<[MarketEvent]> + IntoIterator<Item = MarketEvent>,
     event_tx: &ClobEventSender,
     lifecycle: &mut ClobLifecycle,
     health: &mut WsHealth,
@@ -4291,6 +4291,7 @@ fn forward_clob_events(
     let forward_started = Instant::now();
     let mut forwarded = 0usize;
     let has_usable_book = events
+        .as_ref()
         .iter()
         .filter(|event| should_forward_clob_event(event, tokens))
         .any(|event| is_usable_subscribed_book_event(event, tokens));
@@ -6779,7 +6780,10 @@ enum ClobBookSource {
 
 #[derive(Debug)]
 enum ClobBookApplyOutcome {
-    Applied(Vec<MarketEvent>),
+    // Exactly one canonical snapshot and at most one health transition.
+    // A heap-growing scratch Vec here triggered allocator purge on the CLOB
+    // owner in the 2026-09-21 22:30:19 perf capture.
+    Applied(arrayvec::ArrayVec<MarketEvent, 2>),
     /// A REST snapshot older than already-applied websocket state is a benign
     /// race, not a transport failure.  The caller may request a fresh repair
     /// while the condition stays locally scoped.
@@ -7420,34 +7424,34 @@ impl ClobLocalBook {
                 quantity: quantity.to_f64()?,
             })
         };
+        // Option<Vec<_>>::collect cannot retain the source's exact lower size
+        // hint. Allocate the owned event's required depth once, then never grow
+        // it while converting levels. The event still owns its independent
+        // buffers; a pool/ownership-transfer migration is a separate step.
+        fn collect_levels(
+            count: usize,
+            levels: impl Iterator<Item = Option<PriceLevel>>,
+        ) -> Option<Vec<PriceLevel>> {
+            let mut output = Vec::with_capacity(count);
+            for level in levels {
+                output.push(level?);
+            }
+            Some(output)
+        }
         let (bids, asks): (Vec<_>, Vec<_>) = if mirror_down {
             // A bid to buy Down is an ask to sell Up at 1-p; a Down ask
             // maps to an Up bid. Iteration order remains best-to-worst after
             // the complement transformation.
-            let bids = self
-                .asks
-                .iter()
-                .map(|(price, quantity)| level(Decimal::ONE - *price, *quantity))
-                .collect::<Option<Vec<_>>>()?;
-            let asks = self
-                .bids
-                .iter()
-                .rev()
-                .map(|(price, quantity)| level(Decimal::ONE - *price, *quantity))
-                .collect::<Option<Vec<_>>>()?;
+            let bids = collect_levels(self.asks.len(), self.asks.iter()
+                .map(|(price, quantity)| level(Decimal::ONE - *price, *quantity)))?;
+            let asks = collect_levels(self.bids.len(), self.bids.iter().rev()
+                .map(|(price, quantity)| level(Decimal::ONE - *price, *quantity)))?;
             (bids, asks)
         } else {
-            let bids = self
-                .bids
-                .iter()
-                .rev()
-                .map(|(price, quantity)| level(*price, *quantity))
-                .collect::<Option<Vec<_>>>()?;
-            let asks = self
-                .asks
-                .iter()
-                .map(|(price, quantity)| level(*price, *quantity))
-                .collect::<Option<Vec<_>>>()?;
+            let bids = collect_levels(self.bids.len(), self.bids.iter().rev()
+                .map(|(price, quantity)| level(*price, *quantity)))?;
+            let asks = collect_levels(self.asks.len(), self.asks.iter()
+                .map(|(price, quantity)| level(*price, *quantity)))?;
             (bids, asks)
         };
         Some(OrderBookSnapshot {
@@ -7981,7 +7985,7 @@ impl ClobLocalBooks {
         // the event-level Up snapshot already accepted. Keep the newer event
         // book, but re-emit it once so completion of initial L2 seeding can
         // transition the feed to READY without letting the old Down book win.
-        let mut events = Vec::new();
+        let mut events = arrayvec::ArrayVec::new();
         if let Some(event) = self
             .canonicalize_token(&symbol, local_now)
             .or_else(|| self.canonical_snapshot_for_token(&symbol))
@@ -10118,6 +10122,77 @@ mod clob_event_lane_tests {
             percentile(999),
             *samples.last().unwrap(),
         )
+    }
+
+    fn live_99_level_book() -> ClobLocalBook {
+        let mut book = ClobLocalBook::default();
+        for tick in 1..100 {
+            let side = if tick <= 70 { &mut book.bids } else { &mut book.asks };
+            side.insert(Decimal::new(tick, 2), Decimal::new(tick * 10, 0));
+        }
+        book
+    }
+
+    // The pre-fix snapshot conversion, retained only as an independent
+    // allocation/latency baseline for the captured 70 bid / 29 ask depth.
+    fn legacy_snapshot(book: &ClobLocalBook) -> OrderBookSnapshot {
+        let level = |(price, quantity): (&Decimal, &Decimal)| Some(PriceLevel {
+            price: price.to_f64()?, quantity: quantity.to_f64()?,
+        });
+        OrderBookSnapshot {
+            exchange: Exchange::Polymarket, symbol: String::new(),
+            bids: book.bids.iter().rev().map(level).collect::<Option<Vec<_>>>().unwrap(),
+            asks: book.asks.iter().map(level).collect::<Option<Vec<_>>>().unwrap(),
+            exchange_timestamp_ns: book.exchange_timestamp_ns, local_timestamp_ns: 1,
+        }
+    }
+
+    #[test]
+    fn clob_snapshot_allocates_each_depth_once_and_retains_owned_mirrors() {
+        let mut book = live_99_level_book();
+        let (snapshot, allocations, _) = super::clob_test_allocator::count(|| {
+            book.snapshot(String::new(), false, 1).unwrap()
+        });
+        assert_eq!(allocations, 2, "one exact allocation per independently owned side");
+        let legacy = legacy_snapshot(&book);
+        assert_eq!(serde_json::to_value(&snapshot).unwrap(), serde_json::to_value(&legacy).unwrap());
+        let mirror = book.snapshot(String::new(), true, 1).unwrap();
+        assert_eq!((mirror.bids.len(), mirror.asks.len()), (29, 70));
+        assert_eq!(mirror.bids[0].price, 0.29);
+        assert_eq!(mirror.asks[0].price, 0.30);
+        book.bids.clear();
+        assert_eq!(snapshot.bids.len(), 70);
+        assert_eq!(mirror.asks.len(), 70);
+        let (_, allocations, _) = super::clob_test_allocator::count(|| {
+            let mut events = arrayvec::ArrayVec::<MarketEvent, 2>::new();
+            events.push(MarketEvent::OrderBook(snapshot));
+            events.push(MarketEvent::OrderBook(mirror));
+            ClobBookApplyOutcome::Applied(events)
+        });
+        assert_eq!(allocations, 0, "bounded apply result must not enter the allocator");
+    }
+
+    #[test]
+    #[ignore = "focused live-depth snapshot allocation/latency comparison; run with --release --ignored"]
+    fn benchmark_clob_live_snapshot_depth() {
+        const N: usize = 100_000;
+        let book = live_99_level_book();
+        for legacy in [true, false] {
+            let convert = || if legacy { legacy_snapshot(&book) }
+                else { book.snapshot(String::new(), false, 1).unwrap() };
+            let (_, allocations, bytes) = super::clob_test_allocator::count(|| {
+                std::hint::black_box(convert());
+            });
+            let mut samples = Vec::with_capacity(N);
+            for _ in 0..N {
+                let start = Instant::now();
+                let snapshot = std::hint::black_box(convert());
+                samples.push(start.elapsed().as_nanos() as u64);
+                drop(snapshot);
+            }
+            let (p50, p99, p999, max) = latency_summary_ns(&mut samples);
+            println!("clob_snapshot legacy={legacy} n={N} boundary=resident_book_to_owned_70_bid_29_ask_snapshot unit=ns p50={p50} p99={p99} p999={p999} max={max} allocations_per_event={allocations} allocated_bytes_per_event={bytes} queue_depth=0 overflow=0");
+        }
     }
 
     fn quote(sequence: u64) -> MarketEvent {
