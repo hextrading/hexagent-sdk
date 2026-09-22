@@ -99,7 +99,7 @@ impl<T> TryQueue<T> {
     }
 
     #[inline]
-    fn push_with(&self, value: T, after_reserve: impl FnOnce()) -> Result<(), T> {
+    pub(crate) fn push_with(&self, value: T, after_reserve: impl FnOnce()) -> Result<(), T> {
         let tail = self.tail.0.load(Ordering::Relaxed);
         let slot = &self.slots[tail & (self.lap - 1)];
         if slot.stamp.load(Ordering::Acquire) != tail

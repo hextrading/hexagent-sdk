@@ -19,7 +19,7 @@ fn fixture(
         receivers.push(rx);
     }
     let (tx, _) = bounded(8);
-    (routes, receivers, ExecutorUpdateSender { owner: 1, tx })
+    (routes, receivers, ExecutorUpdateSender { owner: 1, tx: tx.into() })
 }
 
 fn command(iid: &str, coid: &str, sender: &ExecutorUpdateSender) -> PolyConnectionCommand {

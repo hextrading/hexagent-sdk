@@ -894,11 +894,12 @@ fn spawn_polymarket_supervisor(
                         snapshot.current_event_end_ns,
                     );
                     info!(
-                        "[market_dispatch_health] polls={} poll_age_us={} pending={} capacity_per_lane={} contention_drops={} alive={} phase={} max_poll_gap_us={} pending_high_water={} phase_key=0:unknown,1:supervisor,2:lifecycle,3:select,4:market,5:recorder",
+                        "[market_dispatch_health] polls={} poll_age_us={} pending={} capacity_per_lane={} contention_drops={} alive={} phase={} max_poll_gap_us={} pending_high_water={} executor_pending_high_water={} executor_capacity={} phase_key=0:unknown,1:supervisor,2:lifecycle,3:select,4:market,5:recorder",
                         consumer.polls, consumer.poll_age_ns / 1_000,
                         consumer.pending, consumer.capacity_per_lane,
                         consumer.contention_drops, consumer.alive, consumer.phase,
                         consumer.max_poll_gap_ns / 1_000, consumer.pending_high_water,
+                        consumer.executor_pending_high_water, CHANNEL_CAPACITY,
                     );
                     last_log = std::time::Instant::now();
                 }
@@ -2785,7 +2786,40 @@ pub struct RoutedSignal {
 #[derive(Clone)]
 struct ExecutorUpdateSender {
     owner: u16,
-    tx: Sender<RoutedOrderUpdate>,
+    tx: ExecutionUpdateTx,
+}
+
+/// Live root delivery uses a polling lane. Compatibility callers and physical
+/// connection owners keep their existing bounded outboxes; no new worker or
+/// mutable strategy authority is introduced.
+#[derive(Clone)]
+enum ExecutionUpdateTx {
+    Compatibility(Sender<RoutedOrderUpdate>),
+    Root(hexagent_runtime::poll_channel::Sender<RoutedOrderUpdate>),
+}
+
+impl From<Sender<RoutedOrderUpdate>> for ExecutionUpdateTx {
+    fn from(tx: Sender<RoutedOrderUpdate>) -> Self {
+        Self::Compatibility(tx)
+    }
+}
+
+impl From<hexagent_runtime::poll_channel::Sender<RoutedOrderUpdate>> for ExecutionUpdateTx {
+    fn from(tx: hexagent_runtime::poll_channel::Sender<RoutedOrderUpdate>) -> Self {
+        Self::Root(tx)
+    }
+}
+
+impl ExecutionUpdateTx {
+    fn send(
+        &self,
+        update: RoutedOrderUpdate,
+    ) -> Result<(), crossbeam_channel::SendError<RoutedOrderUpdate>> {
+        match self {
+            Self::Compatibility(tx) => tx.send(update),
+            Self::Root(tx) => tx.send(update),
+        }
+    }
 }
 
 const SYSTEM_SIGNAL_OWNER: u16 = SYSTEM_STRATEGY_OWNER;
@@ -4056,7 +4090,7 @@ impl Engine {
             )
         };
         let (executor_update_tx, executor_update_rx) =
-            bounded::<RoutedOrderUpdate>(CHANNEL_CAPACITY);
+            hexagent_runtime::poll_channel::bounded::<RoutedOrderUpdate>(CHANNEL_CAPACITY);
         // Authenticated user feeds are independent producers and may need
         // recovery routing by venue order id. Keep them separate from exact
         // owner-stamped executor feedback.
@@ -4200,7 +4234,7 @@ impl Engine {
 
         let exec_handle = self.spawn_execution_thread_with_poly_shutdown(
             signal_rx,
-            executor_update_tx,
+            executor_update_tx.into(),
             poly_states.clone(),
             stale_threshold_handles.clone(),
             shutdown_done_tx,
@@ -7963,7 +7997,7 @@ impl Engine {
         market_rx: PublicMarketReceiver,
         signal_tx: SignalSender,
         update_rx: Receiver<RoutedOrderUpdate>,
-        mut executor_update_rx: Option<Receiver<RoutedOrderUpdate>>,
+        mut executor_update_rx: Option<hexagent_runtime::poll_channel::Receiver<RoutedOrderUpdate>>,
         backtest: bool,
         recorder_tx: Option<Sender<Arc<MarketEvent>>>,
         rtt_probe_install: HashMap<
@@ -8707,7 +8741,7 @@ impl Engine {
         market_rx: PublicMarketReceiver,
         signal_tx: SignalSender,
         update_rx: Receiver<RoutedOrderUpdate>,
-        executor_update_rx: Option<Receiver<RoutedOrderUpdate>>,
+        executor_update_rx: Option<hexagent_runtime::poll_channel::Receiver<RoutedOrderUpdate>>,
         recorder_tx: Option<Sender<Arc<MarketEvent>>>,
         data_dirs: Vec<PathBuf>,
         shutdown_done_rx: Option<Receiver<()>>,
@@ -8864,8 +8898,6 @@ impl Engine {
                     .iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
                 let shutdown_done_rx = shutdown_done_rx
                     .unwrap_or_else(crossbeam_channel::never);
-                let executor_update_rx = executor_update_rx
-                    .unwrap_or_else(crossbeam_channel::never);
                 let mut shutdown_in_progress = false;
                 let mut lifecycle_outboxes = LifecycleOwnerOutboxes::new(instance_ids.len());
                 'router: loop {
@@ -8915,7 +8947,13 @@ impl Engine {
                             }
                         }
                     }
-                    let market_poll_interval = market_rx.poll_interval();
+                    let market_poll_interval = if executor_update_rx.as_ref()
+                        .is_some_and(|rx| rx.front_ready())
+                    {
+                        std::time::Duration::ZERO
+                    } else {
+                        market_rx.poll_interval()
+                    };
                     market_rx.mark_phase(2);
                     if let Err(failure) = lifecycle_outboxes.try_flush_one(&update_txs) {
                         if handle_lifecycle_route_failure(
@@ -8962,121 +9000,135 @@ impl Engine {
                             }
                             Err(_) => break,
                         },
-                        recv(executor_update_rx) -> msg => match msg {
-                            Ok(routed) => {
-                                market_rx.mark_phase(2);
-                                match Self::route_executor_update(
-                                    routed,
-                                    &iid_to_idx,
-                                    &update_txs,
-                                    &worker_quarantined,
-                                    &mut lifecycle_outboxes,
-                                ) {
-                                    Ok(()) => {},
-                                    Err(failure) => {
-                                        if handle_lifecycle_route_failure(
-                                            &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                        default(market_poll_interval) => {
+                            if let Some(executor_rx) = executor_update_rx.as_ref() {
+                                market_rx.observe_executor_depth(executor_rx.len());
+                                match executor_rx.try_recv() {
+                                    Ok(routed) => {
+                                        market_rx.mark_phase(2);
+                                        match Self::route_executor_update(
+                                            routed,
+                                            &iid_to_idx,
+                                            &update_txs,
+                                            &worker_quarantined,
                                             &mut lifecycle_outboxes,
                                         ) {
-                                            break 'router;
+                                            Ok(()) => {},
+                                            Err(failure) => {
+                                                if handle_lifecycle_route_failure(
+                                                    &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                                                    &mut lifecycle_outboxes,
+                                                ) {
+                                                    break 'router;
+                                                }
+                                            }
                                         }
+                                        continue;
                                     }
-                                }
-                            }
-                            Err(_) => break,
-                        },
-                        default(market_poll_interval) => match market_rx.try_recv() {
-                            Ok(MarketEvent::Exit) => {
-                                if shutdown_in_progress { continue; }
-                                forward_recorder_event(
-                                    recorder_tx.as_ref(), &MarketEvent::Exit,
-                                );
-                                let mut waiting: HashSet<usize> = (0..instance_ids.len())
-                                    .filter(|idx| !worker_quarantined[*idx].load(Ordering::Acquire))
-                                    .collect();
-                                for idx in &waiting {
-                                    worker_shutdown_requested[*idx].store(true, Ordering::Release);
-                                }
-                                // A worker acknowledges only after its current
-                                // callback has returned and on_exit has run, so
-                                // all order-producing signals are ahead of the
-                                // executor barrier.
-                                let deadline = std::time::Instant::now()
-                                    + std::time::Duration::from_nanos(STRATEGY_WORKER_STALL_NS);
-                                while !waiting.is_empty() {
-                                    let now = std::time::Instant::now();
-                                    if now >= deadline { break; }
-                                    match shutdown_ack_rx.recv_timeout(deadline.saturating_duration_since(now)) {
-                                        Ok(idx) => { waiting.remove(&idx); }
-                                        Err(_) => break,
-                                    }
-                                }
-                                for idx in waiting {
-                                    quarantine_strategy_worker(
-                                        idx,
-                                        "shutdown acknowledgement timed out",
-                                        &instance_ids,
-                                        &worker_quarantined,
-                                        &signal_tx,
-                                    );
-                                }
-                                shutdown_in_progress = true;
-                                if signal_tx.send(Signal::BeginShutdown).is_err() {
-                                    warn!("[Strategy] executor disappeared before shutdown barrier");
-                                    break;
-                                }
-                            }
-                            Ok(event) => {
-                                market_rx.mark_phase(4);
-                                if shutdown_in_progress { continue; }
-                                if let Some(age) = market_receive_age_ns(&event, crate::types::now_ns()) {
-                                    crate::latency::record_ns("market.receive_to_router", age);
-                                }
-                                let event = Arc::new(event);
-                                let mut dropped_mask = Self::route_market_event(
-                                    Arc::clone(&event),
-                                    &sym_to_instances,
-                                    &mut token_to_instances,
-                                    &mut latest_key_ids,
-                                    &market_lanes,
-                                );
-                                while dropped_mask != 0 {
-                                    let idx = dropped_mask.trailing_zeros() as usize;
-                                    dropped_mask &= dropped_mask - 1;
-                                    if let Some(drops) = market_overflow_drops.get_mut(idx) {
-                                        *drops = drops.saturating_add(1);
-                                    }
-                                    quarantine_strategy_worker(
-                                        idx,
-                                        "market queue overflow (event loss)",
-                                        &instance_ids,
-                                        &worker_quarantined,
-                                        &signal_tx,
-                                    );
-                                }
-                                market_rx.mark_phase(5);
-                                forward_recorder_shared(recorder_tx.as_ref(), event);
-                                if market_overflow_drops.iter().any(|drops| *drops > 0)
-                                    && market_overflow_log_at.elapsed()
-                                        >= std::time::Duration::from_secs(1)
-                                {
-                                    for (idx, drops) in market_overflow_drops.iter_mut().enumerate() {
-                                        if *drops == 0 {
+                                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                                        if executor_rx.has_pending() {
+                                            // An admitted lifecycle head is still being published.
+                                            // Yield to its owner, retaining private-before-market order.
+                                            thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
                                             continue;
                                         }
-                                        warn!(
-                                            "[market_queue_metric] instance={} router_overflow_drops={} window_ms={}",
-                                            instance_ids.get(idx).map(String::as_str).unwrap_or("<unknown>"),
-                                            *drops,
-                                            market_overflow_log_at.elapsed().as_millis(),
-                                        );
-                                        *drops = 0;
                                     }
-                                    market_overflow_log_at = std::time::Instant::now();
+                                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                                 }
                             }
-                            Err(crossbeam_channel::TryRecvError::Empty) => continue,
-                            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                            match market_rx.try_recv() {
+                                Ok(MarketEvent::Exit) => {
+                                    if shutdown_in_progress { continue; }
+                                    forward_recorder_event(
+                                        recorder_tx.as_ref(), &MarketEvent::Exit,
+                                    );
+                                    let mut waiting: HashSet<usize> = (0..instance_ids.len())
+                                        .filter(|idx| !worker_quarantined[*idx].load(Ordering::Acquire))
+                                        .collect();
+                                    for idx in &waiting {
+                                        worker_shutdown_requested[*idx].store(true, Ordering::Release);
+                                    }
+                                    // A worker acknowledges only after its current
+                                    // callback has returned and on_exit has run, so
+                                    // all order-producing signals are ahead of the
+                                    // executor barrier.
+                                    let deadline = std::time::Instant::now()
+                                        + std::time::Duration::from_nanos(STRATEGY_WORKER_STALL_NS);
+                                    while !waiting.is_empty() {
+                                        let now = std::time::Instant::now();
+                                        if now >= deadline { break; }
+                                        match shutdown_ack_rx.recv_timeout(deadline.saturating_duration_since(now)) {
+                                            Ok(idx) => { waiting.remove(&idx); }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    for idx in waiting {
+                                        quarantine_strategy_worker(
+                                            idx,
+                                            "shutdown acknowledgement timed out",
+                                            &instance_ids,
+                                            &worker_quarantined,
+                                            &signal_tx,
+                                        );
+                                    }
+                                    shutdown_in_progress = true;
+                                    if signal_tx.send(Signal::BeginShutdown).is_err() {
+                                        warn!("[Strategy] executor disappeared before shutdown barrier");
+                                        break;
+                                    }
+                                }
+                                Ok(event) => {
+                                    market_rx.mark_phase(4);
+                                    if shutdown_in_progress { continue; }
+                                    if let Some(age) = market_receive_age_ns(&event, crate::types::now_ns()) {
+                                        crate::latency::record_ns("market.receive_to_router", age);
+                                    }
+                                    let event = Arc::new(event);
+                                    let mut dropped_mask = Self::route_market_event(
+                                        Arc::clone(&event),
+                                        &sym_to_instances,
+                                        &mut token_to_instances,
+                                        &mut latest_key_ids,
+                                        &market_lanes,
+                                    );
+                                    while dropped_mask != 0 {
+                                        let idx = dropped_mask.trailing_zeros() as usize;
+                                        dropped_mask &= dropped_mask - 1;
+                                        if let Some(drops) = market_overflow_drops.get_mut(idx) {
+                                            *drops = drops.saturating_add(1);
+                                        }
+                                        quarantine_strategy_worker(
+                                            idx,
+                                            "market queue overflow (event loss)",
+                                            &instance_ids,
+                                            &worker_quarantined,
+                                            &signal_tx,
+                                        );
+                                    }
+                                    market_rx.mark_phase(5);
+                                    forward_recorder_shared(recorder_tx.as_ref(), event);
+                                    if market_overflow_drops.iter().any(|drops| *drops > 0)
+                                        && market_overflow_log_at.elapsed()
+                                            >= std::time::Duration::from_secs(1)
+                                    {
+                                        for (idx, drops) in market_overflow_drops.iter_mut().enumerate() {
+                                            if *drops == 0 {
+                                                continue;
+                                            }
+                                            warn!(
+                                                "[market_queue_metric] instance={} router_overflow_drops={} window_ms={}",
+                                                instance_ids.get(idx).map(String::as_str).unwrap_or("<unknown>"),
+                                                *drops,
+                                                market_overflow_log_at.elapsed().as_millis(),
+                                            );
+                                            *drops = 0;
+                                        }
+                                        market_overflow_log_at = std::time::Instant::now();
+                                    }
+                                }
+                                Err(crossbeam_channel::TryRecvError::Empty) => continue,
+                                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                            }
                         },
                         recv(shutdown_done_rx) -> _ => {
                             if shutdown_in_progress {
@@ -9105,7 +9157,15 @@ impl Engine {
                                         break 'router;
                                     }
                                 }
-                                while let Ok(routed) = executor_update_rx.try_recv() {
+                                while let Some(executor_rx) = executor_update_rx.as_ref() {
+                                    let routed = match executor_rx.try_recv() {
+                                        Ok(routed) => routed,
+                                        Err(crossbeam_channel::TryRecvError::Empty) if executor_rx.has_pending() => {
+                                            thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
+                                            continue;
+                                        }
+                                        Err(_) => break,
+                                    };
                                     let result = Self::route_executor_update(
                                         routed,
                                         &iid_to_idx,
@@ -9146,6 +9206,11 @@ impl Engine {
 
                 // Close direct private-update lanes before workers are
                 // released to generate their final reports.
+                // The router also retains these senders for paper/non-Poly
+                // instances, whose absent SharedState cannot keep them alive.
+                // Otherwise their workers see a disconnected priority lane
+                // and exit before handling any execution or market message.
+                drop(direct_private_routes);
                 drop(update_txs);
                 drop(market_lanes);
                 for (idx, handle) in handles.into_iter().enumerate() {
@@ -12003,7 +12068,7 @@ impl Engine {
         let (shutdown_done_tx, _shutdown_done_rx) = bounded::<()>(1);
         self.spawn_execution_thread_with_poly_shutdown(
             signal_rx,
-            update_tx,
+            update_tx.into(),
             poly_states,
             stale_threshold_handles,
             shutdown_done_tx,
@@ -12016,7 +12081,7 @@ impl Engine {
     fn spawn_execution_thread_with_poly_shutdown(
         &self,
         signal_rx: Receiver<RoutedSignal>,
-        update_tx: Sender<RoutedOrderUpdate>,
+        update_tx: ExecutionUpdateTx,
         poly_states: HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
         shutdown_done_tx: Sender<()>,
@@ -12829,6 +12894,7 @@ impl Engine {
                             poly_completion_txs.get(shared.account_state.account_id())
                         })
                         .cloned()
+                        .map(ExecutionUpdateTx::from)
                         .unwrap_or_else(|| update_tx.clone());
                     let update_sender = ExecutorUpdateSender {
                         owner: routed.owner,
@@ -14161,7 +14227,7 @@ fn rejected_venue_signal(signal: &Signal, detail: &str) -> Vec<OrderUpdate> {
 fn spawn_venue_execution_owner<T: ExchangeTrade + 'static>(
     venue: Exchange,
     mut worker: T,
-    root_update_tx: Sender<RoutedOrderUpdate>,
+    root_update_tx: ExecutionUpdateTx,
     diagnostics: Sender<ExecutionDiagnostic>,
 ) -> (VenueExecutionRoutes, Vec<thread::JoinHandle<()>>) {
     let (fast_tx, fast_rx) = bounded::<VenueExecutionCommand>(VENUE_FAST_OWNER_QUEUE_CAPACITY);
@@ -16883,6 +16949,10 @@ impl ExchangeTrade for LiveRouter {
 mod startup_lifecycle_intake_tests;
 
 #[cfg(test)]
+#[path = "router_poll_lane_tests.rs"]
+mod router_poll_lane_tests;
+
+#[cfg(test)]
 mod market_router_tests {
     use super::*;
     use crossbeam_channel::Receiver;
@@ -17605,7 +17675,7 @@ mod market_router_tests {
         let (shutdown_done_tx, shutdown_done_rx) = bounded(1);
         let execution = engine.spawn_execution_thread_with_poly_shutdown(
             signal_rx,
-            update_tx,
+            update_tx.into(),
             HashMap::new(),
             HashMap::new(),
             shutdown_done_tx,
@@ -17675,7 +17745,7 @@ mod market_router_tests {
         let (shutdown_done_tx, _shutdown_done_rx) = bounded(1);
         let execution = engine.spawn_execution_thread_with_poly_shutdown(
             signal_rx,
-            update_tx,
+            update_tx.into(),
             poly_states,
             HashMap::new(),
             shutdown_done_tx,
@@ -18707,7 +18777,7 @@ mod market_router_tests {
         let (raw_tx, rx) = bounded(1);
         let tx = ExecutorUpdateSender {
             owner: 7,
-            tx: raw_tx,
+            tx: raw_tx.into(),
         };
         let before = now_ns();
         send_executor_update(&tx, update).unwrap();
@@ -18771,7 +18841,7 @@ mod market_router_tests {
         let orders = [order_req("probe-1", "owner"), order_req("probe-2", "owner")];
         for order in orders {
             assert!(dispatch_poly_signal_to_connection_owner(Signal::NewOrder(order), 0,
-                ExecutorUpdateSender { owner: 9, tx: update_tx.clone() }, &mut routes));
+                ExecutorUpdateSender { owner: 9, tx: update_tx.clone().into() }, &mut routes));
         }
         let command = fast_a_rx.try_recv().unwrap();
         assert!(matches!(command, PolyConnectionCommand::Place {
@@ -18798,7 +18868,7 @@ mod market_router_tests {
             cancel: vec![PolyConnectionLane::for_test(cancel_tx, Role::Cancel, 0)],
             ..Default::default()
         };
-        let sender = ExecutorUpdateSender { owner: 4, tx: update_tx };
+        let sender = ExecutorUpdateSender { owner: 4, tx: update_tx.into() };
         dispatch_poly_signal_to_connection_owner(
             Signal::NewOrder(order_req("new", "owner")), 0, sender.clone(), &mut routes);
         dispatch_poly_signal_to_connection_owner(Signal::CancelOrder {
@@ -18820,7 +18890,7 @@ mod market_router_tests {
         let (raw_update_tx, update_rx) = bounded(8);
         let update_tx = ExecutorUpdateSender {
             owner: 3,
-            tx: raw_update_tx,
+            tx: raw_update_tx.into(),
         };
         assert!(fast_tx
             .try_send(PolyConnectionCommand::Fallback {
@@ -18878,7 +18948,7 @@ mod market_router_tests {
         let (raw_update_tx, _update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
             owner: 4,
-            tx: raw_update_tx,
+            tx: raw_update_tx.into(),
         };
         let mut routes = PolyAccountConnectionRoutes {
             cancel: vec![PolyConnectionLane::for_test(
@@ -18933,7 +19003,7 @@ mod market_router_tests {
         let (raw_update_tx, _update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
             owner: 4,
-            tx: raw_update_tx,
+            tx: raw_update_tx.into(),
         };
         let mut routes = PolyAccountConnectionRoutes {
             fast: vec![
@@ -19033,7 +19103,7 @@ mod market_router_tests {
         let (raw_update_tx, _update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
             owner: 9,
-            tx: raw_update_tx,
+            tx: raw_update_tx.into(),
         };
         let mut routes = PolyAccountConnectionRoutes {
             cancel: vec![
@@ -19118,7 +19188,7 @@ mod market_router_tests {
         let (raw_update_tx, update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
             owner: 9,
-            tx: raw_update_tx,
+            tx: raw_update_tx.into(),
         };
         let mut routes = PolyAccountConnectionRoutes {
             cancel: vec![PolyConnectionLane::for_test(
@@ -19163,7 +19233,7 @@ mod market_router_tests {
         let (raw_update_tx, update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
             owner: 10,
-            tx: raw_update_tx,
+            tx: raw_update_tx.into(),
         };
         let mut routes = PolyAccountConnectionRoutes {
             safety_cancel: vec![PolyConnectionLane::for_test(
@@ -19227,7 +19297,7 @@ mod market_router_tests {
         let (raw_update_tx, update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
             owner: 11,
-            tx: raw_update_tx,
+            tx: raw_update_tx.into(),
         };
         let mut routes = PolyAccountConnectionRoutes {
             cancel: vec![PolyConnectionLane::for_test(
@@ -19305,7 +19375,7 @@ mod market_router_tests {
         let (raw_update_tx, _update_rx) = bounded(1);
         let update_tx = ExecutorUpdateSender {
             owner: 5,
-            tx: raw_update_tx,
+            tx: raw_update_tx.into(),
         };
         let mut routes = PolyAccountConnectionRoutes {
             cancel: vec![PolyConnectionLane::for_test(
@@ -19372,7 +19442,7 @@ mod market_router_tests {
         let (raw_update_tx, update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
             owner: 2,
-            tx: raw_update_tx,
+            tx: raw_update_tx.into(),
         };
         let mut routes = PolyAccountConnectionRoutes {
             fast: vec![
@@ -19526,8 +19596,9 @@ mod market_router_tests {
             Arc::new(AtomicBool::new(false)),
         ];
         let mut outboxes = LifecycleOwnerOutboxes::new(2);
-        let routed = Engine::route_executor_update(
-            RoutedOrderUpdate {
+        let (root_tx, root_rx) = hexagent_runtime::poll_channel::bounded(4);
+        let root_tx = ExecutionUpdateTx::Root(root_tx);
+        root_tx.send(RoutedOrderUpdate {
                 owner: 1,
                 // Deliberately not namespaced: string recovery routing would
                 // reject this update as unowned.
@@ -19551,7 +19622,9 @@ mod market_router_tests {
                     error: None,
                 },
                 timing: LifecycleTiming::default(),
-            },
+            }).unwrap();
+        let routed = Engine::route_executor_update(
+            root_rx.try_recv().unwrap(),
             &HashMap::new(),
             &[owner0_tx, owner1_tx],
             &flags,
