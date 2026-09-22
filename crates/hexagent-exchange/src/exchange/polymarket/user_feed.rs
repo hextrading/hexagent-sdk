@@ -17,7 +17,6 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use crossbeam_channel::Sender;
 use futures_util::{SinkExt, StreamExt};
 use hexagent_account::account::shared_account::normalize_order_id;
 use hexagent_account::account::shared_account::FrozenTradeExecution;
@@ -363,7 +362,7 @@ fn accept_reconnect_replay(
 
 fn enqueue_recovery_update(
     shared: &SharedState,
-    update_tx: &Sender<RoutedOrderUpdate>,
+    update_tx: &impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     generation: u64,
     update: OrderUpdate,
 ) -> Result<()> {
@@ -402,7 +401,7 @@ fn enqueue_recovery_update(
 fn flush_startup_recovery_updates(
     shared: &SharedState,
     generation: u64,
-    update_tx: &Sender<RoutedOrderUpdate>,
+    update_tx: &impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     shutdown: &AtomicBool,
 ) -> Result<()> {
     if !shared.user_feed_health.strategy_consumer_ready() {
@@ -464,7 +463,7 @@ fn flush_startup_recovery_updates(
 async fn wait_for_recovery_delivery(
     shared: &SharedState,
     generation: u64,
-    update_tx: &Sender<RoutedOrderUpdate>,
+    update_tx: &impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     shutdown: &AtomicBool,
 ) -> Result<()> {
     let mut ready_started = None;
@@ -2447,7 +2446,7 @@ impl PrivateApplyLane {
 
 fn dispatch_private_update(
     shared: &SharedState,
-    update_tx: &Sender<RoutedOrderUpdate>,
+    update_tx: &impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     recovery_generation: Option<u64>,
     routed: RoutedOrderUpdate,
 ) -> std::result::Result<(), String> {
@@ -2539,7 +2538,7 @@ fn dispatch_private_update(
 
 fn dispatch_repaired_private_update(
     shared: &SharedState,
-    update_tx: &Sender<RoutedOrderUpdate>,
+    update_tx: &impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     generation: Option<u64>,
     instance: &str,
     routed: RoutedOrderUpdate,
@@ -2565,7 +2564,7 @@ fn dispatch_repaired_private_update(
 
 fn route_private_batch(
     shared: &SharedState,
-    update_tx: &Sender<RoutedOrderUpdate>,
+    update_tx: &impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     events: Vec<PrivateEventDelta>,
     recovery_generation: Option<u64>,
     route_dedupe: &mut PrivateRouteDedupe,
@@ -2940,7 +2939,7 @@ pub(crate) fn apply_private_cold_command(
 
 fn finish_private_execution_repair(
     shared: &SharedState,
-    update_tx: &Sender<RoutedOrderUpdate>,
+    update_tx: &impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     route_dedupe: &mut PrivateRouteDedupe,
     reply: PrivateExecutionRepairReply,
 ) -> std::result::Result<(), String> {
@@ -3035,7 +3034,7 @@ fn validate_terminal_replay_scope(
 
 fn spawn_private_apply_worker(
     shared: Arc<SharedState>,
-    update_tx: Sender<RoutedOrderUpdate>,
+    update_tx: impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(PrivateApplyLane, Vec<std::thread::JoinHandle<()>>)> {
     let (live_tx, live_rx) = crossbeam_channel::bounded(PRIVATE_APPLY_QUEUE_CAPACITY);
@@ -4306,7 +4305,7 @@ impl OpenOrderRecovery {
     async fn poll(
         &mut self,
         shared: &Arc<SharedState>,
-        update_tx: &Sender<RoutedOrderUpdate>,
+        update_tx: &impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
         lane: &PrivateApplyLane,
         shutdown: &Arc<AtomicBool>,
     ) -> Result<()> {
@@ -4443,7 +4442,7 @@ impl OpenOrderRecovery {
     async fn drain_disconnected(
         &mut self,
         shared: &Arc<SharedState>,
-        update_tx: &Sender<RoutedOrderUpdate>,
+        update_tx: &impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
         lane: &PrivateApplyLane,
         shutdown: &Arc<AtomicBool>,
     ) -> Result<()> {
@@ -4464,7 +4463,7 @@ impl OpenOrderRecovery {
 
 fn deliver_open_order_recovery(
     shared: &SharedState,
-    update_tx: &Sender<RoutedOrderUpdate>,
+    update_tx: &impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     generation: u64,
     pass: super::trade::RuntimeOrderRecovery,
     shutdown: &AtomicBool,
@@ -4517,7 +4516,7 @@ async fn user_feed_loop(
     api_secret: String,
     passphrase: String,
     shared: Arc<SharedState>,
-    update_tx: Sender<RoutedOrderUpdate>,
+    update_tx: impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     apply_lane: PrivateApplyLane,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -5049,7 +5048,7 @@ pub fn spawn_user_feed(
     api_secret: &str,
     passphrase: &str,
     shared: Arc<SharedState>,
-    update_tx: Sender<RoutedOrderUpdate>,
+    update_tx: impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<std::thread::JoinHandle<()>> {
     let api_key = api_key.to_string();
@@ -5306,7 +5305,7 @@ mod tests {
         let second = recovery_test_update(&shared, "coid-b", "0xb1", "owner");
         shared.user_feed_health.mark_strategy_consumer_ready();
         let generation = shared.user_feed_health.begin_recovery_delivery();
-        let (tx, rx) = crossbeam_channel::bounded(2);
+        let (tx, rx) = hexagent_runtime::poll_channel::bounded(2);
         let result = deliver_open_order_recovery(
             &shared,
             &tx,
@@ -5352,7 +5351,7 @@ mod tests {
             .unwrap();
         let update = recovery_test_update(&shared, "coid-startup", "0xe1", "owner-1");
         let generation = shared.user_feed_health.begin_recovery_delivery();
-        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (tx, rx) = hexagent_runtime::poll_channel::bounded(1);
         enqueue_recovery_update(&shared, &tx, generation, update).unwrap();
         assert!(rx.is_empty());
         shared.user_feed_health.mark_strategy_consumer_ready();

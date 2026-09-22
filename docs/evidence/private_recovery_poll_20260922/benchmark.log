@@ -1,0 +1,11 @@
+   Compiling hexagent-runtime v0.1.0 (/Users/Admin1/projects/hexagent-sdk/crates/hexagent-runtime)
+    Finished `release` profile [optimized] target(s) in 50.96s
+     Running unittests src/lib.rs (target/release/deps/hexagent_runtime-c8193195ef0ef5f9)
+
+running 1 test
+crossbeam n=100000 p50_ns=44 p99_ns=49 p999_ns=53 max_ns=19241 depth_high_water=1 dropped=0 boundary=prebuilt_message_push_then_pop_same_thread
+poll_channel n=100000 p50_ns=43 p99_ns=51 p999_ns=55 max_ns=23545 depth_high_water=1 dropped=0 boundary=prebuilt_message_push_then_pop_same_thread
+test poll_channel::tests::crossbeam_and_poll_lane_roundtrip_benchmark ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 76 filtered out; finished in 0.02s
+

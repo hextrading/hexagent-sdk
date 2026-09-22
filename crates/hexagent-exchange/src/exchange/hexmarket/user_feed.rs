@@ -8,7 +8,6 @@
 //! polymarket/user_feed.rs.
 
 use anyhow::{anyhow, Result};
-use crossbeam_channel::Sender;
 use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
 use serde::Serialize;
@@ -168,7 +167,7 @@ async fn user_ws_task(
     url: String,
     credentials: ApiCredentials,
     owner: u16,
-    update_tx: Sender<RoutedOrderUpdate>,
+    update_tx: impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut backoff = crate::exchange::ReconnectBackoff::new(RECONNECT_MIN_MS, RECONNECT_MAX_MS);
@@ -304,7 +303,7 @@ pub fn spawn_user_feed(
     wss_url: &str,
     credentials: ApiCredentials,
     owner: u16,
-    update_tx: Sender<RoutedOrderUpdate>,
+    update_tx: impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<std::thread::JoinHandle<()>> {
     let url = format!("{}/user", wss_url.trim_end_matches('/'));

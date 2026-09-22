@@ -1,0 +1,153 @@
+warning: unused import: `Rng`
+    --> crates/hexagent-exchange/src/exchange/sim/latency.rs:3312:20
+     |
+3312 |         use rand::{Rng, SeedableRng};
+     |                    ^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: use of deprecated associated function `k256::elliptic_curve::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+   --> crates/hexagent-exchange/src/exchange/polymarket/deploy_wallet.rs:785:52
+    |
+785 |         k256::Scalar::from_repr(*k256::FieldBytes::from_slice(il)),
+    |                                                    ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated associated function `k256::elliptic_curve::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+   --> crates/hexagent-exchange/src/exchange/polymarket/deploy_wallet.rs:789:52
+    |
+789 |         k256::Scalar::from_repr(*k256::FieldBytes::from_slice(k_par)),
+    |                                                    ^^^^^^^^^^
+
+warning: field `exchange_address` is never read
+   --> crates/hexagent-exchange/src/exchange/polymarket/signer.rs:118:5
+    |
+112 | pub struct OrderSigner {
+    |            ----------- field in this struct
+...
+118 |     exchange_address: String,
+    |     ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `exchange_address` and `builder_code` are never read
+   --> crates/hexagent-exchange/src/exchange/polymarket/signer_v2.rs:141:5
+    |
+137 | pub struct OrderSignerV2 {
+    |            ------------- fields in this struct
+...
+141 |     exchange_address: String,
+    |     ^^^^^^^^^^^^^^^^
+142 |     builder_code: [u8; 32],
+    |     ^^^^^^^^^^^^
+
+warning: associated function `make_timeout_cancel` is never used
+    --> crates/hexagent-exchange/src/exchange/polymarket/trade.rs:9582:8
+     |
+6578 | impl PolymarketTrade {
+     | -------------------- associated function in this implementation
+...
+9582 |     fn make_timeout_cancel(
+     |        ^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_user_event_diagnosed_owned` is never used
+    --> crates/hexagent-exchange/src/exchange/polymarket/user_feed.rs:3346:15
+     |
+3346 | pub(crate) fn parse_user_event_diagnosed_owned(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused `std::result::Result` that must be used
+    --> crates/hexagent-exchange/src/exchange/polymarket/user_feed.rs:6138:9
+     |
+6138 | /         shared
+6139 | |             .account_state
+6140 | |             .apply_physical_snapshot(100.0, HashMap::new());
+     | |___________________________________________________________^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+     = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+     |
+6138 |         let _ = shared
+     |         +++++++
+
+warning: unused `std::result::Result` that must be used
+    --> crates/hexagent-exchange/src/exchange/polymarket/user_feed.rs:6218:9
+     |
+6218 | /         shared
+6219 | |             .account_state
+6220 | |             .apply_physical_snapshot(200.0, HashMap::new());
+     | |___________________________________________________________^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+     |
+6218 |         let _ = shared
+     |         +++++++
+
+warning: unused `std::result::Result` that must be used
+    --> crates/hexagent-exchange/src/exchange/polymarket/user_feed.rs:6294:9
+     |
+6294 | /         shared
+6295 | |             .account_state
+6296 | |             .apply_physical_snapshot(200.0, HashMap::new());
+     | |___________________________________________________________^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+     |
+6294 |         let _ = shared
+     |         +++++++
+
+warning: unused `std::result::Result` that must be used
+    --> crates/hexagent-exchange/src/exchange/polymarket/user_feed.rs:6450:9
+     |
+6450 | /         shared
+6451 | |             .account_state
+6452 | |             .apply_physical_snapshot(200.0, HashMap::new());
+     | |___________________________________________________________^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+     |
+6450 |         let _ = shared
+     |         +++++++
+
+warning: unused `std::result::Result` that must be used
+    --> crates/hexagent-exchange/src/exchange/polymarket/user_feed.rs:6538:9
+     |
+6538 | /         shared
+6539 | |             .account_state
+6540 | |             .apply_physical_snapshot(100.0, HashMap::new());
+     | |___________________________________________________________^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+     |
+6538 |         let _ = shared
+     |         +++++++
+
+warning: unused `std::result::Result` that must be used
+    --> crates/hexagent-exchange/src/exchange/polymarket/user_feed.rs:7215:9
+     |
+7215 | /         shared
+7216 | |             .account_state
+7217 | |             .apply_physical_snapshot(200.0, HashMap::new());
+     | |___________________________________________________________^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+     |
+7215 |         let _ = shared
+     |         +++++++
+
+warning: `hexagent-exchange` (lib test) generated 13 warnings (run `cargo fix --lib -p hexagent-exchange --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.28s
+     Running unittests src/lib.rs (target/debug/deps/hexagent_exchange-b84e3c9f5750e80c)
+
+running 1 test
+test exchange::polymarket::user_feed::tests::partial_audit_failure_delivers_successful_siblings_to_exact_owners ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 944 filtered out; finished in 0.24s
+
