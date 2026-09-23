@@ -1,0 +1,7 @@
+# Reject incomplete strategy construction before owner routing starts
+
+maker02's BTC03 static model was older than its configured 30-day limit. Its factory returned `None`; construction previously omitted the instance and compacted BTC02/BTC01 to owner indexes 0/1, while executor and private routes still used configured indexes 1/2. The first BTC01 control signal reached owner 1 (BTC02), triggering `signal owner mismatch`. Private startup delivery also failed its durable ownership proof. These checks correctly prevented ambiguous execution, but the process could remain partially alive with a stalled market router.
+
+An enabled factory rejection now fails the entire construction step. The live error path requests shutdown, joins startup producers, then finishes and drains lossless account/audit workers. No strategy worker/public feed starts from an incomplete vector. Disabled configuration entries are still ignored consistently. The original strict private/embedded owner checks remain intact.
+
+This is startup-only validation and cleanup. It introduces no mutable runtime fields, message lanes, worker roles, or quote/dispatch work. Existing queue capacity, priority, ordering and overflow semantics are unchanged. Tests cover rejected first/middle/last factories, disabled entries, repeated valid construction, unknown enabled factories, and clean live-startup shutdown. Production latency must be measured after a complete startup; the failed startup is not a latency baseline.
