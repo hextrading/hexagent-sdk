@@ -3264,6 +3264,8 @@ pub struct SharedState {
     pub(crate) unified_private_owner: bool,
     #[cfg(test)]
     pub(crate) private_commit_benchmark: OnceLock<crossbeam_channel::Sender<u64>>,
+    #[cfg(test)]
+    pub(crate) private_pending_apply_high: std::sync::atomic::AtomicUsize,
     /// Strategy instance identifier (the `[poly.<id>]` key). Tags each
     /// row in the per-request latency CSV so a single file can hold
     /// multiple instances. `"cli"` for one-off CLI subcommands.
@@ -4313,6 +4315,7 @@ impl SharedState {
                     "polymarket.account.owner_turn",
                     "polymarket.user.ws_enqueue_to_owner_dequeue",
                     "polymarket.user.private_delivery_outbox_high_water",
+                    "polymarket.user.pending_apply_depth",
                 ]);
                 let recovery_binding = if unified {
                     match shared_recovery.bind_recovery_owner() {
@@ -7014,6 +7017,8 @@ impl PolymarketTrade {
             unified_private_owner,
             #[cfg(test)]
             private_commit_benchmark: OnceLock::new(),
+            #[cfg(test)]
+            private_pending_apply_high: std::sync::atomic::AtomicUsize::new(0),
             instance_id: instance_id.to_string(),
             account_state,
             account_owner_handle,

@@ -1,10 +1,14 @@
 //! One account's ingress state moves into its lifecycle owner at startup.
 //! Each turn handles at most one repair, one advisory acknowledgement, one
-//! live record and one replay record. Large WS frames retain their iterator
+//! bounded live-routing burst, one replay record and one lifecycle apply.
+//! Large WS frames retain their iterator
 //! locally; a recovery fence cannot overtake any record of its frame. The
 //! lifecycle loop services its own bounded mailboxes between these turns.
 //! No account/strategy state is shared with another account owner.
 use super::*;
+
+const LIVE_ROUTE_BUDGET: usize = 32;
+const PENDING_APPLY_CAPACITY: usize = 64;
 
 type ReplayCompletion =
     tokio::sync::oneshot::Sender<std::result::Result<ReplayApplySummary, String>>;
@@ -46,6 +50,8 @@ struct UnifiedIngress<T> {
     committed: PrivateRouteDedupe,
     live: Option<LiveFrame>,
     replay: Option<ReplayFrame>,
+    pending_apply: VecDeque<PrivateColdCommand>,
+    fence: Option<(u64, tokio::sync::oneshot::Sender<bool>)>,
 }
 
 pub(crate) fn prepare(
@@ -95,6 +101,8 @@ pub(crate) fn prepare(
             committed: PrivateRouteDedupe::new(),
             live: None,
             replay: None,
+            pending_apply: VecDeque::with_capacity(PENDING_APPLY_CAPACITY),
+            fence: None,
         }),
     ))
 }
@@ -116,8 +124,6 @@ impl<T: hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>> UnifiedI
         generation: Option<u64>,
         certificate: Option<u64>,
         completion: Option<ReplayCompletion>,
-        positions: &mut LivePositionManager,
-        replay: &mut PrivateReplayOwner,
     ) {
         let routed =
             validate_terminal_replay_scope(&shared.user_feed_health, certificate, generation)
@@ -154,23 +160,28 @@ impl<T: hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>> UnifiedI
                 }
             }
             Ok(routed) => {
-                // Already on the lifecycle writer: no self-send, queue-full
-                // retry, second thread wake or cross-thread account borrow.
-                apply_private_cold_command(
-                    shared,
-                    positions,
-                    replay,
-                    PrivateColdCommand {
-                        events: routed.events,
-                        identities: routed.identities,
-                        durable_skips: routed.durable_skips,
-                        recovery_generation: generation,
-                        expected_recovery_certificate: certificate,
-                        completion,
-                        routed_at: crate::latency::Instant::now(),
-                        feedback: self.feedback.clone(),
-                    },
+                // Owner-local FIFO, preallocated at startup. Reserve capacity
+                // before consuming input; do not self-send or block routing on
+                // bookkeeping for preceding records in the same short burst.
+                assert!(self.pending_apply.len() < PENDING_APPLY_CAPACITY);
+                self.pending_apply.push_back(PrivateColdCommand {
+                    events: routed.events,
+                    identities: routed.identities,
+                    durable_skips: routed.durable_skips,
+                    recovery_generation: generation,
+                    expected_recovery_certificate: certificate,
+                    completion,
+                    routed_at: crate::latency::Instant::now(),
+                    feedback: self.feedback.clone(),
+                });
+                crate::latency::record_ns(
+                    "polymarket.user.pending_apply_depth",
+                    self.pending_apply.len() as u64,
                 );
+                #[cfg(test)]
+                shared
+                    .private_pending_apply_high
+                    .fetch_max(self.pending_apply.len(), Ordering::Relaxed);
             }
         }
     }
@@ -191,9 +202,6 @@ impl<T: hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>> PrivateI
         positions: &mut LivePositionManager,
         replay: &mut PrivateReplayOwner,
     ) -> bool {
-        if shared.user_feed_health.private_delivery_pending() {
-            return false;
-        }
         let mut progressed = false;
         if let Ok(reply) = self.repair_rx.try_recv() {
             progressed = true;
@@ -214,139 +222,165 @@ impl<T: hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>> PrivateI
                 self.committed.remember(identity);
             }
         }
-        if self.live.is_none() {
-            if let Ok(command) = self.live_rx.try_recv() {
-                progressed = true;
-                match command {
-                    PrivateApplyCommand::Live {
-                        events,
-                        recovery_generation,
-                        enqueued_at,
-                    } => {
-                        crate::latency::record(
-                            "polymarket.user.ws_enqueue_to_owner_dequeue",
-                            enqueued_at,
-                        );
-                        self.live = Some(LiveFrame {
-                            events: events.into_iter(),
-                            generation: recovery_generation,
-                        });
-                    }
-                    PrivateApplyCommand::RecoveryFence {
-                        generation,
-                        completion,
-                    } => {
-                        let finished = !self.route.repair_inflight
-                            && shared
-                                .user_feed_health
-                                .finish_recovery_delivery_enrollment(generation);
-                        let _ = completion.send(finished);
-                    }
-                    PrivateApplyCommand::Replay { completion, .. } => {
-                        let _ =
-                            completion.send(Err("replay command reached private live lane".into()));
-                    }
-                }
+        for _ in 0..LIVE_ROUTE_BUDGET {
+            // Keep one credit for replay even under continuous live input.
+            if self.pending_apply.len() >= PENDING_APPLY_CAPACITY - 1
+                || self.fence.is_some()
+                || shared.user_feed_health.private_delivery_pending()
+            {
+                break;
             }
-        }
-        if let Some(mut frame) = self.live.take() {
-            if let Some(event) = frame.events.next() {
-                progressed = true;
-                let generation = frame.generation;
-                if frame.events.len() > 0 {
-                    self.live = Some(frame);
-                }
-                self.route_one(shared, event, generation, None, None, positions, replay);
-            }
-        }
-        if self.replay.is_none() {
-            if let Ok(command) = self.replay_rx.try_recv() {
-                progressed = true;
-                match command {
-                    PrivateApplyCommand::Replay {
-                        events,
-                        recovery_generation,
-                        expected_recovery_certificate,
-                        completion,
-                    } => {
-                        match validate_terminal_replay_scope(
-                            &shared.user_feed_health,
-                            expected_recovery_certificate,
+            if self.live.is_none() {
+                if let Ok(command) = self.live_rx.try_recv() {
+                    progressed = true;
+                    match command {
+                        PrivateApplyCommand::Live {
+                            events,
                             recovery_generation,
-                        ) {
-                            Err(error) => {
-                                let _ = completion.send(Err(error));
-                            }
-                            Ok(()) => {
-                                self.replay = Some(ReplayFrame {
-                                    events: events.into_iter(),
-                                    generation: recovery_generation,
-                                    certificate: expected_recovery_certificate,
-                                    completion,
-                                    pending: None,
-                                    summary: ReplayApplySummary::default(),
-                                });
-                            }
+                            enqueued_at,
+                        } => {
+                            crate::latency::record(
+                                "polymarket.user.ws_enqueue_to_owner_dequeue",
+                                enqueued_at,
+                            );
+                            self.live = Some(LiveFrame {
+                                events: events.into_iter(),
+                                generation: recovery_generation,
+                            });
+                        }
+                        PrivateApplyCommand::RecoveryFence {
+                            generation,
+                            completion,
+                        } => {
+                            self.fence = Some((generation, completion));
+                            break;
+                        }
+                        PrivateApplyCommand::Replay { completion, .. } => {
+                            let _ = completion
+                                .send(Err("replay command reached private live lane".into()));
                         }
                     }
-                    PrivateApplyCommand::RecoveryFence { completion, .. } => {
-                        let _ = completion.send(false);
+                }
+            }
+            if let Some(mut frame) = self.live.take() {
+                if let Some(event) = frame.events.next() {
+                    progressed = true;
+                    let generation = frame.generation;
+                    if frame.events.len() > 0 {
+                        self.live = Some(frame);
                     }
-                    PrivateApplyCommand::Live { .. } => {
-                        self.fail(shared, "live command reached private replay lane")
-                    }
+                    self.route_one(shared, event, generation, None, None);
                 }
             }
         }
-        if let Some(mut frame) = self.replay.take() {
-            let result = frame.pending.as_mut().map(|done| done.try_recv());
-            match result {
-                Some(Ok(Ok(summary))) => {
+        if self.pending_apply.len() < PENDING_APPLY_CAPACITY
+            && !shared.user_feed_health.private_delivery_pending()
+        {
+            if self.replay.is_none() {
+                if let Ok(command) = self.replay_rx.try_recv() {
                     progressed = true;
-                    frame.summary.applied += summary.applied;
-                    frame.summary.durable_skips += summary.durable_skips;
-                    frame.pending = None;
+                    match command {
+                        PrivateApplyCommand::Replay {
+                            events,
+                            recovery_generation,
+                            expected_recovery_certificate,
+                            completion,
+                        } => {
+                            match validate_terminal_replay_scope(
+                                &shared.user_feed_health,
+                                expected_recovery_certificate,
+                                recovery_generation,
+                            ) {
+                                Err(error) => {
+                                    let _ = completion.send(Err(error));
+                                }
+                                Ok(()) => {
+                                    self.replay = Some(ReplayFrame {
+                                        events: events.into_iter(),
+                                        generation: recovery_generation,
+                                        certificate: expected_recovery_certificate,
+                                        completion,
+                                        pending: None,
+                                        summary: ReplayApplySummary::default(),
+                                    });
+                                }
+                            }
+                        }
+                        PrivateApplyCommand::RecoveryFence { completion, .. } => {
+                            let _ = completion.send(false);
+                        }
+                        PrivateApplyCommand::Live { .. } => {
+                            self.fail(shared, "live command reached private replay lane")
+                        }
+                    }
                 }
-                Some(Ok(Err(error))) => {
-                    let _ = frame.completion.send(Err(error));
-                    return true;
-                }
-                Some(Err(tokio::sync::oneshot::error::TryRecvError::Closed)) => {
-                    let _ = frame
-                        .completion
-                        .send(Err("private replay completion dropped".into()));
-                    return true;
-                }
-                _ => {}
             }
-            if frame.pending.is_none() {
-                if let Some(event) = frame.events.next() {
-                    progressed = true;
-                    let (done, result) = tokio::sync::oneshot::channel();
-                    self.route_one(
-                        shared,
-                        event,
-                        frame.generation,
-                        frame.certificate,
-                        Some(done),
-                        positions,
-                        replay,
-                    );
-                    frame.pending = Some(result);
-                } else {
-                    let _ = frame.completion.send(Ok(frame.summary));
-                    return true;
+            if let Some(mut frame) = self.replay.take() {
+                let result = frame.pending.as_mut().map(|done| done.try_recv());
+                match result {
+                    Some(Ok(Ok(summary))) => {
+                        progressed = true;
+                        frame.summary.applied += summary.applied;
+                        frame.summary.durable_skips += summary.durable_skips;
+                        frame.pending = None;
+                    }
+                    Some(Ok(Err(error))) => {
+                        let _ = frame.completion.send(Err(error));
+                        return true;
+                    }
+                    Some(Err(tokio::sync::oneshot::error::TryRecvError::Closed)) => {
+                        let _ = frame
+                            .completion
+                            .send(Err("private replay completion dropped".into()));
+                        return true;
+                    }
+                    _ => {}
                 }
+                if frame.pending.is_none() {
+                    if let Some(event) = frame.events.next() {
+                        progressed = true;
+                        let (done, result) = tokio::sync::oneshot::channel();
+                        self.route_one(
+                            shared,
+                            event,
+                            frame.generation,
+                            frame.certificate,
+                            Some(done),
+                        );
+                        frame.pending = Some(result);
+                    } else {
+                        let _ = frame.completion.send(Ok(frame.summary));
+                        return true;
+                    }
+                }
+                self.replay = Some(frame);
             }
-            self.replay = Some(frame);
+        }
+        // Never defer the entire bookkeeping burst to an unbounded queue.
+        // One FIFO commit per turn runs even while output delivery is blocked.
+        if let Some(command) = self.pending_apply.pop_front() {
+            apply_private_cold_command(shared, positions, replay, command);
+            progressed = true;
+        }
+        if self.pending_apply.is_empty() && !shared.user_feed_health.private_delivery_pending() {
+            if let Some((generation, completion)) = self.fence.take() {
+                let finished = !self.route.repair_inflight
+                    && shared
+                        .user_feed_health
+                        .finish_recovery_delivery_enrollment(generation);
+                let _ = completion.send(finished);
+                progressed = true;
+            }
         }
         progressed
     }
 
     fn register<'a>(&'a self, wait: &mut crossbeam_channel::Select<'a>) {
         if !self.shutdown.load(Ordering::Acquire) {
-            wait.recv(&self.live_rx);
-            if self.replay.is_none() {
+            if self.fence.is_none() && self.pending_apply.len() < PENDING_APPLY_CAPACITY - 1 {
+                wait.recv(&self.live_rx);
+            }
+            if self.replay.is_none() && self.pending_apply.len() < PENDING_APPLY_CAPACITY {
                 wait.recv(&self.replay_rx);
             }
             wait.recv(&self.ack_rx);

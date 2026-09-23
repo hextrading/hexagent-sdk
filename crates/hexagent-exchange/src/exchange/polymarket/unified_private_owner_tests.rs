@@ -186,6 +186,78 @@ fn unified_recovery_fence_follows_entire_frame_and_strategy_ack() {
 }
 
 #[test]
+fn unified_burst_bounds_pending_commits_and_allows_replay_progress() {
+    let (shared, lane, rx, _, _) = fixture(true, 256);
+    let small = |id: &str| {
+        let mut event = route_event(1, id);
+        event.payload["size"] = serde_json::json!("0.001");
+        event.payload["maker_orders"][0]["matched_amount"] = serde_json::json!("0.001");
+        event
+    };
+    lane.dispatch_live(
+        (0..128).map(|i| small(&format!("burst-{i}"))).collect(),
+        None,
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let summary = runtime.block_on(async {
+        timeout(
+            Duration::from_secs(5),
+            lane.apply_replay_batch(vec![small("mixed-replay")], None),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    });
+    assert_eq!(summary.applied, 1);
+    let mut next_live = 0;
+    let mut replay_seen = false;
+    for _ in 0..129 {
+        let update = recv(&rx);
+        if update.update.trade_id.as_deref() == Some("mixed-replay") {
+            replay_seen = true;
+        } else {
+            assert_eq!(
+                update.update.trade_id.as_deref(),
+                Some(format!("burst-{next_live}").as_str())
+            );
+            next_live += 1;
+        }
+    }
+    assert!(replay_seen && next_live == 128);
+    // A FIFO fence waits for previously accepted owner-local commits, too.
+    let (completion, done) = tokio::sync::oneshot::channel();
+    lane.live_tx
+        .try_send(PrivateApplyCommand::RecoveryFence {
+            generation: 0,
+            completion,
+        })
+        .unwrap();
+    runtime.block_on(async {
+        timeout(Duration::from_secs(5), done)
+            .await
+            .unwrap()
+            .unwrap();
+    });
+    let high = shared.private_pending_apply_high.load(Ordering::Relaxed);
+    assert!((32..=64).contains(&high), "pending high water: {high}");
+    assert!(
+        (shared
+            .account_state
+            .instance_snapshot("owner-1")
+            .unwrap()
+            .positions["DOWN"]
+            - 99.871)
+            .abs()
+            < 1e-8
+    );
+    assert_eq!(lane.reconnect_generation.load(Ordering::Acquire), 0);
+}
+
+#[test]
 fn unified_empty_replay_still_rejects_a_stale_recovery_certificate() {
     let (shared, lane, rx, _, _) = fixture(true, 8);
     let old_certificate = shared.user_feed_health.recovery_certificate();
@@ -311,6 +383,8 @@ fn benchmark_three_account_private_owners() {
                 "routed_consumer":stats(routed), "local_lifecycle_applied":stats(applied),
                 "live_lane_capacity":PRIVATE_APPLY_QUEUE_CAPACITY,"live_lane_high_water":live_high,
                 "output_lane_capacity":BURST*2,"output_lane_sampled_high_water":output_high,
+                "pending_apply_capacity":if unified {64} else {16384},
+                "pending_apply_high_water":if unified {Some(accounts.iter().map(|account| account.0.private_pending_apply_high.load(Ordering::Relaxed)).max().unwrap())} else {None},
                 "overflow":0,"network_included":false,"strategy_application_included":false,"durable_flush_included":false,
                 "pinning_active":false,"fifo_active":false
             })
