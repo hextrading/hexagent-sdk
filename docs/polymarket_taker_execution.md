@@ -17,6 +17,26 @@ Missing fee metadata remains separate: the prior published curve, otherwise the
 explicit current BTC-crypto adapter fallback 0.07 / exponent 1, is usable without
 waiting for metadata.
 
+Binary-condition proof has the same retention boundary as private replay, not
+the wallet's zero-inventory query scope. The immutable per-account publication
+includes exact two-token settled audit references as well as current wallet
+interests. Existing audit WAL records reconstruct it at startup, including when
+the ten-minute wallet-interest grace has already expired. FIFO release alone
+does not remove the proof: an empty audit reference remains until every instance
+owner certifies that its order/trade history can be retired. The existing final
+GC transaction then removes the reference and refreshes the publication. This
+adds no durable schema, worker, queue, or independently growing history table.
+Conflicting bindings or non-binary audit scopes provide no pair proof.
+
+This fixes periodic replay of an already confirmed complementary-token trade
+after settlement/interest pruning. Such a replay previously depended on a
+shorter-lived wallet registry and could leave a sticky private-event anomaly,
+blocking quotes and split maintenance despite sufficient cash. Normal validated
+replay now retains the evidence needed to clear that anomaly without rebooking
+the trade. Unknown tokens, changed conditions, sides, quantities or execution
+notional still fail closed. Proof construction and refresh occur in existing
+cold control operations; the private lookup and all quote-path code are unchanged.
+
 The private owner selects one `FrozenTradeExecution` containing canonical price,
 gross principal, raw venue price, selected fee basis, and fee amounts. Its first
 strategy message contains that exact price and `TradeFee`; the existing
