@@ -4352,6 +4352,29 @@ impl Engine {
             Some(shutdown_done_rx),
             admission_receivers,
         );
+        let strategy_handle = match strategy_handle {
+            Ok(handle) => handle,
+            Err(error) => {
+                // No strategy worker or public feed has started, so no order
+                // can have been emitted. Stop startup producers before letting
+                // the lossless account/audit workers drain and persist.
+                shutdown_token.request();
+                let _ = exec_handle.join();
+                if let Some(handle) = user_feed_handle { let _ = handle.join(); }
+                for handle in poly_feed_handles { let _ = handle.join(); }
+                for handle in heartbeat_handles { let _ = handle.join(); }
+                for handle in probe_handles { let _ = handle.join(); }
+                if let Some(handle) = signal_arbiter_handle { let _ = handle.join(); }
+                shutdown_token.finish();
+                for (_, shared) in Self::dedup_states_by_account(&poly_states) {
+                    let _ = shared.join_background_workers();
+                }
+                let _ = recorder_handle.join();
+                if let Some(handle) = latency_flush_handle { let _ = handle.join(); }
+                if let Some(handle) = latency_dump_handle { let _ = handle.join(); }
+                return Err(error);
+            }
+        };
 
         // Strategy construction may spend seconds warming predictors while
         // the authenticated private feed is already replaying. Release each
@@ -4521,6 +4544,17 @@ impl Engine {
             Some(shutdown_done_rx),
             HashMap::new(),
         );
+        let strategy_handle = match strategy_handle {
+            Ok(handle) => handle,
+            Err(error) => {
+                shutdown.store(true, Ordering::Relaxed);
+                for handle in feed_handles { let _ = handle.join(); }
+                let _ = exec_handle.join();
+                if let Some(handle) = signal_arbiter_handle { let _ = handle.join(); }
+                let _ = recorder_handle.join();
+                return Err(error);
+            }
+        };
 
         Self::wait_for_shutdown(&shutdown, &shutdown_tx);
 
@@ -5147,7 +5181,7 @@ impl Engine {
             .unwrap_or_else(HashMap::new);
 
         let perf_strategy_init_started = Instant::now();
-        let mut strategies = self.build_strategies(bt_probe_map, HashMap::new(), &HashMap::new());
+        let mut strategies = self.build_strategies(bt_probe_map, HashMap::new(), &HashMap::new())?;
         let hist_data_dir = PathBuf::from(&data_dir);
         for s in &mut strategies {
             s.on_init();
@@ -7581,7 +7615,7 @@ impl Engine {
         >,
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
         poly_states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
-    ) -> Vec<Box<dyn Strategy>> {
+    ) -> Result<Vec<Box<dyn Strategy>>> {
         let mut strategies: Vec<Box<dyn Strategy>> = Vec::new();
         let bt_start_ns = self.parse_backtest_start_ns();
         let rtt_probe_map_nonempty = !rtt_probe_install.is_empty();
@@ -7601,11 +7635,16 @@ impl Engine {
                 stale_threshold_map_nonempty,
                 poly_state: poly_states.get(&cfg.instance_id).cloned(),
             };
-            if let Some(s) = self.registry.build(deps) {
-                strategies.push(s);
-            }
+            // Every numeric owner lane was allocated in enabled config order.
+            // Skipping one rejected factory would shift all later strategies
+            // onto another instance's execution/private lifecycle identity.
+            let strategy = self.registry.build(deps).ok_or_else(|| anyhow::anyhow!(
+                "refusing startup: enabled strategy `{}` instance `{}` failed construction at owner {}; no strategy workers were started",
+                cfg.name, cfg.instance_id, strategies.len(),
+            ))?;
+            strategies.push(strategy);
         }
-        strategies
+        Ok(strategies)
     }
 
     /// Paper execution thread: the sim_v2 matching core (`SimExchangeV2`) fed by
@@ -8019,9 +8058,9 @@ impl Engine {
         poly_states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
         shutdown_done_rx: Option<Receiver<()>>,
         admission_receivers: HashMap<String, Receiver<ExecutionAdmission>>,
-    ) -> thread::JoinHandle<()> {
+    ) -> Result<thread::JoinHandle<()>> {
         let mut strategies =
-            self.build_strategies(rtt_probe_install, stale_threshold_handles, poly_states);
+            self.build_strategies(rtt_probe_install, stale_threshold_handles, poly_states)?;
         let data_dir = PathBuf::from(&self.config.backtest.data_dir);
         // Prediction-warmup data sources.
         //
@@ -8482,7 +8521,7 @@ impl Engine {
         //
         // Backtest keeps the deterministic single-thread loop below.
         if should_spawn_per_instance_strategy_workers(backtest, strategies.len()) {
-            return self.spawn_per_instance_strategy_threads(
+            return Ok(self.spawn_per_instance_strategy_threads(
                 strategies,
                 market_rx,
                 signal_tx,
@@ -8494,7 +8533,7 @@ impl Engine {
                 shutdown_done_rx,
                 poly_states,
                 admission_receivers,
-            );
+            ));
         }
         drop(private_poll_rx.take());
         drop(executor_update_rx.take());
@@ -8729,7 +8768,7 @@ impl Engine {
                     }
                 }
             })
-            .unwrap()
+            .map_err(Into::into)
     }
 
     /// LIVE/PAPER per-instance routing (P1+P2). Spawns one worker
@@ -17004,6 +17043,10 @@ impl ExchangeTrade for LiveRouter {
 #[cfg(test)]
 #[path = "startup_lifecycle_intake_tests.rs"]
 mod startup_lifecycle_intake_tests;
+
+#[cfg(test)]
+#[path = "strategy_construction_tests.rs"]
+mod strategy_construction_tests;
 
 #[cfg(test)]
 #[path = "router_poll_lane_tests.rs"]
