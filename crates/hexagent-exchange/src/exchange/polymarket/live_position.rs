@@ -34,7 +34,7 @@ const RECOVERY_PENDING_CAPACITY: usize = 16_384;
 /// This is a *narrow* handle on purpose: the strategy must NOT read the full
 /// `LivePositionManager` (its position/balance source of truth is its own
 /// internal ledger), but it DOES need to know when the fill feed is
-/// untrustworthy so it can pause quoting. Three independent conditions:
+/// untrustworthy so it can pause quoting. Independent conditions:
 ///
 /// - `recovering`: the user WS is disconnected / reconnecting / replaying the
 ///   post-reconnect REST gap-fetch. The local ledger may be missing in-flight
@@ -49,6 +49,9 @@ const RECOVERY_PENDING_CAPACITY: usize = 16_384;
 ///   independent of inventory uncertainty while the private WS remains
 ///   connected. New placements still pause until catch-up; private events,
 ///   cancellations and recovery continue.
+/// - Private delivery backpressure: an accepted update is retained in the
+///   owner's bounded outbox. Pause new orders until the destination accepts
+///   it, without starting a new reconnect epoch or clearing a recovery proof.
 #[derive(Debug)]
 pub struct UserFeedHealth {
     /// Low bit is the gate; upper bits advance on every recovery assertion.
@@ -70,13 +73,14 @@ pub struct UserFeedHealth {
     /// query.
     recovery_pending_fast: Arc<AtomicUsize>,
     recovery_generation_fast: Arc<AtomicU64>,
+    delivery_backpressure_since: Arc<AtomicU64>,
     recovery_delivery_tx: crossbeam_channel::Sender<RecoveryDeliveryCommand>,
     recovery_queue_high_water: AtomicUsize,
     recovery_queue_overflow: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct RecoveryUpdateKey {
+pub(crate) struct RecoveryUpdateKey {
     instance_id: String,
     client_order_id: String,
     exchange_order_id: Option<String>,
@@ -112,7 +116,10 @@ struct RecoveryDeliveryState {
     startup_buffer: VecDeque<(u64, OrderUpdate)>,
 }
 
-enum RecoveryDeliveryCommand {
+pub(crate) enum RecoveryDeliveryCommand {
+    Transfer {
+        reply: crossbeam_channel::Sender<RecoveryDeliveryOwner>,
+    },
     Begin {
         reply: crossbeam_channel::Sender<u64>,
     },
@@ -156,140 +163,260 @@ pub struct RecoveryDeliveryMetrics {
     pub queue_overflow: u64,
 }
 
+const PRIVATE_DELIVERY_OUTBOX_CAPACITY: usize = 1024;
+trait PrivateUpdateSink: Send + Sync {
+    fn try_deliver(
+        &self,
+        update: crate::types::RoutedOrderUpdate,
+    ) -> Result<(), crossbeam_channel::TrySendError<crate::types::RoutedOrderUpdate>>;
+}
+impl<T: hexagent_runtime::poll_channel::EventSender<crate::types::RoutedOrderUpdate>>
+    PrivateUpdateSink for T
+{
+    fn try_deliver(
+        &self,
+        update: crate::types::RoutedOrderUpdate,
+    ) -> Result<(), crossbeam_channel::TrySendError<crate::types::RoutedOrderUpdate>> {
+        self.try_send(update)
+    }
+}
+enum PrivateDeliveryTarget {
+    Root(Arc<dyn PrivateUpdateSink>),
+    Direct(crossbeam_channel::Sender<crate::types::RoutedOrderUpdate>),
+}
+impl PrivateDeliveryTarget {
+    fn try_deliver(
+        &self,
+        update: crate::types::RoutedOrderUpdate,
+    ) -> Result<(), crossbeam_channel::TrySendError<crate::types::RoutedOrderUpdate>> {
+        match self {
+            Self::Root(sink) => sink.try_deliver(update),
+            Self::Direct(tx) => tx.try_send(update),
+        }
+    }
+}
+struct RetainedPrivateDelivery {
+    target: PrivateDeliveryTarget,
+    update: crate::types::RoutedOrderUpdate,
+}
+
+pub(crate) struct RecoveryDeliveryOwner {
+    delivery: RecoveryDeliveryState,
+    rx: crossbeam_channel::Receiver<RecoveryDeliveryCommand>,
+    pending_fast: Arc<AtomicUsize>,
+    generation_fast: Arc<AtomicU64>,
+    delivery_backpressure_since: Arc<AtomicU64>,
+    root_sink: Option<Arc<dyn PrivateUpdateSink>>,
+    outbox: VecDeque<RetainedPrivateDelivery>,
+}
+impl RecoveryDeliveryOwner {
+    fn execute(&mut self, command: RecoveryDeliveryCommand) {
+        let delivery = &mut self.delivery;
+        let pending_fast = &self.pending_fast;
+        let generation_fast = &self.generation_fast;
+        match command {
+            RecoveryDeliveryCommand::Transfer { reply } => {
+                // Only the temporary startup worker can transfer itself.
+                drop(reply);
+            }
+            RecoveryDeliveryCommand::Begin { reply } => {
+                delivery.generation = delivery.generation.wrapping_add(1).max(1);
+                delivery.enrolling = true;
+                delivery.pending.clear();
+                delivery.pending_count = 0;
+                delivery.startup_buffer.clear();
+                pending_fast.store(0, Ordering::Release);
+                generation_fast.store(delivery.generation, Ordering::Release);
+                let _ = reply.try_send(delivery.generation);
+            }
+            RecoveryDeliveryCommand::Register {
+                generation,
+                key,
+                update,
+                reply,
+            } => {
+                let buffer_update = !delivery.consumer_ready;
+                let result = if delivery.generation != generation || !delivery.enrolling {
+                    Err(format!(
+                        "recovery delivery generation {generation} is no longer accepting updates"
+                    ))
+                } else if buffer_update
+                    && delivery.startup_buffer.len() >= STARTUP_RECOVERY_BUFFER_CAPACITY
+                {
+                    Err(format!(
+                                "startup recovery buffer is full ({STARTUP_RECOVERY_BUFFER_CAPACITY} updates)"
+                            ))
+                } else if delivery.pending_count >= RECOVERY_PENDING_CAPACITY {
+                    Err(format!(
+                        "recovery pending set is full ({RECOVERY_PENDING_CAPACITY} updates)"
+                    ))
+                } else {
+                    *delivery.pending.entry(key).or_insert(0) += 1;
+                    delivery.pending_count += 1;
+                    pending_fast.store(delivery.pending_count, Ordering::Release);
+                    if buffer_update {
+                        delivery.startup_buffer.push_back((generation, update));
+                    }
+                    Ok(buffer_update)
+                };
+                let _ = reply.try_send(result);
+            }
+            RecoveryDeliveryCommand::ConsumerReady { reply } => {
+                delivery.consumer_ready = true;
+                let _ = reply.try_send(());
+            }
+            RecoveryDeliveryCommand::TakeStartup { generation, reply } => {
+                let result = if delivery.generation != generation {
+                    Err(format!(
+                        "recovery delivery generation {generation} was superseded"
+                    ))
+                } else if !delivery.consumer_ready {
+                    Ok(Vec::new())
+                } else {
+                    let mut updates = Vec::with_capacity(delivery.startup_buffer.len());
+                    while let Some((buffered_generation, update)) =
+                        delivery.startup_buffer.pop_front()
+                    {
+                        if buffered_generation == generation {
+                            updates.push(update);
+                        }
+                    }
+                    Ok(updates)
+                };
+                let _ = reply.try_send(result);
+            }
+            RecoveryDeliveryCommand::FinishEnrollment { generation, reply } => {
+                let finished = delivery.generation == generation;
+                if finished {
+                    delivery.enrolling = false;
+                }
+                let _ = reply.try_send(finished);
+            }
+            RecoveryDeliveryCommand::Acknowledge {
+                generation,
+                key,
+                reply,
+            } => {
+                let generation_matches =
+                    generation.is_none_or(|generation| generation == delivery.generation);
+                let acknowledged = if generation_matches {
+                    if let Some(count) = delivery.pending.get_mut(&key) {
+                        if *count > 1 {
+                            *count -= 1;
+                        } else {
+                            delivery.pending.remove(&key);
+                        }
+                        delivery.pending_count = delivery.pending_count.saturating_sub(1);
+                        pending_fast.store(delivery.pending_count, Ordering::Release);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let _ = reply.try_send(acknowledged);
+            }
+            RecoveryDeliveryCommand::AcknowledgeAsync { generation, key } => {
+                if generation == delivery.generation {
+                    if let Some(count) = delivery.pending.get_mut(&key) {
+                        if *count > 1 {
+                            *count -= 1;
+                        } else {
+                            delivery.pending.remove(&key);
+                        }
+                        delivery.pending_count = delivery.pending_count.saturating_sub(1);
+                        pending_fast.store(delivery.pending_count, Ordering::Release);
+                    }
+                }
+            }
+            RecoveryDeliveryCommand::Progress { generation, reply } => {
+                let progress = (delivery.generation == generation)
+                    .then(|| (!delivery.enrolling, delivery.pending_count));
+                let _ = reply.try_send(progress);
+            }
+        }
+    }
+}
+
+// One explicitly bound account per dedicated owner thread. No cross-thread
+// access to this state is possible; every other caller uses the bounded lane.
+// The guard clears the binding at owner shutdown, including unwinding.
+thread_local! {
+    static LOCAL_RECOVERY_OWNER: std::cell::RefCell<Option<RecoveryDeliveryOwner>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) struct RecoveryOwnerBinding;
+impl Drop for RecoveryOwnerBinding {
+    fn drop(&mut self) {
+        LOCAL_RECOVERY_OWNER.with(|owner| {
+            owner.borrow_mut().take();
+        });
+    }
+}
+impl RecoveryOwnerBinding {
+    pub(crate) fn service_one(&self) -> bool {
+        LOCAL_RECOVERY_OWNER.with(|owner| {
+            let mut owner = owner.borrow_mut();
+            let owner = owner.as_mut().expect("recovery owner bound");
+            let mut progressed = false;
+            if let Some(mut delivery) = owner.outbox.pop_front() {
+                match delivery.target.try_deliver(delivery.update) {
+                    Ok(()) => {
+                        progressed = true;
+                        if owner.outbox.is_empty() {
+                            owner
+                                .delivery_backpressure_since
+                                .store(0, Ordering::Release);
+                        }
+                    }
+                    Err(error) => {
+                        delivery.update = error.into_inner();
+                        owner.outbox.push_front(delivery);
+                    }
+                }
+            }
+            if let Ok(command) = owner.rx.try_recv() {
+                owner.execute(command);
+                progressed = true;
+            }
+            progressed
+        })
+    }
+    pub(crate) fn with_receiver<R>(
+        &self,
+        f: impl FnOnce(&crossbeam_channel::Receiver<RecoveryDeliveryCommand>) -> R,
+    ) -> R {
+        LOCAL_RECOVERY_OWNER
+            .with(|owner| f(&owner.borrow().as_ref().expect("recovery owner bound").rx))
+    }
+}
+
 fn spawn_recovery_delivery_owner(
     pending_fast: Arc<AtomicUsize>,
     generation_fast: Arc<AtomicU64>,
+    delivery_backpressure_since: Arc<AtomicU64>,
 ) -> crossbeam_channel::Sender<RecoveryDeliveryCommand> {
     let (tx, rx) = crossbeam_channel::bounded(RECOVERY_DELIVERY_OWNER_CAPACITY);
     std::thread::Builder::new()
         .name("poly-recovery-owner".to_string())
         .spawn(move || {
             crate::os_tune::pin_background("poly-recovery-owner");
-            let mut delivery = RecoveryDeliveryState::default();
-            while let Ok(command) = rx.recv() {
-                match command {
-                    RecoveryDeliveryCommand::Begin { reply } => {
-                        delivery.generation = delivery.generation.wrapping_add(1).max(1);
-                        delivery.enrolling = true;
-                        delivery.pending.clear();
-                        delivery.pending_count = 0;
-                        delivery.startup_buffer.clear();
-                        pending_fast.store(0, Ordering::Release);
-                        generation_fast.store(delivery.generation, Ordering::Release);
-                        let _ = reply.try_send(delivery.generation);
-                    }
-                    RecoveryDeliveryCommand::Register {
-                        generation,
-                        key,
-                        update,
-                        reply,
-                    } => {
-                        let buffer_update = !delivery.consumer_ready;
-                        let result = if delivery.generation != generation || !delivery.enrolling {
-                            Err(format!(
-                                "recovery delivery generation {generation} is no longer accepting updates"
-                            ))
-                        } else if buffer_update
-                            && delivery.startup_buffer.len()
-                                >= STARTUP_RECOVERY_BUFFER_CAPACITY
-                        {
-                            Err(format!(
-                                "startup recovery buffer is full ({STARTUP_RECOVERY_BUFFER_CAPACITY} updates)"
-                            ))
-                        } else if delivery.pending_count >= RECOVERY_PENDING_CAPACITY {
-                            Err(format!(
-                                "recovery pending set is full ({RECOVERY_PENDING_CAPACITY} updates)"
-                            ))
-                        } else {
-                            *delivery.pending.entry(key).or_insert(0) += 1;
-                            delivery.pending_count += 1;
-                            pending_fast.store(delivery.pending_count, Ordering::Release);
-                            if buffer_update {
-                                delivery.startup_buffer.push_back((generation, update));
-                            }
-                            Ok(buffer_update)
-                        };
-                        let _ = reply.try_send(result);
-                    }
-                    RecoveryDeliveryCommand::ConsumerReady { reply } => {
-                        delivery.consumer_ready = true;
-                        let _ = reply.try_send(());
-                    }
-                    RecoveryDeliveryCommand::TakeStartup {
-                        generation,
-                        reply,
-                    } => {
-                        let result = if delivery.generation != generation {
-                            Err(format!(
-                                "recovery delivery generation {generation} was superseded"
-                            ))
-                        } else if !delivery.consumer_ready {
-                            Ok(Vec::new())
-                        } else {
-                            let mut updates = Vec::with_capacity(delivery.startup_buffer.len());
-                            while let Some((buffered_generation, update)) =
-                                delivery.startup_buffer.pop_front()
-                            {
-                                if buffered_generation == generation {
-                                    updates.push(update);
-                                }
-                            }
-                            Ok(updates)
-                        };
-                        let _ = reply.try_send(result);
-                    }
-                    RecoveryDeliveryCommand::FinishEnrollment { generation, reply } => {
-                        let finished = delivery.generation == generation;
-                        if finished {
-                            delivery.enrolling = false;
-                        }
-                        let _ = reply.try_send(finished);
-                    }
-                    RecoveryDeliveryCommand::Acknowledge {
-                        generation,
-                        key,
-                        reply,
-                    } => {
-                        let generation_matches =
-                            generation.is_none_or(|generation| generation == delivery.generation);
-                        let acknowledged = if generation_matches {
-                            if let Some(count) = delivery.pending.get_mut(&key) {
-                                if *count > 1 {
-                                    *count -= 1;
-                                } else {
-                                    delivery.pending.remove(&key);
-                                }
-                                delivery.pending_count = delivery.pending_count.saturating_sub(1);
-                                pending_fast.store(delivery.pending_count, Ordering::Release);
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-                        let _ = reply.try_send(acknowledged);
-                    }
-                    RecoveryDeliveryCommand::AcknowledgeAsync { generation, key } => {
-                        if generation == delivery.generation {
-                            if let Some(count) = delivery.pending.get_mut(&key) {
-                                if *count > 1 {
-                                    *count -= 1;
-                                } else {
-                                    delivery.pending.remove(&key);
-                                }
-                                delivery.pending_count = delivery.pending_count.saturating_sub(1);
-                                pending_fast.store(delivery.pending_count, Ordering::Release);
-                            }
-                        }
-                    }
-                    RecoveryDeliveryCommand::Progress { generation, reply } => {
-                        let progress = (delivery.generation == generation).then(|| {
-                            (!delivery.enrolling, delivery.pending_count)
-                        });
-                        let _ = reply.try_send(progress);
-                    }
+            let mut owner = RecoveryDeliveryOwner {
+                delivery: RecoveryDeliveryState::default(),
+                rx,
+                pending_fast,
+                generation_fast,
+                delivery_backpressure_since,
+                root_sink: None,
+                outbox: VecDeque::with_capacity(PRIVATE_DELIVERY_OUTBOX_CAPACITY),
+            };
+            while let Ok(command) = owner.rx.recv() {
+                if let RecoveryDeliveryCommand::Transfer { reply } = command {
+                    // Startup handoff moves both state and the sole receiver.
+                    let _ = reply.send(owner);
+                    return;
                 }
+                owner.execute(command);
             }
         })
         .expect("failed to spawn recovery-delivery owner");
@@ -341,9 +468,11 @@ impl UserFeedHealth {
     pub fn new() -> Self {
         let recovery_pending_fast = Arc::new(AtomicUsize::new(0));
         let recovery_generation_fast = Arc::new(AtomicU64::new(0));
+        let delivery_backpressure_since = Arc::new(AtomicU64::new(0));
         let recovery_delivery_tx = spawn_recovery_delivery_owner(
             Arc::clone(&recovery_pending_fast),
             Arc::clone(&recovery_generation_fast),
+            Arc::clone(&delivery_backpressure_since),
         );
         Self {
             recovering_state: AtomicU64::new(1),
@@ -356,13 +485,143 @@ impl UserFeedHealth {
             strategy_consumer_ready_notify: tokio::sync::Notify::new(),
             recovery_pending_fast,
             recovery_generation_fast,
+            delivery_backpressure_since,
             recovery_delivery_tx,
             recovery_queue_high_water: AtomicUsize::new(0),
             recovery_queue_overflow: AtomicU64::new(0),
         }
     }
 
+    pub(crate) fn install_private_update_sink(
+        &self,
+        sink: impl hexagent_runtime::poll_channel::EventSender<crate::types::RoutedOrderUpdate>,
+    ) {
+        LOCAL_RECOVERY_OWNER.with(|owner| {
+            let mut owner = owner.borrow_mut();
+            let owner = owner
+                .as_mut()
+                .expect("private delivery requires bound owner");
+            assert!(Arc::ptr_eq(
+                &owner.pending_fast,
+                &self.recovery_pending_fast
+            ));
+            assert!(
+                owner.root_sink.is_none(),
+                "private root sink installed once"
+            );
+            owner.root_sink = Some(Arc::new(sink));
+        });
+    }
+
+    pub(crate) fn private_delivery_pending(&self) -> bool {
+        LOCAL_RECOVERY_OWNER.with(|owner| {
+            owner.borrow().as_ref().is_some_and(|owner| {
+                Arc::ptr_eq(&owner.pending_fast, &self.recovery_pending_fast)
+                    && !owner.outbox.is_empty()
+            })
+        })
+    }
+
+    /// Account-owner-only lossless outbox. Once retained, stop consuming new
+    /// ingress until it drains; lifecycle/control mailboxes continue running.
+    /// A disconnected destination retains the exact envelope and fails closed.
+    pub(crate) fn deliver_private_owned(
+        &self,
+        update: crate::types::RoutedOrderUpdate,
+        direct: Option<crossbeam_channel::Sender<crate::types::RoutedOrderUpdate>>,
+    ) -> Result<(), String> {
+        LOCAL_RECOVERY_OWNER.with(|owner| {
+            let mut owner = owner.borrow_mut();
+            let owner = owner
+                .as_mut()
+                .expect("private delivery requires bound owner");
+            assert!(Arc::ptr_eq(
+                &owner.pending_fast,
+                &self.recovery_pending_fast
+            ));
+            let target = match direct {
+                Some(tx) => PrivateDeliveryTarget::Direct(tx),
+                None => PrivateDeliveryTarget::Root(Arc::clone(
+                    owner
+                        .root_sink
+                        .as_ref()
+                        .ok_or("private root sink missing")?,
+                )),
+            };
+            if owner.outbox.len() == PRIVATE_DELIVERY_OUTBOX_CAPACITY {
+                self.set_inventory_uncertain(true);
+                return Err("private delivery outbox full; authoritative replay required".into());
+            }
+            let update = if owner.outbox.is_empty() {
+                match target.try_deliver(update) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        if matches!(error, crossbeam_channel::TrySendError::Disconnected(_)) {
+                            self.set_inventory_uncertain(true);
+                        }
+                        error.into_inner()
+                    }
+                }
+            } else {
+                update
+            };
+            owner
+                .delivery_backpressure_since
+                .compare_exchange(0, now_ns(), Ordering::AcqRel, Ordering::Acquire)
+                .ok();
+            owner
+                .outbox
+                .push_back(RetainedPrivateDelivery { target, update });
+            crate::latency::record_ns(
+                "polymarket.user.private_delivery_outbox_high_water",
+                owner.outbox.len() as u64,
+            );
+            Ok(())
+        })
+    }
+
+    pub(crate) fn recovery_bound_here(&self) -> bool {
+        LOCAL_RECOVERY_OWNER.with(|owner| {
+            owner
+                .borrow()
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(&owner.pending_fast, &self.recovery_pending_fast))
+        })
+    }
+
+    /// Startup-only transfer; called on the account lifecycle thread before
+    /// its readiness acknowledgement and before private WS traffic starts.
+    pub(crate) fn bind_recovery_owner(&self) -> Result<RecoveryOwnerBinding, String> {
+        if LOCAL_RECOVERY_OWNER.with(|owner| owner.borrow().is_some()) {
+            return Err("another recovery account is already bound to this thread".into());
+        }
+        let (reply, done) = crossbeam_channel::bounded(1);
+        self.send_recovery_command(RecoveryDeliveryCommand::Transfer { reply })?;
+        let owner = done
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|error| error.to_string())?;
+        LOCAL_RECOVERY_OWNER.with(|slot| *slot.borrow_mut() = Some(owner));
+        Ok(RecoveryOwnerBinding)
+    }
+
     fn send_recovery_command(&self, command: RecoveryDeliveryCommand) -> Result<(), String> {
+        let mut command = Some(command);
+        let local = LOCAL_RECOVERY_OWNER.with(|owner| {
+            let mut owner = owner.borrow_mut();
+            if let Some(owner) = owner
+                .as_mut()
+                .filter(|owner| Arc::ptr_eq(&owner.pending_fast, &self.recovery_pending_fast))
+            {
+                owner.execute(command.take().unwrap());
+                true
+            } else {
+                false
+            }
+        });
+        if local {
+            return Ok(());
+        }
+        let command = command.unwrap();
         let admitted_depth = self
             .recovery_delivery_tx
             .len()
@@ -428,6 +687,7 @@ impl UserFeedHealth {
     }
     pub fn is_recovering(&self) -> bool {
         self.recovering_state.load(Ordering::Acquire) & 1 != 0
+            || self.delivery_backpressure_since.load(Ordering::Acquire) != 0
     }
 
     /// Capture before the gap/audit/delivery proof begins. Every subsequent
@@ -484,7 +744,13 @@ impl UserFeedHealth {
         if !self.is_recovering() {
             return 0;
         }
-        let since = self.recovering_since_ns.load(Ordering::Acquire);
+        let mut since = self.recovering_since_ns.load(Ordering::Acquire);
+        let backpressure = self.delivery_backpressure_since.load(Ordering::Acquire);
+        if backpressure != 0
+            && (self.recovering_state.load(Ordering::Acquire) & 1 == 0 || backpressure < since)
+        {
+            since = backpressure;
+        }
         current_ns.saturating_sub(since)
     }
     pub fn inventory_uncertain(&self) -> bool {
@@ -547,7 +813,8 @@ impl UserFeedHealth {
     /// This is a hint, not enrollment authority: the delivery owner rejects
     /// stale or closed generations when the event is actually registered.
     pub(crate) fn current_recovery_delivery_generation(&self) -> Result<Option<u64>, String> {
-        if !self.is_recovering() {
+        // Outbox backpressure pauses quoting without inventing a reconnect epoch.
+        if self.recovering_state.load(Ordering::Acquire) & 1 == 0 {
             return Ok(None);
         }
         let generation = self.recovery_generation_fast.load(Ordering::Acquire);
@@ -800,9 +1067,20 @@ pub struct LivePositionManager {
     /// Fill ledger, keyed by trade_id (taker) or `trade_id:order_id` (maker).
     /// Retained only to dedup status transitions and drive the lifecycle log.
     trades: HashMap<String, LiveTrade>,
+    // Lifecycle-owner-only token index for bounded history retirement.
+    trades_by_token: HashMap<String, VecDeque<String>>,
     /// Largest `match_time` (unix seconds) seen so far. Used as the `after=`
     /// lower bound when replaying missed trades over REST after reconnect.
     last_match_time_secs: u64,
+}
+
+pub(crate) struct LiveHistoryRetirement {
+    tokens: VecDeque<(String, usize)>,
+}
+impl LiveHistoryRetirement {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
 }
 
 impl LivePositionManager {
@@ -810,6 +1088,7 @@ impl LivePositionManager {
     pub fn new() -> Self {
         Self {
             trades: HashMap::new(),
+            trades_by_token: HashMap::new(),
             last_match_time_secs: 0,
         }
     }
@@ -937,6 +1216,12 @@ impl LivePositionManager {
         }
 
         let is_new = !self.trades.contains_key(trade_id);
+        if is_new {
+            self.trades_by_token
+                .entry(asset_id.to_string())
+                .or_default()
+                .push_back(trade_id.to_string());
+        }
         self.trades.insert(
             trade_id.to_string(),
             LiveTrade {
@@ -988,11 +1273,66 @@ impl LivePositionManager {
         true
     }
 
+    pub(crate) fn retirement(&self, tokens: &HashSet<String>) -> LiveHistoryRetirement {
+        LiveHistoryRetirement {
+            tokens: tokens
+                .iter()
+                .map(|token| {
+                    (
+                        token.clone(),
+                        self.trades_by_token.get(token).map_or(0, VecDeque::len),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// At most `budget` records, no unrelated-history scan. New records after
+    /// the certificate are outside this cursor; nonterminal records survive.
+    pub(crate) fn prune_terminal_step(
+        &mut self,
+        cursor: &mut LiveHistoryRetirement,
+        budget: usize,
+    ) -> usize {
+        let mut removed = 0;
+        for _ in 0..budget {
+            let Some((token, remaining)) = cursor.tokens.front_mut() else {
+                break;
+            };
+            if *remaining == 0 {
+                cursor.tokens.pop_front();
+                continue;
+            }
+            *remaining -= 1;
+            let ids = self.trades_by_token.get_mut(token);
+            if let Some(ids) = ids {
+                if let Some(id) = ids.pop_front() {
+                    if self
+                        .trades
+                        .get(&id)
+                        .is_some_and(|trade| trade.status.is_terminal())
+                    {
+                        self.trades.remove(&id);
+                        removed += 1;
+                    } else if self.trades.contains_key(&id) {
+                        ids.push_back(id);
+                    }
+                }
+                if ids.is_empty() {
+                    self.trades_by_token.remove(token);
+                }
+            }
+        }
+        removed
+    }
+
     pub fn prune_terminal_history(&mut self, tokens: &HashSet<String>) -> usize {
-        let before = self.trades.len();
-        self.trades
-            .retain(|_, trade| !tokens.contains(&trade.asset_id) || !trade.status.is_terminal());
-        before.saturating_sub(self.trades.len())
+        let mut cursor = self.retirement(tokens);
+        let mut removed = 0;
+        while !cursor.is_empty() {
+            removed += self.prune_terminal_step(&mut cursor, 64);
+        }
+        removed
     }
 
     #[cfg(test)]
@@ -1621,5 +1961,98 @@ mod update_trade_dedup_tests {
         };
         let manager = LivePositionManager::from_restored([restored]);
         assert!(manager.last_match_time_secs() <= receipt_secs);
+    }
+}
+
+#[cfg(test)]
+mod unified_history_tests {
+    use super::*;
+    #[test]
+    fn bounded_history_retirement_preserves_live_and_new_rows() {
+        let mut positions = LivePositionManager::new();
+        for i in 0..100 {
+            positions.update_trade(
+                &format!("done-{i}"),
+                TradeStatus::Confirmed,
+                "old",
+                Side::Buy,
+                1.0,
+                0.5,
+                false,
+                None,
+            );
+        }
+        positions.update_trade(
+            "live",
+            TradeStatus::Matched,
+            "old",
+            Side::Buy,
+            1.0,
+            0.5,
+            false,
+            None,
+        );
+        positions.update_trade(
+            "sibling",
+            TradeStatus::Confirmed,
+            "other",
+            Side::Buy,
+            1.0,
+            0.5,
+            false,
+            None,
+        );
+        let mut cursor = positions.retirement(&HashSet::from(["old".into()]));
+        positions.update_trade(
+            "late",
+            TradeStatus::Confirmed,
+            "old",
+            Side::Buy,
+            1.0,
+            0.5,
+            false,
+            None,
+        );
+        assert_eq!(positions.prune_terminal_step(&mut cursor, 16), 16);
+        assert_eq!(positions.trades.len(), 87);
+        while !cursor.is_empty() {
+            positions.prune_terminal_step(&mut cursor, 16);
+        }
+        assert_eq!(positions.trades.len(), 3);
+        for id in ["live", "late", "sibling"] {
+            assert!(positions.trades.contains_key(id));
+        }
+        assert_eq!(
+            positions.prune_terminal_history(&HashSet::from(["old".into()])),
+            1
+        );
+    }
+    #[test]
+    fn recovery_handoff_preserves_generation_and_other_thread_requests() {
+        let health = Arc::new(UserFeedHealth::new());
+        health.mark_strategy_consumer_ready();
+        let generation = health.begin_recovery_delivery();
+        let binding = health.bind_recovery_owner().unwrap();
+        assert!(health.recovery_bound_here());
+        assert_eq!(
+            health.recovery_delivery_progress(generation),
+            Some((false, 0))
+        );
+        let peer = health.clone();
+        let caller =
+            std::thread::spawn(move || peer.finish_recovery_delivery_enrollment(generation));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !caller.is_finished() {
+            binding.service_one();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(caller.join().unwrap());
+        assert_eq!(
+            health.recovery_delivery_progress(generation),
+            Some((true, 0))
+        );
+        drop(binding);
+        assert!(!health.recovery_bound_here());
     }
 }

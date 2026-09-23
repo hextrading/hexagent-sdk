@@ -260,6 +260,27 @@ impl RuntimeOwnershipIndex {
         }
     }
 
+    /// Bounded retirement lookup with the ownership check inside the RCU CAS.
+    /// A concurrent identity publication must not be removed by a stale plan.
+    fn remove_client_order(&self, order_id: &str, client_order_id: &str) {
+        let normalized = runtime_order_id_view(order_id);
+        let start = self.start_index(order_id);
+        for offset in 0..RUNTIME_OWNERSHIP_MAX_PROBES {
+            let slot = &self.slots[(start + offset) % self.slots.len()];
+            let matches = |entry: &RuntimeOwnershipEntry| {
+                entry.normalized_order_id.as_ref().eq_ignore_ascii_case(normalized)
+                    && entry.ownership.client_order_id == client_order_id
+            };
+            if slot.load().as_ref().is_some_and(|entry| matches(entry)) {
+                slot.rcu(|current| match current {
+                    Some(entry) if matches(entry) => None,
+                    _ => current.clone(),
+                });
+                return;
+            }
+        }
+    }
+
     #[cfg(test)]
     fn clear(&self) {
         for slot in &self.slots {
@@ -2299,6 +2320,9 @@ const EXECUTION_AUDIT_QUEUE_CAPACITY: usize = 4_096;
 /// must never carry an HTTP future, connection permit, completion closure or
 /// synchronous reply wait: cancel and completion pools remain separate so a
 /// permit waiter cannot occupy the workers needed to release that permit.
+#[path = "account_owner_loop.rs"]
+mod account_owner_loop;
+
 enum AccountLifecycleJob {
     StartupBarrier(crossbeam_channel::Sender<()>),
     RegisterLocalOrder {
@@ -3219,8 +3243,29 @@ impl Default for GapReplayConfig {
     }
 }
 
+#[cfg(test)]
+thread_local! { static TEST_PRIVATE_OWNER_MODE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
+
+#[cfg(test)]
+pub(crate) fn with_private_owner_mode<T>(unified: bool, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_PRIVATE_OWNER_MODE.with(|mode| mode.set(self.0));
+        }
+    }
+    let _restore = Restore(TEST_PRIVATE_OWNER_MODE.with(|mode| mode.replace(Some(unified))));
+    f()
+}
+
 /// Shared state between PolymarketTrade and the user_feed WebSocket thread.
 pub struct SharedState {
+    /// Startup-frozen architecture selection; never changes while workers run.
+    pub(crate) unified_private_owner: bool,
+    #[cfg(test)]
+    pub(crate) private_commit_benchmark: OnceLock<crossbeam_channel::Sender<u64>>,
+    #[cfg(test)]
+    pub(crate) private_pending_apply_high: std::sync::atomic::AtomicUsize,
     /// Strategy instance identifier (the `[poly.<id>]` key). Tags each
     /// row in the per-request latency CSV so a single file can hold
     /// multiple instances. `"cli"` for one-off CLI subcommands.
@@ -3250,6 +3295,8 @@ pub struct SharedState {
     /// Startup-published message endpoint. Terminal REST backfill must pass
     /// through the same private owner that freezes live execution economics.
     private_apply_lane: OnceLock<super::user_feed::PrivateApplyLane>,
+    private_ingress_install_tx:
+        crossbeam_channel::Sender<account_owner_loop::PrivateIngressInstall>,
     // Startup-bound immutable handle to the existing bounded execution-owner
     // mailbox. Only the cold user-feed recovery job waits on these replies.
     recovery_http: OnceLock<super::rtt_probe::ProbeHttpTransport>,
@@ -3878,6 +3925,23 @@ impl SharedState {
         apply(&mut live_position)
     }
 
+    /// Startup-only ownership transfer into the already-running lifecycle
+    /// writer. The bounded reply is awaited before the WS producer starts.
+    pub(crate) fn install_private_ingress(
+        &self,
+        ingress: Box<dyn super::user_feed::unified_private_owner::PrivateIngress>,
+    ) -> std::result::Result<(), String> {
+        if !self.unified_private_owner {
+            return Err("private ingress installation requires unified owner mode".into());
+        }
+        let (ready, done) = crossbeam_channel::bounded(1);
+        self.private_ingress_install_tx
+            .try_send(account_owner_loop::PrivateIngressInstall { ingress, ready })
+            .map_err(|_| "private ingress installation unavailable".to_string())?;
+        done.recv_timeout(Duration::from_secs(5))
+            .map_err(|error| format!("private ingress startup acknowledgement: {error}"))?
+    }
+
     pub(crate) fn install_private_apply_lane(
         &self,
         lane: super::user_feed::PrivateApplyLane,
@@ -4108,6 +4172,9 @@ impl SharedState {
         account_owner: hexagent_account::account::shared_account::SharedAccountOwnerState,
         maintenance_rx: crossbeam_channel::Receiver<AccountMaintenanceJob>,
         settled_gc_rx: crossbeam_channel::Receiver<()>,
+        private_ingress_install_rx: crossbeam_channel::Receiver<
+            account_owner_loop::PrivateIngressInstall,
+        >,
     ) -> (
         std::thread::JoinHandle<()>,
         std::thread::JoinHandle<()>,
@@ -4123,6 +4190,16 @@ impl SharedState {
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(2);
         let cold_ready_tx = ready_tx.clone();
         let lifecycle_account_id = account_id.clone();
+        let unified = shared.unified_private_owner;
+        let cold_gc_rx = if unified {
+            settled_gc_rx.clone()
+        } else {
+            crossbeam_channel::never()
+        };
+        // One prepared retirement plus one retained cold-side result. A full
+        // lane stops further GC commits; no certificate/cleanup is dropped.
+        let (gc_ready_tx, gc_ready_rx) = crossbeam_channel::bounded(1);
+
         let cold_handle = std::thread::Builder::new()
             .name(format!("poly-account-owner-{}", shared.instance_id))
             .spawn(move || {
@@ -4139,6 +4216,13 @@ impl SharedState {
                 ]);
                 let _ = cold_ready_tx.send(());
                 let wallet_grace_tick = crossbeam_channel::tick(Duration::from_millis(10));
+                let mut pending_gc = None;
+                let mut drive_gc = |shared: &SharedState| {
+                    if pending_gc.is_none() { pending_gc = account_owner_loop::RuntimeRetirement::prepare(shared); }
+                    if let Some(work) = pending_gc.take() {
+                        if let Err(error) = gc_ready_tx.try_send(work) { pending_gc = Some(error.into_inner()); }
+                    }
+                };
                 loop {
                     let Some(_shared) = cold_weak.upgrade() else {
                         break;
@@ -4181,7 +4265,11 @@ impl SharedState {
                             Ok(()) => account_owner.execute_wallet_calibration(),
                             Err(_) => break,
                         },
+                        recv(cold_gc_rx) -> wake => {
+                            if wake.is_ok() { drive_gc(&_shared); }
+                        },
                         recv(wallet_grace_tick) -> _ => {
+                            if unified { drive_gc(&_shared); }
                             account_owner.execute_wallet_calibration();
                             account_owner.reclaim_retired_routes();
                             if let Err(error) = account_owner.poll_inactive_settled_gc() {
@@ -4198,12 +4286,16 @@ impl SharedState {
             })
             .expect("spawn Polymarket cold account owner");
 
+        let shared_recovery = Arc::clone(&shared.user_feed_health);
         let lifecycle_handle = std::thread::Builder::new()
-            .name(format!("poly-lifecycle-owner-{}", shared.instance_id))
+            .name(format!(
+                "poly-{}-owner-{}",
+                if unified { "private" } else { "lifecycle" },
+                shared.instance_id
+            ))
             .spawn(move || {
-                let mut execution = ExecutionStateOwner::new(initial_execution_state);
-                let mut live_position = initial_live_position;
-                let mut private_replay = super::user_feed::PrivateReplayOwner::new();
+                let execution = ExecutionStateOwner::new(initial_execution_state);
+                let live_position = initial_live_position;
                 crate::os_tune::pin_private_account_apply(
                     "polymarket-lifecycle-owner",
                     &lifecycle_account_id,
@@ -4220,80 +4312,38 @@ impl SharedState {
                 crate::latency::prepare_thread_stages(&[
                     "polymarket.account.settled_gc_coordinator_control_busy",
                     "polymarket.account.settled_gc_coordinator_state_busy",
+                    "polymarket.account.owner_turn",
+                    "polymarket.user.ws_enqueue_to_owner_dequeue",
+                    "polymarket.user.private_delivery_outbox_high_water",
+                    "polymarket.user.pending_apply_depth",
                 ]);
+                let recovery_binding = if unified {
+                    match shared_recovery.bind_recovery_owner() {
+                        Ok(binding) => Some(binding),
+                        Err(error) => {
+                            log::error!("private recovery handoff failed: {error}");
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let _ = ready_tx.send(());
-                loop {
-                    let Some(shared) = lifecycle_weak.upgrade() else {
-                        break;
-                    };
-                    if lifecycle_shutdown.is_finished() {
-                        // Producers are joined. Drain high-priority lifecycle
-                        // first, then maintenance. GC is coalesced and runs
-                        // last; cold account commands have their own worker.
-                        loop {
-                            if let Ok(command) = lifecycle_account_owner.receiver().try_recv() {
-                                lifecycle_account_owner.execute(command);
-                                continue;
-                            }
-                            if let Ok(job) = lifecycle_rx.try_recv() {
-                                shared.apply_account_lifecycle_job(
-                                    &mut execution,
-                                    &mut live_position,
-                                    &mut private_replay,
-                                    job,
-                                );
-                                continue;
-                            }
-                            if let Ok(job) = maintenance_rx.try_recv() {
-                                shared.apply_account_maintenance_job(job);
-                                continue;
-                            }
-                            if settled_gc_rx.try_recv().is_ok() {
-                                shared.run_settled_gc_pass(&mut execution, &mut live_position);
-                                continue;
-                            }
-                            break;
-                        }
-                        break;
-                    }
-                    crossbeam_channel::select_biased! {
-                        recv(lifecycle_account_owner.receiver()) -> command => match command {
-                            Ok(command) => lifecycle_account_owner.execute(command),
-                            Err(_) => break,
-                        },
-                        recv(lifecycle_rx) -> job => match job {
-                            Ok(job) => shared.apply_account_lifecycle_job(
-                                &mut execution,
-                                &mut live_position,
-                                &mut private_replay,
-                                job,
-                            ),
-                            Err(_) => break,
-                        },
-                        recv(maintenance_rx) -> job => match job {
-                            Ok(job) => shared.apply_account_maintenance_job(job),
-                            Err(_) => break,
-                        },
-                        recv(settled_gc_rx) -> wake => match wake {
-                            Ok(()) => shared.run_settled_gc_pass(
-                                &mut execution,
-                                &mut live_position,
-                            ),
-                            Err(_) => break,
-                        },
-                        recv(lifecycle_shutdown_rx) -> phase => {
-                            if matches!(phase, Ok(ShutdownPhase::Finished) | Err(_)) {
-                                continue;
-                            }
-                        },
-                        default(std::time::Duration::from_millis(100)) => {
-                            // A certificate may become ready without another
-                            // producer wake. This poll is account-owner local
-                            // and lower priority than both bounded work lanes.
-                            shared.run_settled_gc_pass(&mut execution, &mut live_position);
-                        }
-                    }
-                }
+                account_owner_loop::run(
+                    lifecycle_weak,
+                    lifecycle_shutdown,
+                    lifecycle_shutdown_rx,
+                    lifecycle_rx,
+                    lifecycle_account_owner,
+                    maintenance_rx,
+                    settled_gc_rx,
+                    private_ingress_install_rx,
+                    gc_ready_rx,
+                    unified,
+                    recovery_binding,
+                    execution,
+                    live_position,
+                );
             })
             .expect("spawn Polymarket lifecycle owner");
         (cold_handle, lifecycle_handle, ready_rx)
@@ -6937,6 +6987,8 @@ impl PolymarketTrade {
             (None, None)
         };
         let (account_lifecycle_tx, account_lifecycle_rx) = crossbeam_channel::bounded(16_384);
+        let (private_ingress_install_tx, private_ingress_install_rx) =
+            crossbeam_channel::bounded(1);
         let (account_owner_handle, account_owner_state) = account_state
             .bind_account_owner()
             .map_err(|error| anyhow!("Polymarket account owner bind failed: {error}"))?;
@@ -6956,7 +7008,17 @@ impl PolymarketTrade {
         };
         let initial_live_position = LivePositionManager::from_restored(recovered_trades);
         let restored_live_position_watermark = initial_live_position.last_match_time_secs();
+        let unified_private_owner =
+            crate::os_tune::unified_private_owner(account_state.account_id());
+        #[cfg(test)]
+        let unified_private_owner =
+            TEST_PRIVATE_OWNER_MODE.with(|mode| mode.get().unwrap_or(unified_private_owner));
         let shared = Arc::new(SharedState {
+            unified_private_owner,
+            #[cfg(test)]
+            private_commit_benchmark: OnceLock::new(),
+            #[cfg(test)]
+            private_pending_apply_high: std::sync::atomic::AtomicUsize::new(0),
             instance_id: instance_id.to_string(),
             account_state,
             account_owner_handle,
@@ -6965,6 +7027,7 @@ impl PolymarketTrade {
             strategy_owner_by_instance: ArcSwap::from_pointee(HashMap::new()),
             strategy_private_routes: ArcSwap::from_pointee(HashMap::new()),
             private_apply_lane: OnceLock::new(),
+            private_ingress_install_tx,
             recovery_http: OnceLock::new(),
             probe_order_ids: ProbeOrderIdRing::default(),
             probe_orphan_owner,
@@ -7028,6 +7091,7 @@ impl PolymarketTrade {
                 account_owner_state,
                 account_maintenance_rx,
                 settled_gc_rx,
+                private_ingress_install_rx,
             );
         for worker in ["cold account owner", "private lifecycle owner"] {
             account_owner_ready
@@ -14356,6 +14420,16 @@ mod tests {
         assert!(index.contains("  0XDeF "));
         index.remove("  0XdEf  ");
         assert!(index.get("DEF").is_none());
+    }
+
+    #[test]
+    fn runtime_ownership_single_retirement_preserves_rebound_identity() {
+        let index = RuntimeOwnershipIndex::new();
+        index.insert("0xABC", runtime_ownership("0xABC", "new-owner")).unwrap();
+        index.remove_client_order("abc", "old-owner");
+        assert_eq!(index.client_order_id("ABC").as_deref(), Some("new-owner"));
+        index.remove_client_order("  0XaBc ", "new-owner");
+        assert!(!index.contains("abc"));
     }
 
     #[test]

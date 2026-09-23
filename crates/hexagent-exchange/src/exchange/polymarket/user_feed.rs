@@ -33,6 +33,9 @@ use crate::types::*;
 mod private_execution_cache;
 use private_execution_cache::{ExecutionAckLane, ExecutionAckTicket, PrivateExecutionCache};
 
+#[path = "unified_private_owner.rs"]
+pub(crate) mod unified_private_owner;
+
 /// Current BTC crypto live default, matching the app's event fallback. Existing
 /// token curves take precedence; the selected amounts travel with the update.
 /// Non-crypto adapters must supply their own explicit basis instead of this policy.
@@ -385,13 +388,21 @@ fn enqueue_recovery_update(
     if buffered {
         Ok(())
     } else {
-        update_tx
-            .send(RoutedOrderUpdate {
-                owner: numeric_owner,
-                update,
-                timing: LifecycleTiming::default(),
-            })
-            .map_err(|_| anyhow!("order update channel closed during reconnect recovery"))
+        let routed = RoutedOrderUpdate {
+            owner: numeric_owner,
+            update,
+            timing: LifecycleTiming::default(),
+        };
+        if shared.user_feed_health.recovery_bound_here() {
+            shared
+                .user_feed_health
+                .deliver_private_owned(routed, None)
+                .map_err(|error| anyhow!(error))
+        } else {
+            update_tx
+                .send(routed)
+                .map_err(|_| anyhow!("order update channel closed during reconnect recovery"))
+        }
     }
 }
 
@@ -2502,19 +2513,32 @@ fn dispatch_private_update(
             "polymarket.user.direct_private_queue_high_water",
             depth as u64,
         );
-        direct
-            .send_timeout(
-                RoutedOrderUpdate {
-                    owner,
-                    update,
-                    timing,
-                },
-                std::time::Duration::from_secs(2),
-            )
-            .map_err(|error| {
-                crate::latency::record_ns("polymarket.user.direct_private_queue_overflow", 1);
-                format!("owner-direct private lifecycle lane unavailable: {error}")
-            })
+        let routed = RoutedOrderUpdate {
+            owner,
+            update,
+            timing,
+        };
+        if shared.user_feed_health.recovery_bound_here() {
+            shared
+                .user_feed_health
+                .deliver_private_owned(routed, Some(direct))
+        } else {
+            direct
+                .send_timeout(routed, std::time::Duration::from_secs(2))
+                .map_err(|error| {
+                    crate::latency::record_ns("polymarket.user.direct_private_queue_overflow", 1);
+                    format!("owner-direct private lifecycle lane unavailable: {error}")
+                })
+        }
+    } else if shared.user_feed_health.recovery_bound_here() {
+        shared.user_feed_health.deliver_private_owned(
+            RoutedOrderUpdate {
+                owner,
+                update,
+                timing,
+            },
+            None,
+        )
     } else {
         update_tx
             .try_send(RoutedOrderUpdate {
@@ -2554,9 +2578,13 @@ fn dispatch_repaired_private_update(
         if buffered {
             return Ok(());
         }
-        update_tx
-            .try_send(routed)
-            .map_err(|error| format!("historical repair strategy delivery unavailable: {error}"))
+        if shared.user_feed_health.recovery_bound_here() {
+            shared.user_feed_health.deliver_private_owned(routed, None)
+        } else {
+            update_tx.try_send(routed).map_err(|error| {
+                format!("historical repair strategy delivery unavailable: {error}")
+            })
+        }
     } else {
         dispatch_private_update(shared, update_tx, None, routed)
     }
@@ -2565,7 +2593,7 @@ fn dispatch_repaired_private_update(
 fn route_private_batch(
     shared: &SharedState,
     update_tx: &impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
-    events: Vec<PrivateEventDelta>,
+    events: impl IntoIterator<Item = PrivateEventDelta>,
     recovery_generation: Option<u64>,
     route_dedupe: &mut PrivateRouteDedupe,
     cold_committed: Option<&PrivateRouteDedupe>,
@@ -2577,8 +2605,10 @@ fn route_private_batch(
             shared.account_state.private_execution_seed(),
         )?);
     }
-    let mut cold_events = Vec::with_capacity(events.len());
-    let mut cold_identities = Vec::with_capacity(events.len());
+    let events = events.into_iter();
+    let capacity = events.size_hint().0;
+    let mut cold_events = Vec::with_capacity(capacity);
+    let mut cold_identities = Vec::with_capacity(capacity);
     let mut durable_skips = 0usize;
     for mut event in events {
         event.timing.private_owner_dequeued_ns = crate::types::monotonic_now_ns();
@@ -2852,6 +2882,18 @@ pub(crate) fn apply_private_cold_command(
     crate::latency::record("polymarket.user.fast_route_to_account_owner", routed_at);
     let result =
         apply_private_cold_batch_owned(shared, live_position, replay, &events, recovery_generation);
+    #[cfg(test)]
+    if let Some(measurement) = shared.private_commit_benchmark.get() {
+        assert!(result.is_ok(), "benchmark lifecycle failed: {result:?}");
+        let completed = crate::types::monotonic_now_ns();
+        for event in &events {
+            if event.timing.private_ws_received_ns != 0 {
+                measurement
+                    .try_send(completed.saturating_sub(event.timing.private_ws_received_ns))
+                    .expect("benchmark consumer capacity");
+            }
+        }
+    }
     shared.publish_live_position_watermark(live_position.last_match_time_secs());
     if let Err(error) = &result {
         shared.user_feed_health.set_recovering(true);
@@ -3037,6 +3079,16 @@ fn spawn_private_apply_worker(
     update_tx: impl hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(PrivateApplyLane, Vec<std::thread::JoinHandle<()>>)> {
+    if shared.unified_private_owner {
+        let (lane, ingress) = unified_private_owner::prepare(&shared, update_tx, shutdown)?;
+        shared
+            .install_private_ingress(ingress)
+            .map_err(|error| anyhow!(error))?;
+        shared
+            .install_private_apply_lane(lane.clone())
+            .map_err(|error| anyhow!(error))?;
+        return Ok((lane, Vec::new()));
+    }
     let (live_tx, live_rx) = crossbeam_channel::bounded(PRIVATE_APPLY_QUEUE_CAPACITY);
     let (replay_tx, replay_rx) = crossbeam_channel::bounded(PRIVATE_APPLY_QUEUE_CAPACITY);
     // Account actor -> private owner, SPSC and bounded. Overflow drops only the
@@ -6031,7 +6083,9 @@ mod tests {
             let routed = route_private_batch(
                 &shared,
                 &update_tx,
-                (0..GAP_APPLY_BATCH_SIZE).map(|_| event.clone()).collect(),
+                (0..GAP_APPLY_BATCH_SIZE)
+                    .map(|_| event.clone())
+                    .collect::<Vec<_>>(),
                 Some(1),
                 &mut route_dedupe,
                 None,
@@ -7678,3 +7732,7 @@ mod tests {
         assert_ne!(advancing.terminal_trade_key().unwrap(), key);
     }
 }
+
+#[cfg(test)]
+#[path = "unified_private_owner_tests.rs"]
+mod unified_owner_tests;

@@ -86,6 +86,15 @@ pub struct OsTuneConfig {
     /// starve both lanes for the duration of the burst.
     #[serde(default)]
     pub private_route_cores: HashMap<String, usize>,
+    /// Account -> one event-loop CPU for private ingress and lifecycle apply.
+    /// Selecting this mode removes the separate ingress thread. An account
+    /// cannot also appear in private_route_cores/private_apply_cores.
+    #[serde(default)]
+    pub private_owner_cores: HashMap<String, usize>,
+    /// Permit account-local SCHED_OTHER cold writers to share a cold CPU.
+    /// They remain separate owners; sharing with any critical role is forbidden.
+    #[serde(default)]
+    pub allow_shared_private_cold_core: bool,
     /// Shared-account id -> dedicated private event application core.  These
     /// lifecycle owners apply authenticated order/trade updates to their
     /// account-local state. Keeping them off the ingress and housekeeping
@@ -164,6 +173,8 @@ impl Default for OsTuneConfig {
             strategy_core: None,
             strategy_cores: HashMap::new(),
             private_route_cores: HashMap::new(),
+            private_owner_cores: HashMap::new(),
+            allow_shared_private_cold_core: false,
             private_apply_cores: HashMap::new(),
             private_cold_cores: HashMap::new(),
             execution_core: None,

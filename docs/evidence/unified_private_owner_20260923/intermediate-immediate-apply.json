@@ -1,0 +1,81 @@
+{
+  "status": "superseded intermediate implementation; not the final bounded-routing mode",
+  "platform": "macOS x86_64 Intel i9-9880H, 16 logical CPUs, pinning/FIFO disabled",
+  "measurement": "same-code split vs unified immediate-apply; final source replaces the immediate-apply loop",
+  "records": [
+    {
+      "accounts": 3,
+      "boundary_start": "classified_frame_before_private_lane_enqueue",
+      "burst_per_account": 32,
+      "durable_flush_included": false,
+      "fifo_active": false,
+      "live_lane_capacity": 1024,
+      "live_lane_high_water": 1,
+      "local_lifecycle_applied": {
+        "max_ns": 16550397,
+        "n": 12288,
+        "p50_ns": 8184064,
+        "p999_ns": 16550397,
+        "p99_ns": 15776461
+      },
+      "mode": "split",
+      "network_included": false,
+      "output_lane_capacity": 64,
+      "output_lane_sampled_high_water": 32,
+      "overflow": 0,
+      "pinning_active": false,
+      "producer_ready": {
+        "max_ns": 690527,
+        "n": 12288,
+        "p50_ns": 252730,
+        "p999_ns": 645484,
+        "p99_ns": 523293
+      },
+      "routed_consumer": {
+        "max_ns": 16608146,
+        "n": 12288,
+        "p50_ns": 4893912,
+        "p999_ns": 16574145,
+        "p99_ns": 15432924
+      },
+      "strategy_application_included": false
+    },
+    {
+      "accounts": 3,
+      "boundary_start": "classified_frame_before_private_lane_enqueue",
+      "burst_per_account": 32,
+      "durable_flush_included": false,
+      "fifo_active": false,
+      "live_lane_capacity": 1024,
+      "live_lane_high_water": 1,
+      "local_lifecycle_applied": {
+        "max_ns": 16240735,
+        "n": 12288,
+        "p50_ns": 3793538,
+        "p999_ns": 15251269,
+        "p99_ns": 13570594
+      },
+      "mode": "unified",
+      "network_included": false,
+      "output_lane_capacity": 64,
+      "output_lane_sampled_high_water": 32,
+      "overflow": 0,
+      "pinning_active": false,
+      "producer_ready": {
+        "max_ns": 15783829,
+        "n": 12288,
+        "p50_ns": 3580712,
+        "p999_ns": 14880604,
+        "p99_ns": 13196872
+      },
+      "routed_consumer": {
+        "max_ns": 16254386,
+        "n": 12288,
+        "p50_ns": 6574203,
+        "p999_ns": 16251458,
+        "p99_ns": 15413112
+      },
+      "strategy_application_included": false
+    }
+  ]
+}

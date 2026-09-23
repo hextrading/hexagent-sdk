@@ -12,7 +12,7 @@ const CONDITION: &str = "route-test-condition";
 const TOKEN: &str = "DOWN";
 const ORDER: &str = "0xabcdef";
 
-fn route_fixture() -> Arc<SharedState> {
+pub(super) fn route_fixture() -> Arc<SharedState> {
     let shared = tests::test_shared();
     shared.account_state.register_instance("owner-1", 1.0);
     shared
@@ -46,7 +46,7 @@ fn route_fixture() -> Arc<SharedState> {
     shared
 }
 
-fn route_event(legs: usize, trade_id: &str) -> PrivateEventDelta {
+pub(super) fn route_event(legs: usize, trade_id: &str) -> PrivateEventDelta {
     let (quantity, makers) = match legs {
         1 => (15.0, vec![json!({"order_id":"other-0", "asset_id":TOKEN,"side":"BUY", "matched_amount":"15", "price":"0.16"})]),
         2 => (15.0, vec![

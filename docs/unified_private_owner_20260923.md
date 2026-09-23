@@ -1,0 +1,164 @@
+# Three private account owners on 16 vCPUs
+
+`os_tune.private_owner_cores` selects one lifecycle event loop per physical
+account. It owns private ingress routing/deduplication, execution lifecycle,
+`LivePositionManager`, replay state and recovery enrollment/acknowledgement.
+Strategy threads still own their independent `StrategyAccount` and strategy
+state. No account is shared between the three BTC strategy instances.
+
+## Ownership and placement
+
+The lifecycle thread binds the existing account lifecycle owner and takes the
+recovery state and its sole receiver from the temporary startup recovery thread.
+That temporary thread exits. Installing ingress transfers all routing state
+before the websocket producer starts; no second private routing thread starts.
+Recovery requests from the bound owner execute locally. External control/ACK
+traffic uses the existing bounded mailbox. A thread-local binding identifies
+exactly one account and is destroyed with that owner thread.
+
+Each unified owner uses its configured CPU and `fifo_private_apply` priority.
+Each account retains its own cold ledger thread using SCHED_OTHER.
+`allow_shared_private_cold_core=true` permits those independent cold threads to
+share a CPU; it never permits overlap with strategy, private owner, feed or HTTP
+worker roles. Strict validation rejects mixed split/unified declarations,
+missing cold CPUs, critical-role overlaps and active accounts without an owner
+CPU. Configurations without `private_owner_cores` retain split ownership.
+
+The intended application mapping is strategy CPUs 9/11/6, private account CPUs
+10/12/13, cold CPU 5, dispatch/cancel CPU 14 and completion CPU 15. Existing I/O,
+feed and router CPUs remain 2/3/7/8/4. CPUs 0–1 remain system/IRQ CPUs.
+
+## Message and backpressure behavior
+
+| Lane | Capacity | Owner / behavior |
+| --- | ---: | --- |
+| Live ingress | 1,024 frames | WS to account owner, FIFO; retain a frame iterator and route at most 32 records per turn; a fence follows the entire frame |
+| REST replay | 1,024 batches | Recovery producer to the same owner; one record per turn with completion and recovery certificate checks |
+| Pending lifecycle apply | 64 records | Preallocated owner-local FIFO; one apply per turn, backpressure stops routing before capacity; one credit reserved for replay |
+| Private delivery outbox | 1,024 envelopes | Preallocated, owner-local FIFO; retain exact destination and update on downstream fullness |
+| Commit acknowledgements | 1,024 batches | Existing advisory deduplication lane; overflow cannot acknowledge an uncommitted event |
+| Historical repair reply | 1 | Existing single in-flight repair credit; generation/certificate checks remain required |
+| Recovery control / ACK | 16,384 commands | Same account owner in unified mode; external callers retain existing failure and timeout rules |
+| Execution lifecycle / maintenance | 16,384 each | Existing lanes; service lifecycle every turn, maintenance at idle or every 64 active turns |
+| Ingress installation | 1 | Startup only; duplicate or split-mode installation is rejected |
+| GC plan | 1 plus one retained cold result | Cold coordinator scans immutable execution publications; only the lifecycle owner deletes its mutable state |
+
+Every loop turn services recovery/output retry, account lifecycle control,
+execution lifecycle, then private ingress. Live routing gets at most 32 records and replay gets one, followed by one
+local lifecycle apply. The 64-record pending FIFO reserves a replay credit;
+continuous live traffic cannot starve replay. Maintenance/GC cannot starve. These are message-count bounds, not CPU
+time guarantees for a large individual trade. Crossbeam transport on the
+existing internal lanes is retained. The live engine's existing polling root
+private sender is preserved.
+
+When an output is retained, new ingress consumption pauses while lifecycle and
+recovery control remain serviceable. A separate atomic backpressure gate pauses
+new quotes without inventing a reconnect epoch. Draining the outbox clears only
+that gate, never a reconnect proof or inventory-uncertain condition. Capacity
+exhaustion/disconnection fails closed and requires authoritative recovery.
+Stopping with undelivered envelopes retains the health gate and emits a shutdown
+error; startup replay is required. No successful delivery is claimed for them.
+
+Recovery fences cannot overtake earlier live frame records or their pending
+local lifecycle commits. Quote recovery still
+requires strategy application acknowledgements. Duplicate and replay economics
+continue using the existing frozen execution certificates and idempotent ledger.
+
+## Cold work and remaining migration
+
+Settled GC coordination and full execution-snapshot selection move to the cold
+account thread. The private owner removes at most 16 execution identities and
+16 indexed trade-history records per GC turn. It rechecks local token ownership
+and atomically rechecks runtime client-order ownership before removing a route.
+Readers retain immutable snapshots. Nonterminal history and rows added after
+the retirement cursor survive.
+
+No quote callback, global mutable map, strategy-account lock or synchronous
+quote-path I/O is added. Existing account-local parsing/ledger code still
+allocates and can use existing account control synchronization; this change
+does not claim a fully allocation-free private lifecycle. Follow-up work should
+profile those account-local stages and migrate them to preallocated records and
+bounded owner publications, while preserving recovery correctness. Sharing cold
+CPU 5 also requires live measurement of ledger/reconciliation queue pressure.
+
+## Validation and measurements
+
+Functional coverage includes large-frame ordering, duplicate replay, three
+independent account lanes, full output retention with control progress, quote
+pause/resume, input saturation, recovery fence/strategy ACK ordering, stale
+epochs, recovery ownership handoff and bounded GC with rebound identities.
+
+Commands:
+
+```sh
+cargo test --offline -p hexagent-exchange --lib -- --test-threads=2
+cargo test --offline -p hexagent-runtime -p hexagent-config -p hexagent-account --lib
+cargo check --offline --workspace --all-targets
+cargo test --release --offline -p hexagent-exchange --lib benchmark_three_account_private_owners -- --ignored --nocapture --test-threads=1
+```
+
+The focused benchmark compares split and unified modes in the same current SDK,
+not historical whole binaries. Each mode processes 12,288 events: three accounts
+with 4,096 distinct trades each, in bursts of 32/account. Payload construction and
+classification are outside the measured boundary. Start is immediately before
+the classified frame enters the private lane. Endpoints are the existing
+producer-ready timestamp, receipt by the benchmark consumer, and completion of
+local lifecycle application. Split application completes a whole 32-record
+batch; unified application completes each record. Consumer measurements include
+the harness's sequential per-account draining and scheduling delays.
+
+The host is macOS x86_64, Intel i9-9880H, 16 logical CPUs. Pinning and FIFO are
+explicitly disabled. Results exclude network, JSON classification, strategy
+application, quote generation, HTTP ACK, disk flush and production CPU topology.
+They do not establish production end-to-end P99/P999 or prove the chosen
+16-vCPU plan is globally optimal. All distributions, queue sampling boundaries
+and overflows are retained in the adjacent benchmark evidence. In particular,
+an initial immediate-apply variant regressed producer-ready P99 from 0.523 ms
+to 13.197 ms despite a lower lifecycle median. The final bounded routing phase
+was added to remove that per-record routing stall. This intermediate result is
+retained separately from the final benchmark, not reported as the shipped mode.
+
+Functional results: 918 exchange tests passed (39 ignored benchmarks/live tests),
+328 account tests passed (14 ignored), 9 config tests passed, and 76 runtime tests
+passed (2 ignored). SDK workspace/all-targets check passed. Hexbot's six real
+live-config integration tests and six binary startup/config tests passed against
+the new API; the application pin is updated again after SDK main is merged.
+
+In the benchmark, the legacy pending-apply capacity counts lifecycle commands
+(each measured command contains a 32-record batch), whereas the unified capacity
+counts individual records. Legacy internal pending depth is not sampled and is
+reported as null. Unified pending depth is an exact test-only maximum. Both
+application endpoints include their respective pending queues. Output depth is
+sampled at consumer drain, as labelled in JSON; its capacity is 64 and there are
+only 32 outputs/account between drains. No overflow or retained-output backlog
+occurs in this workload. These are burst measurements, not an overload test;
+functional saturation tests exercise the fail-closed and retained-output paths.
+
+### Final measured distributions
+
+All times below are milliseconds, with 12,288 events per row.
+
+| Boundary / mode | Median | P99 | P999 | Maximum |
+| --- | ---: | ---: | ---: | ---: |
+| Producer ready / split | 0.255304 | 0.544878 | 0.701588 | 0.816023 |
+| Producer ready / unified | 0.233747 | 0.705284 | 3.051148 | 3.171198 |
+| Consumer receipt / split | 5.561524 | 15.598357 | 15.926113 | 15.954456 |
+| Consumer receipt / unified | 5.046271 | 17.463606 | 17.740958 | 17.743907 |
+| Local lifecycle applied / split | 8.139329 | 15.368304 | 15.873622 | 15.873622 |
+| Local lifecycle applied / unified | 3.927866 | 14.674669 | 17.105300 | 17.930767 |
+
+Raw evidence: [final benchmark](evidence/unified_private_owner_20260923/benchmark.json),
+[superseded immediate-apply variant](evidence/unified_private_owner_20260923/intermediate-immediate-apply.json),
+[functional validation](evidence/unified_private_owner_20260923/validation.json).
+Both modes had live queue high water 1/1,024 frames, sampled output high water
+32/64 envelopes and zero overflow. Unified pending application peaked at 32/64
+records. The 128-record saturation regression separately exercises the 64-record
+bound and replay progress.
+
+The final routing P99 is 0.705 ms versus split mode's 0.545 ms, substantially
+below the rejected immediate-apply variant's 13.197 ms. Unified lifecycle median
+is lower, but routing P999 (3.051 vs 0.702 ms) and lifecycle P999 (17.105 vs
+15.874 ms) remain higher in this local run. This is a resource-fit implementation
+with explicit burst bounds, not evidence of universally lower tails. Production
+acceptance needs the actual 16-vCPU Linux host, live queue pressure and complete
+market receipt → decision → dispatch → HTTP ACK → private application traces.
