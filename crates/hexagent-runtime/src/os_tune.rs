@@ -122,6 +122,8 @@ pub struct CorePlan {
     /// Per-account authenticated private-ingress routing cores. In strict
     /// mode these are dedicated and disjoint from lifecycle/account apply.
     pub private_route_cores: HashMap<String, usize>,
+    pub private_owner_cores: HashMap<String, usize>,
+    pub allow_shared_private_cold_core: bool,
     /// Per-account private order/trade application cores.
     pub private_apply_cores: HashMap<String, usize>,
     /// Per-account cold ledger/lifecycle cores. These stay SCHED_OTHER and
@@ -161,6 +163,8 @@ impl CorePlan {
             strategy: DEFAULT_STRATEGY_CORE,
             strategy_cores: HashMap::new(),
             private_route_cores: HashMap::new(),
+            private_owner_cores: HashMap::new(),
+            allow_shared_private_cold_core: false,
             private_apply_cores: HashMap::new(),
             private_cold_cores: HashMap::new(),
             execution: DEFAULT_EXECUTION_CORE,
@@ -210,6 +214,8 @@ impl CorePlan {
             strategy: cfg.strategy_core.unwrap_or(DEFAULT_STRATEGY_CORE),
             strategy_cores: cfg.strategy_cores.clone(),
             private_route_cores: cfg.private_route_cores.clone(),
+            private_owner_cores: cfg.private_owner_cores.clone(),
+            allow_shared_private_cold_core: cfg.allow_shared_private_cold_core,
             private_apply_cores: cfg.private_apply_cores.clone(),
             private_cold_cores: cfg.private_cold_cores.clone(),
             execution: cfg.execution_core.unwrap_or(DEFAULT_EXECUTION_CORE),
@@ -448,22 +454,44 @@ impl CorePlan {
                 format!("private_account_apply:{account_id}"),
                 &mut exclusive,
             )?;
-            let cold_core = self.private_cold_cores.get(account_id).copied().ok_or_else(|| {
-                format!(
-                    "strict_core_isolation requires private_cold_cores entry for account `{account_id}`"
-                )
+        }
+        for (account_id, &core) in &self.private_owner_cores {
+            if self.private_route_cores.contains_key(account_id)
+                || self.private_apply_cores.contains_key(account_id)
+            {
+                return Err(format!(
+                    "account `{account_id}` configures both unified and split private owners"
+                ));
+            }
+            claim(
+                core,
+                format!("private_account_owner:{account_id}"),
+                &mut exclusive,
+            )?;
+        }
+        let private_accounts: HashSet<_> = self
+            .private_apply_cores
+            .keys()
+            .chain(self.private_owner_cores.keys())
+            .collect();
+        let mut cold_cores = HashSet::new();
+        for account_id in &private_accounts {
+            let cold_core = self.private_cold_cores.get(*account_id).copied().ok_or_else(|| {
+                format!("strict_core_isolation requires private_cold_cores entry for account `{account_id}`")
             })?;
+            if self.allow_shared_private_cold_core && cold_cores.contains(&cold_core) {
+                continue;
+            }
             claim(
                 cold_core,
                 format!("private_account_cold:{account_id}"),
                 &mut exclusive,
             )?;
+            cold_cores.insert(cold_core);
         }
         for account_id in self.private_cold_cores.keys() {
-            if !self.private_apply_cores.contains_key(account_id) {
-                return Err(format!(
-                    "private_cold_cores account `{account_id}` has no private_apply_cores entry"
-                ));
+            if !private_accounts.contains(account_id) {
+                return Err(format!("private_cold_cores account `{account_id}` has no private_apply_cores entry or private_owner_cores entry"));
             }
         }
         for account_id in self.private_route_cores.keys() {
@@ -620,6 +648,10 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
         plan.allow_strategy_router_on_execution_core,
         plan.allow_private_apply_on_completion_core,
     );
+    info!(
+        "[os_tune] unified private owners={:?} shared_cold={}",
+        plan.private_owner_cores, plan.allow_shared_private_cold_core
+    );
     let _ = CORE_PLAN.set(plan);
 }
 
@@ -633,6 +665,29 @@ pub fn init_disabled() {
     plan.enable_pin = false;
     plan.enable_fifo = false;
     let _ = CORE_PLAN.set(plan);
+}
+
+/// Pure structural validation, usable by config tests without installing a
+/// process-global plan, pinning threads, reading secrets, or starting trading.
+pub fn validate_configured_topology(
+    cfg: &OsTuneConfig,
+    instance_ids: &[String],
+    account_ids: &[String],
+) -> Result<(), String> {
+    let plan = CorePlan::from_config(cfg);
+    plan.validate_strategy_isolation(instance_ids)?;
+    if plan.strict_core_isolation {
+        for account_id in account_ids {
+            if !plan.private_owner_cores.contains_key(account_id)
+                && !plan.private_apply_cores.contains_key(account_id)
+            {
+                return Err(format!(
+                    "active account `{account_id}` has no private owner CPU"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Fail-fast validation for production live/paper per-instance topology.
@@ -1077,12 +1132,41 @@ fn pretouch_strategy_stack() {
 /// their higher priorities.
 pub fn pin_private_account_apply(thread_name: &str, account_id: &str) {
     let p = plan();
-    if let Some(core) = p.private_apply_cores.get(account_id).copied() {
+    if let Some(core) = p
+        .private_owner_cores
+        .get(account_id)
+        .or_else(|| p.private_apply_cores.get(account_id))
+        .copied()
+    {
         pin_current(core, thread_name);
         set_fifo(p.fifo_private_apply, thread_name);
     } else {
         pin_background(thread_name);
     }
+}
+
+/// Startup-only selection. This changes the worker architecture, not merely affinity.
+pub fn unified_private_owner(account_id: &str) -> bool {
+    plan().private_owner_cores.contains_key(account_id)
+}
+
+/// Check actual active accounts as well as the declared CPU map. Missing
+/// entries must not silently fall back to a background CPU in live mode.
+pub fn validate_private_accounts(account_ids: &[String]) -> Result<(), String> {
+    let p = plan();
+    if !p.strict_core_isolation {
+        return Ok(());
+    }
+    for account_id in account_ids {
+        if !p.private_owner_cores.contains_key(account_id)
+            && !p.private_apply_cores.contains_key(account_id)
+        {
+            return Err(format!(
+                "active account `{account_id}` has no private owner CPU"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Pin the lossless authenticated private-ingress router. In production this
@@ -1287,6 +1371,74 @@ pub fn mlockall_best_effort() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unified_three_account_plan_fits_16_cpus_without_sharing_critical_owners() {
+        let mut cfg = OsTuneConfig::default();
+        cfg.strict_core_isolation = true;
+        cfg.allow_strategy_router_on_execution_core = true;
+        cfg.allow_background_on_execution_core = true;
+        cfg.allow_shared_private_cold_core = true;
+        cfg.async_ord_core = Some(2);
+        cfg.async_rt_core = Some(3);
+        cfg.async_clob_core = Some(8);
+        cfg.execution_core = Some(4);
+        cfg.strategy_core = Some(4);
+        cfg.background_cores = vec![4];
+        cfg.feed_cores = HashMap::from([("polymarket".into(), 7)]);
+        cfg.strategy_cores = HashMap::from([
+            ("btc01".into(), 9),
+            ("btc02".into(), 11),
+            ("btc03".into(), 6),
+        ]);
+        cfg.private_owner_cores = HashMap::from([
+            ("zhu02".into(), 10),
+            ("zhu03".into(), 12),
+            ("hex001".into(), 13),
+        ]);
+        cfg.private_cold_cores = HashMap::from([
+            ("zhu02".into(), 5),
+            ("zhu03".into(), 5),
+            ("hex001".into(), 5),
+        ]);
+        cfg.poly_exec_cores = vec![14];
+        cfg.poly_cancel_cores = vec![14];
+        cfg.poly_completion_cores = vec![15];
+        let enabled = vec!["btc01".into(), "btc02".into(), "btc03".into()];
+        assert!(CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&enabled)
+            .is_ok());
+        let valid = cfg.clone();
+        cfg.allow_shared_private_cold_core = false;
+        assert!(CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&enabled)
+            .is_err());
+        for core in [6, 10, 14, 15] {
+            let mut cfg = valid.clone();
+            cfg.private_owner_cores.insert("hex001".into(), core);
+            assert!(
+                CorePlan::from_config(&cfg)
+                    .validate_strategy_isolation(&enabled)
+                    .is_err(),
+                "overlap {core}"
+            );
+        }
+        let mut cfg = valid.clone();
+        cfg.private_apply_cores.insert("hex001".into(), 13);
+        assert!(CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&enabled)
+            .is_err());
+        let mut cfg = valid.clone();
+        cfg.private_cold_cores.remove("hex001");
+        assert!(CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&enabled)
+            .is_err());
+        let mut cfg = valid;
+        cfg.private_cold_cores.insert("hex001".into(), 15);
+        assert!(CorePlan::from_config(&cfg)
+            .validate_strategy_isolation(&enabled)
+            .is_err());
+    }
 
     #[test]
     fn selective_stack_lock_range_is_page_aligned_and_bounded() {
