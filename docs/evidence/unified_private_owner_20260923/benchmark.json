@@ -1,0 +1,91 @@
+{
+  "source_revision": "962ce223110c097119a7dbe664d49be5c10a8571",
+  "command": "cargo test --release --offline -p hexagent-exchange --lib benchmark_three_account_private_owners -- --ignored --nocapture --test-threads=1",
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "platform": "macOS x86_64 Intel i9-9880H, 16 logical CPUs",
+  "profile": {
+    "opt_level": 3,
+    "lto": "fat",
+    "codegen_units": 1
+  },
+  "records": [
+    {
+      "accounts": 3,
+      "boundary_start": "classified_frame_before_private_lane_enqueue",
+      "burst_per_account": 32,
+      "durable_flush_included": false,
+      "fifo_active": false,
+      "live_lane_capacity": 1024,
+      "live_lane_high_water": 1,
+      "local_lifecycle_applied": {
+        "max_ns": 15873622,
+        "n": 12288,
+        "p50_ns": 8139329,
+        "p999_ns": 15873622,
+        "p99_ns": 15368304
+      },
+      "mode": "split",
+      "network_included": false,
+      "output_lane_capacity": 64,
+      "output_lane_sampled_high_water": 32,
+      "overflow": 0,
+      "pending_apply_capacity": 16384,
+      "pending_apply_high_water": null,
+      "pinning_active": false,
+      "producer_ready": {
+        "max_ns": 816023,
+        "n": 12288,
+        "p50_ns": 255304,
+        "p999_ns": 701588,
+        "p99_ns": 544878
+      },
+      "routed_consumer": {
+        "max_ns": 15954456,
+        "n": 12288,
+        "p50_ns": 5561524,
+        "p999_ns": 15926113,
+        "p99_ns": 15598357
+      },
+      "strategy_application_included": false
+    },
+    {
+      "accounts": 3,
+      "boundary_start": "classified_frame_before_private_lane_enqueue",
+      "burst_per_account": 32,
+      "durable_flush_included": false,
+      "fifo_active": false,
+      "live_lane_capacity": 1024,
+      "live_lane_high_water": 1,
+      "local_lifecycle_applied": {
+        "max_ns": 17930767,
+        "n": 12288,
+        "p50_ns": 3927866,
+        "p999_ns": 17105300,
+        "p99_ns": 14674669
+      },
+      "mode": "unified",
+      "network_included": false,
+      "output_lane_capacity": 64,
+      "output_lane_sampled_high_water": 32,
+      "overflow": 0,
+      "pending_apply_capacity": 64,
+      "pending_apply_high_water": 32,
+      "pinning_active": false,
+      "producer_ready": {
+        "max_ns": 3171198,
+        "n": 12288,
+        "p50_ns": 233747,
+        "p999_ns": 3051148,
+        "p99_ns": 705284
+      },
+      "routed_consumer": {
+        "max_ns": 17743907,
+        "n": 12288,
+        "p50_ns": 5046271,
+        "p999_ns": 17740958,
+        "p99_ns": 17463606
+      },
+      "strategy_application_included": false
+    }
+  ]
+}

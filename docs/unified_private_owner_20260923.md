@@ -117,3 +117,48 @@ an initial immediate-apply variant regressed producer-ready P99 from 0.523 ms
 to 13.197 ms despite a lower lifecycle median. The final bounded routing phase
 was added to remove that per-record routing stall. This intermediate result is
 retained separately from the final benchmark, not reported as the shipped mode.
+
+Functional results: 918 exchange tests passed (39 ignored benchmarks/live tests),
+328 account tests passed (14 ignored), 9 config tests passed, and 76 runtime tests
+passed (2 ignored). SDK workspace/all-targets check passed. Hexbot's six real
+live-config integration tests and six binary startup/config tests passed against
+the new API; the application pin is updated again after SDK main is merged.
+
+In the benchmark, the legacy pending-apply capacity counts lifecycle commands
+(each measured command contains a 32-record batch), whereas the unified capacity
+counts individual records. Legacy internal pending depth is not sampled and is
+reported as null. Unified pending depth is an exact test-only maximum. Both
+application endpoints include their respective pending queues. Output depth is
+sampled at consumer drain, as labelled in JSON; its capacity is 64 and there are
+only 32 outputs/account between drains. No overflow or retained-output backlog
+occurs in this workload. These are burst measurements, not an overload test;
+functional saturation tests exercise the fail-closed and retained-output paths.
+
+### Final measured distributions
+
+All times below are milliseconds, with 12,288 events per row.
+
+| Boundary / mode | Median | P99 | P999 | Maximum |
+| --- | ---: | ---: | ---: | ---: |
+| Producer ready / split | 0.255304 | 0.544878 | 0.701588 | 0.816023 |
+| Producer ready / unified | 0.233747 | 0.705284 | 3.051148 | 3.171198 |
+| Consumer receipt / split | 5.561524 | 15.598357 | 15.926113 | 15.954456 |
+| Consumer receipt / unified | 5.046271 | 17.463606 | 17.740958 | 17.743907 |
+| Local lifecycle applied / split | 8.139329 | 15.368304 | 15.873622 | 15.873622 |
+| Local lifecycle applied / unified | 3.927866 | 14.674669 | 17.105300 | 17.930767 |
+
+Raw evidence: [final benchmark](evidence/unified_private_owner_20260923/benchmark.json),
+[superseded immediate-apply variant](evidence/unified_private_owner_20260923/intermediate-immediate-apply.json),
+[functional validation](evidence/unified_private_owner_20260923/validation.json).
+Both modes had live queue high water 1/1,024 frames, sampled output high water
+32/64 envelopes and zero overflow. Unified pending application peaked at 32/64
+records. The 128-record saturation regression separately exercises the 64-record
+bound and replay progress.
+
+The final routing P99 is 0.705 ms versus split mode's 0.545 ms, substantially
+below the rejected immediate-apply variant's 13.197 ms. Unified lifecycle median
+is lower, but routing P999 (3.051 vs 0.702 ms) and lifecycle P999 (17.105 vs
+15.874 ms) remain higher in this local run. This is a resource-fit implementation
+with explicit burst bounds, not evidence of universally lower tails. Production
+acceptance needs the actual 16-vCPU Linux host, live queue pressure and complete
+market receipt → decision → dispatch → HTTP ACK → private application traces.
