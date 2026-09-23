@@ -41,6 +41,107 @@ fn fixture() -> (Arc<SharedState>, PrivateEventDelta) {
 }
 
 #[test]
+fn historical_complementary_replay_clears_only_its_anomaly_without_rebooking() {
+    let (shared, mut event) = fixture();
+    // The wallet-interest registry is already empty, as after zero-inventory
+    // retirement or a restart of the affected process. The persisted settled
+    // audit is still retained while its order/trade rows remain replayable.
+    assert!(shared.account_state.token_interests().is_empty());
+    shared
+        .account_state
+        .retain_settled_event_audit(
+            "owner-1",
+            "test-condition",
+            &["TOKEN".into(), "COMPLEMENT".into()],
+        )
+        .unwrap();
+    event.payload["maker_orders"][0]["asset_id"] = json!("COMPLEMENT");
+    event.payload["maker_orders"][0]["side"] = json!("BUY");
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let mut route = PrivateRouteDedupe::new();
+    let first =
+        route_private_batch(&shared, &tx, vec![event.clone()], None, &mut route, None).unwrap();
+    assert_eq!(rx.try_recv().unwrap().owner, 0);
+    apply_private_cold_batch(&shared, &first.events, None).unwrap();
+    let owner = shared.account_state.instance_snapshot("owner-1").unwrap();
+    let sibling = shared.account_state.instance_snapshot("sibling").unwrap();
+    shared.account_state.mark_private_event_anomaly(
+        "trade:anomaly-trade",
+        "taker execution lacks complementary-token proof",
+    );
+    shared
+        .account_state
+        .mark_private_event_anomaly("trade:unrelated", "another unresolved event");
+    for mutation in ["token", "condition", "price", "quantity", "side"] {
+        let mut bad = event.clone();
+        match mutation {
+            "token" => bad.payload["maker_orders"][0]["asset_id"] = json!("FOREIGN"),
+            "condition" => bad.payload["market"] = json!("FOREIGN"),
+            "price" => bad.payload["maker_orders"][0]["price"] = json!("0.4"),
+            "quantity" => bad.payload["maker_orders"][0]["matched_amount"] = json!("3"),
+            "side" => bad.payload["maker_orders"][0]["side"] = json!("SELL"),
+            _ => unreachable!(),
+        }
+        assert!(
+            route_private_batch(&shared, &tx, vec![bad], None, &mut route, None).is_err(),
+            "{mutation}"
+        );
+        assert!(rx.is_empty());
+        assert!(shared
+            .account_state
+            .private_trade_requires_revalidation("anomaly-trade"));
+    }
+    let replay =
+        route_private_batch(&shared, &tx, vec![event.clone()], None, &mut route, None).unwrap();
+    assert_eq!(
+        replay.events.len(),
+        1,
+        "anomalous history must reach cold validation"
+    );
+    apply_private_cold_batch(&shared, &replay.events, None).unwrap();
+    assert!(!shared
+        .account_state
+        .private_trade_requires_revalidation("anomaly-trade"));
+    assert!(shared
+        .account_state
+        .private_trade_requires_revalidation("unrelated"));
+    assert!(
+        rx.is_empty(),
+        "same owner lifecycle must not be delivered twice"
+    );
+    let after = shared.account_state.instance_snapshot("owner-1").unwrap();
+    assert_eq!(after.cash, owner.cash);
+    assert_eq!(after.positions, owner.positions);
+    assert_eq!(
+        shared
+            .account_state
+            .instance_snapshot("sibling")
+            .unwrap()
+            .cash,
+        sibling.cash
+    );
+    // Startup cache re-seeding uses the same durable pair publication.
+    let mut restarted_route = PrivateRouteDedupe::new();
+    shared
+        .account_state
+        .mark_private_event_anomaly("trade:anomaly-trade", "restart revalidation");
+    let restart =
+        route_private_batch(&shared, &tx, vec![event], None, &mut restarted_route, None).unwrap();
+    apply_private_cold_batch(&shared, &restart.events, None).unwrap();
+    assert!(!shared
+        .account_state
+        .private_trade_requires_revalidation("anomaly-trade"));
+    assert_eq!(
+        shared
+            .account_state
+            .instance_snapshot("owner-1")
+            .unwrap()
+            .cash,
+        owner.cash
+    );
+}
+
+#[test]
 fn pending_anomalies_bypass_all_replay_skips_without_double_booking() {
     let (shared, event) = fixture();
     let (tx, rx) = crossbeam_channel::bounded(8);

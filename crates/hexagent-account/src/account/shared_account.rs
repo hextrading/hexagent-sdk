@@ -10643,6 +10643,8 @@ impl SharedAccount {
             }
         }
         if pruned {
+            self.binary_pairs_fast
+                .store(Arc::new(published_binary_pairs(&state)));
             self.schedule_persist(&state);
         }
         interests
@@ -10791,6 +10793,11 @@ impl SharedAccount {
                     );
                 }
             }
+            // Wallet interests expire once inventory is zero. Private replay
+            // can still revisit these trades, so its immutable pair proof is
+            // retained by the existing durable audit/GC ownership instead.
+            self.binary_pairs_fast
+                .store(Arc::new(published_binary_pairs(&state)));
             let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
                 let mut changes = Vec::with_capacity(1);
                 persistence_wal_map_entry(
@@ -11267,6 +11274,10 @@ impl SharedAccount {
                 false
             } else {
                 state.settled_audit_references.remove(&condition_id);
+                // All instance lifecycle owners certified retirement before
+                // this transaction. Only now may the historical pair expire.
+                self.binary_pairs_fast
+                    .store(Arc::new(published_binary_pairs(&state)));
                 let fee_tokens = tokens
                     .iter()
                     .filter_map(|token| {
@@ -19464,23 +19475,42 @@ fn bind_trade_fee_config(trade: &mut AppliedTrade, config: Option<TokenFeeConfig
 
 fn published_binary_pairs(state: &SharedAccountState) -> HashMap<String, Option<(String, String)>> {
     let mut pairs = HashMap::new();
+    let mut insert = |condition: &str, pair: Option<(String, String)>| {
+        pairs
+            .entry(condition.to_string())
+            .and_modify(|prior: &mut Option<(String, String)>| {
+                if !matches!((prior.as_ref(), pair.as_ref()),
+                    (Some(prior), Some(pair)) if prior == pair || (prior.0 == pair.1 && prior.1 == pair.0))
+                {
+                    *prior = None;
+                }
+            })
+            .or_insert(pair);
+    };
     for interest in state
         .instances
         .values()
         .flat_map(|instance| instance.token_interests.values())
     {
-        let pair = (interest.up_token_id.clone(), interest.down_token_id.clone());
-        pairs
-            .entry(interest.condition_id.clone())
-            .and_modify(|prior: &mut Option<(String, String)>| {
-                if prior
-                    .as_ref()
-                    .is_none_or(|prior| prior != &pair && (prior.0 != pair.1 || prior.1 != pair.0))
-                {
-                    *prior = None;
-                }
-            })
-            .or_insert(Some(pair));
+        insert(
+            &interest.condition_id,
+            Some((interest.up_token_id.clone(), interest.down_token_id.clone())),
+        );
+    }
+    // These references already survive wallet-interest pruning, WAL/restart,
+    // and FIFO release while any owner's order/trade can still be revised.
+    // Reuse their exact condition/assets, never infer a pair from trade legs
+    // or keep a separate growing history. Non-binary/conflicting scopes deny
+    // proof; they cannot accidentally authorize a complementary execution.
+    for reference in state.settled_audit_references.values() {
+        let pair = (reference.asset_ids.len() == 2).then(|| {
+            let mut tokens = reference.asset_ids.iter();
+            (
+                tokens.next().unwrap().clone(),
+                tokens.next().unwrap().clone(),
+            )
+        });
+        insert(&reference.condition_id, pair);
     }
     pairs
 }
@@ -33993,3 +34023,7 @@ mod execution_tests;
 #[cfg(test)]
 #[path = "shared_account_startup_seed_tests.rs"]
 mod startup_seed_tests;
+
+#[cfg(test)]
+#[path = "shared_account_execution_pair_tests.rs"]
+mod execution_pair_tests;
