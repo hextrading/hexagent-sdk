@@ -29355,41 +29355,98 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     #[test]
     fn fresh_wallet_redeem_does_not_fund_an_older_missing_payout_first() {
         let _guard = persistence_test_guard();
-        let path = std::env::temp_dir().join(format!("hexagent-fresh-redeem-{}-{}.json", std::process::id(), wall_clock_ms()));
-        let account = SharedAccount::new_persistent("fresh-before-history", &path).unwrap();
-        account.register_instance("old", 1.0);
-        account.register_instance("new", 1.0);
-        account.register_token_interest("old", "a-old", "OLD-WIN", "OLD-LOSE").unwrap();
-        account.register_token_interest("new", "z-new", "NEW-WIN", "NEW-LOSE").unwrap();
-        account.apply_physical_snapshot(100.0, HashMap::from([
-            ("OLD-WIN".into(), 80.0), ("NEW-WIN".into(), 80.0),
-        ])).unwrap();
-        account.record_settled_token_values(&HashMap::from([
-            ("OLD-WIN".into(), 1.0), ("OLD-LOSE".into(), 0.0),
-            ("NEW-WIN".into(), 1.0), ("NEW-LOSE".into(), 0.0),
-        ]));
-        let scope = HashSet::from(["OLD-WIN".into(), "OLD-LOSE".into(), "NEW-WIN".into(), "NEW-LOSE".into()]);
-        // First observation has a historical missing position but no payout.
-        assert!(!account.observe_platform_binary_redeem(100.0, &HashMap::from([("NEW-WIN".into(), 80.0)]), &scope));
-        // Only NEW disappears in this observation, with its exact $80 payout.
-        assert!(account.observe_platform_binary_redeem(180.0, &HashMap::new(), &scope));
-        assert_eq!(account.instance_snapshot("new").unwrap().cash, 130.0);
-        assert_eq!(account.instance_snapshot("old").unwrap().cash, 50.0);
-        assert_eq!(account.instance_snapshot("old").unwrap().positions["OLD-WIN"], 80.0);
-        assert_eq!(account.monitoring_snapshot().unallocated_cash, 0.0);
-        // Repeated observation cannot credit the new owner a second time.
-        assert!(!account.observe_platform_binary_redeem(180.0, &HashMap::new(), &scope));
-        assert_eq!(account.instance_snapshot("new").unwrap().cash, 130.0);
-        account.flush_persistence(Duration::from_secs(2)).unwrap();
-        drop(account);
-        let restored = SharedAccount::new_persistent("fresh-before-history", &path).unwrap();
-        assert_eq!(restored.instance_snapshot("new").unwrap().cash, 130.0);
-        assert_eq!(restored.instance_snapshot("old").unwrap().cash, 50.0);
-        assert_eq!(restored.instance_snapshot("old").unwrap().positions["OLD-WIN"], 80.0);
-        assert!(!restored.observe_platform_binary_redeem(180.0, &HashMap::new(), &scope));
-        drop(restored);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(persistence_wal_path(&path));
+        for (case, old_quantity, fresh_quantity, residual_cash) in [
+            (0, 80.0, 80.0, 0.0),
+            // Observed WAL: current +20 cash / -20 winning shares, but the
+            // old condition consumed 37.006121 from the combined 50.349567.
+            (1, 37.006121, 20.0, 30.34956694001812),
+        ] {
+            let observed_cash = 100.0 + residual_cash + fresh_quantity;
+            let expected_cash = 50.0 + fresh_quantity;
+            let path = std::env::temp_dir().join(format!(
+                "hexagent-fresh-redeem-{}-{}-{case}.json",
+                std::process::id(),
+                wall_clock_ms()
+            ));
+            let account = SharedAccount::new_persistent("fresh-before-history", &path).unwrap();
+            account.register_instance("old", 1.0);
+            account.register_instance("new", 1.0);
+            account
+                .register_token_interest("old", "a-old", "OLD-WIN", "OLD-LOSE")
+                .unwrap();
+            account
+                .register_token_interest("new", "z-new", "NEW-WIN", "NEW-LOSE")
+                .unwrap();
+            account
+                .apply_physical_snapshot(
+                    100.0,
+                    HashMap::from([
+                        ("OLD-WIN".into(), old_quantity),
+                        ("NEW-WIN".into(), fresh_quantity),
+                    ]),
+                )
+                .unwrap();
+            account.record_settled_token_values(&HashMap::from([
+                ("OLD-WIN".into(), 1.0),
+                ("OLD-LOSE".into(), 0.0),
+                ("NEW-WIN".into(), 1.0),
+                ("NEW-LOSE".into(), 0.0),
+            ]));
+            let scope = HashSet::from([
+                "OLD-WIN".into(),
+                "OLD-LOSE".into(),
+                "NEW-WIN".into(),
+                "NEW-LOSE".into(),
+            ]);
+            // First observation has a historical missing position but no payout.
+            assert!(!account.observe_platform_binary_redeem(
+                100.0 + residual_cash,
+                &HashMap::from([("NEW-WIN".into(), fresh_quantity)]),
+                &scope
+            ));
+            // Only NEW disappears in this observation, with its exact payout.
+            assert!(account.observe_platform_binary_redeem(observed_cash, &HashMap::new(), &scope));
+            assert_eq!(
+                account.instance_snapshot("new").unwrap().cash,
+                expected_cash
+            );
+            assert_eq!(account.instance_snapshot("old").unwrap().cash, 50.0);
+            assert_eq!(
+                account.instance_snapshot("old").unwrap().positions["OLD-WIN"],
+                old_quantity
+            );
+            assert!((account.monitoring_snapshot().unallocated_cash - residual_cash).abs() < 1e-9);
+            // Repeated observation cannot credit the new owner a second time.
+            assert!(!account.observe_platform_binary_redeem(
+                observed_cash,
+                &HashMap::new(),
+                &scope
+            ));
+            assert_eq!(
+                account.instance_snapshot("new").unwrap().cash,
+                expected_cash
+            );
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+            drop(account);
+            let restored = SharedAccount::new_persistent("fresh-before-history", &path).unwrap();
+            assert_eq!(
+                restored.instance_snapshot("new").unwrap().cash,
+                expected_cash
+            );
+            assert_eq!(restored.instance_snapshot("old").unwrap().cash, 50.0);
+            assert_eq!(
+                restored.instance_snapshot("old").unwrap().positions["OLD-WIN"],
+                old_quantity
+            );
+            assert!(!restored.observe_platform_binary_redeem(
+                observed_cash,
+                &HashMap::new(),
+                &scope
+            ));
+            drop(restored);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(persistence_wal_path(&path));
+        }
     }
 
     #[test]
