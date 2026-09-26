@@ -4942,24 +4942,22 @@ async fn user_feed_loop(
                             }
 
                             let frame_started = crate::latency::Instant::now();
-                            let json_started = crate::latency::Instant::now();
-                            // simd-json drop-in for SIMD parse speedup.
-                            let mut buf = text.as_bytes().to_vec();
-                            let data = match simd_json::serde::from_slice::<serde_json::Value>(
-                                &mut buf,
-                            ) {
-                                Ok(data) => {
-                                    crate::latency::record(
-                                        "polymarket.user.json_parse",
-                                        json_started,
-                                    );
-                                    data
-                                }
+                            let json_started_ns = crate::types::monotonic_now_ns();
+                            let cpu_started_ns = crate::latency::thread_cpu_ns();
+                            let parsed = parse_private_frame(&text);
+                            // Capture receive -> parse completion before instrumentation.
+                            let private_json_parsed_ns = crate::types::monotonic_now_ns();
+                            let cpu_completed_ns = crate::latency::thread_cpu_ns();
+                            let elapsed_ns = private_json_parsed_ns.saturating_sub(json_started_ns);
+                            crate::latency::record_ns("polymarket.user.json_parse", elapsed_ns);
+                            if cpu_started_ns != 0 && cpu_completed_ns >= cpu_started_ns {
+                                let cpu_ns = cpu_completed_ns - cpu_started_ns;
+                                crate::latency::record_ns("polymarket.user.json_parse_cpu", cpu_ns);
+                                crate::latency::record_ns("polymarket.user.json_parse_off_cpu", elapsed_ns.saturating_sub(cpu_ns));
+                            }
+                            let events = match parsed {
+                                Ok(events) => events,
                                 Err(error) => {
-                                    crate::latency::record(
-                                        "polymarket.user.json_parse",
-                                        json_started,
-                                    );
                                     shared.user_feed_health.set_recovering(true);
                                     shared.user_feed_health.set_inventory_uncertain(true);
                                     let raw: String = text.chars().take(256).collect();
@@ -4977,18 +4975,12 @@ async fn user_feed_loop(
                                     break;
                                 }
                             };
-                            let private_json_parsed_ns = crate::types::monotonic_now_ns();
                             let frame_timing = LifecycleTiming {
                                 private_ws_received_ns,
                                 private_json_parsed_ns,
                                 ..LifecycleTiming::default()
                             };
-                            let events = if data.is_array() {
-                                data.as_array().cloned().unwrap_or_default()
-                            } else {
-                                vec![data]
-                            }
-                            .into_iter()
+                            let events = events.into_iter()
                             .filter_map(|payload| {
                                 PrivateEventDelta::classify_with_timing(payload, frame_timing)
                             })
@@ -7740,3 +7732,17 @@ mod tests {
 #[cfg(test)]
 #[path = "unified_private_owner_tests.rs"]
 mod unified_owner_tests;
+
+#[cfg(test)]
+#[path = "private_parse_tail_tests.rs"]
+mod private_parse_tail_tests;
+
+// Parsing runs on the private WS runtime, before ownership transfer to the
+// bounded lossless apply lane. Preserve original array order without cloning
+// every owned JSON subtree or copying the complete input into a scratch buffer.
+fn parse_private_frame(text: &str) -> serde_json::Result<Vec<serde_json::Value>> {
+    Ok(match serde_json::from_str(text)? {
+        serde_json::Value::Array(events) => events,
+        event => vec![event],
+    })
+}

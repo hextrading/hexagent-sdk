@@ -9778,7 +9778,7 @@ impl ExchangeMarket for PolymarketMarket {
 }
 
 #[cfg(test)]
-mod clob_test_allocator {
+pub(super) mod clob_test_allocator {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -9818,7 +9818,7 @@ mod clob_test_allocator {
         }
     }
 
-    pub(super) fn count<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
+    pub(crate) fn count<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
         let _measurement = MEASUREMENT_LOCK.lock().unwrap();
         ALLOCATIONS.store(0, Ordering::Relaxed);
         ALLOCATED_BYTES.store(0, Ordering::Relaxed);

@@ -106,6 +106,13 @@ pub(super) fn run(
     mut execution: ExecutionStateOwner,
     mut positions: LivePositionManager,
 ) {
+    crate::latency::prepare_thread_stages(&[
+        "polymarket.account.owner_command",
+        "polymarket.account.owner_execution",
+        "polymarket.account.owner_ingress",
+        "polymarket.account.owner_maintenance",
+        "polymarket.account.owner_retirement",
+    ]);
     let mut replay = super::super::user_feed::PrivateReplayOwner::new();
     let mut ingress: Option<Box<dyn PrivateIngress>> = None;
     let mut retirement: Option<RuntimeRetirement> = None;
@@ -132,22 +139,32 @@ pub(super) fn run(
         // One message from each lifecycle source per turn: a continuously
         // runnable producer cannot starve the other lifecycle lane or ingress.
         if let Ok(command) = account_owner.receiver().try_recv() {
+            let stage_started = crate::latency::Instant::now();
             account_owner.execute(command);
+            crate::latency::record("polymarket.account.owner_command", stage_started);
             worked = true;
         }
         if let Ok(job) = lifecycle_rx.try_recv() {
+            let stage_started = crate::latency::Instant::now();
             shared.apply_account_lifecycle_job(&mut execution, &mut positions, &mut replay, job);
+            crate::latency::record("polymarket.account.owner_execution", stage_started);
             worked = true;
         }
         if let Some(ingress) = ingress.as_mut() {
-            worked |= ingress.step(&shared, &mut positions, &mut replay);
+            let stage_started = crate::latency::Instant::now();
+            if ingress.step(&shared, &mut positions, &mut replay) {
+                crate::latency::record("polymarket.account.owner_ingress", stage_started);
+                worked = true;
+            }
         }
         turns = turns.wrapping_add(1);
         // Maintenance gets a bounded opportunity every 64 active turns; it
         // cannot hold up an entire private burst, nor starve indefinitely.
         if !worked || turns % 64 == 0 {
             if let Ok(job) = maintenance_rx.try_recv() {
+                let stage_started = crate::latency::Instant::now();
                 shared.apply_account_maintenance_job(job);
+                crate::latency::record("polymarket.account.owner_maintenance", stage_started);
                 worked = true;
             }
             if unified {
@@ -155,9 +172,11 @@ pub(super) fn run(
                     retirement = gc_ready_rx.try_recv().ok();
                 }
                 if let Some(work) = retirement.as_mut() {
+                    let stage_started = crate::latency::Instant::now();
                     if work.step(&shared, &mut execution, &mut positions) {
                         retirement = None;
                     }
+                    crate::latency::record("polymarket.account.owner_retirement", stage_started);
                     worked = true;
                 }
             } else if settled_gc_rx.try_recv().is_ok() || !worked {
