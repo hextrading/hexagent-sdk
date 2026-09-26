@@ -5070,6 +5070,10 @@ async fn user_feed_loop(
             GapReplayCheckpoint::new(disconnect_anchor.saturating_sub(reconnect_rewind_secs))
         });
         shared.user_feed_health.set_recovering(true);
+        // Private recovery alone cannot certify idle Fast/Cancel sockets from
+        // the failed endpoint generation. Retire them through account-local
+        // execution-owner messages while order/cancel recovery stays active.
+        shared.request_execution_connection_reset();
         if let Err(error) = recovery
             .drain_disconnected(&shared, &update_tx, &apply_lane, &shutdown)
             .await

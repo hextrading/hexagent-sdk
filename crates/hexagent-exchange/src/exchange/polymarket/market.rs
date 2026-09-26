@@ -4077,6 +4077,7 @@ fn spawn_clob_seeded_candidate(
         .await?;
         let mut books = ClobLocalBooks::new(&subscription.canonical_events);
         let mut parser = ResidentClobParser::new();
+        let mut frame_batch = ClobParsedBatch::preallocated();
         let mut seed_events = Vec::with_capacity(subscription.tokens.len() * 2);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -4112,7 +4113,7 @@ fn spawn_clob_seeded_candidate(
                     // allocation without a second per-frame copy.
                     let mut frame_bytes = text.into_bytes();
                     let mut frame_phases = ClobFramePhaseTimings::default();
-                    let batch = process_clob_frame_in_place_observed(
+                    process_clob_frame_in_place_observed_into(
                         &mut frame_bytes,
                         &mut parser,
                         &mut books,
@@ -4122,12 +4123,14 @@ fn spawn_clob_seeded_candidate(
                         now_ns(),
                         &mut frame_phases,
                         lane.protocol.as_mut(),
+                        &mut frame_batch,
                     );
+                    let batch = &mut frame_batch;
                     frame_phases.record();
                     lane.burst.record_frame(received_at, frame_len);
                     lane.diagnostics
                         .record_frame(received_at, frame_len, &batch);
-                    for event in batch.events {
+                    for event in batch.events.drain(..) {
                         match &event {
                             MarketEvent::OrderBook(_) => {
                                 push_latest_order_book(&mut seed_events, event)
@@ -4412,7 +4415,7 @@ async fn fetch_authoritative_clob_book(
 }
 
 fn request_clob_book_repairs(
-    tokens: Vec<String>,
+    tokens: impl IntoIterator<Item = String>,
     active_tokens: &[String],
     generation: u64,
     generation_epoch: &Arc<AtomicU64>,
@@ -4770,6 +4773,7 @@ async fn clob_ws_task(
     let mut thread_resource_sampler = ClobThreadResourceSampler::default();
     let mut clob_perf_ring = ClobPerfRing::start();
     let mut parser = ResidentClobParser::new();
+    let mut frame_batch = ClobParsedBatch::preallocated();
     let repair_generation_epoch = Arc::new(AtomicU64::new(0));
     let was_previously_subscribed = subscribed_once.load(Ordering::Relaxed);
     let mut lifecycle = ClobLifecycle {
@@ -5158,7 +5162,7 @@ async fn clob_ws_task(
                         books.flush_deferred_due(now, now_ns(), &subscription.tokens);
                     retain_active_clob_deferred_diagnostics(&mut batch, &subscription.tokens);
                     active.diagnostics.record_deferred(&batch);
-                    for diagnostic in batch.diagnostics {
+                    for diagnostic in batch.diagnostics.drain(..) {
                         diagnostic_sampler.observe(now, diagnostic);
                     }
                     for token in &batch.repair_tokens {
@@ -5787,7 +5791,7 @@ async fn clob_ws_task(
                             let frame_len = text.len();
                             let mut frame_bytes = text.into_bytes();
                             let mut frame_phases = ClobFramePhaseTimings::default();
-                            let mut batch = process_clob_frame_in_place_observed(
+                            process_clob_frame_in_place_observed_into(
                                 &mut frame_bytes,
                                 &mut parser,
                                 &mut books,
@@ -5797,7 +5801,9 @@ async fn clob_ws_task(
                                 now_ns(),
                                 &mut frame_phases,
                                 active.protocol.as_mut(),
+                                &mut frame_batch,
                             );
+                            let batch = &mut frame_batch;
                             frame_phases.record();
                             let parse_apply_elapsed = t_parse.elapsed();
                             let parse_cpu_ns = clob_thread_cpu_ns()
@@ -5814,7 +5820,7 @@ async fn clob_ws_task(
                                 "polymarket.ws.clob_parse_apply_preempted",
                                 parse_preempted_ns,
                             );
-                            retain_active_clob_diagnostics(&mut batch, &subscription.tokens);
+                            retain_active_clob_diagnostics(batch, &subscription.tokens);
                             active.diagnostics.record_parse_apply(parse_apply_elapsed);
                             crate::latency::record_ns(
                                 "polymarket.ws.clob_parse_apply",
@@ -5826,14 +5832,14 @@ async fn clob_ws_task(
                                 health.record_topic_frame(received_at);
                                 liveness.record_market_data(clob_monotonic_now_ns());
                             }
-                            for diagnostic in batch.diagnostics {
+                            for diagnostic in batch.diagnostics.drain(..) {
                                 diagnostic_sampler.observe(received_at, diagnostic);
                             }
                             for token in &batch.repair_tokens {
                                 repair_superseded_attempts.entry(token.clone()).or_insert(0);
                             }
                             request_clob_book_repairs(
-                                batch.repair_tokens,
+                                batch.repair_tokens.drain(..),
                                 &subscription.tokens,
                                 repair_generation,
                                 &repair_generation_epoch,
@@ -5841,7 +5847,7 @@ async fn clob_ws_task(
                                 &repair_tx,
                             );
                             if !forward_clob_events(
-                                batch.events,
+                                batch.events.drain(..),
                                 &event_tx,
                                 &mut lifecycle,
                                 &mut health,
@@ -7314,6 +7320,27 @@ struct ClobParsedBatch {
     repair_tokens: Vec<String>,
 }
 
+// Owned exclusively by its CLOB reader/candidate task. Live frames measured
+// at most four published events; reserve 256 before entering the receive loop.
+// Larger legal frames may adopt a larger already-owned adapter buffer; retain
+// that high-water capacity thereafter. Payload Strings and book snapshots
+// remain owned wire messages (a separate bounded-symbol migration).
+impl ClobParsedBatch {
+    fn preallocated() -> Self {
+        Self { events: Vec::with_capacity(256), diagnostics: Vec::with_capacity(128),
+            repair_tokens: Vec::with_capacity(32), wire: ClobWireCounters::default(),
+            recognized_topic: false, bbo_change_snapshots: 0 }
+    }
+}
+
+impl ClobParsedBatch {
+    fn clear(&mut self) {
+        self.events.clear(); self.diagnostics.clear(); self.repair_tokens.clear();
+        self.wire = ClobWireCounters::default();
+        self.recognized_topic = false; self.bbo_change_snapshots = 0;
+    }
+}
+
 /// Exclusive top-level CLOB frame phases. Canonicalization and BBO-settle
 /// histograms are additionally recorded at their exact inner boundaries.
 #[derive(Clone, Copy, Debug, Default)]
@@ -7847,7 +7874,7 @@ impl ClobLocalBooks {
 
     fn canonicalize_quote_ready(&mut self, mut quote: QuoteTick) -> Option<MarketEvent> {
         let sequence = self.next_sequence();
-        let Some(role) = self.roles.get(&quote.symbol).cloned() else {
+        let Some(role) = self.roles.get(&quote.symbol) else {
             return Some(MarketEvent::Quote(quote));
         };
         let version = ClobBookVersion {
@@ -7867,8 +7894,16 @@ impl ClobLocalBooks {
             quote.bid_price = 1.0 - down_ask;
             quote.ask_price = 1.0 - down_bid;
         }
-        quote.symbol = role.up_token;
-        self.quote_versions.insert(role.condition_id, version);
+        if quote.symbol != role.up_token {
+            quote.symbol.clone_from(&role.up_token);
+        }
+        if let Some(current) = self.quote_versions.get_mut(&role.condition_id) {
+            *current = version;
+        } else {
+            // First authoritative quote only; subsequent updates reuse the
+            // existing key instead of cloning role Strings on every frame.
+            self.quote_versions.insert(role.condition_id.clone(), version);
+        }
         Some(MarketEvent::Quote(quote))
     }
 
@@ -8766,7 +8801,7 @@ impl ClobLocalBooks {
 /// Move that owned buffer into an empty frame batch instead of allocating and
 /// freeing a second Vec. Nonempty JSON-array batches retain newest-wire order.
 fn append_canonical_clob_events(target: &mut Vec<MarketEvent>, incoming: Vec<MarketEvent>) {
-    if target.is_empty() {
+    if target.is_empty() && target.capacity() < incoming.capacity() {
         *target = incoming;
     } else {
         for event in incoming {
@@ -8922,11 +8957,29 @@ fn process_clob_frame_in_place_observed(
     received_at: Instant,
     local_now: u64,
     phases: &mut ClobFramePhaseTimings,
-    mut protocol: Option<&mut BookProtocolSession>,
+    protocol: Option<&mut BookProtocolSession>,
 ) -> ClobParsedBatch {
     let mut batch = ClobParsedBatch::default();
+    process_clob_frame_in_place_observed_into(parse_buffer, parser, books, _tokens,
+        active_tokens, received_at, local_now, phases, protocol, &mut batch);
+    batch
+}
+
+fn process_clob_frame_in_place_observed_into(
+    parse_buffer: &mut [u8],
+    parser: &mut ResidentClobParser,
+    books: &mut ClobLocalBooks,
+    _tokens: &[String],
+    active_tokens: &[String],
+    received_at: Instant,
+    local_now: u64,
+    phases: &mut ClobFramePhaseTimings,
+    mut protocol: Option<&mut BookProtocolSession>,
+    batch: &mut ClobParsedBatch,
+) {
+    batch.clear();
     if parse_buffer.is_empty() {
-        return batch;
+        return;
     }
     if parse_buffer.len() > CLOB_MAX_FRAME_BYTES {
         if let Some(protocol) = protocol.as_deref_mut() {
@@ -8941,7 +8994,7 @@ fn process_clob_frame_in_place_observed(
                 CLOB_MAX_FRAME_BYTES,
             ),
         });
-        return batch;
+        return;
     }
 
     let decode_ns_before_construction = phases.json_decode_ns;
@@ -9050,11 +9103,7 @@ fn process_clob_frame_in_place_observed(
                     );
                 batch.bbo_change_snapshots =
                     batch.bbo_change_snapshots.saturating_add(bbo_snapshots);
-                if batch.repair_tokens.is_empty() {
-                    batch.repair_tokens = repair_tokens;
-                } else {
-                    batch.repair_tokens.extend(repair_tokens);
-                }
+                batch.repair_tokens.extend(repair_tokens);
                 append_canonical_clob_events(&mut batch.events, events);
             }
             DecodedClobFrame::BestBidAsk(fields) => {
@@ -9191,7 +9240,7 @@ fn process_clob_frame_in_place_observed(
                 key: "parse_error",
                 detail: format!("error={error}"),
             });
-            return batch;
+            return;
         }
     };
     phases.json_decode_ns = phases.json_decode_ns.saturating_add(simd_json_ns);
@@ -9204,7 +9253,7 @@ fn process_clob_frame_in_place_observed(
             key: "parse_error",
             detail: format!("error={error}"),
         });
-        return batch;
+        return;
     }
     let construction_total_ns = construction_started
         .elapsed()
@@ -9218,7 +9267,6 @@ fn process_clob_frame_in_place_observed(
         )
         .saturating_sub(phases.book_apply_ns)
         .saturating_sub(phases.price_change_apply_ns);
-    batch
 }
 
 /// Stateless compatibility helper used by focused parser tests. Stateful
@@ -9787,6 +9835,10 @@ mod clob_test_allocator {
 #[global_allocator]
 static CLOB_TEST_ALLOCATOR: clob_test_allocator::CountingAllocator =
     clob_test_allocator::CountingAllocator;
+
+#[cfg(test)]
+#[path = "clob_frame_reuse_tests.rs"]
+mod clob_frame_reuse_tests;
 
 #[cfg(test)]
 #[path = "clob_canonical_cache_tests.rs"]

@@ -1412,6 +1412,14 @@ impl HttpErr {
             || matches!(self, HttpErr::Transport(_) | HttpErr::InvalidResponse(_))
     }
 
+    /// A failed DELETE must retain an explicit cancellation intent. Even a
+    /// locally unsent DELETE leaves the previously accepted order live;
+    /// returning Accepted alone does not arrange a retry when quoting pauses.
+    fn requires_cancel_recovery(&self) -> bool {
+        self.is_unknown_state()
+            || matches!(self, HttpErr::Transport(_) | HttpErr::InvalidResponse(_) | HttpErr::NotSent(_))
+    }
+
     /// Polymarket returns this policy rejection as HTTP 503 even though the
     /// request is authoritative: no order was admitted while trading was
     /// disabled. It must not enter timeout/orphan reconciliation.
@@ -3321,6 +3329,10 @@ pub struct SharedState {
     // Startup-bound immutable handle to the existing bounded execution-owner
     // mailbox. Only the cold user-feed recovery job waits on these replies.
     recovery_http: OnceLock<super::rtt_probe::ProbeHttpTransport>,
+    /// Account-local, capacity-one reset intent. Private WS produces; the
+    /// execution dispatcher consumes. Full coalesces identical reset intent;
+    /// no strategy/account mutable state is read across threads.
+    execution_reset_tx: OnceLock<crossbeam_channel::Sender<()>>,
     /// client_order_id → token_id (outcome asset). Written alongside the
     /// coid↔oid maps at registration and kept for the SAME lifetime, so the
     /// event-expiry sweep can purge an event's mappings by its outcome
@@ -3853,6 +3865,17 @@ fn reclaim_token_mappings(
 }
 
 impl SharedState {
+    pub fn bind_execution_reset_sender(&self, sender: crossbeam_channel::Sender<()>) {
+        let _ = self.execution_reset_tx.set(sender);
+    }
+
+    pub(crate) fn request_execution_connection_reset(&self) {
+        if let Some(sender) = self.execution_reset_tx.get() {
+            // A full lane already retains the same account-wide reset intent.
+            let _ = sender.try_send(());
+        }
+    }
+
     pub fn bind_recovery_http_transport(&self, transport: super::rtt_probe::ProbeHttpTransport) {
         // Multiple instance IDs may reference the same account SharedState.
         let _ = self.recovery_http.set(transport);
@@ -7050,6 +7073,7 @@ impl PolymarketTrade {
             private_apply_lane: OnceLock::new(),
             private_ingress_install_tx,
             recovery_http: OnceLock::new(),
+            execution_reset_tx: OnceLock::new(),
             probe_order_ids: ProbeOrderIdRing::default(),
             probe_orphan_owner,
             auth,
@@ -9779,9 +9803,64 @@ impl PolymarketTrade {
     /// All completion branches consume the identity captured before network
     /// I/O. Never re-read `open_orders` after committing a terminal audit.
     #[allow(clippy::too_many_arguments)]
+    fn reconcile_orphans_with_permit(
+        &self,
+        permit: Option<&crate::http1_pool::Permit>,
+        pending_places: &[(String, String, Side, f64, Option<String>)],
+        pending_cancels: &[(String, String)],
+        pending_trade_ids: &[String],
+    ) -> Vec<OrderUpdate> {
+        self.reconcile_orphans_with_transport(permit, false, pending_places, pending_cancels, pending_trade_ids)
+    }
+
+    /// Live per-instance cold coordinator entry. Never call from a physical
+    /// connection owner: HTTP work is messaged to those owners and awaited
+    /// only by the separately pinned recovery worker.
+    pub fn reconcile_orphans_via_owners(
+        &self,
+        pending_places: &[(String, String, Side, f64, Option<String>)],
+        pending_cancels: &[(String, String)],
+        pending_trade_ids: &[String],
+    ) -> Vec<OrderUpdate> {
+        self.reconcile_orphans_with_transport(None, true, pending_places, pending_cancels, pending_trade_ids)
+    }
+
+    fn orphan_owner_request(&self, method: &'static str, path: &str, body: &str) -> HttpReply {
+        let transport = self.shared.recovery_http.get()
+            .ok_or_else(|| HttpErr::NotSent("recovery owner transport unavailable".into()))?;
+        let response = transport.request(&self.shared, &self.instance_id, method, path, body, None, None);
+        let expected = if method == "DELETE" { crate::http1_pool::Role::Cancel }
+            else { crate::http1_pool::Role::Reconcile };
+        if !matches!(response.location, Some((role, _)) if role == expected) {
+            return match response.reply {
+                Err(error) => Err(error),
+                Ok(_) => Err(HttpErr::InvalidResponse("recovery response lacks exact connection owner".into())),
+            };
+        }
+        response.reply
+    }
+
+    fn fetch_orphan_order(
+        &self, coid: &str, oid: &str, permit: Option<&crate::http1_pool::Permit>,
+        via_owners: bool, parallel: bool,
+    ) -> FetchOrderResult {
+        if !via_owners { return self.fetch_order_by_id(coid, oid, permit, parallel); }
+        let Some(ownership) = self.shared.account_state.order(coid) else {
+            return self.classify_order_lookup_reply(coid, oid,
+                Err(HttpErr::NotSent("orphan has no durable owner".into())));
+        };
+        if ownership.instance_id != self.instance_id || ownership.order_id != oid
+            || self.shared.recovery_http.get().is_none() {
+            return self.classify_order_lookup_reply(coid, oid,
+                Err(HttpErr::NotSent("orphan owner identity/transport unavailable".into())));
+        }
+        self.fetch_recovery_order_via_owners(&ownership, oid)
+    }
+
     fn finish_reconciled_cancel(
         &self,
         permit: Option<&crate::http1_pool::Permit>,
+        via_owners: bool,
         coid: &str,
         order_id: &str,
         identity: TrackedOrder,
@@ -9802,8 +9881,9 @@ impl PolymarketTrade {
                 self.shared
                     .commit_authoritative_terminal_audit(coid, status, audit);
                 if !audit.associate_trades.is_empty() {
-                    updates.extend(self.reconcile_orphans_with_permit(
+                    updates.extend(self.reconcile_orphans_with_transport(
                         permit,
+                        via_owners,
                         &[],
                         &[],
                         &audit.associate_trades,
@@ -9856,9 +9936,10 @@ impl PolymarketTrade {
         });
     }
 
-    fn reconcile_orphans_with_permit(
+    fn reconcile_orphans_with_transport(
         &self,
         permit: Option<&crate::http1_pool::Permit>,
+        via_owners: bool,
         pending_places: &[(String, String, Side, f64, Option<String>)],
         pending_cancels: &[(String, String)],
         pending_trade_ids: &[String],
@@ -9911,7 +9992,18 @@ impl PolymarketTrade {
                 if self.shared.in_http_425_backoff(coid) {
                     continue;
                 }
-                let fetch_result = self.fetch_order_by_id(coid, oid, permit, true);
+                let fetch_result = self.fetch_orphan_order(coid, oid, permit, via_owners, true);
+                if via_owners && order_lookup_is_absent(&fetch_result) {
+                    if let Some(ownership) = self.shared.account_state.order(coid) {
+                        if let Some(update) = self.cancel_unknown_order_via_owners(&ownership, oid) {
+                            updates.push(update);
+                            continue;
+                        }
+                    }
+                    // Missing/ambiguous cancellation evidence never falls
+                    // through to the legacy repeated-not-found release rule.
+                    continue;
+                }
                 // A 425 from this GET is not a not-found answer. Keep this
                 // orphan parked without affecting the rest of the batch.
                 if matches!(&fetch_result, FetchOrderResult::Unavailable(_))
@@ -10018,8 +10110,9 @@ impl PolymarketTrade {
                             );
                         if let Some(audit) = order_audit.as_ref() {
                             if !audit.associate_trades.is_empty() {
-                                updates.extend(self.reconcile_orphans_with_permit(
+                                updates.extend(self.reconcile_orphans_with_transport(
                                     permit,
+                                    via_owners,
                                     &[],
                                     &[],
                                     &audit.associate_trades,
@@ -10084,8 +10177,9 @@ impl PolymarketTrade {
                                 audit,
                             );
                             if !audit.associate_trades.is_empty() {
-                                updates.extend(self.reconcile_orphans_with_permit(
+                                updates.extend(self.reconcile_orphans_with_transport(
                                     permit,
+                                    via_owners,
                                     &[],
                                     &[],
                                     &audit.associate_trades,
@@ -10139,8 +10233,9 @@ impl PolymarketTrade {
                         // ledger has the latest local filled quantity before
                         // the authoritative cumulative match is applied.
                         if !audit.associate_trades.is_empty() {
-                            updates.extend(self.reconcile_orphans_with_permit(
+                            updates.extend(self.reconcile_orphans_with_transport(
                                 permit,
+                                via_owners,
                                 &[],
                                 &[],
                                 &audit.associate_trades,
@@ -10302,7 +10397,15 @@ impl PolymarketTrade {
                     continue;
                 }
             };
-            let fetch_result = self.fetch_order_by_id(coid, order_id, permit, false);
+            let fetch_result = self.fetch_orphan_order(coid, order_id, permit, via_owners, false);
+            if via_owners && order_lookup_is_absent(&fetch_result) {
+                if let Some(ownership) = self.shared.account_state.order(coid) {
+                    if let Some(update) = self.cancel_order_via_owners(&ownership, order_id) {
+                        updates.push(update);
+                        continue;
+                    }
+                }
+            }
             // A 425 mid-iteration parks only this cancel orphan; unrelated
             // orders continue through the loop and can release their locks.
             let http_425_backoff_active = matches!(&fetch_result, FetchOrderResult::Unavailable(_),)
@@ -10334,7 +10437,12 @@ impl PolymarketTrade {
                     // `canceled=[orderID]` → Cancelled; an explicit matched
                     // reason → Filled. Ambiguous/missing outcomes stay parked.
                     let body = serde_json::json!({ "orderID": order_id });
-                    match self.delete_detailed("/order", &body) {
+                    let reply = if via_owners {
+                        self.orphan_owner_request("DELETE", "/order", &body.to_string())
+                    } else {
+                        self.delete_detailed("/order", &body)
+                    };
+                    match reply {
                         Ok(resp) => {
                             let reason = resp
                                 .get("not_canceled")
@@ -10495,6 +10603,7 @@ impl PolymarketTrade {
             }
             self.finish_reconciled_cancel(
                 permit,
+                via_owners,
                 coid,
                 order_id,
                 identity,
@@ -10512,6 +10621,9 @@ impl PolymarketTrade {
         // returning them again here would create a second delivery lane.
         for trade_id in pending_trade_ids {
             let reply = fetch_terminal_trade_records(trade_id, |path| {
+                if via_owners {
+                    self.orphan_owner_request("GET", path, "").map_err(|error| error.to_string())
+                } else {
                 permit
                     .map_or_else(
                         || self.shared.http_call_sync("GET", path, ""),
@@ -10525,6 +10637,7 @@ impl PolymarketTrade {
                         },
                     )
                     .map_err(|error| error.to_string())
+                }
             });
             let records = match reply {
                 Ok(records) => records,
@@ -10793,6 +10906,14 @@ impl PolymarketTrade {
             || ownership.order_id != order_id
             || ownership.instance_id.is_empty()
         {
+            return None;
+        }
+        self.cancel_order_via_owners(ownership, order_id)
+    }
+
+    fn cancel_order_via_owners(&self, ownership: &OrderOwnership, order_id: &str) -> Option<OrderUpdate> {
+        if ownership.instance_id.is_empty() || ownership.order_id != order_id
+            || matches!(ownership.status, OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected) {
             return None;
         }
         let transport = self.shared.recovery_http.get()?;
@@ -11881,6 +12002,10 @@ impl PolymarketTrade {
         reply: Option<HttpReply>,
         legacy_trace: bool,
     ) -> OrderUpdate {
+        // Capture before consuming the reply. Cancellation failures must be
+        // visible in the attempt audit as well as the recovery state machine.
+        let attempt_error = reply.as_ref().and_then(|reply| reply.as_ref().err())
+            .map(ToString::to_string);
         let update = (|| {
             let CancelCtx {
                 local_oid,
@@ -11964,7 +12089,7 @@ impl PolymarketTrade {
                             // path can retry once the mapping appears.
                         }
                     }
-                    Err(e) if e.is_unknown_state() => {
+                    Err(e) if e.requires_cancel_recovery() => {
                         if matches!(e, HttpErr::Timeout) {
                             let detail = format!(
                                 "operation=cancel target={} coid={}",
@@ -12015,6 +12140,7 @@ impl PolymarketTrade {
                 let mut update =
                     Self::make_orphan_cancel(client_order_id, &symbol, side, local_oid, effective);
                 update.order_slot = order_slot;
+                update.error = attempt_error.clone();
                 crate::latency::record(
                     "polymarket.cancel.response_account_apply",
                     account_apply_started,
@@ -12060,7 +12186,7 @@ impl PolymarketTrade {
                 trade_id: None,
                 trade_fee: None,
                 order_audit: None,
-                error: None,
+                error: attempt_error.clone(),
             };
             crate::latency::record(
                 "polymarket.cancel.response_account_apply",
