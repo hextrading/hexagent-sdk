@@ -1,6 +1,79 @@
 use super::*;
 
 #[test]
+fn observed_cash_attribution_preserves_wallet_and_survives_restart() {
+    let _guard = super::tests::persistence_test_guard();
+    let path = std::env::temp_dir().join(format!(
+        "observed-cash-{}-{}.json",
+        std::process::id(),
+        wall_clock_ms()
+    ));
+    let account = SharedAccount::new_persistent("observed-cash", &path).unwrap();
+    account.register_instance("a", 1.0);
+    account.register_instance("b", 1.0);
+    account
+        .apply_physical_snapshot(200.0, HashMap::new())
+        .unwrap();
+    // A manual transfer has already reached the physical snapshot. Applying
+    // the old two-ledger API here would debit the physical balance twice.
+    account.observe_platform_binary_redeem(170.0, &HashMap::new(), &HashSet::new());
+    account
+        .attribute_observed_cash_adjustment("receipt-1", "a", -30.0, 170.0, 100.0)
+        .unwrap();
+    assert_eq!(account.monitoring_snapshot().physical_cash, 170.0);
+    assert_eq!(account.monitoring_snapshot().unallocated_cash, 0.0);
+    assert_eq!(account.instance_snapshot("a").unwrap().cash, 70.0);
+    assert_eq!(account.instance_snapshot("b").unwrap().cash, 100.0);
+    account.flush_persistence(Duration::from_secs(2)).unwrap();
+    drop(account);
+    let restored = SharedAccount::new_persistent("observed-cash", &path).unwrap();
+    restored
+        .attribute_observed_cash_adjustment("receipt-1", "a", -30.0, 170.0, 100.0)
+        .unwrap();
+    assert_eq!(restored.instance_snapshot("a").unwrap().cash, 70.0);
+    assert_eq!(restored.monitoring_snapshot().physical_cash, 170.0);
+    assert!(restored
+        .attribute_observed_cash_adjustment("receipt-1", "b", -30.0, 170.0, 100.0)
+        .is_err());
+    assert!(restored
+        .attribute_observed_cash_adjustment("receipt-1", "a", -31.0, 170.0, 100.0)
+        .is_err());
+    assert!(restored
+        .attribute_observed_cash_adjustment("stale", "a", -1.0, 169.0, 70.0)
+        .is_err());
+    assert!(restored
+        .attribute_observed_cash_adjustment("unfunded", "a", 1.0, 170.0, 70.0)
+        .is_err());
+    assert!(restored
+        .attribute_observed_cash_adjustment("negative", "a", -71.0, 170.0, 70.0)
+        .is_err());
+    restored
+        .reserve_order(
+            "a",
+            "reserved",
+            "0xreserved",
+            "UP",
+            Side::Buy,
+            100.0,
+            0.5,
+            0,
+        )
+        .unwrap();
+    assert!(restored
+        .attribute_observed_cash_adjustment("reserved", "a", -30.0, 170.0, 70.0)
+        .is_err());
+    let restored = Arc::new(restored);
+    let _owner = restored.bind_account_lifecycle_owner().unwrap();
+    assert!(restored
+        .attribute_observed_cash_adjustment("online", "a", -1.0, 170.0, 70.0)
+        .is_err());
+    drop(_owner);
+    drop(restored);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(persistence_wal_path(&path));
+}
+
+#[test]
 fn zero_fill_recovery_revalidates_on_lifecycle_owner_before_releasing_reservation() {
     let account = Arc::new(SharedAccount::new("zero-fill-owner"));
     for iid in ["a", "b"] {

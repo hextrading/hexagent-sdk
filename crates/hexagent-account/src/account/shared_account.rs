@@ -12717,6 +12717,92 @@ impl SharedAccount {
         Ok(adjustment)
     }
 
+    /// Offline attribution of a cash movement already included in the latest
+    /// authoritative wallet balance. The operator supplies audited ownership;
+    /// this method never discovers or guesses it from a reconciliation delta.
+    /// Unlike `attribute_external_adjustment`, physical cash stays unchanged.
+    /// The durable external root keeps immutable-baseline replay idempotent.
+    pub fn attribute_observed_cash_adjustment(
+        &self,
+        operation_id: &str,
+        instance_id: &str,
+        cash_delta: f64,
+        expected_physical_cash: f64,
+        expected_instance_cash: f64,
+    ) -> Result<ExternalAdjustment, ReservationError> {
+        if self.account_owner_lane_bound.load(Ordering::Acquire)
+            || self.account_lifecycle_lane_bound.load(Ordering::Acquire)
+        {
+            return Err(ReservationError::InvalidOrder(
+                "observed cash attribution requires an offline account".into(),
+            ));
+        }
+        if operation_id.trim().is_empty()
+            || ![cash_delta, expected_physical_cash, expected_instance_cash]
+                .iter()
+                .all(|value| value.is_finite())
+        {
+            return Err(ReservationError::InvalidOrder(
+                "observed cash attribution requires an operation id and finite values".into(),
+            ));
+        }
+        let operation_id = format!("observed-cash:{operation_id}");
+        // Offline only: include current reservations as well as economics.
+        // A wallet-calibration guard deliberately omits lifecycle aggregates.
+        let mut state = self.lock_state_for_persistence();
+        if let Some(existing) = state.external_adjustments.get(&operation_id) {
+            if existing.instance_id == instance_id
+                && existing.cash_delta == cash_delta
+                && existing.position_deltas.is_empty()
+            {
+                return Ok(existing.clone());
+            }
+            return Err(ReservationError::InvalidOrder(
+                "observed cash operation was already attributed differently".into(),
+            ));
+        }
+        if !state.seeded
+            || pending_physical_deltas_from_trades(state.trades.values()).unsettled
+            || has_unsettled_maintenance_operation(&state)
+        {
+            return Err(ReservationError::InvalidOrder(
+                "observed cash attribution requires seeded, settled wallet economics".into(),
+            ));
+        }
+        let instance = state
+            .instances
+            .get(instance_id)
+            .ok_or_else(|| ReservationError::UnknownInstance(instance_id.into()))?;
+        if (state.physical_cash - expected_physical_cash).abs() > EPS
+            || (instance.cash - expected_instance_cash).abs() > EPS
+        {
+            return Err(ReservationError::InvalidOrder(
+                "observed cash attribution precondition changed; regenerate the repair plan".into(),
+            ));
+        }
+        if instance.cash + cash_delta + EPS < instance.total_reserved_cash()
+            || (cash_delta > 0.0 && cash_delta > state.unallocated_cash + EPS)
+        {
+            return Err(ReservationError::InvalidOrder(
+                "observed cash attribution would consume reserved or unfunded cash".into(),
+            ));
+        }
+        state.instances.get_mut(instance_id).unwrap().cash += cash_delta;
+        let adjustment = ExternalAdjustment {
+            operation_id: operation_id.clone(),
+            instance_id: instance_id.to_string(),
+            cash_delta,
+            position_deltas: HashMap::new(),
+            recorded_at_ms: wall_clock_ms(),
+        };
+        state
+            .external_adjustments
+            .insert(operation_id, adjustment.clone());
+        recompute_reconciliation(&mut state, "audited observed cash attribution");
+        self.schedule_persist(&state);
+        Ok(adjustment)
+    }
+
     pub fn record_gap_replay_pages(&self, pages: usize) {
         let mut state = self.lock_state();
         let pages = pages as u64;
