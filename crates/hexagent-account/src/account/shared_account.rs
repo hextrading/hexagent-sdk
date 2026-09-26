@@ -21195,26 +21195,24 @@ fn recompute_reconciliation_with_pending(
     // healthy in-flight settlement does not look like missing cash/shares.
     state.unallocated_cash = state.physical_cash - (virtual_cash - pending.cash);
     state.unallocated_positions.clear();
-    let mut all_tokens: HashSet<String> = state.physical_positions.keys().cloned().collect();
+    let mut all_tokens: HashSet<&str> = state.physical_positions.keys().map(String::as_str).collect();
     all_tokens.extend(
-        state
-            .instances
-            .values()
-            .flat_map(|instance| instance.positions.keys().cloned()),
+        state.instances.values()
+            .flat_map(|instance| instance.positions.keys().map(String::as_str)),
     );
     for token in all_tokens {
-        let physical = state.physical_positions.get(&token).copied().unwrap_or(0.0);
+        let physical = state.physical_positions.get(token).copied().unwrap_or(0.0);
         let virtual_qty: f64 = state
             .instances
             .values()
-            .map(|instance| instance.positions.get(&token).copied().unwrap_or(0.0))
+            .map(|instance| instance.positions.get(token).copied().unwrap_or(0.0))
             .sum();
-        let pending_quantity = pending.positions.get(&token).copied().unwrap_or(0.0);
+        let pending_quantity = pending.positions.get(token).copied().unwrap_or(0.0);
         let expected_virtual = virtual_qty - pending_quantity;
         let delta = physical - expected_virtual;
         let tolerance = reconciliation_tolerance(physical, expected_virtual);
         if delta.abs() > tolerance {
-            state.unallocated_positions.insert(token, delta);
+            state.unallocated_positions.insert(token.to_owned(), delta);
         }
     }
     recompute_reconciliation_status(state);
@@ -34247,3 +34245,7 @@ mod startup_seed_tests;
 #[cfg(test)]
 #[path = "shared_account_execution_pair_tests.rs"]
 mod execution_pair_tests;
+
+#[cfg(test)]
+#[path = "control_snapshot_reuse_tests.rs"]
+mod control_snapshot_reuse_tests;
