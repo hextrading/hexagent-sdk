@@ -179,6 +179,11 @@ impl ProbeHttpRequest {
     }
 
     #[cfg(test)]
+    pub(crate) fn request_parts_for_test(&self) -> (&str, &str, &str) {
+        (self.method, &self.path, &self.body)
+    }
+
+    #[cfg(test)]
     pub(crate) fn reply_for_test(
         self,
         reply: Result<serde_json::Value, HttpErr>,

@@ -11986,6 +11986,7 @@ impl SharedAccount {
             &self.account_id,
             None,
             None,
+            None,
             missing_settlement_conditions,
         );
         state.startup_snapshot_applied_this_process = true;
@@ -12169,9 +12170,15 @@ impl SharedAccount {
         }
         let mut changed_conditions = BTreeSet::new();
         let mut changed_tokens = Vec::new();
+        let mut fresh_removals = HashSet::new();
         for token in authoritative_tokens {
             let prior = state.physical_positions.get(token).copied().unwrap_or(0.0);
             let observed = observed_positions.get(token).copied().unwrap_or(0.0);
+            if prior - observed > reconciliation_tolerance(prior, observed)
+                && state.unallocated_positions.get(token).copied().unwrap_or(0.0) >= -EPS
+            {
+                fresh_removals.insert(token.clone());
+            }
             if (observed - prior).abs() > reconciliation_tolerance(observed, prior) {
                 if let Some(conditions) = token_conditions.get(token) {
                     changed_conditions.extend(conditions.iter().cloned());
@@ -12198,6 +12205,7 @@ impl SharedAccount {
             &self.account_id,
             Some(&pending),
             Some(authoritative_tokens),
+            Some((&fresh_removals, (observed_cash - prior_cash).max(0.0))),
             missing_settlement_conditions,
         );
         self.schedule_wallet_calibration_persist(
@@ -12705,6 +12713,92 @@ impl SharedAccount {
             &mut state,
             &format!("external operation `{operation_id}` awaiting physical reconciliation"),
         );
+        self.schedule_persist(&state);
+        Ok(adjustment)
+    }
+
+    /// Offline attribution of a cash movement already included in the latest
+    /// authoritative wallet balance. The operator supplies audited ownership;
+    /// this method never discovers or guesses it from a reconciliation delta.
+    /// Unlike `attribute_external_adjustment`, physical cash stays unchanged.
+    /// The durable external root keeps immutable-baseline replay idempotent.
+    pub fn attribute_observed_cash_adjustment(
+        &self,
+        operation_id: &str,
+        instance_id: &str,
+        cash_delta: f64,
+        expected_physical_cash: f64,
+        expected_instance_cash: f64,
+    ) -> Result<ExternalAdjustment, ReservationError> {
+        if self.account_owner_lane_bound.load(Ordering::Acquire)
+            || self.account_lifecycle_lane_bound.load(Ordering::Acquire)
+        {
+            return Err(ReservationError::InvalidOrder(
+                "observed cash attribution requires an offline account".into(),
+            ));
+        }
+        if operation_id.trim().is_empty()
+            || ![cash_delta, expected_physical_cash, expected_instance_cash]
+                .iter()
+                .all(|value| value.is_finite())
+        {
+            return Err(ReservationError::InvalidOrder(
+                "observed cash attribution requires an operation id and finite values".into(),
+            ));
+        }
+        let operation_id = format!("observed-cash:{operation_id}");
+        // Offline only: include current reservations as well as economics.
+        // A wallet-calibration guard deliberately omits lifecycle aggregates.
+        let mut state = self.lock_state_for_persistence();
+        if let Some(existing) = state.external_adjustments.get(&operation_id) {
+            if existing.instance_id == instance_id
+                && existing.cash_delta == cash_delta
+                && existing.position_deltas.is_empty()
+            {
+                return Ok(existing.clone());
+            }
+            return Err(ReservationError::InvalidOrder(
+                "observed cash operation was already attributed differently".into(),
+            ));
+        }
+        if !state.seeded
+            || pending_physical_deltas_from_trades(state.trades.values()).unsettled
+            || has_unsettled_maintenance_operation(&state)
+        {
+            return Err(ReservationError::InvalidOrder(
+                "observed cash attribution requires seeded, settled wallet economics".into(),
+            ));
+        }
+        let instance = state
+            .instances
+            .get(instance_id)
+            .ok_or_else(|| ReservationError::UnknownInstance(instance_id.into()))?;
+        if (state.physical_cash - expected_physical_cash).abs() > EPS
+            || (instance.cash - expected_instance_cash).abs() > EPS
+        {
+            return Err(ReservationError::InvalidOrder(
+                "observed cash attribution precondition changed; regenerate the repair plan".into(),
+            ));
+        }
+        if instance.cash + cash_delta + EPS < instance.total_reserved_cash()
+            || (cash_delta > 0.0 && cash_delta > state.unallocated_cash + EPS)
+        {
+            return Err(ReservationError::InvalidOrder(
+                "observed cash attribution would consume reserved or unfunded cash".into(),
+            ));
+        }
+        state.instances.get_mut(instance_id).unwrap().cash += cash_delta;
+        let adjustment = ExternalAdjustment {
+            operation_id: operation_id.clone(),
+            instance_id: instance_id.to_string(),
+            cash_delta,
+            position_deltas: HashMap::new(),
+            recorded_at_ms: wall_clock_ms(),
+        };
+        state
+            .external_adjustments
+            .insert(operation_id, adjustment.clone());
+        recompute_reconciliation(&mut state, "audited observed cash attribution");
         self.schedule_persist(&state);
         Ok(adjustment)
     }
@@ -22672,6 +22766,7 @@ fn try_attribute_binary_redeem_with_pending(
         pending,
         authoritative_tokens,
         None,
+        None,
     )
 }
 
@@ -22683,6 +22778,7 @@ fn try_attribute_binary_redeem_with_diagnostics(
     account_id: &str,
     pending: Option<&PendingPhysicalDeltas>,
     authoritative_tokens: Option<&HashSet<String>>,
+    fresh_wallet_removals: Option<(&HashSet<String>, f64)>,
     mut missing_settlement_conditions: Option<&mut Vec<String>>,
 ) -> bool {
     let negative_tokens: BTreeSet<String> = state
@@ -22855,7 +22951,30 @@ fn try_attribute_binary_redeem_with_diagnostics(
 
     let observed_cash_delta = state.unallocated_cash;
     let mut remaining_cash = observed_cash_delta.max(0.0);
+    // A current wallet burn with a funded, settled payout must not lose its
+    // cash to a lexicographically earlier historical shortfall. Only prioritize
+    // wholly fresh residuals when this observation funds their entire cohort.
+    // Existing residuals, incomplete outcomes and ordinary settled trade deltas
+    // receive no new inference or release. Startup keeps its existing policy.
+    if let Some((fresh_tokens, new_cash)) = fresh_wallet_removals {
+        let fresh = |candidate: &ConditionRedeemCandidate| {
+            !candidate.removed.is_empty()
+                && candidate.removed.iter().all(|leg| fresh_tokens.contains(&leg.token_id))
+        };
+        let required: f64 = candidates.iter().filter(|c| fresh(c)).map(|c| c.expected_payout).sum();
+        if required > EPS && new_cash + EPS >= required {
+            candidates.sort_by_key(|candidate| !fresh(candidate));
+        }
+    }
     let mut selected = Vec::new();
+    // Calibration is a cold wallet-owner transaction. Report one bounded
+    // shortfall diagnostic per pass, instead of formatting one WARN for every
+    // historical condition on every retry. Accounting/admission is unchanged;
+    // never manufacture the missing payout or erase the unresolved positions.
+    let mut unfunded_conditions = 0u64;
+    let mut unfunded_payout = 0.0;
+    let mut unfunded_samples: [Option<(String, f64, f64, f64)>; 4] = std::array::from_fn(|_| None);
+    let mut unfunded_sample_count = 0;
     for candidate in candidates {
         let tolerance = 0.02_f64.max(
             candidate
@@ -22866,19 +22985,23 @@ fn try_attribute_binary_redeem_with_diagnostics(
         );
         if candidate.expected_payout > EPS && remaining_cash + tolerance < candidate.expected_payout
         {
-            log::warn!(
-                "[shared_account_redeem_attribution_failed] account={} condition={} reason=insufficient_unallocated_cash detail={:?}",
-                account_id,
-                candidate.condition_id,
-                format!(
-                    "expected_payout={:.9} remaining_unallocated_cash={:.9} tolerance={:.9}",
-                    candidate.expected_payout, remaining_cash, tolerance,
-                ),
-            );
+            unfunded_conditions += 1;
+            unfunded_payout += candidate.expected_payout;
+            if unfunded_sample_count < unfunded_samples.len() {
+                unfunded_samples[unfunded_sample_count] = Some((candidate.condition_id, candidate.expected_payout, remaining_cash, tolerance));
+                unfunded_sample_count += 1;
+            }
             continue;
         }
         remaining_cash = (remaining_cash - candidate.expected_payout).max(0.0);
         selected.push(candidate);
+    }
+    if unfunded_conditions != 0 {
+        log::warn!(
+            "[shared_account_redeem_attribution_failed] account={} reason=insufficient_unallocated_cash affected_conditions={} expected_payout_total={:.9} remaining_unallocated_cash={:.9} sample_fields=condition,payout,cash_at_check,tolerance samples={:?} suppressed_conditions={}",
+            account_id, unfunded_conditions, unfunded_payout, remaining_cash,
+            &unfunded_samples[..unfunded_sample_count], unfunded_conditions.saturating_sub(unfunded_sample_count as u64),
+        );
     }
     if selected.is_empty() {
         return false;
@@ -29313,6 +29436,103 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             ("LOSE".to_string(), 0.0),
         ]));
         assert_redeem_credit_survives_maintenance_reservation(&account);
+    }
+
+    #[test]
+    fn fresh_wallet_redeem_does_not_fund_an_older_missing_payout_first() {
+        let _guard = persistence_test_guard();
+        for (case, old_quantity, fresh_quantity, residual_cash) in [
+            (0, 80.0, 80.0, 0.0),
+            // Observed WAL: current +20 cash / -20 winning shares, but the
+            // old condition consumed 37.006121 from the combined 50.349567.
+            (1, 37.006121, 20.0, 30.34956694001812),
+        ] {
+            let observed_cash = 100.0 + residual_cash + fresh_quantity;
+            let expected_cash = 50.0 + fresh_quantity;
+            let path = std::env::temp_dir().join(format!(
+                "hexagent-fresh-redeem-{}-{}-{case}.json",
+                std::process::id(),
+                wall_clock_ms()
+            ));
+            let account = SharedAccount::new_persistent("fresh-before-history", &path).unwrap();
+            account.register_instance("old", 1.0);
+            account.register_instance("new", 1.0);
+            account
+                .register_token_interest("old", "a-old", "OLD-WIN", "OLD-LOSE")
+                .unwrap();
+            account
+                .register_token_interest("new", "z-new", "NEW-WIN", "NEW-LOSE")
+                .unwrap();
+            account
+                .apply_physical_snapshot(
+                    100.0,
+                    HashMap::from([
+                        ("OLD-WIN".into(), old_quantity),
+                        ("NEW-WIN".into(), fresh_quantity),
+                    ]),
+                )
+                .unwrap();
+            account.record_settled_token_values(&HashMap::from([
+                ("OLD-WIN".into(), 1.0),
+                ("OLD-LOSE".into(), 0.0),
+                ("NEW-WIN".into(), 1.0),
+                ("NEW-LOSE".into(), 0.0),
+            ]));
+            let scope = HashSet::from([
+                "OLD-WIN".into(),
+                "OLD-LOSE".into(),
+                "NEW-WIN".into(),
+                "NEW-LOSE".into(),
+            ]);
+            // First observation has a historical missing position but no payout.
+            assert!(!account.observe_platform_binary_redeem(
+                100.0 + residual_cash,
+                &HashMap::from([("NEW-WIN".into(), fresh_quantity)]),
+                &scope
+            ));
+            // Only NEW disappears in this observation, with its exact payout.
+            assert!(account.observe_platform_binary_redeem(observed_cash, &HashMap::new(), &scope));
+            assert_eq!(
+                account.instance_snapshot("new").unwrap().cash,
+                expected_cash
+            );
+            assert_eq!(account.instance_snapshot("old").unwrap().cash, 50.0);
+            assert_eq!(
+                account.instance_snapshot("old").unwrap().positions["OLD-WIN"],
+                old_quantity
+            );
+            assert!((account.monitoring_snapshot().unallocated_cash - residual_cash).abs() < 1e-9);
+            // Repeated observation cannot credit the new owner a second time.
+            assert!(!account.observe_platform_binary_redeem(
+                observed_cash,
+                &HashMap::new(),
+                &scope
+            ));
+            assert_eq!(
+                account.instance_snapshot("new").unwrap().cash,
+                expected_cash
+            );
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+            drop(account);
+            let restored = SharedAccount::new_persistent("fresh-before-history", &path).unwrap();
+            assert_eq!(
+                restored.instance_snapshot("new").unwrap().cash,
+                expected_cash
+            );
+            assert_eq!(restored.instance_snapshot("old").unwrap().cash, 50.0);
+            assert_eq!(
+                restored.instance_snapshot("old").unwrap().positions["OLD-WIN"],
+                old_quantity
+            );
+            assert!(!restored.observe_platform_binary_redeem(
+                observed_cash,
+                &HashMap::new(),
+                &scope
+            ));
+            drop(restored);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(persistence_wal_path(&path));
+        }
     }
 
     #[test]

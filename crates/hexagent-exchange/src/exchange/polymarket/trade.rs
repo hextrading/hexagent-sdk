@@ -761,6 +761,27 @@ fn order_lookup_is_absent(result: &FetchOrderResult) -> bool {
         || matches!(result, FetchOrderResult::Unavailable(kind) if kind.is_json_null())
 }
 
+fn exact_cancel_acknowledged(json: &serde_json::Value, order_id: &str) -> bool {
+    let Some(cancelled) = json.get("canceled").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    let Some(failed) = json
+        .get("not_canceled")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    cancelled
+        .iter()
+        .all(|id| id.as_str().is_some_and(|id| !id.is_empty()))
+        && cancelled.iter().any(|id| {
+            id.as_str()
+                .is_some_and(|id| id.eq_ignore_ascii_case(order_id))
+        })
+        && failed.values().all(serde_json::Value::is_string)
+        && !failed.keys().any(|id| id.eq_ignore_ascii_case(order_id))
+}
+
 fn combine_parallel_order_lookups(
     primary: FetchOrderResult,
     secondary: FetchOrderResult,
@@ -7743,6 +7764,22 @@ impl PolymarketTrade {
         if !recovery_scope_authorized || !event_has_ended {
             return None;
         }
+        self.recover_cancelled_order_after_trade_audit_with(
+            ownership, order_id, absence, audit_history,
+        )
+    }
+
+    /// A caller must first prove the order cannot remain live: either the
+    /// existing expiry proof or an exact successful DELETE acknowledgement.
+    /// Complete trade history and the lifecycle-owner compare/commit are
+    /// still required; a cancellation alone does not prove zero fills.
+    fn recover_cancelled_order_after_trade_audit_with(
+        &self,
+        ownership: &OrderOwnership,
+        order_id: &str,
+        evidence: &str,
+        audit_history: impl FnOnce(&str, u64) -> HistoricalOrderTradeAudit,
+    ) -> Option<OrderUpdate> {
         // A no-fill history cannot override already observed matched quantity
         // or a durable associated trade. Those need exact trade-id recovery.
         if ownership.filled_quantity != 0.0
@@ -7791,8 +7828,8 @@ impl PolymarketTrade {
                     &ownership.client_order_id,
                     OrderStatus::Cancelled,
                 );
-                info!("[PolymarketTrade] recovered order no-successful-fill proof coid={} orderID={} event_ended=true absence={} trade_pages={} after_secs={} reconciled_failed_trades={} terminal=Cancelled reservation_released=true",
-                    ownership.client_order_id, order_id, absence, pages, after_secs, failed_count);
+                info!("[PolymarketTrade] recovered order no-successful-fill proof coid={} orderID={} evidence={} trade_pages={} after_secs={} reconciled_failed_trades={} terminal=Cancelled reservation_released=true",
+                    ownership.client_order_id, order_id, evidence, pages, after_secs, failed_count);
                 Some(Self::authoritative_recovery_update(
                     ownership,
                     order_id,
@@ -8428,6 +8465,12 @@ impl PolymarketTrade {
             } else {
                 self.fetch_order_by_id(&coid, &order_id, None, parallel_evidence)
             };
+            if use_recovery_owner_transport && order_lookup_is_absent(&lookup) {
+                if let Some(update) = self.cancel_unknown_order_via_owners(&ownership, &order_id) {
+                    updates.push(update);
+                    continue;
+                }
+            }
             let fetched = match lookup {
                 FetchOrderResult::Found(order) => order,
                 FetchOrderResult::NotFound(evidence) => {
@@ -10735,6 +10778,86 @@ impl PolymarketTrade {
         let secondary_result = self.classify_order_lookup_reply(
             &ownership.client_order_id, order_id, secondary.reply);
         combine_parallel_order_lookups(primary_result, secondary_result, primary_location, secondary_location)
+    }
+
+    /// Cold recovery only. Repeated GET nulls cannot stop an unknown order.
+    /// Ask its Cancel owner to remove that exact signed order, then audit
+    /// every trade page through its Reconcile owners. No account-wide cancel,
+    /// shared socket fallback, resubmission, or absence-based lock release.
+    fn cancel_unknown_order_via_owners(
+        &self,
+        ownership: &OrderOwnership,
+        order_id: &str,
+    ) -> Option<OrderUpdate> {
+        if ownership.status != OrderStatus::NewOrderTimeout
+            || ownership.order_id != order_id
+            || ownership.instance_id.is_empty()
+        {
+            return None;
+        }
+        let transport = self.shared.recovery_http.get()?;
+        let identity = self
+            .shared
+            .reconcile_order_identity(&ownership.client_order_id, order_id)
+            .ok()?;
+        if identity.instance_id != ownership.instance_id
+            || identity.symbol != ownership.token_id
+            || identity.side != ownership.side
+            || identity.order_slot != ownership.order_slot
+        {
+            return None;
+        }
+        let body = serde_json::json!({"orderID": order_id}).to_string();
+        let response = transport.request(
+            &self.shared,
+            &ownership.instance_id,
+            "DELETE",
+            "/order",
+            &body,
+            None,
+            None,
+        );
+        if !matches!(
+            response.location,
+            Some((crate::http1_pool::Role::Cancel, _))
+        ) {
+            return None;
+        }
+        let response = response.reply.ok()?;
+        if !exact_cancel_acknowledged(&response, order_id) {
+            return None;
+        }
+        let market = self
+            .shared
+            .account_state
+            .recovery_market_for_token(&ownership.token_id);
+        self.recover_cancelled_order_after_trade_audit_with(
+            ownership,
+            order_id,
+            "exact_order_cancel_acknowledged",
+            |oid, stamp| {
+                fetch_historical_order_trade_audit_in_market(
+                    oid,
+                    stamp,
+                    market.as_deref(),
+                    |path| {
+                        let page = transport.request(
+                            &self.shared,
+                            &ownership.instance_id,
+                            "GET",
+                            path,
+                            "",
+                            None,
+                            None,
+                        );
+                        if !matches!(page.location, Some((crate::http1_pool::Role::Reconcile, _))) {
+                            return Err("history reply lacks Reconcile owner identity".to_string());
+                        }
+                        page.reply.map_err(|error| error.to_string())
+                    },
+                )
+            },
+        )
     }
 
     /// Reconcile an ambiguous synthetic probe without touching strategy order
