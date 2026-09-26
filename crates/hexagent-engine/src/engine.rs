@@ -12435,6 +12435,7 @@ impl Engine {
                     PolyAccountConnectionRoutes,
                 >::new();
                 let mut poly_connection_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+                let mut poly_recovery_handles = Vec::new();
                 let mut poly_connection_metrics: Vec<Arc<PolyConnectionLaneMetrics>> = Vec::new();
                 let mut poly_completion_txs = HashMap::<String, Sender<RoutedOrderUpdate>>::new();
                 let mut poly_completion_handles: Vec<thread::JoinHandle<()>> = Vec::new();
@@ -12584,13 +12585,37 @@ impl Engine {
                         if !routes.safety_cancel.is_empty() {
                             routes.health.as_mut().unwrap().reserve_cancel_slot(0);
                         }
+                        let (reset_tx, reset_rx) = bounded(1);
+                        routes.reset_rx = Some(reset_rx);
+                        routes.reset_pending = vec![false; routes.fast.len() + routes.cancel.len() + routes.safety_cancel.len()];
                         for (instance_id, shared) in &poly_states {
                             if shared.account_state.account_id() == account_id {
+                                shared.bind_execution_reset_sender(reset_tx.clone());
+                                routes.reset_prewarm_url = Arc::from(format!("{}/", shared.clob_base_url.trim_end_matches('/')));
                                 if let Some(publisher) = admission_publishers.remove(instance_id) {
                                     routes.admission_publishers.push(publisher);
                                 }
                             }
                         }
+                    }
+                    // One cold coordinator per strategy instance. No physical
+                    // Reconcile actor waits on another request to itself. The
+                    // dispatcher remains free to route Cancel/GET HTTP legs.
+                    for (instance_id, shared) in &poly_states {
+                        // Offline/shutdown-only engines have no physical HTTP
+                        // routes, so they must not start a recovery coordinator.
+                        let Some(routes) = poly_connection_routes.get_mut(shared.account_state.account_id()) else { continue; };
+                        let (tx, rx) = bounded::<PolyConnectionCommand>(1);
+                        routes.recovery.insert(instance_id.clone(), tx);
+                        let trade = PolymarketTrade::from_shared(shared.clone(), "", instance_id);
+                        let thread_name = format!("poly-orphan-recovery-{instance_id}");
+                        poly_recovery_handles.push(thread::Builder::new().name(thread_name.clone())
+                            .spawn(move || {
+                                // SCHED_OTHER + configured background affinity;
+                                // pin_background registers topology placement.
+                                crate::os_tune::pin_background(&thread_name);
+                                run_poly_orphan_recovery(trade, rx);
+                            }).expect("spawn per-instance orphan recovery"));
                     }
                     let owner_count = poly_connection_handles.len();
                     info!(
@@ -13019,7 +13044,15 @@ impl Engine {
                                         }
                                     }
                                 }
+                                // Disconnect the cold HTTP transport before
+                                // joining coordinators: queued/in-flight reply
+                                // channels fail closed instead of waiting for
+                                // a dispatcher that is now shutting down.
+                                probe_http_rx = crossbeam_channel::never();
                                 poly_connection_routes = None;
+                                for h in std::mem::take(&mut poly_recovery_handles) {
+                                    let _ = h.join();
+                                }
                                 for h in std::mem::take(&mut poly_connection_handles) {
                                     let _ = h.join();
                                 }
@@ -14432,6 +14465,7 @@ fn spawn_venue_execution_owner<T: ExchangeTrade + 'static>(
 /// owner.  The owner retains its exact admission slot for its whole lifetime,
 /// so a command never migrates to an arbitrary worker or completion drainer.
 enum PolyConnectionCommand {
+    RefreshTransport { prewarm_url: Arc<str> },
     /// Existing durable RTT probe HTTP legs use the same capacity and generation
     /// fences as normal orders. The cold probe thread waits on its bounded reply.
     ProbeHttp { request: ProbeHttpRequest, expected_generation: Option<u64> },
@@ -14753,6 +14787,14 @@ struct PolyAccountConnectionRoutes {
     cancel: Vec<PolyConnectionLane>,
     safety_cancel: Vec<PolyConnectionLane>,
     reconcile: Vec<PolyConnectionLane>,
+    /// Startup-created per-instance cold lanes, capacity one each. Producer:
+    /// execution dispatcher; consumer: that instance's recovery coordinator.
+    /// FIFO, nonblocking admission; full/disconnected returns typed deferred
+    /// updates so the owning strategy retains and retries every intent.
+    recovery: HashMap<String, Sender<PolyConnectionCommand>>,
+    reset_rx: Option<Receiver<()>>,
+    reset_pending: Vec<bool>,
+    reset_prewarm_url: Arc<str>,
     fast_rr: usize,
     cancel_rr: usize,
     safety_cancel_rr: usize,
@@ -14788,6 +14830,10 @@ impl Default for PolyAccountConnectionRoutes {
             cancel: Vec::new(),
             safety_cancel: Vec::new(),
             reconcile: Vec::new(),
+            recovery: HashMap::new(),
+            reset_rx: None,
+            reset_pending: Vec::new(),
+            reset_prewarm_url: Arc::from(""),
             fast_rr: 0,
             cancel_rr: 0,
             safety_cancel_rr: 0,
@@ -14814,6 +14860,21 @@ impl PolyAccountConnectionRoutes {
             }
         }
         let now = now_ns();
+        if self.reset_rx.as_ref().is_some_and(|rx| rx.try_recv().is_ok()) {
+            health.retire_transport_generations(now);
+            self.reset_pending.fill(true);
+        }
+        // The pending bit remains set while an owner is occupied. This is a
+        // bounded latest-value control lane, never a blocking dispatcher send.
+        for (pending, lane) in self.reset_pending.iter_mut().zip(
+            self.fast.iter().chain(self.cancel.iter()).chain(self.safety_cancel.iter())) {
+            if *pending && !lane.metrics.occupied.load(Ordering::Acquire)
+                && lane.try_send(PolyConnectionCommand::RefreshTransport {
+                    prewarm_url: Arc::clone(&self.reset_prewarm_url),
+                }).is_ok() {
+                *pending = false;
+            }
+        }
         let mut snapshot = health.refresh(now);
         let value = (snapshot.state, snapshot.available_place_slots);
         let previous_state = self.admission_last_value.map(|value| value.0);
@@ -15170,6 +15231,28 @@ fn finish_poly_typed_completion(router: &mut LiveRouter, completion: PolyTypedCo
     }
 }
 
+fn try_send_poly_recovery(
+    routes: &PolyAccountConnectionRoutes, instance_id: &str, command: PolyConnectionCommand,
+) -> Result<(), PolyConnectionCommand> {
+    let Some(sender) = routes.recovery.get(instance_id) else { return Err(command); };
+    sender.try_send(command).map_err(crossbeam_channel::TrySendError::into_inner)
+}
+
+fn run_poly_orphan_recovery(trade: PolymarketTrade, rx: Receiver<PolyConnectionCommand>) {
+    while let Ok(command) = rx.recv() {
+        let PolyConnectionCommand::Reconcile { pending_places, pending_cancels,
+            pending_trade_ids, update_tx, enqueued_at, .. } = command else {
+                unreachable!("recovery lane accepts only typed reconciliation commands");
+            };
+        crate::latency::record_ns("polymarket.orphan.coordinator_queue",
+            enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        for update in trade.reconcile_orphans_via_owners(
+            &pending_places, &pending_cancels, &pending_trade_ids) {
+            if send_executor_update(&update_tx, update).is_err() { return; }
+        }
+    }
+}
+
 fn run_poly_connection_owner(
     mut router: LiveRouter,
     permit: hexagent_runtime::http1_pool::Permit,
@@ -15205,6 +15288,10 @@ fn run_poly_connection_owner(
         let connection = permit.current_pooled_client().connection_snapshot();
         let _occupancy = PolyConnectionOccupancyGuard::new(Arc::clone(&lane_metrics), connection);
         match command {
+            PolyConnectionCommand::RefreshTransport { prewarm_url } => {
+                permit.current_pooled_client()
+                    .note_instrumented_transport_failure(prewarm_url.to_string());
+            }
             PolyConnectionCommand::ProbeHttp { request, expected_generation } => {
                 let current = permit.health_snapshot();
                 if request.role == Role::Fast
@@ -15953,7 +16040,7 @@ fn dispatch_poly_signal_to_connection_owner(
                 pending_cancels,
                 pending_trade_ids,
                 ..
-            }) = try_send_poly_owner(routes, Role::Reconcile, command)
+            }) = try_send_poly_recovery(routes, &instance_id, command)
             {
                 for update in reconcile_deferred_updates(
                     &instance_id,
@@ -18855,6 +18942,71 @@ mod market_router_tests {
                 .collect::<Vec<_>>(),
             vec!["trade-1"]
         );
+    }
+
+    #[test]
+    fn private_reset_is_coalesced_and_retries_busy_connection_owners() {
+        use hexagent_runtime::http1_pool::Role;
+        let (reset_tx, reset_rx) = bounded(1);
+        let (fast_tx, fast_rx) = bounded(1);
+        let (cancel_tx, cancel_rx) = bounded(1);
+        let mut routes = PolyAccountConnectionRoutes {
+            health: Some(AccountExecutionAdmission::new(1, 1, now_ns())),
+            reset_rx: Some(reset_rx), reset_pending: vec![false; 2],
+            reset_prewarm_url: Arc::from("https://example.invalid/"),
+            fast: vec![PolyConnectionLane::for_test(fast_tx, Role::Fast, 0)],
+            cancel: vec![PolyConnectionLane::for_test(cancel_tx, Role::Cancel, 0)],
+            ..Default::default()
+        };
+        routes.fast[0].metrics.occupied.store(true, Ordering::Release);
+        reset_tx.try_send(()).unwrap();
+        assert!(matches!(reset_tx.try_send(()), Err(crossbeam_channel::TrySendError::Full(()))));
+        routes.refresh_health(now_ns());
+        assert!(fast_rx.is_empty());
+        assert!(matches!(cancel_rx.try_recv().unwrap(), PolyConnectionCommand::RefreshTransport { .. }));
+        assert_eq!(routes.reset_pending, [true, false]);
+        routes.fast[0].metrics.occupied.store(false, Ordering::Release);
+        routes.refresh_health(now_ns());
+        assert!(matches!(fast_rx.try_recv().unwrap(), PolyConnectionCommand::RefreshTransport { .. }));
+        assert_eq!(routes.reset_pending, [false, false]);
+        routes.refresh_health(now_ns());
+        assert!(fast_rx.is_empty() && cancel_rx.is_empty());
+    }
+
+    #[test]
+    fn live_reconcile_dispatch_uses_instance_coordinator_and_defers_overflow() {
+        let (cold_tx, cold_rx) = bounded(1);
+        let (physical_tx, physical_rx) = bounded(1);
+        let (raw_tx, replies) = bounded(8);
+        let tx = ExecutorUpdateSender { owner: 7, tx: raw_tx.into() };
+        let mut routes = PolyAccountConnectionRoutes {
+            reconcile: vec![PolyConnectionLane::for_test(physical_tx,
+                hexagent_runtime::http1_pool::Role::Reconcile, 0)],
+            recovery: HashMap::from([("btc01".into(), cold_tx)]),
+            ..Default::default()
+        };
+        let signal = |iid: &str| Signal::ReconcilePolymarket {
+            instance_id: iid.into(),
+            pending_places: vec![(format!("{iid}-unknown"), "UP".into(), Side::Buy, 0.4, Some("0xid".into()))],
+            pending_cancels: vec![], pending_trade_ids: vec![],
+        };
+        assert!(dispatch_poly_signal_to_connection_owner(signal("btc01"), 150, tx.clone(), &mut routes));
+        assert!(physical_rx.try_recv().is_err());
+        assert!(replies.try_recv().is_err());
+        // Capacity-one lane stays bounded. The exact strategy gets retry
+        // feedback, never a fabricated cancel/release or another owner route.
+        assert!(dispatch_poly_signal_to_connection_owner(signal("btc01"), 150, tx.clone(), &mut routes));
+        let deferred = replies.try_recv().unwrap();
+        assert_eq!(deferred.owner, 7);
+        assert_eq!(deferred.update.error.as_deref(), Some(ORPHAN_RECONCILE_DEFERRED));
+        assert_eq!(deferred.update.status, OrderStatus::ExecutorRejected);
+        assert!(dispatch_poly_signal_to_connection_owner(signal("btc02"), 150, tx.clone(), &mut routes));
+        assert_eq!(replies.try_recv().unwrap().update.client_order_id, "btc02-unknown");
+        assert!(matches!(cold_rx.recv().unwrap(), PolyConnectionCommand::Reconcile { instance_id, .. } if instance_id == "btc01"));
+        drop(cold_rx);
+        assert!(dispatch_poly_signal_to_connection_owner(signal("btc01"), 150, tx, &mut routes));
+        assert_eq!(replies.try_recv().unwrap().update.error.as_deref(), Some(ORPHAN_RECONCILE_DEFERRED));
+        assert!(physical_rx.try_recv().is_err());
     }
 
     #[test]

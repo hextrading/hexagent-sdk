@@ -115,8 +115,18 @@ fn recovery_nulls_wrong_slot_and_disconnected_mailbox_preserve_reservation() {
 
 #[test]
 fn active_unknown_order_cancel_ack_and_complete_history_resolve_without_expiry() {
+    exact_cancel_recovery_entry(false);
+}
+
+#[test]
+fn live_per_order_entry_cancels_unknown_order_and_audits_history_without_expiry() {
+    exact_cancel_recovery_entry(true);
+}
+
+fn exact_cancel_recovery_entry(per_order: bool) {
     let shutdown = ShutdownToken::new();
-    let trade = super::tests::shutdown_test_trade(shutdown.clone());
+    let seeded = super::tests::shutdown_test_trade(shutdown.clone());
+    let trade = PolymarketTrade::from_shared(seeded.shared.clone(), "", "btc01");
     let mut order = ownership(Side::Sell, "btc01-1789622848819", "0xmissing", "btc01");
     order.status = OrderStatus::NewOrderTimeout;
     trade
@@ -173,7 +183,13 @@ fn active_unknown_order_cancel_ack_and_complete_history_resolve_without_expiry()
         }
     });
     // Audit just this unknown order; the unrelated sibling reservation survives.
-    let pass = trade.reconcile_runtime_open_orders_with_updates();
+    let pass = if per_order {
+        RuntimeOrderRecovery {
+            updates: trade.reconcile_orphans_via_owners(&[(order.client_order_id.clone(),
+                order.token_id.clone(), order.side, order.price, Some(order.order_id.clone()))], &[], &[]),
+            errors: vec![],
+        }
+    } else { trade.reconcile_runtime_open_orders_with_updates() };
     assert!(pass.errors.is_empty(), "{:?}", pass.errors);
     assert_eq!(pass.updates.len(), 1);
     let update = &pass.updates[0];
@@ -438,4 +454,63 @@ fn benchmark_active_unknown_cancel_recovery() {
     shutdown.request();
     shutdown.finish();
     trade.shared.join_background_workers();
+}
+
+#[test]
+fn cancel_transport_failure_keeps_intent_and_original_error_until_authoritative_recovery() {
+    let shutdown = ShutdownToken::new();
+    let seeded = super::tests::shutdown_test_trade(shutdown.clone());
+    let mut trade = PolymarketTrade::from_shared(seeded.shared.clone(), "", "btc01");
+    let order = ownership(Side::Sell, "btc01-1789622848820", "0xreset", "btc01");
+    trade.shared.install_runtime_order_id(&order.client_order_id, &order.order_id,
+        &order.token_id, Some(&order)).unwrap();
+    install(&trade.shared, &order);
+    for failure in [HttpErr::Transport("Connection reset by peer".into()),
+        HttpErr::InvalidResponse("truncated response".into()),
+        HttpErr::NotSent("slot changed generation".into())] {
+        let expected_error = failure.to_string();
+        let update = trade.handle_cancel_reply(Exchange::Polymarket, &order.client_order_id,
+            CancelCtx { local_oid: Some(order.order_id.clone()), order_slot: order.order_slot,
+                symbol: order.token_id.clone(), side: order.side }, Some(Err(failure)));
+        assert_eq!(update.status, OrderStatus::CancelOrderTimeout);
+        assert_eq!(update.error.as_deref(), Some(expected_error.as_str()));
+        assert_eq!(trade.shared.account_state.order(&order.client_order_id).unwrap().reserved_quantity, 16.0);
+    }
+    let (transport, requests) = super::super::rtt_probe::probe_http_lane(2);
+    trade.shared.bind_recovery_http_transport(transport);
+    let server = std::thread::spawn(move || {
+        for slot in [0, 1] {
+            let req = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(req.instance_id, "btc01");
+            req.reply_for_test(Ok(serde_json::Value::Null), Some((Role::Reconcile, slot)));
+        }
+        let req = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(req.request_parts_for_test(), ("DELETE", "/order", "{\"orderID\":\"0xreset\"}"));
+        req.reply_for_test(Ok(serde_json::json!({"canceled":["0xreset"],"not_canceled":{}})), Some((Role::Cancel, 0)));
+        let req = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(req.role, Role::Reconcile);
+        req.reply_for_test(Ok(serde_json::json!({"data":[],"next_cursor":"LTE="})), Some((Role::Reconcile, 0)));
+    });
+    let updates = trade.reconcile_orphans_via_owners(&[], &[(order.client_order_id.clone(),order.order_id.clone())], &[]);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].status, OrderStatus::Cancelled);
+    assert_eq!(trade.shared.account_state.order(&order.client_order_id).unwrap().reserved_quantity, 0.0);
+    server.join().unwrap();
+    shutdown.request(); shutdown.finish(); trade.shared.join_background_workers();
+}
+
+#[test]
+fn per_order_recovery_rejects_cross_instance_identity_before_http() {
+    let shutdown = ShutdownToken::new();
+    let seeded = super::tests::shutdown_test_trade(shutdown.clone());
+    let trade = PolymarketTrade::from_shared(seeded.shared.clone(), "", "btc01");
+    let sibling = ownership(Side::Sell, "btc02-sibling", "0xsibling", "btc02");
+    install(&trade.shared, &sibling);
+    let (transport, requests) = super::super::rtt_probe::probe_http_lane(2);
+    trade.shared.bind_recovery_http_transport(transport);
+    let updates = trade.reconcile_orphans_via_owners(&[(sibling.client_order_id.clone(),
+        sibling.token_id.clone(), sibling.side, sibling.price, Some(sibling.order_id.clone()))], &[], &[]);
+    assert!(updates.is_empty()); assert!(requests.try_recv().is_err());
+    assert_eq!(trade.shared.account_state.order(&sibling.client_order_id).unwrap().reserved_quantity, 16.0);
+    shutdown.request(); shutdown.finish(); trade.shared.join_background_workers();
 }

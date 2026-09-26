@@ -153,6 +153,19 @@ impl AccountExecutionAdmission {
         }
     }
 
+    /// Called only by this account's dispatcher after an explicit private
+    /// transport reset message. Old generation heartbeats/business ACKs must
+    /// not heal these lanes; new prewarmed generations enter normal recovery.
+    pub(crate) fn retire_transport_generations(&mut self, now_ns: u64) {
+        for lane in self.fast.iter_mut().chain(self.cancel.iter_mut()) {
+            lane.retired_generation = Some(lane.generation);
+            lane.verified = false;
+        }
+        self.probe = None;
+        self.recovery_successes = 0;
+        self.pause_for_recovery(now_ns);
+    }
+
     pub(crate) fn current(&self) -> ExecutionAdmission {
         self.admission
     }
@@ -693,6 +706,29 @@ mod tests {
         assert!(harness.state.fast[0].busy);
         assert!(harness.state.probe.is_some());
         assert!(!harness.state.can_place(harness.now));
+    }
+
+    #[test]
+    fn private_transport_reset_requires_new_generations_and_is_account_local() {
+        let mut account = Harness::healthy(2, 1);
+        let mut sibling = Harness::healthy(2, 1);
+        account.state.retire_transport_generations(account.now);
+        for slot in 0..2 {
+            account.emit(Role::Fast, slot, |_| {});
+            account.outcome(Role::Fast, slot, BusinessHttpOutcome::Healthy);
+            assert!(!account.state.lane_place_allowed(slot, account.now));
+        }
+        assert!(sibling.state.can_place(sibling.now));
+        account.now = account.state.pause_until_ns + 1;
+        account.emit(Role::Cancel, 0, |observation| observation.health.pool_generation += 1);
+        account.emit(Role::Fast, 0, |observation| observation.health.pool_generation += 1);
+        assert!(account.state.lane_place_allowed(0, account.now));
+        assert!(!account.state.lane_place_allowed(1, account.now));
+        // The second reset fences the replacement too; a coalesced warm
+        // heartbeat cannot resurrect a generation preceding that reset.
+        account.state.retire_transport_generations(account.now);
+        account.emit(Role::Fast, 0, |_| {});
+        assert!(!account.state.lane_place_allowed(0, account.now));
     }
 
     #[test]

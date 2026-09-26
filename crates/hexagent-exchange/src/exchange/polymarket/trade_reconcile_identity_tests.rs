@@ -115,6 +115,7 @@ fn reconcile_cancel_preserves_sell_and_buy_identity_after_cleanup_and_duplicate_
             let mut updates = Vec::new();
             trade.finish_reconciled_cancel(
                 None,
+                false,
                 coid,
                 oid,
                 identity,
@@ -177,6 +178,7 @@ fn reconcile_retry_and_filled_pending_audit_keep_original_identity_and_reservati
             let mut updates = Vec::new();
             trade.finish_reconciled_cancel(
                 None,
+                false,
                 coid,
                 oid,
                 identity,
