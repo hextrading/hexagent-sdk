@@ -1571,8 +1571,71 @@ pub struct CashAllocationMigration {
     pub recorded_at_ms: u64,
 }
 
+/// One cold-owner publication. Pending MATCHED deltas are explicit so a
+/// consistent snapshot does not mistake not-yet-MINED cash/shares for a deficit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AccountReconciliationSnapshot {
+    pub ledger_generation: u64,
+    pub captured_at_ms: u64,
+    pub virtual_cash: f64,
+    pub virtual_positions: HashMap<String, f64>,
+    pub pending_physical_cash: f64,
+    pub pending_physical_positions: HashMap<String, f64>,
+    pub cash_delta: f64,
+    pub position_delta_abs: f64,
+}
+
+impl AccountReconciliationSnapshot {
+    fn from_state(state: &SharedAccountState) -> Self {
+        let pending = pending_physical_deltas_from_trades(state.trades.values());
+        let virtual_cash = state.instances.values().map(|instance| instance.cash).sum();
+        let mut virtual_positions = HashMap::<String, f64>::new();
+        for instance in state.instances.values() {
+            for (token, quantity) in &instance.positions {
+                if *quantity != 0.0 {
+                    *virtual_positions.entry(token.clone()).or_default() += quantity;
+                }
+            }
+        }
+        let mut tokens: HashSet<&str> =
+            nonzero_position_tokens(&state.physical_positions).collect();
+        tokens.extend(virtual_positions.keys().map(String::as_str));
+        tokens.extend(nonzero_position_tokens(&state.unallocated_positions));
+        tokens.extend(pending.positions.keys().map(String::as_str));
+        let position_delta_abs = tokens
+            .into_iter()
+            .map(|token| {
+                (state
+                    .physical_positions
+                    .get(token)
+                    .copied()
+                    .unwrap_or_default()
+                    - virtual_positions.get(token).copied().unwrap_or_default()
+                    + pending.positions.get(token).copied().unwrap_or_default()
+                    - state
+                        .unallocated_positions
+                        .get(token)
+                        .copied()
+                        .unwrap_or_default())
+                .abs()
+            })
+            .sum();
+        Self {
+            ledger_generation: state.ledger_generation,
+            captured_at_ms: wall_clock_ms(),
+            virtual_cash,
+            cash_delta: state.physical_cash - virtual_cash + pending.cash - state.unallocated_cash,
+            virtual_positions,
+            pending_physical_cash: pending.cash,
+            pending_physical_positions: pending.positions,
+            position_delta_abs,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AccountMonitoringSnapshot {
+    pub reconciliation: AccountReconciliationSnapshot,
     pub account_id: String,
     pub seeded: bool,
     pub physical_cash: f64,
@@ -2311,8 +2374,9 @@ struct AccountEconomicState {
 /// transaction.
 #[derive(Debug, Clone, Default)]
 struct PublishedEconomicSnapshot {
+    reconciliation: AccountReconciliationSnapshot,
     physical_cash: f64,
-    physical_positions: HashMap<String, f64>,
+    physical_positions: Arc<HashMap<String, f64>>,
     unallocated_cash: f64,
     unallocated_positions: HashMap<String, f64>,
     provisional_position_owners: HashMap<String, String>,
@@ -2328,27 +2392,17 @@ struct PublishedEconomicSnapshot {
     /// Immutable wallet/onchain actor projection. External maintenance
     /// workers query this publication instead of synchronously requesting the
     /// cold account mutex; mutations remain ordered on the sole owner lane.
-    maintenance_operations: BTreeMap<String, MaintenanceOperation>,
+    maintenance_operations: Arc<BTreeMap<String, MaintenanceOperation>>,
     verified_trade_replay_recoveries: u64,
 }
 
 impl PublishedEconomicSnapshot {
     fn from_state(state: &SharedAccountState) -> Self {
-        Self {
-            physical_cash: state.physical_cash,
-            physical_positions: state.physical_positions.clone(),
-            unallocated_cash: state.unallocated_cash,
-            unallocated_positions: state.unallocated_positions.clone(),
-            provisional_position_owners: state.provisional_position_owners.clone(),
-            uncertain_reason: state.uncertain_reason.clone(),
-            uncertain_since_ms: state.uncertain_since_ms,
-            gap_replay_last_pages: state.gap_replay_last_pages,
-            gap_replay_max_pages: state.gap_replay_max_pages,
-            gap_replay_total_pages: state.gap_replay_total_pages,
-            maintenance_queue_last_wait_ms: state.maintenance_queue_last_wait_ms,
-            maintenance_queue_max_wait_ms: state.maintenance_queue_max_wait_ms,
-            maintenance_queue_jobs: state.maintenance_queue_jobs,
-            pending_maintenance_operations: state
+        Self::from_state_with_cold(
+            state,
+            Arc::new(state.physical_positions.clone()),
+            Arc::new(state.maintenance_ops.clone()),
+            state
                 .maintenance_ops
                 .values()
                 .filter(|operation| {
@@ -2360,7 +2414,34 @@ impl PublishedEconomicSnapshot {
                     )
                 })
                 .count(),
-            maintenance_operations: state.maintenance_ops.clone(),
+        )
+    }
+
+    // Typed trade deltas cannot mutate wallet balances or maintenance history.
+    // Reuse those immutable roots; actual cold mutations rebuild them.
+    fn from_state_with_cold(
+        state: &SharedAccountState,
+        physical_positions: Arc<HashMap<String, f64>>,
+        maintenance_operations: Arc<BTreeMap<String, MaintenanceOperation>>,
+        pending_maintenance_operations: usize,
+    ) -> Self {
+        Self {
+            reconciliation: AccountReconciliationSnapshot::from_state(state),
+            physical_cash: state.physical_cash,
+            physical_positions,
+            unallocated_cash: state.unallocated_cash,
+            unallocated_positions: state.unallocated_positions.clone(),
+            provisional_position_owners: state.provisional_position_owners.clone(),
+            uncertain_reason: state.uncertain_reason.clone(),
+            uncertain_since_ms: state.uncertain_since_ms,
+            gap_replay_last_pages: state.gap_replay_last_pages,
+            gap_replay_max_pages: state.gap_replay_max_pages,
+            gap_replay_total_pages: state.gap_replay_total_pages,
+            maintenance_queue_last_wait_ms: state.maintenance_queue_last_wait_ms,
+            maintenance_queue_max_wait_ms: state.maintenance_queue_max_wait_ms,
+            maintenance_queue_jobs: state.maintenance_queue_jobs,
+            pending_maintenance_operations,
+            maintenance_operations,
             verified_trade_replay_recoveries: state.verified_trade_replay_recoveries,
         }
     }
@@ -3286,6 +3367,7 @@ struct VirtualTradePersistenceDelta {
 /// durable WAL and in-memory aggregate advance from identical evidence.
 #[derive(Debug, Clone)]
 enum LifecycleMirrorDelta {
+    FeeConfig { watermark: u64, token_ids: Vec<String>, config: TokenFeeConfig },
     Lifecycle {
         watermark: u64,
         delta: VirtualLifecyclePersistenceDelta,
@@ -3299,7 +3381,7 @@ enum LifecycleMirrorDelta {
 impl LifecycleMirrorDelta {
     fn watermark(&self) -> u64 {
         match self {
-            Self::Lifecycle { watermark, .. } | Self::Trade { watermark, .. } => *watermark,
+            Self::Lifecycle { watermark, .. } | Self::Trade { watermark, .. } | Self::FeeConfig { watermark, .. } => *watermark,
         }
     }
 }
@@ -7140,6 +7222,7 @@ impl SharedAccount {
         let mut contiguous = self
             .lifecycle_mirror_applied_watermark
             .load(Ordering::Acquire);
+        let mut economic_changed = false;
         for delta in deltas {
             let watermark = delta.watermark();
             if watermark == contiguous.saturating_add(1) {
@@ -7161,10 +7244,14 @@ impl SharedAccount {
                 }
             }
             match delta {
+                LifecycleMirrorDelta::FeeConfig { token_ids, config, .. } => {
+                    for token in token_ids { state.token_fee_configs.insert(token, config); }
+                }
                 LifecycleMirrorDelta::Lifecycle { delta, .. } => {
                     apply_lifecycle_projection(&mut state, delta);
                 }
                 LifecycleMirrorDelta::Trade { delta, .. } => {
+                    economic_changed = true;
                     apply_trade_projection(&mut state, delta);
                 }
             }
@@ -7172,7 +7259,15 @@ impl SharedAccount {
         recompute_reconciliation(&mut state, "lifecycle owner delta mirror");
         self.lifecycle_mirror_applied_watermark
             .store(contiguous, Ordering::Release);
-        self.publish_control_snapshots(&state);
+        self.publish_control_snapshots_scoped(&state, false);
+        if economic_changed {
+            let previous = self.economic_snapshot_fast.load();
+            let snapshot = PublishedEconomicSnapshot::from_state_with_cold(
+                &state, Arc::clone(&previous.physical_positions),
+                Arc::clone(&previous.maintenance_operations), previous.pending_maintenance_operations,
+            );
+            self.economic_snapshot_fast.store(Arc::new(snapshot));
+        }
         drop(state);
         drop(_control);
         if !receiver.is_empty() {
@@ -7523,6 +7618,10 @@ impl SharedAccount {
     /// while the transaction still owns the state guard, so readers observing
     /// a new generation also observe the matching immutable values map.
     fn publish_control_snapshots(&self, state: &SharedAccountState) {
+        self.publish_control_snapshots_scoped(state, true);
+    }
+
+    fn publish_control_snapshots_scoped(&self, state: &SharedAccountState, registry_changed: bool) {
         self.anomalous_trade_keys.store(Arc::new(
             state
                 .ownership_anomalies
@@ -7569,12 +7668,13 @@ impl SharedAccount {
             self.settled_token_values_generation_fast
                 .store(generation, Ordering::Release);
         }
-        self.ended_token_ids_fast
-            .store(Arc::new(Self::ended_token_ids(state)));
-        self.ledger_generation_fast
-            .fetch_max(state.ledger_generation, Ordering::AcqRel);
-        self.token_fee_configs_fast
-            .store(Arc::new(state.token_fee_configs.clone()));
+        if registry_changed {
+            self.ended_token_ids_fast.store(Arc::new(Self::ended_token_ids(state)));
+            if !self.account_lifecycle_lane_bound.load(Ordering::Acquire) {
+                self.token_fee_configs_fast.store(Arc::new(state.token_fee_configs.clone()));
+            }
+        }
+        self.ledger_generation_fast.fetch_max(state.ledger_generation, Ordering::AcqRel);
         // `retired_order_audit_tombstones` is append-only and can contain
         // tens of thousands of historical rows. Its immutable replay index is
         // published only by the two mutation sites below; cloning it on every
@@ -9025,8 +9125,9 @@ impl SharedAccount {
             .store(passive, Ordering::Release);
         self.ledger_generation_fast
             .fetch_max(state.ledger_generation, Ordering::AcqRel);
-        self.token_fee_configs_fast
-            .store(Arc::new(state.token_fee_configs.clone()));
+        if !self.account_lifecycle_lane_bound.load(Ordering::Acquire) {
+            self.token_fee_configs_fast.store(Arc::new(state.token_fee_configs.clone()));
+        }
     }
 
     fn sync_state_to_virtual_account(
@@ -9183,8 +9284,9 @@ impl SharedAccount {
             .store(passive, Ordering::Release);
         self.ledger_generation_fast
             .fetch_max(state.ledger_generation, Ordering::AcqRel);
-        self.token_fee_configs_fast
-            .store(Arc::new(state.token_fee_configs.clone()));
+        if !self.account_lifecycle_lane_bound.load(Ordering::Acquire) {
+            self.token_fee_configs_fast.store(Arc::new(state.token_fee_configs.clone()));
+        }
     }
 
     /// Query-repair orders that still lack authoritative terminal/live
@@ -10478,7 +10580,7 @@ impl SharedAccount {
                 "token interest requires instance/condition/up/down identifiers".into(),
             ));
         }
-        let mut state = self.lock_state_for_persistence();
+        let mut state = self.lock_state();
         let Some(instance) = state.instances.get_mut(instance_id) else {
             return Err(ReservationError::UnknownInstance(instance_id.into()));
         };
@@ -10516,8 +10618,36 @@ impl SharedAccount {
         // Never redistribute an already-seeded ledger here. Live startup
         // registers every configured instance before the first fetch; a scope
         // added later must not rewrite cash, PnL, or trade-owned inventory.
-        self.schedule_persist(&state);
+        self.persist_token_interest_changes(&state, &[(instance_id.to_owned(), condition_id.to_owned())]);
         Ok(())
+    }
+
+    fn persist_token_interest_changes(&self, state: &SharedAccountState, keys: &[(String, String)]) {
+        if self.persistence.is_none() {
+            return;
+        }
+        let changes = (|| -> Result<Vec<PersistenceWalChange>, String> {
+            let mut changes = Vec::with_capacity(keys.len());
+            for (instance_id, condition_id) in keys {
+                let path = vec![
+                    "instances".into(),
+                    instance_id.clone(),
+                    "token_interests".into(),
+                    condition_id.clone(),
+                ];
+                if let Some(interest) = state
+                    .instances
+                    .get(instance_id)
+                    .and_then(|instance| instance.token_interests.get(condition_id))
+                {
+                    persistence_wal_set(&mut changes, path, interest)?;
+                } else {
+                    changes.push(PersistenceWalChange::Remove { path });
+                }
+            }
+            Ok(changes)
+        })();
+        self.schedule_typed_persist(state, changes);
     }
 
     /// Fallible account-owner snapshot for background callers. A busy owner is
@@ -10539,7 +10669,7 @@ impl SharedAccount {
                 Vec::new()
             });
         }
-        let mut state = self.lock_state_for_persistence();
+        let mut state = self.lock_state();
         let now_ms = wall_clock_ms();
         // Keep every owned historical token in the explicit ERC-1155 and
         // settlement-query scope until physical and virtual quantities both
@@ -10560,17 +10690,18 @@ impl SharedAccount {
                 .filter(|(_, qty)| **qty > EPS)
                 .map(|(token, _)| token.clone()),
         );
-        let mut pruned = false;
-        for instance in state.instances.values_mut() {
-            let before = instance.token_interests.len();
-            instance.token_interests.retain(|_, interest| {
-                interest
-                    .retire_after_ms
-                    .is_none_or(|deadline| deadline > now_ms)
-                    || owned_tokens_requiring_zero.contains(&interest.up_token_id)
-                    || owned_tokens_requiring_zero.contains(&interest.down_token_id)
-            });
-            pruned |= instance.token_interests.len() != before;
+        // Compute exact removals before mutable access; a read-only poll must
+        // not capture or serialize the historical order/trade ledger.
+        let removed: Vec<(String, String)> = state.instances.iter().flat_map(|(iid, instance)| {
+            let owned = &owned_tokens_requiring_zero;
+            instance.token_interests.iter().filter_map(move |(cid, interest)| {
+                (interest.retire_after_ms.is_some_and(|deadline| deadline <= now_ms)
+                    && !owned.contains(&interest.up_token_id) && !owned.contains(&interest.down_token_id))
+                    .then(|| (iid.clone(), cid.clone()))
+            })
+        }).collect();
+        for (iid, cid) in &removed {
+            state.instances.get_mut(iid).unwrap().token_interests.remove(cid);
         }
         let mut interests: Vec<TokenInterest> = state
             .instances
@@ -10642,10 +10773,10 @@ impl SharedAccount {
                 }
             }
         }
-        if pruned {
+        if !removed.is_empty() {
             self.binary_pairs_fast
                 .store(Arc::new(published_binary_pairs(&state)));
-            self.schedule_persist(&state);
+            self.persist_token_interest_changes(&state, &removed);
         }
         interests
     }
@@ -10737,7 +10868,7 @@ impl SharedAccount {
             }
             return;
         }
-        let mut state = self.lock_state_for_persistence();
+        let mut state = self.lock_state();
         let retired_interest = state
             .instances
             .get_mut(instance_id)
@@ -10755,7 +10886,7 @@ impl SharedAccount {
                 .unwrap()
                 .insert(condition_id.to_string(), interest);
         }
-        self.schedule_persist(&state);
+        self.persist_token_interest_changes(&state, &[(instance_id.to_owned(), condition_id.to_owned())]);
     }
 
     /// Idempotently retain one settled event's late-fill audit for an instance.
@@ -11634,7 +11765,7 @@ impl SharedAccount {
         self.economic_snapshot_fast
             .load()
             .physical_positions
-            .clone()
+            .as_ref().clone()
     }
 
     /// Persist the exchange fee curve for every outcome token in one event.
@@ -11689,12 +11820,38 @@ impl SharedAccount {
             ));
         }
         let token_set: HashSet<&str> = token_ids.iter().map(String::as_str).collect();
-        let mut state = self.lock_state_for_persistence();
         let next_config = TokenFeeConfig {
             rate,
             exponent,
             settlement,
         };
+        if self.account_lifecycle_lane_bound.load(Ordering::Acquire) {
+            // The ordinary five-minute market registration has no executions
+            // for these tokens. There is no provenance to freeze or fee to
+            // retry: publish metadata and transfer only these keys. In
+            // particular, never clone/re-publish the entire lifecycle here.
+            let no_executions = self
+                .virtual_accounts
+                .read()
+                .unwrap()
+                .values()
+                .all(|account| {
+                    !self
+                        .lifecycle(account)
+                        .trades
+                        .values()
+                        .any(|trade| token_set.contains(trade.ownership.token_id.as_str()))
+                });
+            if no_executions {
+                return self.register_unused_token_fee_config(token_ids, next_config);
+            }
+        }
+        let mut state = self.lock_state_for_persistence();
+        if self.account_lifecycle_lane_bound.load(Ordering::Acquire) {
+            // A prior typed registry message can still be queued on the cold
+            // mirror. The lifecycle publication is authoritative for revisions.
+            state.token_fee_configs = self.token_fee_configs_fast.load().as_ref().clone();
+        }
         // Freeze legacy rows against the prior registry before replacing it.
         // This uses the existing cold owner transaction; no extra live lock or
         // hot-path lookup is introduced. Pending rows keep their execution's
@@ -11706,13 +11863,10 @@ impl SharedAccount {
                 ..
             } = &mut *state;
             for trade in trades.values_mut() {
-                if token_set.contains(trade.ownership.token_id.as_str())
-                    && trade.fee_config.is_none()
-                {
-                    if let Some(config) = fee_config_for_trade(
-                        trade,
-                        token_fee_configs.get(&trade.ownership.token_id),
-                    ) {
+                if token_set.contains(trade.ownership.token_id.as_str()) && trade.fee_config.is_none() {
+                    if let Some(config) =
+                        fee_config_for_trade(trade, token_fee_configs.get(&trade.ownership.token_id))
+                    {
                         trade.fee_settlement = Some(config.settlement);
                         trade.fee_config = Some(config);
                     }
@@ -11739,10 +11893,89 @@ impl SharedAccount {
             })
             .collect();
         recompute_reconciliation(&mut state, "token fee curve registration/revision");
+        self.token_fee_configs_fast
+            .store(Arc::new(state.token_fee_configs.clone()));
         self.schedule_persist(&state);
+        self.publish_lifecycle_mirror(|watermark| LifecycleMirrorDelta::FeeConfig {
+            watermark,
+            token_ids: token_ids.to_vec(),
+            config: next_config,
+        });
         drop(state);
         for (trade_key, status, is_maker) in retry {
             let _ = self.apply_configured_trade_fee(&trade_key, status, is_maker);
+        }
+        Ok(())
+    }
+
+    /// Lifecycle-owned metadata update; bounded mirror/WAL lanes preserve the
+    /// same generation ordering as subsequent executions. Overflow keeps the
+    /// account closed and is never acknowledged as a usable registration.
+    fn register_unused_token_fee_config(
+        &self,
+        token_ids: &[String],
+        config: TokenFeeConfig,
+    ) -> Result<(), ReservationError> {
+        if self
+            .lifecycle_mirror_incident_active
+            .load(Ordering::Acquire)
+            || self
+                .persistence
+                .as_ref()
+                .and_then(AccountPersistence::last_error)
+                .is_some()
+        {
+            return Err(ReservationError::PersistenceUnavailable(
+                "fee registry mirror/WAL unavailable".into(),
+            ));
+        }
+        let current = self.token_fee_configs_fast.load();
+        if token_ids
+            .iter()
+            .all(|token| current.get(token) == Some(&config))
+        {
+            return Ok(());
+        }
+        drop(current);
+        let mut changes = Vec::with_capacity(token_ids.len());
+        if self.persistence.is_some() {
+            for token in token_ids {
+                persistence_wal_set(
+                    &mut changes,
+                    vec!["token_fee_configs".into(), token.clone()],
+                    &config,
+                )
+                .map_err(ReservationError::PersistenceUnavailable)?;
+            }
+        }
+        // Concurrent cold GC removes exact retired keys using RCU as well.
+        self.token_fee_configs_fast.rcu(|current| {
+            let mut next = (**current).clone();
+            for token in token_ids {
+                next.insert(token.clone(), config);
+            }
+            Arc::new(next)
+        });
+        self.publish_lifecycle_mirror(|watermark| LifecycleMirrorDelta::FeeConfig {
+            watermark,
+            token_ids: token_ids.to_vec(),
+            config,
+        });
+        if let Some(persistence) = &self.persistence {
+            persistence.schedule_delta(changes);
+        }
+        if self
+            .lifecycle_mirror_incident_active
+            .load(Ordering::Acquire)
+            || self
+                .persistence
+                .as_ref()
+                .and_then(AccountPersistence::last_error)
+                .is_some()
+        {
+            return Err(ReservationError::PersistenceUnavailable(
+                "fee registry mirror/WAL unavailable; admission remains closed".into(),
+            ));
         }
         Ok(())
     }
@@ -12873,6 +13106,7 @@ impl SharedAccount {
             });
         }
         AccountMonitoringSnapshot {
+            reconciliation: AccountReconciliationSnapshot::from_state(&state),
             account_id: self.account_id.clone(),
             seeded: state.seeded,
             physical_cash: state.physical_cash,
@@ -13033,12 +13267,13 @@ impl SharedAccount {
         // Counts are owner-published atomics and may lag by at most one owner
         // mutation; they are observability-only.
         AccountMonitoringSnapshot {
+            reconciliation: state.reconciliation.clone(),
             account_id: self.account_id.clone(),
             seeded: self.seeded_fast.load(Ordering::Acquire),
             physical_cash: state.physical_cash,
             virtual_cash,
             unallocated_cash: state.unallocated_cash,
-            physical_positions: state.physical_positions.clone(),
+            physical_positions: state.physical_positions.as_ref().clone(),
             virtual_positions,
             unallocated_positions: state.unallocated_positions.clone(),
             provisional_position_owners: state.provisional_position_owners.clone(),
@@ -21171,6 +21406,13 @@ fn pending_physical_deltas_from_trades<'a>(
     pending
 }
 
+fn nonzero_position_tokens(positions: &HashMap<String, f64>) -> impl Iterator<Item = &str> {
+    positions
+        .iter()
+        .filter(|(_, quantity)| **quantity != 0.0)
+        .map(|(token, _)| token.as_str())
+}
+
 fn recompute_reconciliation(state: &mut SharedAccountState, deficit_context: &str) {
     let pending = pending_physical_deltas_from_trades(state.trades.values());
     recompute_reconciliation_with_pending(state, deficit_context, &pending);
@@ -21195,11 +21437,11 @@ fn recompute_reconciliation_with_pending(
     // healthy in-flight settlement does not look like missing cash/shares.
     state.unallocated_cash = state.physical_cash - (virtual_cash - pending.cash);
     state.unallocated_positions.clear();
-    let mut all_tokens: HashSet<&str> = state.physical_positions.keys().map(String::as_str).collect();
-    all_tokens.extend(
-        state.instances.values()
-            .flat_map(|instance| instance.positions.keys().map(String::as_str)),
-    );
+    // Zero historical entries contribute nothing. Avoid hashing them on every
+    // mirror wake, while retaining every nonzero (including nonfinite) leg.
+    let mut all_tokens: HashSet<&str> = nonzero_position_tokens(&state.physical_positions).collect();
+    all_tokens.extend(state.instances.values().flat_map(|instance| nonzero_position_tokens(&instance.positions)));
+    all_tokens.extend(nonzero_position_tokens(&pending.positions));
     for token in all_tokens {
         let physical = state.physical_positions.get(token).copied().unwrap_or(0.0);
         let virtual_qty: f64 = state
@@ -34249,3 +34491,7 @@ mod execution_pair_tests;
 #[cfg(test)]
 #[path = "control_snapshot_reuse_tests.rs"]
 mod control_snapshot_reuse_tests;
+
+#[cfg(test)]
+#[path = "tail_snapshot_tests.rs"]
+mod tail_snapshot_tests;

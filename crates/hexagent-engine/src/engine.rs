@@ -1018,6 +1018,7 @@ fn spawn_polymarket_feed_worker(
             let liveness = epoch.liveness;
             let generation = epoch.generation;
             let force_clob_runtime_fallback = epoch.force_clob_runtime_fallback;
+            hexagent_runtime::latency::prepare_market_queue_stages();
             let still_current = || worker_slot.is_current(generation);
             liveness.set_phase(PolymarketFeedPhase::Starting);
             liveness.heartbeat_feed_loop();
@@ -8923,6 +8924,7 @@ impl Engine {
                 let _ = market_queue_monotonic_ns();
                 crate::latency::prepare_polymarket_private_stages();
                 crate::latency::prepare_thread_stages(&["market.receive_to_router"]);
+                hexagent_runtime::latency::prepare_market_queue_stages();
                 market_rx.begin_poll_measurement();
                 info!(
                     "[Strategy] Per-instance routing active: {} instances {:?}, {} routed symbols",
@@ -10471,6 +10473,7 @@ impl Engine {
                         liveness.set_phase(PolymarketFeedPhase::Starting);
                         liveness.heartbeat_feed_loop();
                     }
+                    hexagent_runtime::latency::prepare_market_queue_stages();
                     let exchange = match cfg.name.as_str() {
                         "binance" => Exchange::Binance,
                         "bybit" => Exchange::Bybit,
@@ -12789,15 +12792,27 @@ impl Engine {
                                                 lock("lifecycle", &snapshot.reservation_lifecycle_lock),
                                             );
                                         }
+                                        info!(
+                                            "[account_snapshot_basis] account={} generation={} age_ms={} pending_physical_cash={:.6} pending_physical_tokens={} reconciliation_cash_delta={:.9} reconciliation_position_delta_abs={:.9} live_virtual_cash={:.6} live_vs_snapshot_cash={:.6} mirror_lag={}",
+                                            snapshot.account_id, snapshot.reconciliation.ledger_generation,
+                                            now_ns().saturating_div(1_000_000).saturating_sub(snapshot.reconciliation.captured_at_ms),
+                                            snapshot.reconciliation.pending_physical_cash,
+                                            snapshot.reconciliation.pending_physical_positions.len(),
+                                            snapshot.reconciliation.cash_delta,
+                                            snapshot.reconciliation.position_delta_abs,
+                                            snapshot.virtual_cash,
+                                            snapshot.virtual_cash - snapshot.reconciliation.virtual_cash,
+                                            snapshot.lifecycle_mirror_published_watermark.saturating_sub(snapshot.lifecycle_mirror_applied_watermark),
+                                        );
                                         let log_account = || {
                                             let physical = account_metric_position_summary(&snapshot.physical_positions);
-                                            let virtual_total = account_metric_position_summary(&snapshot.virtual_positions);
+                                            let virtual_total = account_metric_position_summary(&snapshot.reconciliation.virtual_positions);
                                             let unallocated = account_metric_position_summary(&snapshot.unallocated_positions);
                                             let reserved = account_metric_position_summary(&snapshot.reserved_positions);
                                             format!(
                                                 "physical_cash={:.6} virtual_cash={:.6} unallocated_cash={:.6} reserved_cash={:.6} pos_physical(count/abs/invalid)={}/{:.4}/{} pos_virtual={}/{:.4}/{} pos_unallocated={}/{:.4}/{} pos_reserved={}/{:.4}/{} uncertain={} uncertain_since_ms={:?} reason={:?} recovery_pending_orders={} routine_cancel_audits={} retired_trade_tombstones={} verified_trade_replay_recoveries={} gap_pages(last/max/total)={}/{}/{} maintenance_wait_ms(last/max/jobs)={}/{}/{} account_lock_wait_us(last/max)={}/{} account_lock_hold_us(last/max/count)={}/{}/{} persistence={:?} persistence_error={:?} persistence_write_us(last/max/count)={}/{}/{} persistence_flush_us(last/max/count)={}/{}/{} persistence_generation(scheduled/completed/lag)={}/{}/{} persistence_pending_jobs(current/high)={}/{} settled_gc(candidate/inflight)={}/{} settled_gc_request_queue(depth/high/overflow)={}/{}/{} settled_gc_completion_queue(depth/high/overflow)={}/{}/{} settled_gc_certificates={}",
                                                 snapshot.physical_cash,
-                                                snapshot.virtual_cash,
+                                                snapshot.reconciliation.virtual_cash,
                                                 snapshot.unallocated_cash,
                                                 snapshot.reserved_cash,
                                                 physical.0, physical.1, physical.2,

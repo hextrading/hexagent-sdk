@@ -12,10 +12,26 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub use quanta::{Clock, Instant};
 
-const MAX_STAGES: usize = 256;
+// Include recovery-only and queue breakdown stages without late registration
+// drops. Fixed 2 MiB per recorder, allocated before worker readiness.
+const MAX_STAGES: usize = 512;
 const SUB_BUCKETS: usize = 8;
 const BUCKETS: usize = 64 * SUB_BUCKETS;
 static DROPPED_STAGE_REGISTRATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// CPU time of the calling worker, for separating work from scheduling waits.
+/// Returns zero where unavailable; callers must not label that wall time as CPU.
+pub fn thread_cpu_ns() -> u64 {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut clock: libc::timespec = std::mem::zeroed();
+        if libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut clock) == 0 {
+            return (clock.tv_sec as u64).saturating_mul(1_000_000_000)
+                .saturating_add(clock.tv_nsec as u64);
+        }
+    }
+    0
+}
 
 /// One process-wide mapping from static stage names to dense numeric IDs.
 /// It is touched only on the first observation of a stage by each thread.
@@ -207,6 +223,17 @@ pub fn prepare_thread_stages(stages: &[&'static str]) {
     });
 }
 
+/// Fixed queue stages: parser-to-adapter and adapter-to-router use message
+/// enqueue timestamps from the same process monotonic clock, never wall time.
+pub fn prepare_market_queue_stages() {
+    prepare_thread_stages(&[
+        "market.adapter_queue.binance", "market.adapter_queue.coinbase",
+        "market.adapter_queue.polymarket", "market.adapter_queue.other",
+        "market.root_queue.binance", "market.root_queue.coinbase",
+        "market.root_queue.polymarket", "market.root_queue.other",
+    ]);
+}
+
 /// Prewarm every currently-declared Polymarket order-dispatch stage on an
 /// execution or order-runtime thread. Keep this startup-only manifest next to
 /// the recorder so new critical stages have one reviewable registration site.
@@ -257,6 +284,10 @@ pub fn prepare_polymarket_private_stages() {
         "polymarket.user.event_parse",
         "polymarket.user.fast_route_to_account_owner",
         "polymarket.user.frame_total",
+        "polymarket.user.json_parse",
+        "polymarket.user.json_parse_cpu",
+        "polymarket.user.json_parse_off_cpu",
+        "polymarket.user.apply_enqueue",
         "polymarket.user.health_apply",
         "polymarket.user.terminal_high_water",
         "polymarket.user.trade_replay_anchor_apply",

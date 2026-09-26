@@ -53,12 +53,38 @@ fn replaceable_market_event(event: &MarketEvent) -> bool {
 /// Every try operation has a fixed attempt budget, including preempted peers.
 #[derive(Clone)]
 pub struct PublicMarketPublisher {
-    ordered: Arc<hexagent_runtime::try_queue::TryQueue<MarketEvent>>,
-    latest: Arc<hexagent_runtime::try_queue::TryQueue<MarketEvent>>,
+    ordered: Arc<hexagent_runtime::try_queue::TryQueue<QueuedMarketEvent>>,
+    latest: Arc<hexagent_runtime::try_queue::TryQueue<QueuedMarketEvent>>,
     progress: Arc<PublicMarketProgress>,
 }
 
+struct QueuedMarketEvent {
+    event: MarketEvent,
+    enqueued_ns: u64,
+}
+
+fn queue_stage(event: &MarketEvent, adapter: bool) -> &'static str {
+    let venue = match event {
+        MarketEvent::OrderBook(v) => Some(v.exchange),
+        MarketEvent::Quote(v) => Some(v.exchange),
+        MarketEvent::Trade(v) => Some(v.exchange),
+        MarketEvent::AssetCtx(v) => Some(v.exchange),
+        _ => None,
+    };
+    match (adapter, venue) {
+        (true, Some(Exchange::Binance)) => "market.adapter_queue.binance",
+        (true, Some(Exchange::Coinbase)) => "market.adapter_queue.coinbase",
+        (true, Some(Exchange::Polymarket)) => "market.adapter_queue.polymarket",
+        (false, Some(Exchange::Binance)) => "market.root_queue.binance",
+        (false, Some(Exchange::Coinbase)) => "market.root_queue.coinbase",
+        (false, Some(Exchange::Polymarket)) => "market.root_queue.polymarket",
+        (true, _) => "market.adapter_queue.other",
+        (false, _) => "market.root_queue.other",
+    }
+}
+
 struct PublicMarketProgress {
+    adapter: bool,
     alive: AtomicBool,
     origin: Instant,
     contention_drops: AtomicU64,
@@ -102,8 +128,8 @@ pub struct PublicMarketConsumerProgress {
 /// This also avoids AtomicCell<Instant> timer channels, whose fallback locks
 /// can themselves suffer FIFO priority inversion. Queue stamps transfer data.
 pub struct PublicMarketReceiver {
-    ordered: Arc<hexagent_runtime::try_queue::TryQueue<MarketEvent>>,
-    latest: Arc<hexagent_runtime::try_queue::TryQueue<MarketEvent>>,
+    ordered: Arc<hexagent_runtime::try_queue::TryQueue<QueuedMarketEvent>>,
+    latest: Arc<hexagent_runtime::try_queue::TryQueue<QueuedMarketEvent>>,
     progress: Arc<PublicMarketProgress>,
     ordered_burst: AtomicU8,
 }
@@ -159,24 +185,30 @@ impl PublicMarketReceiver {
         if self.ordered_burst.load(Ordering::Relaxed) >= PUBLIC_MARKET_ORDERED_BURST {
             if let Some(event) = self.latest.try_pop() {
                 self.ordered_burst.store(0, Ordering::Relaxed);
-                return Ok(event);
+                return Ok(self.finish_receive(event));
             }
         }
         if let Some(event) = self.ordered.try_pop() {
             if self.ordered_burst.load(Ordering::Relaxed) < PUBLIC_MARKET_ORDERED_BURST {
                 self.ordered_burst.fetch_add(1, Ordering::Relaxed);
             }
-            return Ok(event);
+            return Ok(self.finish_receive(event));
         }
         if let Some(event) = self.latest.try_pop() {
             self.ordered_burst.store(0, Ordering::Relaxed);
-            return Ok(event);
+            return Ok(self.finish_receive(event));
         }
         if Arc::strong_count(&self.ordered) == 1 && self.is_empty() {
             Err(crossbeam_channel::TryRecvError::Disconnected)
         } else {
             Err(crossbeam_channel::TryRecvError::Empty)
         }
+    }
+
+    fn finish_receive(&self, queued: QueuedMarketEvent) -> MarketEvent {
+        let age = crate::types::monotonic_now_ns().saturating_sub(queued.enqueued_ns);
+        hexagent_runtime::latency::record_ns(queue_stage(&queued.event, self.progress.adapter), age);
+        queued.event
     }
 
     fn observe_poll(&self, now_ns: u64) {
@@ -242,10 +274,15 @@ impl Drop for PublicMarketReceiver {
 }
 
 pub fn market_event_channel(capacity: usize) -> (PublicMarketPublisher, PublicMarketReceiver) {
+    market_event_channel_with_role(capacity, false)
+}
+
+fn market_event_channel_with_role(capacity: usize, adapter: bool) -> (PublicMarketPublisher, PublicMarketReceiver) {
     let capacity = capacity.max(1);
     let ordered = Arc::new(hexagent_runtime::try_queue::TryQueue::new(capacity));
     let latest = Arc::new(hexagent_runtime::try_queue::TryQueue::new(capacity));
     let progress = Arc::new(PublicMarketProgress {
+        adapter,
         alive: AtomicBool::new(true),
         origin: Instant::now(),
         contention_drops: AtomicU64::new(0),
@@ -275,7 +312,7 @@ pub fn market_event_channel(capacity: usize) -> (PublicMarketPublisher, PublicMa
 }
 
 pub(crate) fn public_market_channel() -> (PublicMarketPublisher, PublicMarketReceiver) {
-    market_event_channel(PUBLIC_MARKET_ADAPTER_LANE_CAPACITY)
+    market_event_channel_with_role(PUBLIC_MARKET_ADAPTER_LANE_CAPACITY, true)
 }
 
 impl PublicMarketPublisher {
@@ -306,20 +343,21 @@ impl PublicMarketPublisher {
     /// waiting for space, with a deadline. Never used by a quote/parser loop.
     pub fn send_ordered_timeout(
         &self,
-        mut event: MarketEvent,
+        event: MarketEvent,
         timeout: Duration,
     ) -> std::result::Result<(), crossbeam_channel::SendTimeoutError<MarketEvent>> {
+        let mut event = QueuedMarketEvent { event, enqueued_ns: crate::types::monotonic_now_ns() };
         let deadline = Instant::now() + timeout;
         loop {
             if !self.progress.alive.load(Ordering::Acquire) {
-                return Err(crossbeam_channel::SendTimeoutError::Disconnected(event));
+                return Err(crossbeam_channel::SendTimeoutError::Disconnected(event.event));
             }
             match self.ordered.try_push(event) {
                 Ok(()) => return Ok(()),
                 Err(retained) => event = retained,
             }
             if Instant::now() >= deadline {
-                return Err(crossbeam_channel::SendTimeoutError::Timeout(event));
+                return Err(crossbeam_channel::SendTimeoutError::Timeout(event.event));
             }
             std::thread::sleep(Duration::from_micros(50));
         }
@@ -489,7 +527,9 @@ impl MarketEventPublisher for PublicMarketPublisher {
         if !self.progress.alive.load(Ordering::Acquire) {
             return Err(crossbeam_channel::SendError(event));
         }
-        if replaceable_market_event(&event) {
+        let replaceable = replaceable_market_event(&event);
+        let event = QueuedMarketEvent { event, enqueued_ns: crate::types::monotonic_now_ns() };
+        if replaceable {
             if let Err(event) = self.latest.try_push(event) {
                 if self.latest.try_pop().is_some() {
                     PUBLIC_MARKET_OVERFLOW_REPLACEMENTS.fetch_add(1, Ordering::Relaxed);
@@ -511,7 +551,7 @@ impl MarketEventPublisher for PublicMarketPublisher {
                 Err(event) => retained = event,
             }
         }
-        Err(crossbeam_channel::SendError(retained))
+        Err(crossbeam_channel::SendError(retained.event))
     }
 }
 
