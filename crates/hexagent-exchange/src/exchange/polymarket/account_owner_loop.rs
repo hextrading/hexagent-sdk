@@ -109,6 +109,7 @@ pub(super) fn run(
     crate::latency::prepare_observation_stages(
         hexagent_account::account::shared_account::PREPARED_ORDER_OBSERVATION_STAGES,
     );
+    crate::latency::prepare_observation_stages(publication_observation::STAGES);
     crate::latency::prepare_thread_stages(&[
         "polymarket.account.owner_command",
         "polymarket.account.owner_execution",

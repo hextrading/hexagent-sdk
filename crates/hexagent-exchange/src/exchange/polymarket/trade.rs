@@ -4,6 +4,7 @@
 //! Polymarket CLOB REST API, with EIP-712 order signing and HMAC request auth.
 
 mod http_phase_audit;
+mod publication_observation;
 use http_phase_audit::{HttpPhaseAudit, HttpPhaseContext, HttpPhaseRecord};
 
 use std::collections::hash_map::DefaultHasher;
@@ -1813,7 +1814,28 @@ pub(crate) struct OrderLifecycleTrace {
 /// hundreds of owned strings per identity update on the lifecycle owner.
 const EXECUTION_READ_SHARDS: usize = 64;
 const EXECUTION_READ_LEAVES: usize = 64;
-type ExecutionReadShard<V> = [Arc<HashMap<String, V>>; EXECUTION_READ_LEAVES];
+type ExecutionReadShard<V> = [Arc<HashSet<ExecutionReadEntry<V>>>; EXECUTION_READ_LEAVES];
+
+/// Share the complete immutable row, including its key bytes. Copying a leaf
+/// must not allocate or copy every historical String/TrackedOrder in it.
+#[derive(Debug)]
+struct ExecutionReadEntry<V>(Arc<(String, V)>);
+
+impl<V> Clone for ExecutionReadEntry<V> {
+    fn clone(&self) -> Self { Self(Arc::clone(&self.0)) }
+}
+impl<V> std::borrow::Borrow<str> for ExecutionReadEntry<V> {
+    fn borrow(&self) -> &str { &self.0.0 }
+}
+impl<V> std::hash::Hash for ExecutionReadEntry<V> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(self.0.0.as_str(), state);
+    }
+}
+impl<V> PartialEq for ExecutionReadEntry<V> {
+    fn eq(&self, other: &Self) -> bool { self.0.0 == other.0.0 }
+}
+impl<V> Eq for ExecutionReadEntry<V> {}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionReadMap<V> {
@@ -1825,7 +1847,7 @@ impl<V> Default for ExecutionReadMap<V> {
     fn default() -> Self {
         Self {
             shards: Arc::new(std::array::from_fn(|_| {
-                let empty = Arc::new(HashMap::new());
+                let empty = Arc::new(HashSet::new());
                 Arc::new(std::array::from_fn(|_| Arc::clone(&empty)))
             })),
             len: 0,
@@ -1858,10 +1880,11 @@ impl<V> ExecutionReadMap<V> {
 
     fn from_hash_map(values: HashMap<String, V>) -> Self {
         let len = values.len();
-        let mut shards: [[HashMap<String, V>; EXECUTION_READ_LEAVES]; EXECUTION_READ_SHARDS] =
-            std::array::from_fn(|_| std::array::from_fn(|_| HashMap::new()));
+        let mut shards: [[HashSet<ExecutionReadEntry<V>>; EXECUTION_READ_LEAVES]; EXECUTION_READ_SHARDS] =
+            std::array::from_fn(|_| std::array::from_fn(|_| HashSet::new()));
         for (key, value) in values {
-            shards[Self::shard_index(&key)][Self::leaf_index(&key)].insert(key, value);
+            shards[Self::shard_index(&key)][Self::leaf_index(&key)]
+                .insert(ExecutionReadEntry(Arc::new((key, value))));
         }
         Self {
             shards: Arc::new(shards.map(|leaves| Arc::new(leaves.map(Arc::new)))),
@@ -1872,7 +1895,8 @@ impl<V> ExecutionReadMap<V> {
     #[inline]
     pub(crate) fn get(&self, key: &str) -> Option<&V> {
         let hash = Self::hash(key);
-        self.shards[hash % EXECUTION_READ_SHARDS][(hash / EXECUTION_READ_SHARDS) % EXECUTION_READ_LEAVES].get(key)
+        self.shards[hash % EXECUTION_READ_SHARDS][(hash / EXECUTION_READ_SHARDS) % EXECUTION_READ_LEAVES]
+            .get(key).map(|row| &row.0.1)
     }
 
     #[inline]
@@ -1887,6 +1911,7 @@ impl<V> ExecutionReadMap<V> {
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &V)> {
         self.shards.iter().flat_map(|shard| shard.iter()).flat_map(|leaf| leaf.iter())
+            .map(|row| (&row.0.0, &row.0.1))
     }
 
     pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
@@ -1900,11 +1925,13 @@ impl<V> ExecutionReadMap<V> {
 
 impl<V: Clone> ExecutionReadMap<V> {
     fn with_insert(&self, key: String, value: V) -> Self {
-        let index = Self::shard_index(&key);
-        let leaf = Self::leaf_index(&key);
+        let hash = Self::hash(&key);
+        let index = hash % EXECUTION_READ_SHARDS;
+        let leaf = (hash / EXECUTION_READ_SHARDS) % EXECUTION_READ_LEAVES;
         let mut shards = (*self.shards).clone();
         let mut shard = (*shards[index]).clone();
-        let inserted = Arc::make_mut(&mut shard[leaf]).insert(key, value).is_none();
+        let inserted = Arc::make_mut(&mut shard[leaf])
+            .replace(ExecutionReadEntry(Arc::new((key, value)))).is_none();
         shards[index] = Arc::new(shard);
         Self {
             shards: Arc::new(shards),
@@ -1913,9 +1940,10 @@ impl<V: Clone> ExecutionReadMap<V> {
     }
 
     fn with_remove(&self, key: &str) -> Self {
-        let index = Self::shard_index(key);
-        let leaf = Self::leaf_index(key);
-        if !self.shards[index][leaf].contains_key(key) {
+        let hash = Self::hash(key);
+        let index = hash % EXECUTION_READ_SHARDS;
+        let leaf = (hash / EXECUTION_READ_SHARDS) % EXECUTION_READ_LEAVES;
+        if !self.shards[index][leaf].contains(key) {
             return self.clone();
         }
         let mut shards = (*self.shards).clone();
@@ -1936,7 +1964,7 @@ impl<V: Clone> ExecutionReadMap<V> {
         for key in keys {
             let index = Self::shard_index(key);
             let leaf = Self::leaf_index(key);
-            if shards[index][leaf].contains_key(key) {
+            if shards[index][leaf].contains(key) {
                 Arc::make_mut(&mut Arc::make_mut(&mut shards[index])[leaf]).remove(key);
                 removed += 1;
             }
@@ -2026,7 +2054,12 @@ impl ExecutionStateOwner {
     }
 
     fn apply(&mut self, shared: &SharedState, command: ExecutionStateCommand) {
+        let mut observation = matches!(&command, ExecutionStateCommand::InstallIdentity { .. })
+            .then(publication_observation::Observation::new);
         let mut next = (*shared.execution_state.load_full()).clone();
+        if let Some(observation) = observation.as_mut() {
+            observation.mark(0);
+        }
         match command {
             ExecutionStateCommand::InstallIdentity {
                 client_order_id,
@@ -2037,9 +2070,15 @@ impl ExecutionStateOwner {
                     .coid_to_oid
                     .insert(client_order_id.clone(), exchange_order_id.clone());
                 let normalized = normalize_order_id(&exchange_order_id);
+                if let Some(observation) = observation.as_mut() {
+                    observation.mark(1);
+                }
                 next.coid_to_oid = next
                     .coid_to_oid
                     .with_insert(client_order_id.clone(), exchange_order_id);
+                if let Some(observation) = observation.as_mut() {
+                    observation.mark(2);
+                }
                 if let Some(previous) = previous {
                     let previous = normalize_order_id(&previous);
                     if previous != normalized {
@@ -2049,13 +2088,25 @@ impl ExecutionStateOwner {
                 }
                 self.oid_to_coid
                     .insert(normalized.clone(), client_order_id.clone());
+                if let Some(observation) = observation.as_mut() {
+                    observation.mark(3);
+                }
                 next.oid_to_coid = next
                     .oid_to_coid
                     .with_insert(normalized, client_order_id.clone());
+                if let Some(observation) = observation.as_mut() {
+                    observation.mark(4);
+                }
                 if !token.is_empty() {
                     self.coid_to_token
                         .insert(client_order_id.clone(), token.clone());
+                    if let Some(observation) = observation.as_mut() {
+                        observation.mark(5);
+                    }
                     next.coid_to_token = next.coid_to_token.with_insert(client_order_id, token);
+                }
+                if let Some(observation) = observation.as_mut() {
+                    observation.mark(6);
                 }
             }
             ExecutionStateCommand::TrackOpen {
@@ -2094,7 +2145,15 @@ impl ExecutionStateOwner {
                 return;
             }
         }
-        shared.execution_state.store(Arc::new(next));
+        let previous = shared.execution_state.swap(Arc::new(next));
+        if let Some(observation) = observation.as_mut() {
+            observation.mark(7);
+        }
+        drop(previous);
+        if let Some(mut observation) = observation {
+            observation.mark(8);
+            observation.finish();
+        }
     }
 
     // Exact previous full rebuild retained for focused before/after benchmarks.
