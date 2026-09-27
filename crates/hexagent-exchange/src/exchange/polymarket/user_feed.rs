@@ -1789,7 +1789,7 @@ impl PrivateRouteDedupe {
             PrivateRouteIdentity::TradeLifecycle { fingerprint, rank } => self
                 .ranks
                 .get(fingerprint)
-                .is_some_and(|existing| *existing >= 3 || *existing >= *rank),
+                .is_some_and(|existing| *existing >= *rank),
         }
     }
 
@@ -1799,7 +1799,7 @@ impl PrivateRouteDedupe {
                 if self
                     .ranks
                     .get(&fingerprint)
-                    .is_some_and(|existing| *existing >= 3 || *existing >= rank)
+                    .is_some_and(|existing| *existing >= rank)
                 {
                     return;
                 }
@@ -1855,7 +1855,7 @@ fn private_status(data: &serde_json::Value) -> (&str, OrderStatus, u8) {
     match normalized {
         "MATCHED" => (normalized, OrderStatus::PartiallyFilled, 1),
         "MINED" => (normalized, OrderStatus::PartiallyFilled, 2),
-        "CONFIRMED" => (normalized, OrderStatus::Filled, 3),
+        "CONFIRMED" => (normalized, OrderStatus::Filled, 5),
         "FAILED" => (normalized, OrderStatus::Failed, 4),
         _ => (normalized, OrderStatus::PartiallyFilled, 0),
     }
@@ -3478,8 +3478,8 @@ fn parse_user_event_validated(
             // transition (MATCHED → MINED → CONFIRMED/FAILED); each carries
             // the full trade object. Gap replay can repeat the same object,
             // so only an edge accepted by `update_trade` is forwarded.
-            // FAILED is terminal: the first edge is forwarded for inventory
-            // reversal; later FAILED or stale earlier states are dropped.
+            // FAILED reverses inventory once. A later CONFIRMED restores it;
+            // repeated failures and earlier stages remain deduplicated.
             //
             // Fee fields come from the server under `fee_bps` / `fee_rate_bps`;
             // we ignore them here because the strategy computes fee locally
@@ -6155,12 +6155,11 @@ mod tests {
         for _ in 1..118 {
             assert!(!record(&manager, "FAILED"));
         }
-        assert!(!record(&manager, "MATCHED"), "FAILED is terminal");
+        assert!(!record(&manager, "MATCHED"), "FAILED cannot regress");
         assert!(!record(&manager, "MINED"), "FAILED cannot regress");
-        assert!(
-            !record(&manager, "CONFIRMED"),
-            "FAILED cannot flip terminal"
-        );
+        assert!(record(&manager, "CONFIRMED"), "confirmed retry is authoritative");
+        assert!(!record(&manager, "CONFIRMED"));
+        assert!(!record(&manager, "FAILED"), "confirmed cash cannot be reversed");
     }
 
     #[test]

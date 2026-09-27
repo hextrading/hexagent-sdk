@@ -4070,10 +4070,11 @@ impl SharedState {
                 let _ = done.send(());
             }
             AccountLifecycleJob::RegisterLocalOrder { command, ownership } => {
+                let started = crate::latency::Instant::now();
                 if let Some(ownership) = ownership {
                     if self
                         .account_state
-                        .backfill_order_ownership(&ownership)
+                        .register_prepared_order(&ownership)
                         .is_none()
                     {
                         self.runtime_order_ownership.remove(&ownership.order_id);
@@ -4087,6 +4088,7 @@ impl SharedState {
                     }
                 }
                 execution.apply(self, command);
+                crate::latency::record("polymarket.account.owner_register_order", started);
             }
             AccountLifecycleJob::ExecutionState(command) => execution.apply(self, command),
             AccountLifecycleJob::RebindServerIdentity {
@@ -10002,6 +10004,14 @@ impl PolymarketTrade {
                     }
                     // Missing/ambiguous cancellation evidence never falls
                     // through to the legacy repeated-not-found release rule.
+                    // Null replicas used to poll GET/GET/DELETE at every
+                    // watchdog tick, occupying the same cold owner needed by
+                    // other orders' positive evidence. Bound each unresolved
+                    // order to one attempt per 500 ms without releasing risk.
+                    self.shared.placement_reconcile_next_retry_ns.insert(
+                        coid.clone(),
+                        now_ns().saturating_add(RECONCILE_BACKOFF_BASE_MS * 1_000_000),
+                    );
                     continue;
                 }
                 // A 425 from this GET is not a not-found answer. Keep this

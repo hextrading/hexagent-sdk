@@ -514,3 +514,43 @@ fn per_order_recovery_rejects_cross_instance_identity_before_http() {
     assert_eq!(trade.shared.account_state.order(&sibling.client_order_id).unwrap().reserved_quantity, 16.0);
     shutdown.request(); shutdown.finish(); trade.shared.join_background_workers();
 }
+
+#[test]
+fn ambiguous_null_placement_backs_off_without_releasing_or_polling_sibling() {
+    let shutdown = ShutdownToken::new();
+    let seeded = super::tests::shutdown_test_trade(shutdown.clone());
+    let trade = PolymarketTrade::from_shared(seeded.shared.clone(), "", "btc01");
+    let mut order = ownership(Side::Sell, "btc01-1789622848819", "0xmissing", "btc01");
+    order.status = OrderStatus::NewOrderTimeout;
+    trade.shared.install_runtime_order_id(&order.client_order_id, &order.order_id,
+        &order.token_id, Some(&order)).unwrap();
+    install(&trade.shared, &order);
+    let sibling = ownership(Side::Buy, "btc02-1789622848819", "0xsibling", "btc02");
+    install(&trade.shared, &sibling);
+    let (transport, requests) = super::super::rtt_probe::probe_http_lane(2);
+    trade.shared.bind_recovery_http_transport(transport);
+    let server = std::thread::spawn(move || {
+        for slot in [0, 1] {
+            let req = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(req.role, Role::Reconcile);
+            req.reply_for_test(Ok(serde_json::Value::Null), Some((Role::Reconcile, slot)));
+        }
+        let req = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(req.role, Role::Cancel);
+        req.reply_for_test(Ok(serde_json::json!({"canceled":[], "not_canceled":{
+            "0xmissing":"order can't be found - already canceled or matched"}})), Some((Role::Cancel, 0)));
+        requests
+    });
+    let pending = [(order.client_order_id.clone(), order.token_id.clone(), order.side,
+        order.price, Some(order.order_id.clone()))];
+    assert!(trade.reconcile_orphans_via_owners(&pending, &[], &[]).is_empty());
+    let requests = server.join().unwrap();
+    assert!(trade.shared.placement_reconcile_next_retry_ns.get(&order.client_order_id).unwrap() > now_ns());
+    assert!(trade.reconcile_orphans_via_owners(&pending, &[], &[]).is_empty());
+    assert!(requests.try_recv().is_err(), "retry before backoff must issue no HTTP work");
+    assert_eq!(trade.shared.account_state.order(&order.client_order_id).unwrap().reserved_quantity, 16.0);
+    assert_eq!(trade.shared.account_state.order(&sibling.client_order_id).unwrap().reserved_cash, 9.28);
+    shutdown.request();
+    shutdown.finish();
+    trade.shared.join_background_workers();
+}

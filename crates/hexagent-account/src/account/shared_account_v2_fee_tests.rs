@@ -93,7 +93,7 @@ fn v2_failed_reverses_original_cash_fee_after_metadata_revision() {
         replay(&account, "FAILED"),
         TradeTransitionResult::Applied(_)
     ));
-    for status in ["FAILED", "MATCHED", "CONFIRMED"] {
+    for status in ["FAILED", "MATCHED", "MINED"] {
         assert!(matches!(
             replay(&account, status),
             TradeTransitionResult::OwnedNoop(_)
@@ -102,6 +102,12 @@ fn v2_failed_reverses_original_cash_fee_after_metadata_revision() {
         close(owner.cash, 100.0);
         close(owner.positions["UP"], 20.0);
     }
+    assert!(matches!(replay(&account, "CONFIRMED"), TradeTransitionResult::Applied(_)));
+    let owner = account.instance_snapshot("owner").unwrap();
+    close(owner.cash, 100.0 - 11.9 - 0.12495);
+    close(owner.positions["UP"], 34.0);
+    assert!(matches!(replay(&account, "FAILED"), TradeTransitionResult::OwnedNoop(_)));
+    assert!(matches!(replay(&account, "CONFIRMED"), TradeTransitionResult::OwnedNoop(_)));
     let state = account.lock_state();
     close(state.trades["trade"].usdc_fee, 0.12495);
     close(state.trades["trade"].fee_config.unwrap().rate, 0.07);

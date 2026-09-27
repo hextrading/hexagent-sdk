@@ -2594,6 +2594,10 @@ impl VirtualPositionQuota {
 mod gc_index;
 use gc_index::TokenIndexedRows;
 
+#[path = "shared_account_failed_settlement.rs"]
+mod failed_settlement;
+pub use failed_settlement::FailedSettlementCashRepair;
+
 #[derive(Debug, Default)]
 struct VirtualLifecycle {
     orders: TokenIndexedRows<OrderOwnership>,
@@ -14610,6 +14614,71 @@ impl SharedAccount {
         Some(order)
     }
 
+    /// Consume a freshly prepared order on the lifecycle owner. Live dispatch
+    /// transfers this row through its existing bounded lifecycle mailbox.
+    /// Unlike historical backfill, a new identity adds exactly its own
+    /// reservation; it must not scan every retained order on each placement.
+    /// Off-owner calls fail closed instead of introducing a synchronous hop.
+    pub fn register_prepared_order(&self, ownership: &OrderOwnership) -> Option<OrderOwnership> {
+        if self.must_dispatch_lifecycle_to_owner()
+            || ownership.account_id != self.account_id
+            || ownership.client_order_id.is_empty()
+            || ownership.order_id.is_empty()
+            || ownership.token_id.is_empty()
+            || ownership.status != OrderStatus::Pending
+            || ownership.filled_quantity != 0.0
+            || ownership.terminal_matched_quantity.is_some()
+            || !ownership.terminal_trade_ids.is_empty()
+            || ownership.terminal_trade_ids_authoritative
+            || !ownership.quantity.is_finite() || ownership.quantity <= 0.0
+            || !ownership.price.is_finite() || ownership.price <= 0.0
+            || !ownership.reserved_cash.is_finite() || ownership.reserved_cash < 0.0
+            || !ownership.reserved_quantity.is_finite() || ownership.reserved_quantity < 0.0
+        {
+            return None;
+        }
+        let (cash, quantity) = desired_order_reservation(ownership);
+        if !cash.is_finite() || !quantity.is_finite()
+            || (cash - ownership.reserved_cash).abs() > EPS
+            || (quantity - ownership.reserved_quantity).abs() > EPS
+        {
+            return None;
+        }
+        let account = self.virtual_account(&ownership.instance_id)?;
+        let lifecycle = self.lifecycle_mut(&account);
+        let normalized = normalize_order_id(&ownership.order_id);
+        if let Some(existing) = lifecycle.orders.get(&ownership.client_order_id) {
+            // A private fill/terminal edge can overtake this registration.
+            // Accept only the same immutable identity, preserving its newer
+            // economics and status without reserving a second time.
+            return (existing.account_id == ownership.account_id
+                && existing.instance_id == ownership.instance_id
+                && normalize_order_id(&existing.order_id) == normalized
+                && existing.token_id == ownership.token_id
+                && existing.side == ownership.side
+                && existing.order_slot == ownership.order_slot
+                && existing.quantity == ownership.quantity
+                && existing.price == ownership.price
+                && existing.fee_rate_bps == ownership.fee_rate_bps
+                && existing.cash_fee_per_share == ownership.cash_fee_per_share)
+                .then(|| existing.clone());
+        }
+        // Existing routes without a row require explicit historical recovery,
+        // not fresh registration with potentially duplicated reservations.
+        if self.coid_routes.get(&ownership.client_order_id).is_some()
+            || self.oid_routes.get(&normalized).is_some()
+        {
+            return None;
+        }
+        lifecycle.orders.insert(ownership.client_order_id.clone(), ownership.clone());
+        account.adjust_reservation(&ownership.token_id, ownership.reserved_cash, ownership.reserved_quantity);
+        self.coid_routes.insert(ownership.client_order_id.clone(), ownership.instance_id.clone());
+        self.oid_routes.insert(normalized, ownership.instance_id.clone());
+        account.reservation_epoch.fetch_add(1, Ordering::Release);
+        self.schedule_virtual_lifecycle_persist(&account, lifecycle, &ownership.client_order_id);
+        Some(ownership.clone())
+    }
+
     /// Restore a missing instance lifecycle row from the complete ownership
     /// mirror captured at reservation publication. The operation is
     /// idempotent and raises reservation counters only to the conservative
@@ -16986,6 +17055,14 @@ impl SharedAccount {
         {
             return VirtualTradeAttempt::Fallback;
         }
+        // A failed fill for a settled token needs a cold, durable redemption
+        // correction. Never recreate negative inventory on the fast owner lane.
+        if existing.as_ref().is_some_and(|trade| trade.failed)
+            && normalized == "CONFIRMED"
+            && self.settled_token_values_fast.load().values.contains_key(token_id)
+        {
+            return VirtualTradeAttempt::Fallback;
+        }
         // GC publishes this membership before releasing the owner lifecycle
         // mutex. Recheck after taking that same mutex so a concurrent retire
         // cannot leave this call with a stale pre-GC route decision.
@@ -17000,10 +17077,11 @@ impl SharedAccount {
             let prior_rank = match applied.ownership.status.as_str() {
                 "MATCHED" => 1,
                 "MINED" => 2,
-                "CONFIRMED" | "FAILED" => 3,
+                "FAILED" => 3,
+                "CONFIRMED" => 4,
                 _ => 0,
             };
-            if applied.failed
+            if (applied.failed && normalized != "CONFIRMED")
                 || applied.ownership.status == "CONFIRMED"
                 || lifecycle_rank <= prior_rank
             {
@@ -17147,7 +17225,8 @@ impl SharedAccount {
         }
         let quantity_tolerance = 1e-8_f64.max(order.quantity.abs() * 1e-8);
         if fill_violates_limit(side, order.price, price, quantity)
-            || (existing.is_none()
+            || (existing.as_ref().is_none_or(|trade| !trade.booked)
+                && normalized != "FAILED"
                 && order.filled_quantity + quantity > order.quantity + quantity_tolerance)
         {
             return VirtualTradeAttempt::Fallback;
@@ -17535,7 +17614,8 @@ impl SharedAccount {
         let lifecycle_rank = match normalized.as_str() {
             "MATCHED" => 1,
             "MINED" => 2,
-            "CONFIRMED" | "FAILED" => 3,
+            "FAILED" => 3,
+            "CONFIRMED" => 4,
             _ => return None,
         };
         let coid_scope = self.coid_routes.get(client_order_id);
@@ -17657,10 +17737,11 @@ impl SharedAccount {
             let prior_rank = match applied.ownership.status.as_str() {
                 "MATCHED" => 1,
                 "MINED" => 2,
-                "CONFIRMED" | "FAILED" => 3,
+                "FAILED" => 3,
+                "CONFIRMED" => 4,
                 _ => 0,
             };
-            if applied.failed
+            if (applied.failed && normalized != "CONFIRMED")
                 || applied.ownership.status == "CONFIRMED"
                 || lifecycle_rank <= prior_rank
             {
@@ -17770,6 +17851,16 @@ impl SharedAccount {
                 });
                 if let Err(reason) = validation {
                     set_ownership_anomaly(&mut state, anomaly_key.clone(), reason);
+                    schedule_trade_persist(&state);
+                    return None;
+                }
+                if tombstone.ownership.status == "FAILED" && normalized == "CONFIRMED" {
+                    // Its inventory may already have been redeemed. Rebooking
+                    // here would create negative settled positions; require a
+                    // receipt-backed cash/settlement correction on the cold
+                    // owner instead of silently accepting the failed tombstone.
+                    set_ownership_anomaly(&mut state, anomaly_key.clone(),
+                        format!("confirmed_after_failed_retirement trade={trade_key}; authenticated settlement correction required"));
                     schedule_trade_persist(&state);
                     return None;
                 }
@@ -17892,7 +17983,8 @@ impl SharedAccount {
         }
         let violates_limit = fill_violates_limit(side, order.price, price, quantity);
         let quantity_tolerance = 1e-8_f64.max(order.quantity.abs() * 1e-8);
-        let exceeds_order_quantity = existing.is_none()
+        let exceeds_order_quantity = existing.as_ref().is_none_or(|trade| !trade.booked)
+            && normalized != "FAILED"
             && order.filled_quantity + quantity > order.quantity + quantity_tolerance;
         if violates_limit || exceeds_order_quantity {
             set_ownership_anomaly(
@@ -17906,6 +17998,39 @@ impl SharedAccount {
             schedule_trade_persist(&state);
             return None;
         }
+        // A zero-value token removed by a recorded platform redemption can
+        // have been burned in the virtual ledger while this fill was FAILED.
+        // Restore only that exact removed quantity when its CONFIRMED arrives.
+        // This rare cold path uses durable roots; it is never quote processing.
+        let settled_retry = existing.as_ref().is_some_and(|trade| trade.failed)
+            && normalized == "CONFIRMED"
+            && state.settled_token_values.contains_key(token_id);
+        let redeemed_retry_offset = if settled_retry {
+            let owned = state.instances.get(&instance_id)
+                .and_then(|instance| instance.positions.get(token_id)).copied().unwrap_or(0.0);
+            let physical = state.physical_positions.get(token_id).copied().unwrap_or(0.0);
+            let removed: f64 = state.external_adjustments.values()
+                .filter(|adjustment| adjustment.instance_id == instance_id
+                    && (adjustment.operation_id.starts_with("internal:platform_redeem:")
+                        || adjustment.operation_id.starts_with("internal:confirmed_failed_redeem:")))
+                .map(|adjustment| -adjustment.position_deltas.get(token_id).copied().unwrap_or(0.0))
+                .sum();
+            if side == Side::Buy || owned + EPS >= quantity {
+                // Outcome publication can precede the actual burn. Keep the
+                // ordinary fill while enough inventory is still present.
+                0.0
+            } else if state.settled_token_values.get(token_id) == Some(&0.0)
+                && side == Side::Sell && owned.abs() <= EPS && physical.abs() <= EPS
+                && removed + EPS >= quantity
+            {
+                quantity
+            } else {
+                set_ownership_anomaly(&mut state, anomaly_key.clone(),
+                    format!("confirmed_after_failed_settlement trade={trade_key}; settlement correction proof incomplete"));
+                schedule_trade_persist(&state);
+                return None;
+            }
+        } else { 0.0 };
         state.ownership_anomalies.remove(&anomaly_key);
         recompute_reconciliation(&mut state, "corrected trade ownership replay");
         let already_booked = existing.as_ref().map(|trade| trade.booked).unwrap_or(false);
@@ -18017,7 +18142,7 @@ impl SharedAccount {
             }
         }
         if is_failed {
-            // FAILED is terminal for this trade, not for the parent order.
+            // FAILED reverses this attempt without terminalizing the parent order.
             // Restore the worst-case residual reservation; normal order
             // lifecycle/cancel handling proves when the parent is off-book.
             let reservation_delta = if let Some(order) = state.orders.get_mut(&resolved_coid) {
@@ -18025,8 +18150,8 @@ impl SharedAccount {
                     order.filled_quantity = (order.filled_quantity - quantity).max(0.0);
                     // An authoritative cancellation's size_matched includes this
                     // trade while it is MATCHED. Once that trade reaches FAILED,
-                    // it is terminal and can never consume the cancelled parent
-                    // again, so remove it from the cancellation audit target.
+                    // temporarily remove it from the unaudited cancellation
+                    // target. A later CONFIRMED still restores its exact fill.
                     // Other, not-yet-delivered trade legs remain represented by
                     // the residual target and therefore keep their reservation.
                     if order.status == OrderStatus::Cancelled
@@ -18197,8 +18322,20 @@ impl SharedAccount {
         if should_book || should_reverse {
             advance_trade_ledger_generation(&mut state, trade_key);
         }
+        if redeemed_retry_offset > 0.0 {
+            *state.instances.get_mut(&ownership.instance_id).expect("owned instance")
+                .positions.entry(token_id.to_string()).or_insert(0.0) += redeemed_retry_offset;
+            record_internal_external_adjustment(&mut state,
+                &format!("confirmed_failed_redeem:{trade_key}"), &ownership.instance_id,
+                0.0, HashMap::from([(token_id.to_string(), redeemed_retry_offset)]));
+        }
         recompute_reconciliation(&mut state, "trade lifecycle transition");
-        schedule_trade_persist(&state);
+        if redeemed_retry_offset > 0.0 {
+            // Include the compensating redemption root atomically with the fill.
+            self.schedule_persist(&state);
+        } else {
+            schedule_trade_persist(&state);
+        }
         *persistence_required = true;
         let matched_size = state
             .orders
@@ -20356,7 +20493,8 @@ fn terminal_order_audit_complete_virtual(
         .try_fold(0.0, |covered, expected_id| {
             lifecycle
                 .trades
-                .values()
+                .rows_for_order(client_order_id)
+                .map(|(_, trade)| trade)
                 .find(|trade| {
                     trade.ownership.client_order_id == client_order_id
                         && terminal_trade_id_matches(&trade.ownership.trade_key, expected_id)
@@ -33620,6 +33758,217 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         );
         assert!(!account.is_uncertain());
         assert!(account.ownership_anomalies().is_empty());
+    }
+
+    #[test]
+    fn prepared_registration_is_incremental_isolated_and_does_not_revive_terminal_rows() {
+        let account = seeded_account();
+        let order = account.prepare_order_ownership("a", "fresh", "oid-fresh", "UP", Side::Buy, 10.0, 0.5, 0).unwrap();
+        let first = account.instance_snapshot("a").unwrap().reserved_cash;
+        let other = account.instance_snapshot("b").unwrap().reserved_cash;
+        assert_eq!(account.register_prepared_order(&order), Some(order.clone()));
+        assert_eq!(account.register_prepared_order(&order), Some(order.clone()));
+        assert_eq!(account.instance_snapshot("a").unwrap().reserved_cash, first + 5.0);
+        assert_eq!(account.instance_snapshot("b").unwrap().reserved_cash, other);
+        account.mark_order_status("fresh", OrderStatus::Rejected);
+        let terminal = account.order("fresh").unwrap();
+        assert_eq!(account.register_prepared_order(&order), Some(terminal));
+        let mut wrong = order.clone();
+        wrong.instance_id = "b".into();
+        assert!(account.register_prepared_order(&wrong).is_none());
+        wrong = order.clone(); wrong.quantity = 11.0;
+        assert!(account.register_prepared_order(&wrong).is_none());
+        wrong = order.clone(); wrong.reserved_cash = 0.0;
+        assert!(account.register_prepared_order(&wrong).is_none());
+        let virtual_account = account.virtual_account("a").unwrap();
+        account.lifecycle_mut(&virtual_account).orders.remove("fresh");
+        assert!(account.register_prepared_order(&order).is_none(), "route hole is recovery, not a new order");
+    }
+
+    fn failed_redeemed_fixture(account: &SharedAccount) {
+        account.register_instance("owner", 1.0);
+        account.register_token_interest("owner", "event", "WIN", "LOSE").unwrap();
+        account.apply_physical_snapshot(100.0, HashMap::from([("LOSE".into(), 2.0)])).unwrap();
+        account.reserve_order("owner", "sell", "sell-oid", "LOSE", Side::Sell, 2.0, 0.5, 0).unwrap();
+        for status in ["MATCHED", "FAILED"] {
+            assert!(matches!(account.apply_trade_transition_with_context("retry", status,
+                "sell", "sell-oid", "LOSE", Side::Sell, 2.0, 0.5, true, 100),
+                TradeTransitionResult::Applied(_)));
+        }
+        account.apply_authoritative_order_audit("sell", OrderStatus::Cancelled, &AuthoritativeOrderAudit {
+            original_size: Some("2".into()), size_matched: Some("2".into()),
+            associate_trades: vec!["retry".into()],
+        }).unwrap();
+        account.record_settled_token_values(&HashMap::from([("WIN".into(), 1.0), ("LOSE".into(), 0.0)]));
+        assert!(account.observe_platform_binary_redeem(101.0, &HashMap::new(),
+            &HashSet::from(["WIN".into(), "LOSE".into()])));
+        assert_eq!(account.instance_snapshot("owner").unwrap().positions["LOSE"], 0.0);
+    }
+
+    #[test]
+    fn failed_confirmation_after_zero_outcome_redeem_preserves_zero_inventory_and_replay() {
+        let account = SharedAccount::new("redeemed-retry");
+        failed_redeemed_fixture(&account);
+        for (status, delta) in [("CONFIRMED", 2.0), ("CONFIRMED", 0.0), ("FAILED", 0.0)] {
+            assert_eq!(account.apply_trade_transition_with_context("retry", status,
+                "sell", "sell-oid", "LOSE", Side::Sell, 2.0, 0.5, true, 100).fill_delta(), Some(delta));
+        }
+        let state = account.lock_state_for_persistence();
+        assert_eq!(state.instances["owner"].positions["LOSE"], 0.0);
+        assert_eq!(state.instances["owner"].cash, 101.0);
+        assert_eq!(state.physical_cash, 101.0);
+        validate_persisted_state("redeemed-retry", &state).unwrap();
+        let replayed = replay_account_economics(&state).unwrap();
+        assert_eq!(replayed.instances["owner"].positions["LOSE"], 0.0);
+        assert_eq!(replayed.instances["owner"].cash, 101.0);
+    }
+
+    #[test]
+    fn failed_confirmation_with_announced_outcome_before_burn_books_normally() {
+        let account = seeded_account();
+        account.reserve_order("a", "outcome-sell", "outcome-oid", "UP", Side::Sell, 2.0, 0.5, 0).unwrap();
+        let apply = |status| account.apply_trade_transition_with_context("outcome-retry", status,
+            "outcome-sell", "outcome-oid", "UP", Side::Sell, 2.0, 0.5, true, 100);
+        assert_eq!(apply("MATCHED").fill_delta(), Some(2.0));
+        assert_eq!(apply("FAILED").fill_delta(), Some(-2.0));
+        account.record_settled_token_values(&HashMap::from([("UP".into(), 1.0)]));
+        assert_eq!(apply("CONFIRMED").fill_delta(), Some(2.0));
+        assert_eq!(account.instance_snapshot("a").unwrap().positions["UP"], 8.0);
+        assert_eq!(account.instance_snapshot("a").unwrap().cash, 101.0);
+        assert_eq!(account.instance_snapshot("b").unwrap().positions["UP"], 30.0);
+    }
+
+    #[test]
+    fn retired_failed_receipt_cash_repair_is_atomic_idempotent_and_restart_safe() {
+        let _guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!("hexagent-failed-receipt-{}-{}.json", std::process::id(), wall_clock_ms()));
+        let account = SharedAccount::new_persistent("receipt-repair", &path).unwrap();
+        failed_redeemed_fixture(&account);
+        // Mirror the legacy GC result: failed trade compacted, parent audit retained.
+        let parent = account.order("sell").unwrap();
+        assert_eq!(account.prune_terminal_history(&HashSet::from(["LOSE".into()])), (1, 1));
+        assert!(account.backfill_order_ownership(&parent).is_some());
+        let proof = FailedSettlementCashRepair {
+            expected: account.trade_ownership("retry").unwrap(),
+            transaction_hash: format!("0x{}", "1".repeat(64)), cash_received: 1.0,
+            expected_physical_cash: 101.0, expected_instance_cash: 100.0,
+        };
+        for invalid in 0..4 {
+            let mut stale = proof.clone();
+            match invalid {
+                0 => stale.expected_instance_cash = 99.0,
+                1 => stale.expected.instance_id = "other".into(),
+                2 => stale.cash_received = 2.0,
+                _ => stale.expected.quantity = 3.0,
+            }
+            assert!(account.repair_failed_settlement_cash(&stale).is_err());
+            assert_eq!(account.instance_snapshot("owner").unwrap().cash, 100.0);
+            assert_eq!(account.trade_ownership("retry").unwrap().status, "FAILED");
+        }
+        assert!(account.repair_failed_settlement_cash(&proof).unwrap());
+        assert!(!account.repair_failed_settlement_cash(&proof).unwrap());
+        account.flush_persistence(Duration::from_secs(5)).unwrap();
+        drop(account);
+        let restored = SharedAccount::new_persistent("receipt-repair", &path).unwrap();
+        assert!(!restored.repair_failed_settlement_cash(&proof).unwrap());
+        assert_eq!(restored.trade_ownership("retry").unwrap().status, "CONFIRMED");
+        assert_eq!(restored.instance_snapshot("owner").unwrap().cash, 101.0);
+        assert_eq!(restored.instance_snapshot("owner").unwrap().positions["LOSE"], 0.0);
+        assert_eq!(restored.monitoring_snapshot().physical_cash, 101.0);
+        drop(restored);
+        remove_persistence_test_files(&path);
+    }
+
+    #[test]
+    fn failed_trade_can_confirm_once_without_reviving_stale_matched_or_refunding_confirmed_fees() {
+        let account = seeded_account();
+        account.reserve_order("a", "retry-settlement", "oid-retry", "UP", Side::Buy, 10.0, 0.5, 0).unwrap();
+        let apply = |status| account.apply_trade_transition_with_context(
+            "settlement-retry", status, "retry-settlement", "oid-retry", "UP", Side::Buy, 3.0, 0.5, true, 100);
+        for (status, delta) in [("MATCHED", 3.0), ("FAILED", -3.0), ("MATCHED", 0.0),
+            ("MINED", 0.0), ("FAILED", 0.0), ("CONFIRMED", 3.0), ("CONFIRMED", 0.0), ("FAILED", 0.0)] {
+            assert_eq!(apply(status).fill_delta(), Some(delta), "{status}");
+        }
+        let trade = account.trade_ownership("settlement-retry").unwrap();
+        assert_eq!(trade.status, "CONFIRMED");
+        assert_eq!(account.order("retry-settlement").unwrap().filled_quantity, 3.0);
+    }
+
+    #[test]
+    #[ignore = "focused release benchmark: prepared registration versus historical backfill"]
+    fn benchmark_prepared_order_registration() {
+        const HISTORY: usize = 26_500;
+        const SAMPLES: usize = 2_000;
+        let run = |incremental: bool| {
+            let account = seeded_account();
+            let virtual_account = account.virtual_account("a").unwrap();
+            let template = account.prepare_order_ownership("a", "history", "history-oid", "UP", Side::Buy, 1.0, 0.5, 0).unwrap();
+            for n in 0..HISTORY {
+                let mut row = template.clone(); row.client_order_id = format!("old-{n}");
+                row.order_id = format!("old-oid-{n}"); row.status = OrderStatus::Cancelled;
+                row.reserved_cash = 0.0;
+                account.lifecycle_mut(&virtual_account).orders.insert(row.client_order_id.clone(), row);
+            }
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for n in 0..SAMPLES {
+                let order = account.prepare_order_ownership("a", &format!("new-{n}"), &format!("new-oid-{n}"), "UP", Side::Buy, 1.0, 0.5, 0).unwrap();
+                let start = std::time::Instant::now();
+                let result = if incremental { account.register_prepared_order(&order) } else { account.backfill_order_ownership(&order) };
+                samples.push(start.elapsed().as_nanos() as u64);
+                assert!(result.is_some());
+            }
+            samples.sort_unstable();
+            [samples[SAMPLES/2], samples[SAMPLES*99/100], samples[SAMPLES*999/1000], *samples.last().unwrap()]
+        };
+        let before = run(false); let after = run(true);
+        eprintln!("prepared_registration ns N={SAMPLES} history={HISTORY} before(P50/P99/P999/max)={before:?} after={after:?}; synchronous owner turn, queue_depth=0 overflow=0; includes route/mirror publication, excludes row preparation");
+    }
+
+    #[test]
+    #[ignore = "focused release benchmark: terminal audit uses the existing order index"]
+    fn benchmark_indexed_terminal_audit() {
+        const SAMPLES: usize = 10_000;
+        const HISTORY: usize = 3_075;
+        let account = seeded_account();
+        account.reserve_order("a", "audited", "oid-audited", "UP", Side::Buy, 1.0, 0.5, 0).unwrap();
+        account.apply_trade_transition_with_context("audited-trade", "CONFIRMED", "audited", "oid-audited", "UP", Side::Buy, 1.0, 0.5, true, 100);
+        account.apply_authoritative_order_audit("audited", OrderStatus::Filled, &AuthoritativeOrderAudit {
+            original_size: Some("1".into()), size_matched: Some("1".into()), associate_trades: vec!["audited-trade".into()],
+        }).unwrap();
+        let virtual_account = account.virtual_account("a").unwrap();
+        let lifecycle = account.lifecycle_mut(&virtual_account);
+        let template = lifecycle.trades["audited-trade"].clone();
+        for n in 0..HISTORY {
+            let mut trade = template.clone();
+            trade.ownership.trade_key = format!("history-{n}");
+            trade.ownership.client_order_id = format!("history-order-{n}");
+            lifecycle.trades.insert(trade.ownership.trade_key.clone(), trade);
+        }
+        let run = |indexed| {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let start = std::time::Instant::now();
+                let complete = if indexed {
+                    terminal_order_audit_complete_virtual(std::hint::black_box(&lifecycle), "audited")
+                } else {
+                    let order = &lifecycle.orders["audited"];
+                    let covered = order.terminal_trade_ids.iter().try_fold(0.0, |covered, id| {
+                        std::hint::black_box(&lifecycle).trades.values().find(|trade|
+                            trade.ownership.client_order_id == "audited"
+                                && terminal_trade_id_matches(&trade.ownership.trade_key, id)
+                                && (trade.booked || trade.failed))
+                            .map(|trade| covered + trade.ownership.quantity)
+                    });
+                    covered.is_some_and(|covered| (covered - 1.0).abs() <= EPS)
+                };
+                std::hint::black_box(complete);
+                samples.push(start.elapsed().as_nanos() as u64);
+                assert!(complete);
+            }
+            samples.sort_unstable();
+            [samples[SAMPLES/2], samples[SAMPLES*99/100], samples[SAMPLES*999/1000], *samples.last().unwrap()]
+        };
+        eprintln!("terminal_audit ns N={SAMPLES} history={HISTORY} before(P50/P99/P999/max)={:?} after={:?}; owner-local coverage lookup only, queue_depth=0 overflow=0", run(false), run(true));
     }
 
     #[test]

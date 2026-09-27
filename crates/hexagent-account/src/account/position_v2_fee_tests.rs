@@ -51,8 +51,11 @@ fn v2_buy_cash_fee_matches_scan_and_incremental_through_failed_and_restart() {
         close(restored.balance(), 100.0);
         close(restored.available_cash(), 100.0);
         close(restored.get_quantity("UP"), 0.0);
+        assert_eq!(apply(&mut restored, TradeStatus::Confirmed).accumulator_sign, 1);
+        close(restored.balance(), 100.0 - 11.9 - 0.12495);
+        close(restored.get_quantity("UP"), 14.0);
+        assert!(!apply(&mut restored, TradeStatus::Failed).applied);
         assert!(!apply(&mut restored, TradeStatus::Confirmed).applied);
-        close(restored.balance(), 100.0);
     }
 }
 

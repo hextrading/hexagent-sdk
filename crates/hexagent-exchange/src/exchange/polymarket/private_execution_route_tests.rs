@@ -72,6 +72,30 @@ fn route_close(actual: f64, expected: f64) {
 }
 
 #[test]
+fn failed_then_confirmed_routes_once_and_rebooks_frozen_cash_and_inventory() {
+    let shared = route_fixture();
+    let (tx, rx) = crossbeam_channel::bounded(2);
+    let mut owner = PrivateRouteDedupe::new();
+    owner.execution_cache = Some(PrivateExecutionCache::new(Vec::new()).unwrap());
+    let before = shared.account_state.instance_snapshot("owner-1").unwrap();
+    for (status, deliver, booked) in [
+        ("MATCHED", true, true), ("FAILED", true, false),
+        ("MINED", false, false), ("FAILED", false, false),
+        ("CONFIRMED", true, true), ("CONFIRMED", false, true),
+        ("FAILED", false, true),
+    ] {
+        let mut event = route_event(2, "failed-settlement-confirmed");
+        event.payload["status"] = json!(status);
+        let routed = route_private_batch(&shared, &tx, vec![event], None, &mut owner, None).unwrap();
+        assert_eq!(rx.try_recv().is_ok(), deliver, "{status}");
+        apply_private_cold_batch(&shared, &routed.events, None).unwrap();
+        let after = shared.account_state.instance_snapshot("owner-1").unwrap();
+        route_close(after.cash, before.cash + if booked { 2.4327 - 0.14267 } else { 0.0 });
+        route_close(after.positions[TOKEN], before.positions[TOKEN] - if booked { 15.0 } else { 0.0 });
+    }
+}
+
+#[test]
 fn fast_route_and_existing_cold_lane_share_exact_economics_across_metadata_change() {
     let shared = route_fixture();
     let (tx, rx) = crossbeam_channel::bounded(2);
