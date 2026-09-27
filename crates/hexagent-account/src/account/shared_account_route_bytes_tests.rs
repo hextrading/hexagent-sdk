@@ -49,10 +49,9 @@ fn concurrent_route_batches_preserve_other_owners_and_held_snapshots() {
                         .map(|i| (format!("{owner}-{batch}-{i}"), owner.clone()))
                         .collect::<Vec<_>>();
                     routes.apply_batch(&owner, &[], &rows);
-                    assert!(
-                        rows.iter()
-                            .all(|(key, _)| routes.get(key).as_deref() == Some(owner.as_str()))
-                    );
+                    assert!(rows
+                        .iter()
+                        .all(|(key, _)| routes.get(key).as_deref() == Some(owner.as_str())));
                 }
             })
         })
@@ -175,4 +174,78 @@ fn benchmark_route_shard_shared_bytes() {
     summary("lookup_string", &mut read_before);
     summary("lookup_shared", &mut read_after);
     assert_eq!(modern.keys().len(), 45_000);
+}
+
+#[test]
+#[ignore = "release: deployed flat Arc-byte shards versus leaf snapshots, same process"]
+fn benchmark_route_point_updates() {
+    const N: usize = 5_000;
+    let mut maps: [HashMap<Arc<str>, Arc<str>>; ROUTE_SHARD_COUNT] =
+        std::array::from_fn(|_| HashMap::new());
+    for i in 0..45_000 {
+        let key = format!("{i:064x}");
+        maps[ShardedRouteMap::shard_index(&key)].insert(Arc::from(key), Arc::from("owner"));
+    }
+    let modern = ShardedRouteMap::new();
+    for (i, map) in maps.iter().enumerate() {
+        modern.shards[i].published.store(Arc::new(
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        ));
+    }
+    let flat = maps
+        .into_iter()
+        .map(ArcSwap::from_pointee)
+        .collect::<Vec<_>>();
+    let mut before = Vec::with_capacity(N);
+    let mut after = Vec::with_capacity(N);
+    let mut read_before = Vec::with_capacity(N);
+    let mut read_after = Vec::with_capacity(N);
+    for i in 0..N {
+        let key = format!("{:064x}", 45_000 + i);
+        let flat_key = key.clone();
+        let flat_owner = "owner".to_string();
+        let modern_owner = flat_owner.clone();
+        let update_flat = || {
+            let start = Instant::now();
+            let shard = &flat[ShardedRouteMap::shard_index(&flat_key)];
+            let key: Arc<str> = Arc::from(flat_key);
+            let owner: Arc<str> = Arc::from(flat_owner);
+            shard.rcu(|current| {
+                let mut next = (**current).clone();
+                next.insert(key.clone(), owner.clone());
+                Arc::new(next)
+            });
+            start.elapsed().as_nanos() as u64
+        };
+        let update_modern = || {
+            let start = Instant::now();
+            modern.insert(key, modern_owner);
+            start.elapsed().as_nanos() as u64
+        };
+        // Alternate order to avoid always awarding the same warm-cache order.
+        if i % 2 == 0 {
+            before.push(update_flat());
+            after.push(update_modern());
+        } else {
+            after.push(update_modern());
+            before.push(update_flat());
+        }
+        let read_key = format!("{i:064x}");
+        let start = Instant::now();
+        black_box(
+            flat[ShardedRouteMap::shard_index(&read_key)]
+                .load()
+                .get(read_key.as_str())
+                .map(|v| v.to_string()),
+        );
+        read_before.push(start.elapsed().as_nanos() as u64);
+        let start = Instant::now();
+        black_box(modern.get(&read_key));
+        read_after.push(start.elapsed().as_nanos() as u64);
+    }
+    summary("flat_arc_shard_insert_history45000", &mut before);
+    summary("leaf_snapshot_insert_history45000", &mut after);
+    summary("flat_arc_shard_lookup", &mut read_before);
+    summary("leaf_snapshot_lookup", &mut read_after);
+    assert_eq!(modern.keys().len(), 45_000 + N);
 }

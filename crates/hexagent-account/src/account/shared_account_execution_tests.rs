@@ -128,9 +128,15 @@ fn metadata_change_between_fast_selection_and_cold_apply_cannot_change_message_f
             20.0,
         );
     }
-    assert_eq!(apply(&account, "CONFIRMED", Side::Sell, 15.0, frozen).fill_delta(), Some(15.0));
+    assert_eq!(
+        apply(&account, "CONFIRMED", Side::Sell, 15.0, frozen).fill_delta(),
+        Some(15.0)
+    );
     close(account.instance_snapshot("owner").unwrap().cash, 102.29003);
-    assert_eq!(apply(&account, "CONFIRMED", Side::Sell, 15.0, frozen).fill_delta(), Some(0.0));
+    assert_eq!(
+        apply(&account, "CONFIRMED", Side::Sell, 15.0, frozen).fill_delta(),
+        Some(0.0)
+    );
     let next =
         FrozenTradeExecution::new(0.16, 15.0, 2.4327, Side::Sell, false, basis(0.08)).unwrap();
     assert!(next.fee.usdc_fee > frozen.fee.usdc_fee);
@@ -330,6 +336,88 @@ fn restored_one_ulp_execution_replay_preserves_frozen_economics_and_clears_false
     }
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(persistence_wal_path(&path));
+}
+
+#[test]
+fn coalesced_bootstrap_and_trade_wal_replays_without_false_stale_snapshot_repair() {
+    let account = SharedAccount::new(ACCOUNT);
+    let empty = account.lock_state().clone();
+    setup(&account, Side::Sell, 20.0, 0.98);
+    let seeded = account.lock_state().clone();
+    let execution =
+        FrozenTradeExecution::new(0.98, 20.0, 19.6, Side::Sell, false, basis(0.07)).unwrap();
+    apply(&account, "MATCHED", Side::Sell, 20.0, execution);
+    apply(&account, "CONFIRMED", Side::Sell, 20.0, execution);
+    let completed = account.lock_state().clone();
+    let empty_json = serde_json::to_value(&empty).unwrap();
+    let seeded_json = serde_json::to_value(&seeded).unwrap();
+    let completed_json = serde_json::to_value(&completed).unwrap();
+    let mut changes = persistence_json_diff(&empty_json, &seeded_json);
+    changes.extend(persistence_json_diff(&seeded_json, &completed_json));
+    let record = PersistenceWalRecord {
+        version: PERSISTENCE_WAL_VERSION,
+        account_id: ACCOUNT.into(),
+        generation: 7,
+        changes,
+    };
+    // Startup jobs and the first trade can legally share one checksummed
+    // frame. Its initial cash is established inside this frame, not before it.
+    assert!(
+        stale_virtual_trade_snapshot_wal_evidence(&record, &empty_json)
+            .unwrap()
+            .is_empty()
+    );
+    for corrupt in [false, true] {
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-coalesced-bootstrap-{}-{}-{corrupt}.json",
+            std::process::id(),
+            wall_clock_ms()
+        ));
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: PERSISTENCE_WAL_VERSION,
+                account_id: ACCOUNT.into(),
+                persistence_generation: 0,
+                state: empty.clone(),
+            },
+        )
+        .unwrap();
+        let mut record = record.clone();
+        if corrupt {
+            record.changes.push(PersistenceWalChange::Set {
+                path: vec!["instances".into(), "owner".into(), "cash".into()],
+                value: serde_json::json!(completed.instances["owner"].cash + 1.0),
+            });
+        }
+        append_persistence_wal(&path, &record, &mut 0).unwrap();
+        let restored = SharedAccount::new_persistent(ACCOUNT, &path);
+        if corrupt {
+            assert!(
+                restored.is_err(),
+                "ambiguous bootstrap must never authorize a cash repair"
+            );
+        } else {
+            let restored = restored.unwrap();
+            assert_eq!(
+                restored.instance_snapshot("owner").unwrap().cash,
+                completed.instances["owner"].cash
+            );
+            assert_eq!(
+                restored.instance_snapshot("sibling").unwrap().cash,
+                completed.instances["sibling"].cash
+            );
+            assert_eq!(restored.order("order").unwrap().filled_quantity, 20.0);
+            drop(restored);
+            let replayed = SharedAccount::new_persistent(ACCOUNT, &path).unwrap();
+            assert_eq!(
+                replayed.instance_snapshot("owner").unwrap().cash,
+                completed.instances["owner"].cash
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(persistence_wal_path(&path));
+    }
 }
 
 #[test]
