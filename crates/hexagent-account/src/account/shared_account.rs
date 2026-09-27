@@ -50,6 +50,9 @@ const MAX_RETIRED_TRADE_TOMBSTONES: usize = 100_000;
 const PERSISTENCE_WAL_VERSION: u32 = 1;
 const ACCOUNT_PERSISTENCE_QUEUE_CAPACITY: usize = 65_536;
 const ROUTE_SHARD_COUNT: usize = 64;
+#[path = "route_snapshot.rs"]
+mod route_snapshot;
+use route_snapshot::RouteSnapshot;
 const RECENT_VIRTUAL_TRADE_MUTATIONS: usize = 65_536;
 /// One request can be executing while one retry waits behind it. The GC
 /// coordinator never intentionally has more than one outstanding request per
@@ -1021,6 +1024,22 @@ pub struct DeferredLifecycleStageTiming {
     pub persist_enqueue_ns: u64,
 }
 
+/// Prepared on the lifecycle owner before it handles registration messages.
+/// Fresh successful registrations only; compact observations are aggregated
+/// by the existing background dumper, not by the private owner.
+pub const PREPARED_ORDER_OBSERVATION_STAGES: &[&str] = &[
+    "polymarket.account.register.access",
+    "polymarket.account.register.reservation",
+    "polymarket.account.register.routes",
+    "polymarket.account.register.persist_enqueue",
+    "polymarket.account.register.cpu",
+    "polymarket.account.register.off_cpu",
+];
+
+fn observe_registration_stage(stage: &'static str, start: Instant) {
+    crate::latency::observe_ns(stage, start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+}
+
 thread_local! {
     static DEFERRED_LIFECYCLE_TIMING: Cell<Option<DeferredLifecycleStageTiming>> =
         const { Cell::new(None) };
@@ -1195,10 +1214,9 @@ mod terminal_fee_tests;
 struct RouteShard {
     /// Readers consume an immutable ownership snapshot. Route mutation uses
     /// ArcSwap RCU, so neither readers nor account-owner writes take a lock.
-    // Shard snapshots share immutable key/owner bytes. Cloning a shard
-    // increments references instead of allocating/freeing every historical
-    // string in that shard on each GC batch.
-    published: ArcSwap<HashMap<Arc<str>, Arc<str>>>,
+    // Shards share immutable leaves as well as bytes. Registration copies
+    // only its leaf; cold GC keeps the existing whole-shard RCU boundary.
+    published: ArcSwap<RouteSnapshot>,
 }
 
 impl ShardedRouteMap {
@@ -1310,7 +1328,7 @@ impl ShardedRouteMap {
     fn new() -> Self {
         let shards = (0..ROUTE_SHARD_COUNT)
             .map(|_| RouteShard {
-                published: ArcSwap::from_pointee(HashMap::new()),
+                published: ArcSwap::from_pointee(RouteSnapshot::default()),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -1318,24 +1336,31 @@ impl ShardedRouteMap {
     }
 
     fn shard_index(key: &str) -> usize {
+        Self::hash(key) % ROUTE_SHARD_COUNT
+    }
+
+    fn hash(key: &str) -> usize {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
-        hasher.finish() as usize % ROUTE_SHARD_COUNT
+        hasher.finish() as usize
     }
 
     fn get(&self, key: &str) -> Option<String> {
-        self.shards[Self::shard_index(key)]
+        let hash = Self::hash(key);
+        self.shards[hash % ROUTE_SHARD_COUNT]
             .published
             .load()
-            .get(key)
+            .get_hashed(key, hash)
             .map(|owner| owner.to_string())
     }
 
     fn contains(&self, key: &str) -> bool {
-        self.shards[Self::shard_index(key)]
+        let hash = Self::hash(key);
+        self.shards[hash % ROUTE_SHARD_COUNT]
             .published
             .load()
-            .contains_key(key)
+            .get_hashed(key, hash)
+            .is_some()
     }
 
     fn try_get(&self, key: &str) -> Result<Option<String>, ()> {
@@ -5325,10 +5350,18 @@ fn stale_virtual_trade_snapshot_wal_evidence(
             | PersistenceWalChange::SetInsert { path, .. }
             | PersistenceWalChange::SetRemove { path, .. } => path,
         };
-        matches!(
+        // A coalesced bootstrap can establish the owner or seed baseline
+        // earlier in this same frame, then publish its first trade balances.
+        // Comparing those leaves with the pre-frame tree is not evidence of
+        // stale publication. Replay these frames normally and let the final
+        // economic validator reject any unexplained cash/position mismatch.
+        path.is_empty()
+        || matches!(
             path.first().map(String::as_str),
-            Some("external_adjustments" | "cash_allocation_migrations")
+            Some("external_adjustments" | "cash_allocation_migrations" | "seeded" | "seed_baseline")
         )
+        || (path.first().map(String::as_str) == Some("instances")
+            && (path.len() <= 2 || (path.len() == 3 && path[2] == "positions")))
     }) {
         return Ok(Vec::new());
     }
@@ -14669,6 +14702,8 @@ impl SharedAccount {
     /// reservation; it must not scan every retained order on each placement.
     /// Off-owner calls fail closed instead of introducing a synchronous hop.
     pub fn register_prepared_order(&self, ownership: &OrderOwnership) -> Option<OrderOwnership> {
+        let registration_started = Instant::now();
+        let cpu_started = crate::latency::thread_cpu_ns();
         if self.must_dispatch_lifecycle_to_owner()
             || ownership.account_id != self.account_id
             || ownership.client_order_id.is_empty()
@@ -14719,12 +14754,26 @@ impl SharedAccount {
         {
             return None;
         }
+        observe_registration_stage(PREPARED_ORDER_OBSERVATION_STAGES[0], registration_started);
+        let mutation_started = Instant::now();
         lifecycle.orders.insert(ownership.client_order_id.clone(), ownership.clone());
         account.adjust_reservation(&ownership.token_id, ownership.reserved_cash, ownership.reserved_quantity);
+        observe_registration_stage(PREPARED_ORDER_OBSERVATION_STAGES[1], mutation_started);
+        let routes_started = Instant::now();
         self.coid_routes.insert(ownership.client_order_id.clone(), ownership.instance_id.clone());
         self.oid_routes.insert(normalized, ownership.instance_id.clone());
+        observe_registration_stage(PREPARED_ORDER_OBSERVATION_STAGES[2], routes_started);
         account.reservation_epoch.fetch_add(1, Ordering::Release);
+        let persist_started = Instant::now();
         self.schedule_virtual_lifecycle_persist(&account, lifecycle, &ownership.client_order_id);
+        observe_registration_stage(PREPARED_ORDER_OBSERVATION_STAGES[3], persist_started);
+        let cpu_finished = crate::latency::thread_cpu_ns();
+        if cpu_started != 0 && cpu_finished >= cpu_started {
+            let cpu_ns = cpu_finished - cpu_started;
+            let wall_ns = registration_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            crate::latency::observe_ns(PREPARED_ORDER_OBSERVATION_STAGES[4], cpu_ns);
+            crate::latency::observe_ns(PREPARED_ORDER_OBSERVATION_STAGES[5], wall_ns.saturating_sub(cpu_ns));
+        }
         Some(ownership.clone())
     }
 

@@ -7,7 +7,7 @@ use super::*;
 const BATCH_CAPACITY: usize = 8;
 const SNAPSHOTS_PER_BATCH: usize =
     2 * SETTLED_GC_ORDERS_PER_OWNER_TURN + 2 * SETTLED_GC_TRADES_PER_OWNER_TURN;
-type Snapshot = Arc<HashMap<Arc<str>, Arc<str>>>;
+type Snapshot = Arc<RouteSnapshot>;
 
 #[derive(Debug)]
 pub(super) struct RetiredRouteBatch {
@@ -159,7 +159,7 @@ mod tests {
         let queue = RouteRetirementQueue::new();
         let mut held = Vec::new();
         for _ in 0..BATCH_CAPACITY {
-            let snapshot = Arc::new(HashMap::new());
+            let snapshot = Arc::new(RouteSnapshot::default());
             held.push(Arc::clone(&snapshot));
             queue.try_reserve().unwrap().push(snapshot);
         }
@@ -320,7 +320,7 @@ mod tests {
         };
         let mut readers = Vec::new();
         for _ in 0..BATCH_CAPACITY {
-            let snapshot = Arc::new(HashMap::new());
+            let snapshot = Arc::new(RouteSnapshot::default());
             readers.push(snapshot.clone());
             account
                 .route_retirement

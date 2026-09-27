@@ -26,7 +26,8 @@ pub fn thread_cpu_ns() -> u64 {
     unsafe {
         let mut clock: libc::timespec = std::mem::zeroed();
         if libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut clock) == 0 {
-            return (clock.tv_sec as u64).saturating_mul(1_000_000_000)
+            return (clock.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
                 .saturating_add(clock.tv_nsec as u64);
         }
     }
@@ -99,6 +100,7 @@ struct ThreadTelemetry {
 }
 
 const OBSERVATION_CAPACITY: usize = 65_536;
+const OBSERVATION_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// One producer thread, existing latency-dump consumer. FIFO, advisory only:
 /// saturation drops the new observation and counts it, never blocks a feed or
@@ -108,15 +110,29 @@ struct ObservationQueue {
     owner: String,
     dropped: AtomicU64,
     high_water: AtomicU64,
+    /// Consumer-owned interval count. Atomic because test snapshots may also
+    /// consume it; never updated by the business producer.
+    drained: AtomicU64,
 }
 
 impl ObservationQueue {
     fn new(capacity: usize) -> Self {
-        Self { queue: crate::try_queue::TryQueue::new(capacity), owner: std::thread::current().name().unwrap_or("unnamed").into(),
-            dropped: AtomicU64::new(0), high_water: AtomicU64::new(0) }
+        Self {
+            queue: crate::try_queue::TryQueue::new(capacity),
+            owner: std::thread::current().name().unwrap_or("unnamed").into(),
+            dropped: AtomicU64::new(0),
+            high_water: AtomicU64::new(0),
+            drained: AtomicU64::new(0),
+        }
     }
     fn publish(&self, stage: usize, ns: u64) -> bool {
-        self.high_water.fetch_max(self.queue.len().saturating_add(1).min(self.queue.capacity()) as u64, Ordering::Relaxed);
+        self.high_water.fetch_max(
+            self.queue
+                .len()
+                .saturating_add(1)
+                .min(self.queue.capacity()) as u64,
+            Ordering::Relaxed,
+        );
         if self.queue.try_push((stage, ns)).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -135,7 +151,11 @@ impl ThreadTelemetry {
             .take(MAX_STAGES)
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Self { bins, maxima, observations: OnceLock::new() }
+        Self {
+            bins,
+            maxima,
+            observations: OnceLock::new(),
+        }
     }
 
     #[inline]
@@ -143,6 +163,25 @@ impl ThreadTelemetry {
         let bucket = latency_bucket(ns);
         self.bins[stage_id * BUCKETS + bucket].fetch_add(1, Ordering::Relaxed);
         self.maxima[stage_id].fetch_max(ns, Ordering::Relaxed);
+    }
+
+    /// Only latency-dump consumes this FIFO. Bound one pass to the observed
+    /// depth so a continuously active producer cannot starve other threads.
+    fn drain_observations(&self) {
+        let Some(queue) = self.observations.get() else {
+            return;
+        };
+        let mut drained = 0;
+        for _ in 0..queue.queue.len().min(queue.queue.capacity()) {
+            let Some((id, ns)) = queue.queue.try_pop() else {
+                break;
+            };
+            if id < MAX_STAGES {
+                self.record(id, ns);
+            }
+            drained += 1;
+        }
+        queue.drained.fetch_add(drained, Ordering::Relaxed);
     }
 }
 
@@ -256,7 +295,11 @@ pub fn prepare_thread_stages(stages: &[&'static str]) {
 pub fn prepare_observation_stages(stages: &[&'static str]) {
     prepare_thread_stages(stages);
     THREAD_RECORDER.with(|slot| {
-        slot.borrow().as_ref().unwrap().telemetry.observations
+        slot.borrow()
+            .as_ref()
+            .unwrap()
+            .telemetry
+            .observations
             .get_or_init(|| ObservationQueue::new(OBSERVATION_CAPACITY));
     });
 }
@@ -266,9 +309,17 @@ pub fn prepare_observation_stages(stages: &[&'static str]) {
 pub fn observe_ns(stage: &'static str, ns: u64) -> bool {
     THREAD_RECORDER.with(|slot| {
         let slot = slot.borrow();
-        let Some(recorder) = slot.as_ref() else { return false; };
-        let Some(Some(id)) = recorder.stage_ids.get(stage) else { return false; };
-        recorder.telemetry.observations.get().is_some_and(|queue| queue.publish(*id, ns))
+        let Some(recorder) = slot.as_ref() else {
+            return false;
+        };
+        let Some(Some(id)) = recorder.stage_ids.get(stage) else {
+            return false;
+        };
+        recorder
+            .telemetry
+            .observations
+            .get()
+            .is_some_and(|queue| queue.publish(*id, ns))
     })
 }
 
@@ -276,10 +327,14 @@ pub fn observe_ns(stage: &'static str, ns: u64) -> bool {
 /// enqueue timestamps from the same process monotonic clock, never wall time.
 pub fn prepare_market_queue_stages() {
     prepare_thread_stages(&[
-        "market.adapter_queue.binance", "market.adapter_queue.coinbase",
-        "market.adapter_queue.polymarket", "market.adapter_queue.other",
-        "market.root_queue.binance", "market.root_queue.coinbase",
-        "market.root_queue.polymarket", "market.root_queue.other",
+        "market.adapter_queue.binance",
+        "market.adapter_queue.coinbase",
+        "market.adapter_queue.polymarket",
+        "market.adapter_queue.other",
+        "market.root_queue.binance",
+        "market.root_queue.coinbase",
+        "market.root_queue.polymarket",
+        "market.root_queue.other",
     ]);
 }
 
@@ -405,23 +460,25 @@ struct StageSnapshot {
     max: u64,
 }
 
+fn live_recorders() -> Vec<Arc<ThreadTelemetry>> {
+    let mut registered = recorders()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut live = Vec::with_capacity(registered.len());
+    registered.retain(|weak| {
+        if let Some(recorder) = weak.upgrade() {
+            live.push(recorder);
+            true
+        } else {
+            false
+        }
+    });
+    live
+}
+
 fn snapshot_and_reset() -> Vec<(&'static str, StageSnapshot)> {
     let names = stages().names();
-    let telemetry = {
-        let mut registered = recorders()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut live = Vec::with_capacity(registered.len());
-        registered.retain(|weak| {
-            if let Some(recorder) = weak.upgrade() {
-                live.push(recorder);
-                true
-            } else {
-                false
-            }
-        });
-        live
-    };
+    let telemetry = live_recorders();
     let mut snapshots = names
         .iter()
         .map(|_| StageSnapshot {
@@ -431,20 +488,13 @@ fn snapshot_and_reset() -> Vec<(&'static str, StageSnapshot)> {
         })
         .collect::<Vec<_>>();
     for recorder in telemetry {
+        recorder.drain_observations();
         if let Some(queue) = recorder.observations.get() {
-            let depth = queue.queue.len();
-            for _ in 0..depth {
-                let Some((id, ns)) = queue.queue.try_pop() else { break; };
-                if let Some(snapshot) = snapshots.get_mut(id) {
-                    snapshot.bins[latency_bucket(ns)] += 1;
-                    snapshot.count += 1;
-                    snapshot.max = snapshot.max.max(ns);
-                }
-            }
+            let drained = queue.drained.swap(0, Ordering::Relaxed);
             let high_water = queue.high_water.load(Ordering::Relaxed);
             if high_water != 0 {
                 log::info!("[latency_observation_queue] owner={} capacity={} drained={} depth={} high_water={} dropped={}",
-                    queue.owner, OBSERVATION_CAPACITY, depth, queue.queue.len(), high_water,
+                    queue.owner, queue.queue.capacity(), drained, queue.queue.len(), high_water,
                     queue.dropped.load(Ordering::Relaxed));
             }
         }
@@ -530,10 +580,23 @@ pub fn spawn_periodic_dump(
         .name("latency-dump".into())
         .spawn(move || {
             crate::os_tune::pin_background("latency-dump");
+            // Drain independently of the reporting interval: at 60-second
+            // reports a 65,536-item FIFO otherwise overflows above 1,092/s.
+            // Binning stays on this existing background worker; publication,
+            // queue capacity and the feed's nonblocking overflow rule stay put.
+            let interval = interval.max(std::time::Duration::from_millis(1));
+            let drain_tick = crossbeam_channel::tick(interval.min(OBSERVATION_DRAIN_INTERVAL));
+            let mut next_dump = std::time::Instant::now() + interval;
             loop {
                 crossbeam_channel::select! {
                     recv(shutdown_rx) -> _ => break,
-                    recv(crossbeam_channel::after(interval)) -> _ => {}
+                    recv(drain_tick) -> _ => {}
+                }
+                for recorder in live_recorders() {
+                    recorder.drain_observations();
+                }
+                if std::time::Instant::now() < next_dump {
+                    continue;
                 }
                 let dropped = DROPPED_STAGE_REGISTRATIONS.swap(0, Ordering::AcqRel);
                 if dropped > 0 {
@@ -546,6 +609,7 @@ pub fn spawn_periodic_dump(
                 for (stage, snapshot) in snapshot_and_reset() {
                     log::info!("{}", format_line(stage, &snapshot));
                 }
+                next_dump = std::time::Instant::now() + interval;
             }
             PERIODIC_DUMP_STARTED.store(false, Ordering::Release);
         })
@@ -593,9 +657,21 @@ mod tests {
             assert!(observe_ns("benchmark.observation", 100));
             let published = start.elapsed().as_nanos() as u64;
             THREAD_RECORDER.with(|slot| {
-                slot.borrow().as_ref().unwrap().telemetry.observations.get().unwrap().queue.try_pop().unwrap();
+                slot.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .telemetry
+                    .observations
+                    .get()
+                    .unwrap()
+                    .queue
+                    .try_pop()
+                    .unwrap();
             });
-            if i >= 256 { samples.push(published); drained.push(start.elapsed().as_nanos() as u64); }
+            if i >= 256 {
+                samples.push(published);
+                drained.push(start.elapsed().as_nanos() as u64);
+            }
         }
         for (boundary, values) in [("publish", &mut samples), ("through_dequeue", &mut drained)] {
             values.sort_unstable();
@@ -605,9 +681,33 @@ mod tests {
 
     #[test]
     fn periodic_dump_is_woken_by_unified_shutdown() {
+        prepare_observation_stages(&["latency.test.periodic_observation"]);
+        assert!(observe_ns("latency.test.periodic_observation", 123));
         let shutdown = crate::shutdown::ShutdownToken::new();
         let handle = spawn_periodic_dump(std::time::Duration::from_secs(3_600), shutdown.clone())
             .expect("latency dumper starts once");
+        let depth = || {
+            THREAD_RECORDER.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .telemetry
+                    .observations
+                    .get()
+                    .unwrap()
+                    .queue
+                    .len()
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while depth() != 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            depth(),
+            0,
+            "observation draining must not wait for the hourly report"
+        );
         shutdown.request();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         while !handle.is_finished() && std::time::Instant::now() < deadline {
@@ -618,6 +718,82 @@ mod tests {
             "latency dumper ignored shutdown token"
         );
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn frequent_observation_drain_preserves_bursts_until_report() {
+        let telemetry = ThreadTelemetry::new();
+        assert!(telemetry
+            .observations
+            .set(ObservationQueue::new(OBSERVATION_CAPACITY))
+            .is_ok());
+        let queue = telemetry.observations.get().unwrap();
+        // 2,000 observations/s, 60 seconds: the old report-only drain loses
+        // 54,464 samples. Four bounded passes per second retain all 120,000.
+        for _ in 0..240 {
+            for ns in 1..=500 {
+                assert!(queue.publish(0, ns));
+            }
+            telemetry.drain_observations();
+        }
+        assert_eq!(queue.queue.len(), 0);
+        assert_eq!(queue.high_water.load(Ordering::Relaxed), 500);
+        assert_eq!(queue.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(queue.drained.load(Ordering::Relaxed), 120_000);
+        assert_eq!(
+            telemetry.bins[..BUCKETS]
+                .iter()
+                .map(|v| v.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            120_000
+        );
+        assert_eq!(telemetry.maxima[0].load(Ordering::Relaxed), 500);
+        telemetry.drain_observations();
+        assert_eq!(
+            queue.drained.load(Ordering::Relaxed),
+            120_000,
+            "empty passes cannot duplicate samples"
+        );
+    }
+
+    #[test]
+    #[ignore = "release: 60-second logical workload, report-only versus 250ms draining"]
+    fn benchmark_observation_report_cadence() {
+        for frequent in [false, true] {
+            let telemetry = ThreadTelemetry::new();
+            assert!(telemetry
+                .observations
+                .set(ObservationQueue::new(OBSERVATION_CAPACITY))
+                .is_ok());
+            let queue = telemetry.observations.get().unwrap();
+            let mut producer_ns = Vec::with_capacity(120_000);
+            let mut drain_ns = Vec::with_capacity(240);
+            for _ in 0..240 {
+                for ns in 1..=500 {
+                    let start = std::time::Instant::now();
+                    std::hint::black_box(queue.publish(0, ns));
+                    producer_ns.push(start.elapsed().as_nanos() as u64);
+                }
+                if frequent {
+                    let start = std::time::Instant::now();
+                    telemetry.drain_observations();
+                    drain_ns.push(start.elapsed().as_nanos() as u64);
+                }
+            }
+            if !frequent {
+                let start = std::time::Instant::now();
+                telemetry.drain_observations();
+                drain_ns.push(start.elapsed().as_nanos() as u64);
+            }
+            for (boundary, values) in [
+                ("producer_try_publish", &mut producer_ns),
+                ("consumer_pass", &mut drain_ns),
+            ] {
+                values.sort_unstable();
+                let at = |q: usize| values[(values.len() * q).div_ceil(1000) - 1];
+                eprintln!("observation_cadence frequent={frequent} boundary={boundary} N={} p50_ns={} p99_ns={} p999_ns={} max_ns={} final_depth={} high_water={} overflow={} drained={} logical_input=120000 rate_per_second=2000", values.len(), at(500), at(990), at(999), at(1000), queue.queue.len(), queue.high_water.load(Ordering::Relaxed), queue.dropped.load(Ordering::Relaxed), queue.drained.load(Ordering::Relaxed));
+            }
+        }
     }
 
     #[test]
