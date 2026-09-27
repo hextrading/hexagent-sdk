@@ -5710,6 +5710,9 @@ mod tests {
             )
             .unwrap();
         shared.register_order_id("owner-1", "0xabc1", "TOKEN");
+        // The fixture requires an installed identity. Registration is an
+        // asynchronous owner command, so synchronize before injecting the fill.
+        shared.flush_execution_state_for_test();
         let mut event = serde_json::json!({
             "event_type": "trade", "id": "fallback-trade", "status": "MATCHED",
             "asset_id": "TOKEN", "side": "BUY", "size": "14", "price": "0.85",

@@ -2,6 +2,113 @@ use super::*;
 use crate::account::shared_account::SharedAccount;
 
 #[test]
+fn shared_execution_rows_preserve_old_readers_without_cloning_history_values() {
+    #[derive(Debug)]
+    struct Value(usize, Arc<std::sync::atomic::AtomicUsize>);
+    impl Clone for Value {
+        fn clone(&self) -> Self {
+            self.1.fetch_add(1, Ordering::Relaxed);
+            Self(self.0, Arc::clone(&self.1))
+        }
+    }
+    let clones = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let old = ExecutionReadMap::from_hash_map((0..20_000)
+        .map(|i| (format!("key-{i}"), Value(i, Arc::clone(&clones)))).collect());
+    let changed = old.with_insert("key-0".into(), Value(99, Arc::clone(&clones)));
+    let sibling = old.with_insert("key-0".into(), Value(88, Arc::clone(&clones)));
+    assert_eq!(old.get("key-0").unwrap().0, 0);
+    assert_eq!(changed.get("key-0").unwrap().0, 99);
+    assert_eq!(sibling.get("key-0").unwrap().0, 88);
+    assert_eq!(changed.len(), old.len());
+    let removed = changed.with_removed_keys(["key-0", "key-0", "absent"]);
+    assert!(!removed.contains_key("key-0"));
+    assert_eq!(removed.len(), old.len() - 1);
+    assert_eq!(removed.get("key-1").unwrap().0, 1);
+    // Reconnect/replay can publish the identity again without changing readers
+    // that retained either the removed or the pre-rebind generation.
+    let replayed = removed.with_insert("key-0".into(), Value(77, Arc::clone(&clones)));
+    assert_eq!(replayed.len(), old.len());
+    assert_eq!(replayed.get("key-0").unwrap().0, 77);
+    assert_eq!(changed.get("key-0").unwrap().0, 99);
+    assert_eq!(clones.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+#[ignore = "release: deployed owned-string leaves vs shared rows, publication plus destruction"]
+fn benchmark_shared_execution_rows() {
+    type OldShard = [Arc<HashMap<String, String>>; EXECUTION_READ_LEAVES];
+    #[derive(Clone)]
+    struct OldMap(Arc<[Arc<OldShard>; EXECUTION_READ_SHARDS]>);
+    impl OldMap {
+        fn from_map(values: HashMap<String, String>) -> Self {
+            let mut shards: [[HashMap<String, String>; EXECUTION_READ_LEAVES]; EXECUTION_READ_SHARDS] =
+                std::array::from_fn(|_| std::array::from_fn(|_| HashMap::new()));
+            for (k, v) in values {
+                shards[ExecutionReadMap::<String>::shard_index(&k)]
+                    [ExecutionReadMap::<String>::leaf_index(&k)].insert(k, v);
+            }
+            Self(Arc::new(shards.map(|s| Arc::new(s.map(Arc::new)))))
+        }
+        fn insert(&self, k: String, v: String) -> Self {
+            let i = ExecutionReadMap::<String>::shard_index(&k);
+            let j = ExecutionReadMap::<String>::leaf_index(&k);
+            let mut outer = (*self.0).clone();
+            let mut inner = (*outer[i]).clone();
+            Arc::make_mut(&mut inner[j]).insert(k, v);
+            outer[i] = Arc::new(inner);
+            Self(Arc::new(outer))
+        }
+        fn get(&self, k: &str) -> &String {
+            let h = ExecutionReadMap::<String>::hash(k);
+            &self.0[h % EXECUTION_READ_SHARDS][h / EXECUTION_READ_SHARDS % EXECUTION_READ_LEAVES][k]
+        }
+    }
+    const HISTORY: usize = 45_000;
+    const N: usize = 5_000;
+    let maps: [HashMap<String, String>; 3] = std::array::from_fn(|kind| (0..HISTORY).map(|i| {
+        let coid = format!("btc01-{i:013}"); let oid = format!("{i:064x}");
+        match kind { 0 => (coid, oid), 1 => (oid, coid), _ => (coid, format!("{i:077}")) }
+    }).collect());
+    let mut old = maps.clone().map(OldMap::from_map);
+    let mut new = maps.map(ExecutionReadMap::from_hash_map);
+    let mut old_ns = Vec::with_capacity(N); let mut new_ns = Vec::with_capacity(N);
+    let mut old_read = Vec::with_capacity(N); let mut new_read = Vec::with_capacity(N);
+    for i in HISTORY..HISTORY + N {
+        let coid = format!("btc01-{i:013}"); let oid = format!("{i:064x}"); let token = format!("{i:077}");
+        // Clone command inputs before the timers, identically for both paths.
+        let mut before = Some([(coid.clone(), oid.clone()), (oid.clone(), coid.clone()), (coid.clone(), token.clone())]);
+        let mut after = before.clone();
+        for baseline in if i % 2 == 0 { [true, false] } else { [false, true] } {
+            if baseline {
+                let values = before.take().unwrap();
+                let start = std::time::Instant::now();
+                for (map, (k, v)) in old.iter_mut().zip(values) { *map = map.insert(k, v); }
+                old_ns.push(start.elapsed().as_nanos() as u64);
+                let start = std::time::Instant::now();
+                std::hint::black_box(old[0].get(&coid));
+                old_read.push(start.elapsed().as_nanos() as u64);
+            } else {
+                let values = after.take().unwrap();
+                let start = std::time::Instant::now();
+                for (map, (k, v)) in new.iter_mut().zip(values) { *map = map.with_insert(k, v); }
+                new_ns.push(start.elapsed().as_nanos() as u64);
+                let start = std::time::Instant::now();
+                std::hint::black_box(new[0].get(&coid));
+                new_read.push(start.elapsed().as_nanos() as u64);
+            }
+        }
+        assert_eq!(new[0].get(&coid), Some(old[0].get(&coid)));
+        assert_eq!(new[1].get(&oid), Some(old[1].get(&oid)));
+        assert_eq!(new[2].get(&coid), Some(old[2].get(&coid)));
+    }
+    for (boundary, mut values) in [("owned_rows_publish_drop", old_ns), ("shared_rows_publish_drop", new_ns),
+        ("owned_rows_lookup", old_read), ("shared_rows_lookup", new_read)] {
+        values.sort_unstable(); let q = |p: usize| values[(N*p).div_ceil(1000)-1];
+        eprintln!("execution_rows boundary={boundary} n={N} history={HISTORY} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0", q(500), q(990), q(999), q(1000));
+    }
+}
+
+#[test]
 #[ignore = "release: live-sized identity publication, subsequent reader, no network"]
 fn benchmark_live_identity_publication() {
     const HISTORY: usize = 26_500;
