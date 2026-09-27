@@ -28,7 +28,7 @@ pub struct Position {
 /// but is also used for sim/non-live fills (which land as `Confirmed` right away).
 ///
 /// Rules (same as `LivePositionManager::update_trade`):
-/// - `Confirmed` and `Failed` are terminal — subsequent updates are ignored.
+/// - `Confirmed` is final; `Failed` may advance to a retried `Confirmed`.
 /// - `Retrying` is not modeled here; callers should not call `upsert_trade`
 ///   with a retry status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -55,15 +55,16 @@ impl TradeStatus {
 
     /// Lifecycle stage rank for monotonic dedup (idempotent re-pushes / gap
     /// replays): the ledger advances only when an incoming status outranks
-    /// the stored one. Matched(1) → Mined(2) → Confirmed/Failed(3, terminal).
+    /// the stored one. Matched(1) → Mined(2) → Failed(3) → Confirmed(4).
     /// NB: `OrderStatus::PartiallyFilled` collapses both MATCHED and MINED to
     /// `Matched` here (this enum's `from_order_status` never yields `Mined`),
-    /// so at the PositionManager level the effective ranks are 1 and 3.
+    /// so at the PositionManager level the effective ranks are 1, 3 and 4.
     pub fn rank(&self) -> u8 {
         match self {
             TradeStatus::Matched => 1,
             TradeStatus::Mined => 2,
-            TradeStatus::Confirmed | TradeStatus::Failed => 3,
+            TradeStatus::Failed => 3,
+            TradeStatus::Confirmed => 4,
         }
     }
 
@@ -757,7 +758,9 @@ impl PositionManager {
         let prev_status = existing.map(|r| r.status);
 
         let outcome = match prev_status {
-            // Already terminal (Confirmed or Failed) — ignore re-pushes.
+            // A confirmed settlement supersedes a prior failed attempt.
+            // Other terminal repeats/regressions remain no-ops.
+            Some(TradeStatus::Failed) if status == TradeStatus::Confirmed => UpsertResult::add(),
             Some(s) if s.is_terminal() => return UpsertResult::NOOP,
             // First sighting + lands as Failed → record but don't accumulate.
             None if status == TradeStatus::Failed => UpsertResult::update_only(),
@@ -1885,17 +1888,20 @@ mod tests {
         let q = pm.get_quantity("TOKEN");
         assert!(q.abs() < 1e-9, "expected 0, got {}", q);
 
-        // The FAILED tombstone absorbs arbitrary replay and stale earlier
+        // The FAILED tombstone absorbs repeated failures and stale earlier
         // stages without resurrecting inventory, cash, or volume.
         for _ in 1..118 {
             assert!(!upsert(&mut pm, "t1", TradeStatus::Failed).applied);
         }
         assert!(!upsert(&mut pm, "t1", TradeStatus::Matched).applied);
         assert!(!upsert(&mut pm, "t1", TradeStatus::Mined).applied);
-        assert!(!upsert(&mut pm, "t1", TradeStatus::Confirmed).applied);
-        assert!(pm.maker_volume.abs() < 1e-9);
-        assert!(pm.get_quantity("TOKEN").abs() < 1e-9);
-        assert!(pm.balance().abs() < 1e-9);
+        assert_eq!(upsert(&mut pm, "t1", TradeStatus::Confirmed).accumulator_sign, 1);
+        let confirmed = (pm.maker_volume, pm.get_quantity("TOKEN"), pm.balance());
+        for status in [TradeStatus::Matched, TradeStatus::Mined, TradeStatus::Failed, TradeStatus::Confirmed] {
+            assert!(!upsert(&mut pm, "t1", status).applied);
+        }
+        assert_eq!((pm.maker_volume, pm.get_quantity("TOKEN"), pm.balance()), confirmed);
+        assert!(confirmed.1 > 0.0);
     }
 
     #[test]

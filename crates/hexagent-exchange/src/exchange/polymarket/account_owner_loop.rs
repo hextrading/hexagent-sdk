@@ -109,6 +109,7 @@ pub(super) fn run(
     crate::latency::prepare_thread_stages(&[
         "polymarket.account.owner_command",
         "polymarket.account.owner_execution",
+        "polymarket.account.owner_register_order",
         "polymarket.account.owner_ingress",
         "polymarket.account.owner_maintenance",
         "polymarket.account.owner_retirement",

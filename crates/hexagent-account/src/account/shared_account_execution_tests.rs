@@ -118,7 +118,7 @@ fn metadata_change_between_fast_selection_and_cold_apply_cannot_change_message_f
     let first = apply(&account, "MATCHED", Side::Sell, 15.0, frozen);
     assert_eq!(first.trade_fee(), Some(frozen.fee));
     close(account.instance_snapshot("owner").unwrap().cash, 102.29003);
-    for status in ["FAILED", "FAILED", "MATCHED", "CONFIRMED"] {
+    for status in ["FAILED", "FAILED", "MATCHED"] {
         let result = apply(&account, status, Side::Sell, 15.0, frozen);
         assert!(!matches!(result, TradeTransitionResult::Rejected));
         assert_eq!(result.trade_fee(), Some(frozen.fee));
@@ -128,6 +128,9 @@ fn metadata_change_between_fast_selection_and_cold_apply_cannot_change_message_f
             20.0,
         );
     }
+    assert_eq!(apply(&account, "CONFIRMED", Side::Sell, 15.0, frozen).fill_delta(), Some(15.0));
+    close(account.instance_snapshot("owner").unwrap().cash, 102.29003);
+    assert_eq!(apply(&account, "CONFIRMED", Side::Sell, 15.0, frozen).fill_delta(), Some(0.0));
     let next =
         FrozenTradeExecution::new(0.16, 15.0, 2.4327, Side::Sell, false, basis(0.08)).unwrap();
     assert!(next.fee.usdc_fee > frozen.fee.usdc_fee);

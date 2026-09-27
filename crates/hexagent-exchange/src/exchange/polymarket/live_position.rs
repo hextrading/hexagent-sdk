@@ -1008,7 +1008,7 @@ impl TradeStatus {
         }
     }
 
-    /// Whether this is a terminal state (no further updates expected).
+    /// Whether settlement is resolved; FAILED can still advance to CONFIRMED.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Confirmed | Self::Failed)
     }
@@ -1018,7 +1018,7 @@ impl TradeStatus {
     /// makes repeated gap-replay / WS pushes idempotent (same rank → skip)
     /// and rejects out-of-order earlier states (lower rank → skip), so a
     /// stale `Matched` can never reverse a `Mined`/`Confirmed`.
-    ///   Matched(1) → Mined(2) → Confirmed/Failed(3, terminal)
+    ///   Matched(1) → Mined(2) → Failed(3) → Confirmed(4)
     /// `Retrying` is a transient (pre-resolution) state — rank 0, always
     /// skipped by the explicit `Retrying` guard, never written to the ledger.
     pub fn rank(&self) -> u8 {
@@ -1026,7 +1026,8 @@ impl TradeStatus {
             Self::Retrying => 0,
             Self::Matched => 1,
             Self::Mined => 2,
-            Self::Confirmed | Self::Failed => 3,
+            Self::Failed => 3,
+            Self::Confirmed => 4,
         }
     }
 }
@@ -1143,7 +1144,7 @@ impl LivePositionManager {
     /// Update or insert a trade. Returns true if the trade was actually updated.
     ///
     /// Rules:
-    /// - CONFIRMED and FAILED are terminal — no further updates once reached.
+    /// - CONFIRMED is final; FAILED may advance to a retried CONFIRMED.
     /// - RETRYING does not update the local status (preserves current state).
     pub fn update_trade(
         &mut self,
@@ -1205,7 +1206,9 @@ impl LivePositionManager {
                 return false;
             }
             // Terminal state — do not update.
-            if existing.status.is_terminal() {
+            if existing.status.is_terminal()
+                && !(existing.status == TradeStatus::Failed && status == TradeStatus::Confirmed)
+            {
                 return false;
             }
             // Monotonic: only advance to a strictly-later stage. Same or
