@@ -113,6 +113,9 @@ fn expired_runtime_null_orders_recover_on_first_complete_history_pass() {
             update.error.as_deref(),
             Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL)
         );
+        // The recovery result precedes asynchronous immutable publication.
+        // Observe the lifecycle owner at its explicit barrier, not by timing.
+        shared.flush_execution_state_for_test();
         let final_order = shared.account_state.order(coid).unwrap();
         assert_eq!(final_order.reserved_quantity, 0.0);
         assert_eq!(final_order.reserved_cash, 0.0);

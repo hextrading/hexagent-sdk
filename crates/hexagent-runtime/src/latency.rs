@@ -95,6 +95,34 @@ fn stages() -> &'static StageRegistry {
 struct ThreadTelemetry {
     bins: Box<[AtomicU64]>,
     maxima: Box<[AtomicU64]>,
+    observations: OnceLock<ObservationQueue>,
+}
+
+const OBSERVATION_CAPACITY: usize = 65_536;
+
+/// One producer thread, existing latency-dump consumer. FIFO, advisory only:
+/// saturation drops the new observation and counts it, never blocks a feed or
+/// competes with private lifecycle queues. Allocated explicitly at startup.
+struct ObservationQueue {
+    queue: crate::try_queue::TryQueue<(usize, u64)>,
+    owner: String,
+    dropped: AtomicU64,
+    high_water: AtomicU64,
+}
+
+impl ObservationQueue {
+    fn new(capacity: usize) -> Self {
+        Self { queue: crate::try_queue::TryQueue::new(capacity), owner: std::thread::current().name().unwrap_or("unnamed").into(),
+            dropped: AtomicU64::new(0), high_water: AtomicU64::new(0) }
+    }
+    fn publish(&self, stage: usize, ns: u64) -> bool {
+        self.high_water.fetch_max(self.queue.len().saturating_add(1).min(self.queue.capacity()) as u64, Ordering::Relaxed);
+        if self.queue.try_push((stage, ns)).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
 }
 
 impl ThreadTelemetry {
@@ -107,7 +135,7 @@ impl ThreadTelemetry {
             .take(MAX_STAGES)
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Self { bins, maxima }
+        Self { bins, maxima, observations: OnceLock::new() }
     }
 
     #[inline]
@@ -223,6 +251,27 @@ pub fn prepare_thread_stages(stages: &[&'static str]) {
     });
 }
 
+/// Startup-only reservation of stages and the compact observation FIFO.
+/// Percentiles/binning are performed by latency-dump, never the producer.
+pub fn prepare_observation_stages(stages: &[&'static str]) {
+    prepare_thread_stages(stages);
+    THREAD_RECORDER.with(|slot| {
+        slot.borrow().as_ref().unwrap().telemetry.observations
+            .get_or_init(|| ObservationQueue::new(OBSERVATION_CAPACITY));
+    });
+}
+
+/// No implicit initialization: an unprepared thread/stage drops telemetry.
+#[inline]
+pub fn observe_ns(stage: &'static str, ns: u64) -> bool {
+    THREAD_RECORDER.with(|slot| {
+        let slot = slot.borrow();
+        let Some(recorder) = slot.as_ref() else { return false; };
+        let Some(Some(id)) = recorder.stage_ids.get(stage) else { return false; };
+        recorder.telemetry.observations.get().is_some_and(|queue| queue.publish(*id, ns))
+    })
+}
+
 /// Fixed queue stages: parser-to-adapter and adapter-to-router use message
 /// enqueue timestamps from the same process monotonic clock, never wall time.
 pub fn prepare_market_queue_stages() {
@@ -300,6 +349,15 @@ pub fn prepare_polymarket_private_stages() {
 
 /// Prewarm the dedicated public CLOB reader stages before socket polling.
 pub fn prepare_polymarket_clob_stages() {
+    prepare_observation_stages(&[
+        "polymarket.ws.clob_source_age_at_publish",
+        "polymarket.ws.clob_quote_wait_tick",
+        "polymarket.ws.clob_quote_wait_deadline",
+        "polymarket.ws.clob_bbo_wait_ready",
+        "polymarket.ws.clob_bbo_wait_deadline",
+        "polymarket.ws.clob_bbo_wait_snapshot",
+        "polymarket.ws.clob_deferred_timer_late",
+    ]);
     prepare_thread_stages(&[
         "market.root_overflow_drop",
         "polymarket.ws.clob_parse",
@@ -373,6 +431,23 @@ fn snapshot_and_reset() -> Vec<(&'static str, StageSnapshot)> {
         })
         .collect::<Vec<_>>();
     for recorder in telemetry {
+        if let Some(queue) = recorder.observations.get() {
+            let depth = queue.queue.len();
+            for _ in 0..depth {
+                let Some((id, ns)) = queue.queue.try_pop() else { break; };
+                if let Some(snapshot) = snapshots.get_mut(id) {
+                    snapshot.bins[latency_bucket(ns)] += 1;
+                    snapshot.count += 1;
+                    snapshot.max = snapshot.max.max(ns);
+                }
+            }
+            let high_water = queue.high_water.load(Ordering::Relaxed);
+            if high_water != 0 {
+                log::info!("[latency_observation_queue] owner={} capacity={} drained={} depth={} high_water={} dropped={}",
+                    queue.owner, OBSERVATION_CAPACITY, depth, queue.queue.len(), high_water,
+                    queue.dropped.load(Ordering::Relaxed));
+            }
+        }
         for stage_id in 0..names.len() {
             let snapshot = &mut snapshots[stage_id];
             let offset = stage_id * BUCKETS;
@@ -486,6 +561,47 @@ pub fn spawn_periodic_dump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_fifo_is_bounded_ordered_and_thread_isolated() {
+        let a = ObservationQueue::new(2);
+        let b = ObservationQueue::new(2);
+        assert!(a.publish(1, 10));
+        assert!(a.publish(2, 20));
+        assert!(!a.publish(3, 30));
+        assert_eq!(a.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(a.high_water.load(Ordering::Relaxed), 2);
+        assert!(b.publish(4, 40));
+        assert_eq!(a.queue.try_pop().unwrap(), (1, 10));
+        assert_eq!(a.queue.try_pop().unwrap(), (2, 20));
+        assert!(a.queue.try_pop().is_none());
+        assert_eq!(b.queue.try_pop().unwrap(), (4, 40));
+        assert_eq!(b.dropped.load(Ordering::Relaxed), 0);
+        // Recovery after full: the next observation can enter normally.
+        assert!(a.publish(5, 50));
+        assert_eq!(a.queue.try_pop().unwrap(), (5, 50));
+    }
+
+    #[test]
+    #[ignore = "release: compact observation producer cost and following dequeue"]
+    fn benchmark_observation_publish() {
+        prepare_observation_stages(&["benchmark.observation"]);
+        let mut samples = Vec::with_capacity(100_000);
+        let mut drained = Vec::with_capacity(100_000);
+        for i in 0..100_256 {
+            let start = std::time::Instant::now();
+            assert!(observe_ns("benchmark.observation", 100));
+            let published = start.elapsed().as_nanos() as u64;
+            THREAD_RECORDER.with(|slot| {
+                slot.borrow().as_ref().unwrap().telemetry.observations.get().unwrap().queue.try_pop().unwrap();
+            });
+            if i >= 256 { samples.push(published); drained.push(start.elapsed().as_nanos() as u64); }
+        }
+        for (boundary, values) in [("publish", &mut samples), ("through_dequeue", &mut drained)] {
+            values.sort_unstable();
+            eprintln!("observation_probe boundary={boundary} N=100000 p50_ns={} p99_ns={} p999_ns={} max_ns={} high_water=1 overflow=0", values[49_999], values[98_999], values[99_899], values[99_999]);
+        }
+    }
 
     #[test]
     fn periodic_dump_is_woken_by_unified_shutdown() {

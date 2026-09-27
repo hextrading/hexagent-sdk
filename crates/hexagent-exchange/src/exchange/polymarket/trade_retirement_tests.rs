@@ -1,6 +1,39 @@
 use super::*;
 use crate::account::shared_account::SharedAccount;
 
+#[test]
+#[ignore = "release: live-sized identity publication, subsequent reader, no network"]
+fn benchmark_live_identity_publication() {
+    const HISTORY: usize = 26_500;
+    const N: usize = 2_000;
+    let mut view = snapshot_fixture(HISTORY);
+    let changes: Vec<_> = (HISTORY..HISTORY + N + 64).map(|i|
+        (format!("btc01-{i:013}"), format!("0x{i:064x}"), format!("{i:077}"))).collect();
+    let mut times = Vec::with_capacity(N);
+    let mut following = Vec::with_capacity(N);
+    for (i, (coid, oid, token)) in changes.iter().enumerate() {
+        let start = std::time::Instant::now();
+        let previous = view;
+        let mut next = previous.clone();
+        next.coid_to_oid = next.coid_to_oid.with_insert(coid.clone(), oid.clone());
+        next.oid_to_coid = next.oid_to_coid.with_insert(normalize_order_id(oid), coid.clone());
+        next.coid_to_token = next.coid_to_token.with_insert(coid.clone(), token.clone());
+        view = next;
+        drop(previous); // include destruction; do not hide it in setup.
+        let published = start.elapsed().as_nanos() as u64;
+        assert_eq!(view.coid_to_oid.get(coid), Some(oid));
+        if i >= 64 {
+            times.push(published);
+            following.push(start.elapsed().as_nanos() as u64);
+        }
+    }
+    for (boundary, values) in [("identity_publication_and_drop", &mut times), ("following_reader", &mut following)] {
+        values.sort_unstable();
+        let q = |p: usize| values[(N*p).div_ceil(1000)-1];
+        eprintln!("live_identity_probe boundary={boundary} N={N} history={HISTORY} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0", q(500), q(990), q(999), q(1000));
+    }
+}
+
 fn snapshot_fixture(routes: usize) -> ExecutionStateSnapshot {
     let mut coid_to_oid = HashMap::new();
     let mut oid_to_coid = HashMap::new();

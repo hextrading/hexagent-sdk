@@ -213,6 +213,9 @@ pub fn init() -> Result<()> {
             // current_thread scheduler which hosts all hot-path futures).
             crate::os_tune::pin_async_rt("hexbot-async-rt");
             crate::latency::prepare_polymarket_private_stages();
+            // A supervised CLOB epoch may fall back to this runtime. Prepare
+            // its observation lane before polling, including that recovery path.
+            crate::latency::prepare_polymarket_clob_stages();
             let rt = match Builder::new_current_thread()
                 .enable_all()
                 .thread_name("hexbot-async-rt")

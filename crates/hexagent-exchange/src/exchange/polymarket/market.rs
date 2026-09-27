@@ -1639,8 +1639,13 @@ struct ClobEventSender {
     replaceable_evictions: Arc<AtomicU64>,
 }
 
+fn observe_clob_hold(stage: &'static str, now: Instant, received: Instant) {
+    crate::latency::observe_ns(stage, now.saturating_duration_since(received).as_nanos().min(u64::MAX as u128) as u64);
+}
+
 struct ClobEventEnvelope {
     sequence: u64,
+    published_at: Instant,
     event: MarketEvent,
 }
 
@@ -1684,8 +1689,19 @@ impl ClobEventSender {
     /// of blocking the socket reader or silently losing an ordered event.
     fn send(&self, event: MarketEvent) -> bool {
         let replaceable = Self::is_replaceable(&event);
+        let source_ns = match &event {
+            MarketEvent::OrderBook(book) => book.local_timestamp_ns,
+            MarketEvent::Quote(quote) => quote.local_timestamp_ns,
+            _ => 0,
+        };
+        if source_ns != 0 {
+            // Wall-clock source age is deliberately separate from monotonic
+            // queue/hold durations. Preserve the quote's original timestamp.
+            crate::latency::observe_ns("polymarket.ws.clob_source_age_at_publish", now_ns().saturating_sub(source_ns));
+        }
         let event = ClobEventEnvelope {
             sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
+            published_at: Instant::now(),
             event,
         };
         if !replaceable {
@@ -1742,21 +1758,17 @@ impl ClobEventReceiver {
     }
 
     fn pop_next(&mut self) -> Option<MarketEvent> {
-        match (&self.pending_critical, &self.pending_replaceable) {
+        let envelope = match (&self.pending_critical, &self.pending_replaceable) {
             (Some(critical), Some(replaceable)) if critical.sequence <= replaceable.sequence => {
-                self.pending_critical.take().map(|envelope| envelope.event)
+                self.pending_critical.take()
             }
-            (Some(_), Some(_)) => self
-                .pending_replaceable
-                .take()
-                .map(|envelope| envelope.event),
-            (Some(_), None) => self.pending_critical.take().map(|envelope| envelope.event),
-            (None, Some(_)) => self
-                .pending_replaceable
-                .take()
-                .map(|envelope| envelope.event),
+            (Some(_), Some(_)) => self.pending_replaceable.take(),
+            (Some(_), None) => self.pending_critical.take(),
+            (None, Some(_)) => self.pending_replaceable.take(),
             (None, None) => None,
-        }
+        }?;
+        crate::latency::observe_ns("polymarket.ws.clob_bridge_queue", envelope.published_at.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        Some(envelope.event)
     }
 
     fn recv_timeout(
@@ -7987,6 +7999,9 @@ impl ClobLocalBooks {
         // A full book is authoritative for this token and ends any deferred
         // validation/quarantine created by an incomplete price-change batch.
         let pending = self.pending_bbo.remove(&symbol);
+        if let Some(pending) = &pending {
+            observe_clob_hold("polymarket.ws.clob_bbo_wait_snapshot", received_at, pending.first_observed_at);
+        }
         let was_quarantined = self.quarantined_tokens.remove(&symbol);
         if let Some(pending) = pending.as_ref().filter(|pending| pending.saw_mismatch) {
             record_bbo_settle_duration(counters, received_at, pending.first_observed_at);
@@ -8053,6 +8068,8 @@ impl ClobLocalBooks {
         let Some(pending) = self.pending_bbo.remove(token) else {
             return (None, None);
         };
+        observe_clob_hold("polymarket.ws.clob_bbo_wait_deadline", finished_at, pending.first_observed_at);
+        observe_clob_hold("polymarket.ws.clob_deferred_timer_late", finished_at, pending.last_update_at + CLOB_BBO_SETTLE_INTERVAL);
         let actual = self
             .token_books
             .get(token)
@@ -8141,6 +8158,7 @@ impl ClobLocalBooks {
             .pending_bbo
             .remove(token)
             .expect("pending BBO checked above");
+        observe_clob_hold("polymarket.ws.clob_bbo_wait_ready", now, pending.first_observed_at);
         if pending.saw_mismatch {
             counters.bbo_transient_recoveries = counters.bbo_transient_recoveries.saturating_add(1);
             record_bbo_settle_duration(counters, now, pending.first_observed_at);
@@ -8233,6 +8251,7 @@ impl ClobLocalBooks {
         }
 
         if let Some(pending) = self.pending_quotes.remove(&key) {
+            observe_clob_hold("polymarket.ws.clob_quote_wait_tick", received_at, pending.received_at);
             if let Some(event) = self.canonicalize_quote_ready(pending.quote) {
                 events.push(event);
             }
@@ -8317,6 +8336,8 @@ impl ClobLocalBooks {
             let Some(pending) = self.pending_quotes.remove(&key) else {
                 continue;
             };
+            observe_clob_hold("polymarket.ws.clob_quote_wait_deadline", now, pending.received_at);
+            observe_clob_hold("polymarket.ws.clob_deferred_timer_late", now, pending.received_at + CLOB_BBO_SETTLE_INTERVAL);
             if subscribed_token(active_tokens, &pending.quote.symbol) {
                 batch.diagnostics.push(ClobDiagnostic {
                     key: "tick_size_change_lag",
@@ -9461,6 +9482,7 @@ fn make_inline_rtds_event(r: InlineRtdsFields<'_>, local_now: u64) -> Option<Mar
 
 impl ExchangeMarket for PolymarketMarket {
     fn connect(&mut self) -> Result<()> {
+        crate::latency::prepare_observation_stages(&["polymarket.ws.clob_bridge_queue"]);
         // Per-task shutdown Arc: each connect() creates a FRESH Arc
         // rather than reusing the struct field. Old tasks (still
         // draining a previous connection — possibly hung in

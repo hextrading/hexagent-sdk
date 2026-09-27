@@ -110,6 +110,8 @@ pub(super) fn run(
         "polymarket.account.owner_command",
         "polymarket.account.owner_execution",
         "polymarket.account.owner_register_order",
+            "polymarket.account.owner_register_ledger",
+            "polymarket.account.owner_register_publish",
         "polymarket.account.owner_ingress",
         "polymarket.account.owner_maintenance",
         "polymarket.account.owner_retirement",

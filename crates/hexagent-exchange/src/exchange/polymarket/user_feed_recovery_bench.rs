@@ -246,6 +246,7 @@ fn pending_and_null_audit_still_deliver_private_frame_without_opening_health_gat
         )
         .unwrap();
     shared.register_order_id("owner-1", "0xabc1", "TOKEN");
+    shared.flush_execution_state_for_test();
     let initial_reserved_cash = shared.account_state.order("owner-1").unwrap().reserved_cash;
     shared.user_feed_health.mark_strategy_consumer_ready();
     let generation = shared.user_feed_health.begin_recovery_delivery();

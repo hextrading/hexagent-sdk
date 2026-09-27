@@ -1808,18 +1808,26 @@ pub(crate) struct OrderLifecycleTrace {
 /// Immutable execution-state publication consumed by cancel/reconcile/private
 /// workers. The account owner is the only writer; readers take one RCU guard
 /// and never contend with another worker or observe a torn coid/oid update.
+/// Two levels of 64 shared pointers keep publication to one small leaf plus
+/// 128 Arc copies. At 26,500 retained identities a flat 64-way table cloned
+/// hundreds of owned strings per identity update on the lifecycle owner.
 const EXECUTION_READ_SHARDS: usize = 64;
+const EXECUTION_READ_LEAVES: usize = 64;
+type ExecutionReadShard<V> = [Arc<HashMap<String, V>>; EXECUTION_READ_LEAVES];
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionReadMap<V> {
-    shards: Arc<[Arc<HashMap<String, V>>; EXECUTION_READ_SHARDS]>,
+    shards: Arc<[Arc<ExecutionReadShard<V>>; EXECUTION_READ_SHARDS]>,
     len: usize,
 }
 
 impl<V> Default for ExecutionReadMap<V> {
     fn default() -> Self {
         Self {
-            shards: Arc::new(std::array::from_fn(|_| Arc::new(HashMap::new()))),
+            shards: Arc::new(std::array::from_fn(|_| {
+                let empty = Arc::new(HashMap::new());
+                Arc::new(std::array::from_fn(|_| Arc::clone(&empty)))
+            })),
             len: 0,
         }
     }
@@ -1828,6 +1836,16 @@ impl<V> Default for ExecutionReadMap<V> {
 impl<V> ExecutionReadMap<V> {
     #[inline]
     fn shard_index(key: &str) -> usize {
+        Self::hash(key) % EXECUTION_READ_SHARDS
+    }
+
+    #[inline]
+    fn leaf_index(key: &str) -> usize {
+        (Self::hash(key) / EXECUTION_READ_SHARDS) % EXECUTION_READ_LEAVES
+    }
+
+    #[inline]
+    fn hash(key: &str) -> usize {
         // Stable FNV-1a avoids RandomState construction and keeps the same key
         // on one shard across snapshot generations.
         let mut hash = 0xcbf29ce484222325u64;
@@ -1835,25 +1853,26 @@ impl<V> ExecutionReadMap<V> {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x100000001b3);
         }
-        hash as usize % EXECUTION_READ_SHARDS
+        hash as usize
     }
 
     fn from_hash_map(values: HashMap<String, V>) -> Self {
         let len = values.len();
-        let mut shards: [HashMap<String, V>; EXECUTION_READ_SHARDS] =
-            std::array::from_fn(|_| HashMap::new());
+        let mut shards: [[HashMap<String, V>; EXECUTION_READ_LEAVES]; EXECUTION_READ_SHARDS] =
+            std::array::from_fn(|_| std::array::from_fn(|_| HashMap::new()));
         for (key, value) in values {
-            shards[Self::shard_index(&key)].insert(key, value);
+            shards[Self::shard_index(&key)][Self::leaf_index(&key)].insert(key, value);
         }
         Self {
-            shards: Arc::new(shards.map(Arc::new)),
+            shards: Arc::new(shards.map(|leaves| Arc::new(leaves.map(Arc::new)))),
             len,
         }
     }
 
     #[inline]
     pub(crate) fn get(&self, key: &str) -> Option<&V> {
-        self.shards[Self::shard_index(key)].get(key)
+        let hash = Self::hash(key);
+        self.shards[hash % EXECUTION_READ_SHARDS][(hash / EXECUTION_READ_SHARDS) % EXECUTION_READ_LEAVES].get(key)
     }
 
     #[inline]
@@ -1867,7 +1886,7 @@ impl<V> ExecutionReadMap<V> {
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &V)> {
-        self.shards.iter().flat_map(|shard| shard.iter())
+        self.shards.iter().flat_map(|shard| shard.iter()).flat_map(|leaf| leaf.iter())
     }
 
     pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
@@ -1882,9 +1901,10 @@ impl<V> ExecutionReadMap<V> {
 impl<V: Clone> ExecutionReadMap<V> {
     fn with_insert(&self, key: String, value: V) -> Self {
         let index = Self::shard_index(&key);
+        let leaf = Self::leaf_index(&key);
         let mut shards = (*self.shards).clone();
         let mut shard = (*shards[index]).clone();
-        let inserted = shard.insert(key, value).is_none();
+        let inserted = Arc::make_mut(&mut shard[leaf]).insert(key, value).is_none();
         shards[index] = Arc::new(shard);
         Self {
             shards: Arc::new(shards),
@@ -1894,12 +1914,13 @@ impl<V: Clone> ExecutionReadMap<V> {
 
     fn with_remove(&self, key: &str) -> Self {
         let index = Self::shard_index(key);
-        if !self.shards[index].contains_key(key) {
+        let leaf = Self::leaf_index(key);
+        if !self.shards[index][leaf].contains_key(key) {
             return self.clone();
         }
         let mut shards = (*self.shards).clone();
         let mut shard = (*shards[index]).clone();
-        shard.remove(key);
+        Arc::make_mut(&mut shard[leaf]).remove(key);
         shards[index] = Arc::new(shard);
         Self {
             shards: Arc::new(shards),
@@ -1914,8 +1935,9 @@ impl<V: Clone> ExecutionReadMap<V> {
         let mut removed = 0;
         for key in keys {
             let index = Self::shard_index(key);
-            if shards[index].contains_key(key) {
-                Arc::make_mut(&mut shards[index]).remove(key);
+            let leaf = Self::leaf_index(key);
+            if shards[index][leaf].contains_key(key) {
+                Arc::make_mut(&mut Arc::make_mut(&mut shards[index])[leaf]).remove(key);
                 removed += 1;
             }
         }
@@ -4072,6 +4094,7 @@ impl SharedState {
             AccountLifecycleJob::RegisterLocalOrder { command, ownership } => {
                 let started = crate::latency::Instant::now();
                 if let Some(ownership) = ownership {
+                    let registration_started = crate::latency::Instant::now();
                     if self
                         .account_state
                         .register_prepared_order(&ownership)
@@ -4086,8 +4109,11 @@ impl SharedState {
                         );
                         return;
                     }
+                    crate::latency::record("polymarket.account.owner_register_ledger", registration_started);
                 }
+                let publication_started = crate::latency::Instant::now();
                 execution.apply(self, command);
+                crate::latency::record("polymarket.account.owner_register_publish", publication_started);
                 crate::latency::record("polymarket.account.owner_register_order", started);
             }
             AccountLifecycleJob::ExecutionState(command) => execution.apply(self, command),
