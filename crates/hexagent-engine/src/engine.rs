@@ -41,6 +41,7 @@ use crate::virtual_recovery::{
     RecoveryReplay,
 };
 use hexagent_runtime::shutdown::ShutdownToken;
+use crate::shutdown_completion::{completion_lane, CompletionReceiver, CompletionSender};
 use hexagent_strategy::factory::{StrategyBuildDeps, StrategyRegistry};
 
 // Only the offline replay coordinator creates these values. Each payload is
@@ -4100,7 +4101,7 @@ impl Engine {
             hexagent_runtime::poll_channel::bounded::<RoutedOrderUpdate>(CHANNEL_CAPACITY);
         // Live root private/recovery delivery never enters crossbeam array receive.
         let private_update_rx = crossbeam_channel::never();
-        let (shutdown_done_tx, shutdown_done_rx) = bounded::<()>(1);
+        let (shutdown_done_tx, shutdown_done_rx) = completion_lane();
 
         let shutdown = shutdown_token.requested_flag();
         let shutdown_tx = market_tx.clone();
@@ -4502,7 +4503,7 @@ impl Engine {
             )
         };
         let (update_tx, update_rx) = bounded::<RoutedOrderUpdate>(CHANNEL_CAPACITY);
-        let (shutdown_done_tx, shutdown_done_rx) = bounded::<()>(1);
+        let (shutdown_done_tx, shutdown_done_rx) = completion_lane();
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_tx = market_tx.clone();
@@ -7662,7 +7663,7 @@ impl Engine {
         update_tx: Sender<RoutedOrderUpdate>,
         sim_latency_ms: u64,
         bt: crate::config::BacktestConfig,
-        shutdown_done_tx: Sender<()>,
+        shutdown_done_tx: CompletionSender,
     ) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("paper-exec".into())
@@ -7915,7 +7916,7 @@ impl Engine {
                                 signal_owner,
                             );
                             if acknowledge_shutdown {
-                                let _ = shutdown_done_tx.send(());
+                                shutdown_done_tx.publish();
                             }
                         }
                     }
@@ -8057,7 +8058,7 @@ impl Engine {
         >,
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
         poly_states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
-        shutdown_done_rx: Option<Receiver<()>>,
+        shutdown_done_rx: Option<CompletionReceiver>,
         admission_receivers: HashMap<String, Receiver<ExecutionAdmission>>,
     ) -> Result<thread::JoinHandle<()>> {
         let mut strategies =
@@ -8580,7 +8581,7 @@ impl Engine {
                                     if signal_tx.send(Signal::BeginShutdown).is_err() {
                                         warn!("[Strategy] executor disappeared before shutdown barrier");
                                     } else if let Some(done_rx) = shutdown_done_rx.as_ref() {
-                                        loop {
+                                        while !done_rx.is_complete() {
                                             crossbeam_channel::select! {
                                                 recv(update_rx) -> update => match update {
                                                     Ok(update) => {
@@ -8596,13 +8597,12 @@ impl Engine {
                                                     }
                                                     Err(_) => break,
                                                 },
-                                                recv(done_rx) -> _ => break,
+                                                default(hexagent_runtime::poll_channel::IDLE_POLL) => {},
                                             }
                                         }
-                                        // The acknowledgement is sent after
-                                        // updates are enqueued, but select may
-                                        // observe the independent done channel
-                                        // first. Drain that final tail.
+                                        // Completion is published after updates
+                                        // are enqueued. Drain that final tail
+                                        // before final reports and owner exit.
                                         while let Ok(update) = update_rx.try_recv() {
                                             if update.owner == SYSTEM_SIGNAL_OWNER {
                                                 for s in &mut strategies {
@@ -8794,7 +8794,7 @@ impl Engine {
         executor_update_rx: Option<hexagent_runtime::poll_channel::Receiver<RoutedOrderUpdate>>,
         recorder_tx: Option<Sender<Arc<MarketEvent>>>,
         data_dirs: Vec<PathBuf>,
-        shutdown_done_rx: Option<Receiver<()>>,
+        shutdown_done_rx: Option<CompletionReceiver>,
         poly_states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
         mut admission_receivers: HashMap<String, Receiver<ExecutionAdmission>>,
     ) -> thread::JoinHandle<()> {
@@ -8947,11 +8947,89 @@ impl Engine {
                 // the placing instance.
                 let iid_to_idx: HashMap<String, usize> = instance_ids
                     .iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
-                let shutdown_done_rx = shutdown_done_rx
-                    .unwrap_or_else(crossbeam_channel::never);
                 let mut shutdown_in_progress = false;
                 let mut lifecycle_outboxes = LifecycleOwnerOutboxes::new(instance_ids.len());
                 'router: loop {
+                    // The execution owner publishes once without a crossbeam
+                    // wake lock. Early/duplicate completion remains latched;
+                    // final lifecycle queues are still drained before workers exit.
+                    if shutdown_in_progress
+                        && shutdown_done_rx.as_ref().is_some_and(CompletionReceiver::is_complete)
+                    {
+                        // Done is sent after final updates are
+                        // enqueued, the router may observe the completion
+                        // message first. Drain the root tail into the
+                        // same lossless per-instance spools.
+                        if let Err(failure) = lifecycle_outboxes.flush_all_blocking(&update_txs) {
+                            quarantine_lifecycle_failure(
+                                &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                            );
+                            break 'router;
+                    }
+                    while let Ok(u) = update_rx.try_recv() {
+                        let result = Self::route_private_update(
+                            u,
+                            &iid_to_idx,
+                            &update_txs,
+                            &worker_quarantined,
+                            &mut lifecycle_outboxes,
+                        );
+                        if let Err(failure) = result {
+                            quarantine_lifecycle_failure(
+                                &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                            );
+                            break 'router;
+                        }
+                    }
+                    while let Some(private_rx) = private_poll_rx.as_ref() {
+                        let routed = match private_rx.try_recv() {
+                            Ok(routed) => routed,
+                            Err(crossbeam_channel::TryRecvError::Empty) if private_rx.has_pending() => {
+                                thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
+                                continue;
+                            }
+                            Err(_) => break,
+                        };
+                        if let Err(failure) = Self::route_private_update(
+                            routed, &iid_to_idx, &update_txs,
+                            &worker_quarantined, &mut lifecycle_outboxes,
+                        ) {
+                            quarantine_lifecycle_failure(
+                                &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                            );
+                            break 'router;
+                        }
+                    }
+                    while let Some(executor_rx) = executor_update_rx.as_ref() {
+                        let routed = match executor_rx.try_recv() {
+                            Ok(routed) => routed,
+                            Err(crossbeam_channel::TryRecvError::Empty) if executor_rx.has_pending() => {
+                                thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
+                                continue;
+                            }
+                            Err(_) => break,
+                        };
+                        let result = Self::route_executor_update(
+                            routed,
+                            &iid_to_idx,
+                            &update_txs,
+                            &worker_quarantined,
+                            &mut lifecycle_outboxes,
+                        );
+                        if let Err(failure) = result {
+                            quarantine_lifecycle_failure(
+                                &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                            );
+                            break 'router;
+                        }
+                    }
+                    if let Err(failure) = lifecycle_outboxes.flush_all_blocking(&update_txs) {
+                        quarantine_lifecycle_failure(
+                            &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                        );
+                    }
+                    break 'router;
+                    }
                     // Owner-local timers cannot be held by a preempted FIFO
                     // peer through AtomicCell's hashed global locks. The loop
                     // also flushes lifecycle outboxes before every select, so
@@ -9207,83 +9285,6 @@ impl Engine {
                                 }
                                 Err(crossbeam_channel::TryRecvError::Empty) => continue,
                                 Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-                            }
-                        },
-                        recv(shutdown_done_rx) -> _ => {
-                            if shutdown_in_progress {
-                                // Done is sent after final updates are
-                                // enqueued, but select may see this independent
-                                // channel first. Drain the root tail into the
-                                // same lossless per-instance spools.
-                                if let Err(failure) = lifecycle_outboxes.flush_all_blocking(&update_txs) {
-                                    quarantine_lifecycle_failure(
-                                        &failure, &instance_ids, &worker_quarantined, &signal_tx,
-                                    );
-                                    break 'router;
-                                }
-                                while let Ok(u) = update_rx.try_recv() {
-                                    let result = Self::route_private_update(
-                                        u,
-                                        &iid_to_idx,
-                                        &update_txs,
-                                        &worker_quarantined,
-                                        &mut lifecycle_outboxes,
-                                    );
-                                    if let Err(failure) = result {
-                                        quarantine_lifecycle_failure(
-                                            &failure, &instance_ids, &worker_quarantined, &signal_tx,
-                                        );
-                                        break 'router;
-                                    }
-                                }
-                                while let Some(private_rx) = private_poll_rx.as_ref() {
-                                    let routed = match private_rx.try_recv() {
-                                        Ok(routed) => routed,
-                                        Err(crossbeam_channel::TryRecvError::Empty) if private_rx.has_pending() => {
-                                            thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
-                                            continue;
-                                        }
-                                        Err(_) => break,
-                                    };
-                                    if let Err(failure) = Self::route_private_update(
-                                        routed, &iid_to_idx, &update_txs,
-                                        &worker_quarantined, &mut lifecycle_outboxes,
-                                    ) {
-                                        quarantine_lifecycle_failure(
-                                            &failure, &instance_ids, &worker_quarantined, &signal_tx,
-                                        );
-                                        break 'router;
-                                    }
-                                }
-                                while let Some(executor_rx) = executor_update_rx.as_ref() {
-                                    let routed = match executor_rx.try_recv() {
-                                        Ok(routed) => routed,
-                                        Err(crossbeam_channel::TryRecvError::Empty) if executor_rx.has_pending() => {
-                                            thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
-                                            continue;
-                                        }
-                                        Err(_) => break,
-                                    };
-                                    let result = Self::route_executor_update(
-                                        routed,
-                                        &iid_to_idx,
-                                        &update_txs,
-                                        &worker_quarantined,
-                                        &mut lifecycle_outboxes,
-                                    );
-                                    if let Err(failure) = result {
-                                        quarantine_lifecycle_failure(
-                                            &failure, &instance_ids, &worker_quarantined, &signal_tx,
-                                        );
-                                        break 'router;
-                                    }
-                                }
-                                if let Err(failure) = lifecycle_outboxes.flush_all_blocking(&update_txs) {
-                                    quarantine_lifecycle_failure(
-                                        &failure, &instance_ids, &worker_quarantined, &signal_tx,
-                                    );
-                                }
-                                break 'router;
                             }
                         },
                         recv(worker_status_rx) -> msg => {
@@ -12164,7 +12165,7 @@ impl Engine {
         poly_states: HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
     ) -> thread::JoinHandle<()> {
-        let (shutdown_done_tx, _shutdown_done_rx) = bounded::<()>(1);
+        let (shutdown_done_tx, _shutdown_done_rx) = completion_lane();
         self.spawn_execution_thread_with_poly_shutdown(
             signal_rx,
             update_tx.into(),
@@ -12183,7 +12184,7 @@ impl Engine {
         update_tx: ExecutionUpdateTx,
         poly_states: HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
-        shutdown_done_tx: Sender<()>,
+        shutdown_done_tx: CompletionSender,
         shutdown_token: ShutdownToken,
         mut admission_publishers: HashMap<String, SnapshotPublisher<ExecutionAdmission>>,
         probe_http_rx: Receiver<ProbeHttpRequest>,
@@ -13088,7 +13089,7 @@ impl Engine {
                                 shutdown_finalized = true;
                             }
                             if !terminal {
-                                let _ = shutdown_done_tx.send(());
+                                shutdown_done_tx.publish();
                                 info!("[Executor] coordinated shutdown barrier complete");
                                 continue;
                             }
@@ -17874,7 +17875,7 @@ mod market_router_tests {
         let shutdown = ShutdownToken::new();
         let (signal_tx, signal_rx) = bounded(1);
         let (update_tx, _update_rx) = bounded(1);
-        let (shutdown_done_tx, shutdown_done_rx) = bounded(1);
+        let (shutdown_done_tx, shutdown_done_rx) = completion_lane();
         let execution = engine.spawn_execution_thread_with_poly_shutdown(
             signal_rx,
             update_tx.into(),
@@ -17895,12 +17896,11 @@ mod market_router_tests {
         // This is the supervisor action taken by run_live. The executor sees
         // it directly even though no strategy can forward BeginShutdown.
         shutdown.request();
-        assert!(
-            shutdown_done_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .is_ok(),
-            "execution did not finish its coordinated barrier",
-        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !shutdown_done_rx.is_complete() && Instant::now() < deadline {
+            thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
+        }
+        assert!(shutdown_done_rx.is_complete(), "execution did not finish its coordinated barrier");
         drop(signal_tx);
         assert_thread_exits(&execution, "execution");
         let _ = strategy.join();
@@ -17944,7 +17944,7 @@ mod market_router_tests {
         poly_states.insert("shutdown-test".to_string(), shared.clone());
         let (signal_tx, signal_rx) = bounded(1);
         let (update_tx, _update_rx) = bounded(8);
-        let (shutdown_done_tx, _shutdown_done_rx) = bounded(1);
+        let (shutdown_done_tx, _shutdown_done_rx) = completion_lane();
         let execution = engine.spawn_execution_thread_with_poly_shutdown(
             signal_rx,
             update_tx.into(),

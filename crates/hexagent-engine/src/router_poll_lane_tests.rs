@@ -15,6 +15,10 @@ impl Strategy for LifecycleProbe {
     fn subscribed_symbols(&self) -> Vec<String> {
         vec!["btc/usd".into()]
     }
+    fn on_shutdown(&mut self) -> Vec<Signal> {
+        self.trace.try_send((self.iid, u64::MAX)).unwrap();
+        Vec::new()
+    }
     fn on_spot_price(&mut self, _: &SpotPrice) {
         self.trace.try_send((self.iid, 0)).unwrap();
     }
@@ -31,15 +35,20 @@ impl Strategy for LifecycleProbe {
 
 #[test]
 fn live_root_drains_execution_before_market_preserves_replay_and_exits() {
-    run_root_poll_lanes(false);
+    run_root_poll_lanes(false, false);
 }
 
 #[test]
 fn live_private_recovery_poll_lane_preserves_owner_replay_and_priority() {
-    run_root_poll_lanes(true);
+    run_root_poll_lanes(true, false);
 }
 
-fn run_root_poll_lanes(with_recovery: bool) {
+#[test]
+fn early_duplicate_completion_is_retained_until_router_enters_shutdown() {
+    run_root_poll_lanes(true, true);
+}
+
+fn run_root_poll_lanes(with_recovery: bool, early_completion: bool) {
     let config: Config = toml::from_str("[general]\nmode = 'live'\n").unwrap();
     let engine = Engine::new(config, StrategyRegistry::new());
     let (trace_tx, trace_rx) = bounded(16);
@@ -58,6 +67,7 @@ fn run_root_poll_lanes(with_recovery: bool) {
     let (root_tx, root_rx) = hexagent_runtime::poll_channel::bounded(16);
     // Two owners interleaved; a duplicate timestamp deliberately represents
     // replay. Transport must not invent deduplication or change ownership.
+    let mut tail_template = None;
     for (owner, timestamp_ns) in [(1, 11), (0, 21), (1, 11), (0, 22), (1, 12)] {
         let routed = RoutedOrderUpdate {
             owner,
@@ -87,6 +97,7 @@ fn run_root_poll_lanes(with_recovery: bool) {
             replay.update.timestamp_ns += 100;
             private_tx.send(replay).unwrap();
         }
+        tail_template = Some(routed.clone());
         root_tx.send(routed).unwrap();
     }
     crate::exchange::publish_market_event(
@@ -101,7 +112,7 @@ fn run_root_poll_lanes(with_recovery: bool) {
     )
     .unwrap();
     let (signal_tx, signal_rx) = bounded(16);
-    let (done_tx, done_rx) = bounded(1);
+    let (done_tx, done_rx) = completion_lane();
     let router = engine.spawn_per_instance_strategy_threads(
         strategies,
         market_rx,
@@ -132,6 +143,11 @@ fn run_root_poll_lanes(with_recovery: bool) {
         assert_eq!(traces["owner1"], [11, 11, 12, 0]);
     }
     assert_eq!(market_tx.consumer_progress().executor_pending_high_water, 5);
+    if early_completion {
+        // Supervisor can finish cancellation before the market Exit reaches
+        // the router. No event may disappear before shutdown_in_progress.
+        for _ in 0..100 { done_tx.publish(); }
+    }
     crate::exchange::publish_market_event(&market_tx, MarketEvent::Exit).unwrap();
     assert!(matches!(
         signal_rx
@@ -140,7 +156,17 @@ fn run_root_poll_lanes(with_recovery: bool) {
             .signal,
         Signal::BeginShutdown
     ));
-    done_tx.send(()).unwrap();
+    if !early_completion {
+        // Final completion races with queued lifecycle updates; both owners
+        // must apply their exact tail before generating final reports.
+        for (owner, timestamp_ns) in [(0, 301), (1, 401)] {
+            let mut update = tail_template.as_ref().unwrap().clone();
+            update.owner = owner;
+            update.update.timestamp_ns = timestamp_ns;
+            root_tx.send(update).unwrap();
+        }
+        for _ in 0..100 { done_tx.publish(); }
+    }
     assert!(matches!(
         signal_rx
             .recv_timeout(std::time::Duration::from_secs(3))
@@ -149,4 +175,13 @@ fn run_root_poll_lanes(with_recovery: bool) {
         Signal::Exit
     ));
     router.join().unwrap();
+    let mut tail = HashMap::<&str, Vec<u64>>::new();
+    while let Ok((iid, event)) = trace_rx.try_recv() { tail.entry(iid).or_default().push(event); }
+    if early_completion {
+        assert_eq!(tail["owner0"], [u64::MAX]);
+        assert_eq!(tail["owner1"], [u64::MAX]);
+    } else {
+        assert_eq!(tail["owner0"], [301, u64::MAX]);
+        assert_eq!(tail["owner1"], [401, u64::MAX]);
+    }
 }
