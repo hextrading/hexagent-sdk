@@ -6872,6 +6872,21 @@ mod tests {
         assert_eq!(checkpoint.cursor, "page-2");
     }
 
+    // The execution barrier drains its owner lane, not the independently
+    // published cold ledger mirror read by account_state.order().
+    fn await_cold_order_for_test(shared: &SharedState, coid: &str, status: Option<OrderStatus>) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if shared.account_state.order(coid).is_some_and(|order| {
+                status.is_none_or(|expected| order.status == expected)
+            }) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "cold order mirror did not catch up: {coid}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn owned_taker_shared(limit_price: f64) -> Arc<SharedState> {
         let shared = test_shared();
         shared.account_state.register_instance("owner", 1.0);
@@ -6914,6 +6929,7 @@ mod tests {
             )
             .unwrap();
         shared.flush_execution_state_for_test();
+        await_cold_order_for_test(&shared, "owner-1", None);
         shared
     }
 
@@ -7354,6 +7370,7 @@ mod tests {
         });
         assert_eq!(parse_user_event(&stale_placement, &shared).len(), 1);
         shared.flush_execution_state_for_test();
+        await_cold_order_for_test(&shared, "owner-1", Some(OrderStatus::Accepted));
         assert_eq!(
             shared.account_state.order("owner-1").unwrap().status,
             OrderStatus::Accepted

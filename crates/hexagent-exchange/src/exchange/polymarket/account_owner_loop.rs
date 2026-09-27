@@ -58,29 +58,28 @@ impl RuntimeRetirement {
             // Recheck owner state: a stale cold plan must never remove a
             // newly rebound identity belonging to a different market.
             if !execution
+                .current
                 .coid_to_token
                 .get(&coid)
                 .is_some_and(|token| self.tokens.contains(token))
             {
                 continue;
             }
-            if let Some(oid) = execution.coid_to_oid.remove(&coid) {
-                let normalized = normalize_order_id(&oid);
-                if execution.oid_to_coid.get(&normalized) == Some(&coid) {
-                    execution.oid_to_coid.remove(&normalized);
+            if let Some(oid) = execution.current.coid_to_oid.get(&coid) {
+                let normalized = normalize_order_id(oid);
+                if execution.current.oid_to_coid.get(&normalized) == Some(&coid) {
                     shared
                         .runtime_order_ownership
-                        .remove_client_order(&oid, &coid);
+                        .remove_client_order(oid, &coid);
                     retired.normalized_order_ids.push(normalized);
                 }
             }
-            execution.coid_to_token.remove(&coid);
             retired.client_order_ids.push(coid);
         }
         if retired.len() > 0 {
-            let mut next = (*shared.execution_state.load_full()).clone();
+            let mut next = execution.current.clone();
             retired.apply_to(&mut next);
-            shared.execution_state.store(Arc::new(next));
+            drop(execution.publish(shared, next));
             shared.enqueue_lifecycle_trace(LifecycleTraceJob::ForgetMany {
                 client_order_ids: retired.client_order_ids.into_iter().collect(),
             });
@@ -263,7 +262,11 @@ mod tests {
         let mut owner = ExecutionStateOwner::new(initial.clone());
         shared.execution_state.store(Arc::new(initial.clone()));
         // Simulate an owner-local identity rebind after the cold snapshot.
-        owner.coid_to_token.insert("retire-0".into(), "new".into());
+        owner.apply(&shared, ExecutionStateCommand::InstallIdentity {
+            client_order_id: "retire-0".into(),
+            exchange_order_id: format!("0x{:064x}", 1),
+            token: "new".into(),
+        });
         let mut work = RuntimeRetirement {
             tokens: HashSet::from(["old".into()]),
             coids: (0..40)
@@ -275,12 +278,12 @@ mod tests {
         let mut positions = LivePositionManager::new();
         assert!(!work.step(&shared, &mut owner, &mut positions));
         assert!(
-            owner.coid_to_oid.len() >= 24,
+            owner.current.coid_to_oid.len() >= 24,
             "one turn removed more than 16 identities"
         );
         while !work.step(&shared, &mut owner, &mut positions) {}
-        assert_eq!(owner.coid_to_oid.len(), 1);
-        assert!(owner.coid_to_oid.contains_key("retire-0"));
+        assert_eq!(owner.current.coid_to_oid.len(), 1);
+        assert!(owner.current.coid_to_oid.contains_key("retire-0"));
         assert_eq!(
             initial.coid_to_oid.len(),
             40,
