@@ -2020,43 +2020,31 @@ enum ExecutionStateCommand {
     },
 }
 
+// The private owner is the sole writer. Its current immutable generation is
+// also the read index; duplicating every identity in flat mutable HashMaps made
+// an ordinary insert rehash the complete retained history at capacity boundaries.
 struct ExecutionStateOwner {
-    open_orders: HashMap<String, TrackedOrder>,
-    coid_to_oid: HashMap<String, String>,
-    oid_to_coid: HashMap<String, String>,
-    coid_to_token: HashMap<String, String>,
+    current: ExecutionStateSnapshot,
 }
 
 impl ExecutionStateOwner {
     fn new(current: ExecutionStateSnapshot) -> Self {
-        Self {
-            open_orders: current
-                .open_orders
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            coid_to_oid: current
-                .coid_to_oid
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            oid_to_coid: current
-                .oid_to_coid
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            coid_to_token: current
-                .coid_to_token
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        }
+        Self { current }
+    }
+
+    fn publish(
+        &mut self,
+        shared: &SharedState,
+        next: ExecutionStateSnapshot,
+    ) -> Arc<ExecutionStateSnapshot> {
+        self.current = next.clone();
+        shared.execution_state.swap(Arc::new(next))
     }
 
     fn apply(&mut self, shared: &SharedState, command: ExecutionStateCommand) {
         let mut observation = matches!(&command, ExecutionStateCommand::InstallIdentity { .. })
             .then(publication_observation::Observation::new);
-        let mut next = (*shared.execution_state.load_full()).clone();
+        let mut next = self.current.clone();
         if let Some(observation) = observation.as_mut() {
             observation.mark(0);
         }
@@ -2066,9 +2054,7 @@ impl ExecutionStateOwner {
                 exchange_order_id,
                 token,
             } => {
-                let previous = self
-                    .coid_to_oid
-                    .insert(client_order_id.clone(), exchange_order_id.clone());
+                let previous = next.coid_to_oid.get(&client_order_id).cloned();
                 let normalized = normalize_order_id(&exchange_order_id);
                 if let Some(observation) = observation.as_mut() {
                     observation.mark(1);
@@ -2082,12 +2068,9 @@ impl ExecutionStateOwner {
                 if let Some(previous) = previous {
                     let previous = normalize_order_id(&previous);
                     if previous != normalized {
-                        self.oid_to_coid.remove(&previous);
                         next.oid_to_coid = next.oid_to_coid.with_remove(&previous);
                     }
                 }
-                self.oid_to_coid
-                    .insert(normalized.clone(), client_order_id.clone());
                 if let Some(observation) = observation.as_mut() {
                     observation.mark(3);
                 }
@@ -2098,8 +2081,6 @@ impl ExecutionStateOwner {
                     observation.mark(4);
                 }
                 if !token.is_empty() {
-                    self.coid_to_token
-                        .insert(client_order_id.clone(), token.clone());
                     if let Some(observation) = observation.as_mut() {
                         observation.mark(5);
                     }
@@ -2113,20 +2094,13 @@ impl ExecutionStateOwner {
                 client_order_id,
                 tracked,
             } => {
-                self.open_orders
-                    .insert(client_order_id.clone(), tracked.clone());
                 next.open_orders = next.open_orders.with_insert(client_order_id, tracked);
             }
             ExecutionStateCommand::RemoveOpen { client_order_id } => {
-                self.open_orders.remove(&client_order_id);
                 next.open_orders = next.open_orders.with_remove(&client_order_id);
             }
             #[cfg(test)]
             ExecutionStateCommand::Clear => {
-                self.open_orders.clear();
-                self.coid_to_oid.clear();
-                self.oid_to_coid.clear();
-                self.coid_to_token.clear();
                 shared.runtime_order_ownership.clear();
                 next = ExecutionStateSnapshot::default();
             }
@@ -2137,15 +2111,13 @@ impl ExecutionStateOwner {
                 enqueued_ns,
                 completion,
             } => {
-                self.open_orders
-                    .insert(client_order_id.clone(), tracked.clone());
                 next.open_orders = next.open_orders.with_insert(client_order_id, tracked);
-                shared.execution_state.store(Arc::new(next));
+                drop(self.publish(shared, next));
                 let _ = completion.send(now_ns().saturating_sub(enqueued_ns));
                 return;
             }
         }
-        let previous = shared.execution_state.swap(Arc::new(next));
+        let previous = self.publish(shared, next);
         if let Some(observation) = observation.as_mut() {
             observation.mark(7);
         }
@@ -2154,21 +2126,6 @@ impl ExecutionStateOwner {
             observation.mark(8);
             observation.finish();
         }
-    }
-
-    // Exact previous full rebuild retained for focused before/after benchmarks.
-    #[cfg(test)]
-    fn publish(&self, shared: &SharedState, open_changed: bool, identity_changed: bool) {
-        let mut next = (*shared.execution_state.load_full()).clone();
-        if open_changed {
-            next.open_orders = ExecutionReadMap::from_hash_map(self.open_orders.clone());
-        }
-        if identity_changed {
-            next.coid_to_oid = ExecutionReadMap::from_hash_map(self.coid_to_oid.clone());
-            next.oid_to_coid = ExecutionReadMap::from_hash_map(self.oid_to_coid.clone());
-            next.coid_to_token = ExecutionReadMap::from_hash_map(self.coid_to_token.clone());
-        }
-        shared.execution_state.store(Arc::new(next));
     }
 }
 
@@ -3911,10 +3868,41 @@ impl RetiredRuntimeMappings {
     }
 }
 
+/// Select only identities still owned by the certified token/instance scope.
+/// Callers apply the removals to one owner-local generation before publication.
+fn select_token_mappings(
+    current: &ExecutionStateSnapshot,
+    settling: &[String],
+    owned_coids: Option<&HashSet<String>>,
+) -> RetiredRuntimeMappings {
+    let settling: HashSet<&str> = settling.iter().map(String::as_str).collect();
+    let client_order_ids: Vec<String> = current
+        .coid_to_token
+        .iter()
+        .filter(|(coid, token)| {
+            settling.contains(token.as_str())
+                && owned_coids.is_none_or(|owned| owned.contains(*coid))
+        })
+        .map(|(coid, _)| coid.clone())
+        .collect();
+    let normalized_order_ids = client_order_ids
+        .iter()
+        .filter_map(|coid| {
+            let normalized = normalize_order_id(current.coid_to_oid.get(coid)?);
+            (current.oid_to_coid.get(&normalized) == Some(coid)).then_some(normalized)
+        })
+        .collect();
+    RetiredRuntimeMappings {
+        client_order_ids,
+        normalized_order_ids,
+    }
+}
+
 /// Remove every owned coid↔oid / coid↔token entry whose token is in
 /// `settling`, keeping sibling instances and all other events intact. Returns
 /// the exact removed identities for one coherent immutable publication.
 /// The lifecycle owner is the sole writer of all three mutable maps.
+#[cfg(test)]
 fn reclaim_token_mappings(
     coid_to_oid: &mut HashMap<String, String>,
     oid_to_coid: &mut HashMap<String, String>,
@@ -5632,9 +5620,9 @@ impl SharedState {
         }
         let retired_events = ready.len();
         let mut retired_runtime_mappings = 0usize;
-        let mut next = (*self.execution_state.load_full()).clone();
+        let mut next = execution.current.clone();
         for tokens in &ready {
-            let owned_coids: HashSet<String> = execution
+            let owned_coids: HashSet<String> = next
                 .coid_to_token
                 .iter()
                 .filter(|(_, token)| tokens.contains(*token))
@@ -5644,13 +5632,7 @@ impl SharedState {
                 continue;
             }
             let token_list: Vec<String> = tokens.iter().cloned().collect();
-            let retired = reclaim_token_mappings(
-                &mut execution.coid_to_oid,
-                &mut execution.oid_to_coid,
-                &mut execution.coid_to_token,
-                &token_list,
-                Some(&owned_coids),
-            );
+            let retired = select_token_mappings(&next, &token_list, Some(&owned_coids));
             retired_runtime_mappings = retired_runtime_mappings.saturating_add(retired.len());
             retired.apply_to(&mut next);
             self.enqueue_lifecycle_trace(LifecycleTraceJob::ForgetMany {
@@ -5662,7 +5644,7 @@ impl SharedState {
         // This certificate completion is the sole runtime identity retirement
         // point. Publish actual removals without rebuilding unrelated maps.
         if retired_runtime_mappings > 0 {
-            self.execution_state.store(Arc::new(next));
+            drop(execution.publish(self, next));
         }
         let retired_live_trades = ready
             .iter()

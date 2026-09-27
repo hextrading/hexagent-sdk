@@ -189,13 +189,8 @@ fn retirement_publishes_coherent_identity_maps_and_preserves_replayed_routes() {
     let original = snapshot_fixture(256);
     let mut owner = ExecutionStateOwner::new(original.clone());
     let owned = HashSet::from(["owner-0".to_string(), "owner-64".to_string()]);
-    let retired = reclaim_token_mappings(
-        &mut owner.coid_to_oid,
-        &mut owner.oid_to_coid,
-        &mut owner.coid_to_token,
-        &["retiring".into()],
-        Some(&owned),
-    );
+    let retired = select_token_mappings(&owner.current, &["retiring".into()], Some(&owned));
+    retired.apply_to(&mut owner.current);
     assert_eq!(
         retired.len(),
         1,
@@ -215,23 +210,13 @@ fn retirement_publishes_coherent_identity_maps_and_preserves_replayed_routes() {
         "old reader stays valid"
     );
     // Repeated eviction after a later replay in another scope must not erase it.
-    owner
-        .coid_to_oid
-        .insert("owner-0".into(), "0xabcdef".into());
-    owner.oid_to_coid.insert("abcdef".into(), "owner-0".into());
-    owner
-        .coid_to_token
-        .insert("owner-0".into(), "replayed-event".into());
-    let repeated = reclaim_token_mappings(
-        &mut owner.coid_to_oid,
-        &mut owner.oid_to_coid,
-        &mut owner.coid_to_token,
-        &["retiring".into()],
-        Some(&owned),
-    );
+    owner.current.coid_to_oid = owner.current.coid_to_oid.with_insert("owner-0".into(), "0xabcdef".into());
+    owner.current.oid_to_coid = owner.current.oid_to_coid.with_insert("abcdef".into(), "owner-0".into());
+    owner.current.coid_to_token = owner.current.coid_to_token.with_insert("owner-0".into(), "replayed-event".into());
+    let repeated = select_token_mappings(&owner.current, &["retiring".into()], Some(&owned));
     assert_eq!(repeated.len(), 0);
     assert_eq!(
-        owner.oid_to_coid.get("abcdef").map(String::as_str),
+        owner.current.oid_to_coid.get("abcdef").map(String::as_str),
         Some("owner-0")
     );
     let prior_shards = Arc::clone(&next.coid_to_oid.shards);
@@ -359,12 +344,14 @@ fn benchmark_retirement_snapshot_publication() {
     assert_eq!(shared.join_background_workers(), 3);
     for targets in [0, 64] {
         let original = Arc::new(snapshot_fixture(ROUTES));
-        let mut owner = ExecutionStateOwner::new((*original).clone());
+        let mut coid_to_oid: HashMap<_, _> = original.coid_to_oid.iter().map(|(k,v)| (k.clone(),v.clone())).collect();
+        let mut oid_to_coid: HashMap<_, _> = original.oid_to_coid.iter().map(|(k,v)| (k.clone(),v.clone())).collect();
+        let mut coid_to_token: HashMap<_, _> = original.coid_to_token.iter().map(|(k,v)| (k.clone(),v.clone())).collect();
         let owned: HashSet<String> = (0..targets).map(|i| format!("owner-{i}")).collect();
         let retired = reclaim_token_mappings(
-            &mut owner.coid_to_oid,
-            &mut owner.oid_to_coid,
-            &mut owner.coid_to_token,
+            &mut coid_to_oid,
+            &mut oid_to_coid,
+            &mut coid_to_token,
             &["retiring".into()],
             Some(&owned),
         );
@@ -380,7 +367,11 @@ fn benchmark_retirement_snapshot_publication() {
                 assert_eq!(rx.len(), 2);
                 assert!(rx.recv().unwrap().is_none());
                 if baseline {
-                    owner.publish(&shared, false, true);
+                    let mut next = (*shared.execution_state.load_full()).clone();
+                    next.coid_to_oid = ExecutionReadMap::from_hash_map(coid_to_oid.clone());
+                    next.oid_to_coid = ExecutionReadMap::from_hash_map(oid_to_coid.clone());
+                    next.coid_to_token = ExecutionReadMap::from_hash_map(coid_to_token.clone());
+                    shared.execution_state.store(Arc::new(next));
                 } else if retired.len() != 0 {
                     let mut next = (*shared.execution_state.load_full()).clone();
                     retired.apply_to(&mut next);
@@ -408,5 +399,156 @@ fn benchmark_retirement_snapshot_publication() {
                 q(1000)
             );
         }
+    }
+}
+
+#[test]
+fn execution_owner_keeps_rebind_retirement_and_replay_in_one_generation() {
+    let shutdown = ShutdownToken::new();
+    let trade = super::tests::shutdown_test_trade(shutdown.clone());
+    let shared = trade.shared_state();
+    shutdown.request();
+    shutdown.finish();
+    assert_eq!(shared.join_background_workers(), 3);
+    let initial = snapshot_fixture(128);
+    let isolated = ExecutionStateOwner::new(initial.clone());
+    let mut owner = ExecutionStateOwner::new(initial);
+    drop(owner.publish(&shared, owner.current.clone()));
+    let held = shared.execution_state.load_full();
+    let install = |owner: &mut ExecutionStateOwner, token: &str| {
+        owner.apply(
+            &shared,
+            ExecutionStateCommand::InstallIdentity {
+                client_order_id: "owner-0".into(),
+                exchange_order_id: "0xabcdef".into(),
+                token: token.into(),
+            },
+        )
+    };
+    install(&mut owner, "new-event");
+    install(&mut owner, "new-event"); // duplicate/replay does not grow any index
+    assert_eq!(owner.current.coid_to_oid.len(), 128);
+    assert!(!owner
+        .current
+        .oid_to_coid
+        .contains_key(&format!("{:064x}", 0)));
+    assert_eq!(
+        owner.current.oid_to_coid.get("abcdef").map(String::as_str),
+        Some("owner-0")
+    );
+    let owned = HashSet::from(["owner-0".to_owned()]);
+    let stale = select_token_mappings(&owner.current, &["retiring".into()], Some(&owned));
+    assert_eq!(
+        stale.len(),
+        0,
+        "an old certificate cannot retire a rebound identity"
+    );
+    let retire = select_token_mappings(&owner.current, &["new-event".into()], Some(&owned));
+    let mut next = owner.current.clone();
+    retire.apply_to(&mut next);
+    drop(owner.publish(&shared, next));
+    assert!(!owner.current.coid_to_oid.contains_key("owner-0"));
+    let removed = shared.execution_state.load_full();
+    install(&mut owner, "replayed-event");
+    assert_eq!(owner.current.coid_to_oid.len(), 128);
+    let published = shared.execution_state.load_full();
+    for (owned, reader) in [
+        (&owner.current.coid_to_oid, &published.coid_to_oid),
+        (&owner.current.oid_to_coid, &published.oid_to_coid),
+        (&owner.current.coid_to_token, &published.coid_to_token),
+    ] {
+        assert!(Arc::ptr_eq(&owned.shards, &reader.shards));
+    }
+    assert_eq!(
+        held.coid_to_token.get("owner-0").map(String::as_str),
+        Some("retiring")
+    );
+    assert!(!removed.coid_to_oid.contains_key("owner-0"));
+    assert_eq!(
+        isolated
+            .current
+            .coid_to_token
+            .get("owner-0")
+            .map(String::as_str),
+        Some("retiring")
+    );
+    assert!(owner.current.coid_to_oid.contains_key("owner-64"));
+}
+
+#[test]
+#[ignore = "release: full flat-index growth boundary versus owner-local snapshot publication"]
+fn benchmark_execution_owner_capacity_boundary() {
+    const N: usize = 128;
+    let history = HashMap::<String, String>::with_capacity(28_330).capacity();
+    let original = Arc::new(snapshot_fixture(history));
+    let maps: [HashMap<String, String>; 3] = [
+        &original.coid_to_oid,
+        &original.oid_to_coid,
+        &original.coid_to_token,
+    ]
+    .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    for map in &maps {
+        assert_eq!(map.len(), map.capacity());
+    }
+    let shutdown = ShutdownToken::new();
+    let trade = super::tests::shutdown_test_trade(shutdown.clone());
+    let shared = trade.shared_state();
+    shutdown.request();
+    shutdown.finish();
+    assert_eq!(shared.join_background_workers(), 3);
+    crate::latency::prepare_observation_stages(publication_observation::STAGES);
+    let mut old_times = Vec::with_capacity(N);
+    let mut new_times = Vec::with_capacity(N);
+    for i in 0..N {
+        let mut flat = maps.clone();
+        let mut owner = ExecutionStateOwner::new((*original).clone());
+        for baseline in if i % 2 == 0 {
+            [true, false]
+        } else {
+            [false, true]
+        } {
+            shared.execution_state.store(Arc::clone(&original));
+            let coid = format!("owner-{history}");
+            let oid = format!("0x{history:064x}");
+            let token = "new-event".to_owned();
+            let start = std::time::Instant::now();
+            if baseline {
+                // The previous private-owner path maintained all three flat
+                // tables in addition to precisely the same published snapshots.
+                let mut next = (*shared.execution_state.load_full()).clone();
+                flat[0].insert(coid.clone(), oid.clone());
+                let normalized = normalize_order_id(&oid);
+                next.coid_to_oid = next.coid_to_oid.with_insert(coid.clone(), oid);
+                flat[1].insert(normalized.clone(), coid.clone());
+                next.oid_to_coid = next.oid_to_coid.with_insert(normalized, coid.clone());
+                flat[2].insert(coid.clone(), token.clone());
+                next.coid_to_token = next.coid_to_token.with_insert(coid, token);
+                drop(shared.execution_state.swap(Arc::new(next)));
+                old_times.push(start.elapsed().as_nanos() as u64);
+                assert!(flat.iter().all(|m| m.capacity() > history));
+            } else {
+                owner.apply(
+                    &shared,
+                    ExecutionStateCommand::InstallIdentity {
+                        client_order_id: coid,
+                        exchange_order_id: oid,
+                        token,
+                    },
+                );
+                new_times.push(start.elapsed().as_nanos() as u64);
+            }
+            let view = shared.execution_state.load_full();
+            assert_eq!(view.coid_to_oid.len(), history + 1);
+            assert_eq!(view.oid_to_coid.len(), history + 1);
+            assert_eq!(view.coid_to_token.len(), history + 1);
+        }
+    }
+    for (mode, mut values) in [
+        ("flat_duplicate_indexes", old_times),
+        ("owner_snapshot", new_times),
+    ] {
+        values.sort_unstable();
+        let q = |p: usize| values[(N * p).div_ceil(1000) - 1];
+        eprintln!("owner_capacity mode={mode} boundary=identity_update_publish_old_generation_drop n={N} history={history} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0", q(500),q(990),q(999),q(1000));
     }
 }
