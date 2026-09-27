@@ -4,7 +4,9 @@
 //! order no longer carries `feeRateBps`. At match time the server
 //! computes
 //!
-//!     fee = C × feeRate × (p × (1 − p)) ^ exponent
+//! ```text
+//! fee = C × feeRate × (p × (1 − p)) ^ exponent
+//! ```
 //!
 //! using per-market values that the client looks up once via
 //! `GET /markets/{conditionId}` (the "getClobMarketInfo" RPC named in
