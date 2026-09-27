@@ -7160,7 +7160,16 @@ mod tests {
             "asset_id": "TOKEN", "side": "BUY", "price": "0.5",
             "original_size": "10", "size_matched": "0",
         });
-        assert!(parse_user_event(&placement, &shared).is_empty());
+        // The immutable routing identity is not a live status authority.
+        // Depending on cold publication, this legacy parser may suppress the
+        // stale row or forward the venue's zero-fill Accepted update. In both
+        // cases the lifecycle owner must preserve the stronger partial fill.
+        let updates = parse_user_event(&placement, &shared);
+        assert!(updates.len() <= 1);
+        for update in updates {
+            assert_eq!(update.status, OrderStatus::Accepted);
+            assert_eq!(update.filled_quantity, 0.0);
+        }
         shared.flush_execution_state_for_test();
         assert_eq!(
             shared.account_state.order("owner-1").unwrap().status,

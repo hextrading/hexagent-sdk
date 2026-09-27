@@ -122,7 +122,10 @@ Release account tests: 346 passed, 20 ignored. Release exchange tests: 930 passe
 ignored loopback probe; all HTTP boundary/timeout/reuse tests passed. Existing
 ordering, duplicate delivery, replay, bounded overflow and instance-isolation
 tests remain in those suites. Two recovery tests now wait on their existing
-lifecycle test barrier before observing asynchronous publication.
+lifecycle test barrier before observing asynchronous publication. The late-placement
+test verifies the sole owner preserves PartiallyFilled even when the immutable
+routing snapshot allows the legacy parser to forward the raw zero-fill Accepted
+row; routing identity is not used as a live status authority.
 
 ```sh
 CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo test --release -p hexagent-account --lib -- --test-threads=1
