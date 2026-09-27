@@ -7957,7 +7957,7 @@ impl ClobLocalBooks {
             return Err("book has empty asset_id".to_string());
         }
         let exchange_timestamp_ns = timestamp_value_to_ns(fields.timestamp.as_ref(), local_now);
-        if let Some(current) = self.token_books.get(&symbol) {
+        let initial_snapshot = if let Some(current) = self.token_books.get(&symbol) {
             if exchange_timestamp_ns < current.exchange_timestamp_ns {
                 if source == ClobBookSource::RestRepair {
                     counters.bbo_repair_superseded_by_ws =
@@ -7968,7 +7968,10 @@ impl ClobLocalBooks {
                     current_timestamp_ns: current.exchange_timestamp_ns,
                 });
             }
-        }
+            false
+        } else {
+            true
+        };
         let parse_levels = |levels: arrayvec::ArrayVec<BookLevel<'_>, CLOB_BOOK_LEVEL_CAPACITY>| {
             let mut parsed = BTreeMap::new();
             for level in levels {
@@ -8033,12 +8036,24 @@ impl ClobLocalBooks {
         self.token_books.insert(symbol.clone(), book);
         // An initial snapshot for the complementary token can be older than
         // the event-level Up snapshot already accepted. Keep the newer event
-        // book, but re-emit it once so completion of initial L2 seeding can
-        // transition the feed to READY without letting the old Down book win.
+        // book, but re-emit it once so completion of healthy initial L2 seeding
+        // can transition the feed to READY. Runtime repair or replay must not
+        // re-publish an aged cache, especially while its complement is still
+        // quarantined. Preserve the original source timestamp in the one
+        // permitted startup replay.
         let mut events = arrayvec::ArrayVec::new();
         if let Some(event) = self
             .canonicalize_token(&symbol, local_now)
-            .or_else(|| self.canonical_snapshot_for_token(&symbol))
+            .or_else(|| {
+                if initial_snapshot
+                    && self.desired_health_state(self.market_key_ref(&symbol))
+                        == Some(MarketDataHealthState::Healthy)
+                {
+                    self.canonical_snapshot_for_token(&symbol)
+                } else {
+                    None
+                }
+            })
         {
             events.push(event);
         }
@@ -11102,6 +11117,10 @@ mod pick_current_event_tests {
         let base = now();
         let series_id = format!("continuous-rotation-{}", clob_monotonic_now_ns());
         let mut market = PolymarketMarket::new();
+        // Exercise rotation through its bounded mailbox without unrelated
+        // parallel tests replacing this series in the global discovery slot.
+        let (rest_tx, rest_rx) = crossbeam_channel::bounded(1);
+        market.rest_future_event_rx = rest_rx;
         market.series.push(SeriesState {
             name: "series:btc-up-or-down-5m".to_string(),
             interval_minutes: -1,
@@ -11123,7 +11142,10 @@ mod pick_current_event_tests {
         for generation in 0..12_u64 {
             let start_secs = base + generation * 300;
             let event = mk_binary_event("btc", start_secs, start_secs + 300);
-            publish_rest_future_event(&series_id, &event);
+            rest_tx.try_send(RestFutureEventCandidate {
+                series_id: series_id.clone(),
+                event: event.clone(),
+            }).unwrap();
             market.drain_rest_future_events();
             market.series[0].market.end_ns = now_ns().saturating_sub(1);
             market.check_rotation().unwrap();
@@ -11507,9 +11529,11 @@ mod pick_current_event_tests {
             received_at + Duration::from_millis(2),
             9_002_000_000,
         );
-        assert_eq!(stale_up.events.len(), 1);
-        let still_newer = order_book(&stale_up.events[0]);
+        assert!(stale_up.events.is_empty(), "older runtime books do not replay the cache");
+        let retained = books.canonical_snapshot_for_token("up").unwrap();
+        let still_newer = order_book(&retained);
         assert_eq!(still_newer.exchange_timestamp_ns, 2_001_000_000);
+        assert_eq!(still_newer.local_timestamp_ns, 9_001_000_000);
         assert_eq!(still_newer.bids[0].price, 0.35);
     }
 
@@ -11878,6 +11902,126 @@ mod pick_current_event_tests {
                 ..
             })
         )));
+    }
+
+    #[test]
+    fn repair_does_not_republish_cached_book_while_complement_is_quarantined() {
+        let tokens = vec!["up".to_string(), "down".to_string()];
+        let mut books = ClobLocalBooks::new(&[canonical_event_spec()]);
+        let started = Instant::now();
+        process_clob_frame(
+            r#"[{"event_type":"book","asset_id":"up","bids":[{"price":"0.44","size":"10"}],"asks":[{"price":"0.45","size":"11"}],"timestamp":"9300"},{"event_type":"book","asset_id":"down","bids":[{"price":"0.55","size":"11"}],"asks":[{"price":"0.56","size":"10"}],"timestamp":"9300"}]"#,
+            &mut books,
+            &tokens,
+            started,
+            17_300_000_000,
+        );
+        process_clob_frame(
+            r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.42","size":"8","side":"BUY","best_bid":"0.42","best_ask":"0.45"},{"asset_id":"down","price":"0.54","size":"8","side":"BUY","best_bid":"0.54","best_ask":"0.56"}],"timestamp":"9301"}"#,
+            &mut books,
+            &tokens,
+            started + Duration::from_millis(1),
+            17_301_000_000,
+        );
+        let deferred =
+            books.flush_deferred_due(started + Duration::from_millis(52), 17_352_000_000, &tokens);
+        assert_eq!(deferred.repair_tokens, vec!["down", "up"]);
+        for (token, body, millis) in [
+            (
+                "up",
+                r#"{"asset_id":"up","bids":[{"price":"0.42","size":"8"}],"asks":[{"price":"0.45","size":"11"}],"timestamp":"9302"}"#,
+                60,
+            ),
+            (
+                "down",
+                r#"{"asset_id":"down","bids":[{"price":"0.55","size":"11"}],"asks":[{"price":"0.58","size":"8"}],"timestamp":"9302"}"#,
+                70,
+            ),
+        ] {
+            let mut counters = ClobWireCounters::default();
+            let ClobBookApplyOutcome::Applied(events) = books
+                .apply_book(
+                    serde_json::from_str(body).unwrap(),
+                    started + Duration::from_millis(millis),
+                    17_300_000_000 + millis * 1_000_000,
+                    ClobBookSource::RestRepair,
+                    &mut counters,
+                )
+                .unwrap()
+            else {
+                panic!("repair should apply")
+            };
+            assert!(!events.iter().any(|event| matches!(event,
+                MarketEvent::MarketDataHealth(h) if h.taker_ready)));
+            if token == "up" {
+                assert!(books.market_is_quarantined("up"));
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, MarketEvent::OrderBook(_))),
+                    "an incomplete repair must not replay the pre-quarantine cached book"
+                );
+            } else {
+                assert!(!books.market_is_quarantined("up"));
+                let book = first_order_book(&events);
+                assert_eq!(book.local_timestamp_ns, 17_370_000_000);
+                assert_eq!(book.bids[0].price, 0.42);
+                assert_eq!(book.asks[0].price, 0.45);
+            }
+        }
+        let stable = books.flush_deferred_due(
+            started + Duration::from_millis(70) + CLOB_HEALTH_RECOVERY_STABLE_INTERVAL,
+            17_870_000_000,
+            &tokens,
+        );
+        assert!(stable.events.iter().any(|event| matches!(event,
+            MarketEvent::MarketDataHealth(h) if h.taker_ready)));
+    }
+
+    #[test]
+    fn initial_older_complement_replays_canonical_book_only_once() {
+        let tokens = vec!["up".to_string(), "down".to_string()];
+        let mut books = ClobLocalBooks::new(&[canonical_event_spec()]);
+        let started = Instant::now();
+        process_clob_frame(
+            r#"{"event_type":"book","asset_id":"up","bids":[{"price":"0.44","size":"10"}],"asks":[{"price":"0.45","size":"11"}],"timestamp":"9302"}"#,
+            &mut books,
+            &tokens,
+            started,
+            17_300_000_000,
+        );
+        assert!(!books.has_all_seeded(&tokens));
+        let older = r#"{"event_type":"book","asset_id":"down","bids":[{"price":"0.55","size":"11"}],"asks":[{"price":"0.56","size":"10"}],"timestamp":"9301"}"#;
+        let initial = process_clob_frame(
+            older,
+            &mut books,
+            &tokens,
+            started + Duration::from_millis(1),
+            17_301_000_000,
+        );
+        assert!(books.has_all_seeded(&tokens));
+        let book = first_order_book(&initial.events);
+        assert_eq!(
+            book.local_timestamp_ns, 17_300_000_000,
+            "preserve source age"
+        );
+        assert_eq!(book.bids[0].price, 0.44);
+        assert!(initial.events.iter().any(|event| matches!(event,
+            MarketEvent::MarketDataHealth(h) if h.taker_ready)));
+        let duplicate = process_clob_frame(
+            older,
+            &mut books,
+            &tokens,
+            started + Duration::from_millis(100),
+            17_400_000_000,
+        );
+        assert!(
+            !duplicate
+                .events
+                .iter()
+                .any(|event| matches!(event, MarketEvent::OrderBook(_))),
+            "a later older complement must not replay a cached canonical book"
+        );
     }
 
     #[test]

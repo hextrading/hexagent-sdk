@@ -5,17 +5,21 @@
 //!
 //! CSV format (one order per line; `#` line comments allowed):
 //!
-//!     token_id,side,price,size
-//!     token_id,side,price,size,fee_bps      # v1-only; 5th column ignored in v2
+//! ```text
+//! token_id,side,price,size
+//! token_id,side,price,size,fee_bps      # v1-only; 5th column ignored in v2
+//! ```
 //!
 //! Example file `orders.csv`:
 //!
-//!     # Ask ladder
-//!     1728766442...41,SELL,0.99,5
-//!     1728766442...41,SELL,0.98,5
-//!     # Bid ladder
-//!     1728766442...41,BUY,0.01,5
-//!     1728766442...41,BUY,0.02,5
+//! ```text
+//! # Ask ladder
+//! 1728766442...41,SELL,0.99,5
+//! 1728766442...41,SELL,0.98,5
+//! # Bid ladder
+//! 1728766442...41,BUY,0.01,5
+//! 1728766442...41,BUY,0.02,5
+//! ```
 //!
 //! Usage:
 //!   hexbot new_orders --file orders.csv

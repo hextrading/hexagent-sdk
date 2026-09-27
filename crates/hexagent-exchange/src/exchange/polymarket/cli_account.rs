@@ -13,8 +13,10 @@
 //!        with — name a configured strategy, no need to know the secrets
 //!        layout or set `$HEXBOT_SECRETS`.
 //!
-//!          hexbot --instance maker02 --config config/live_polymaker.toml positions
-//!          hexbot positions --instance maker02 --config config/live_polymaker.toml   (also works)
+//!        ```text
+//!        hexbot --instance maker02 --config config/live_polymaker.toml positions
+//!        hexbot positions --instance maker02 --config config/live_polymaker.toml   (also works)
+//!        ```
 //!
 //!   2. `--account <id>`  (low-level escape hatch)
 //!        Names the `[poly.<id>]` secrets block directly, resolving the
