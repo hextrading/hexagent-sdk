@@ -4101,6 +4101,55 @@ fn materialize_cold_transaction(
     Ok(persistence_cold_transaction_diff(&old.into(), &new.into()))
 }
 
+/// Cold-owner-only projection for split/merge transactions. Capture exactly
+/// their writable fields, never order/trade history. Diffing the transaction's
+/// own input preserves newer lifecycle WAL entries for unchanged leaves.
+fn maintenance_persistence_view(
+    state: &SharedAccountState,
+    operation_id: &str,
+    tokens: &HashSet<String>,
+) -> Result<serde_json::Value, String> {
+    let scoped = |values: &HashMap<String, f64>| -> BTreeMap<String, f64> {
+        tokens
+            .iter()
+            .filter_map(|token| values.get(token).map(|value| (token.clone(), *value)))
+            .collect()
+    };
+    let instances: BTreeMap<_, _> = state.instances.iter().map(|(id, ledger)| (id, serde_json::json!({
+        "cash": ledger.cash,
+        "positions": scoped(&ledger.positions),
+        "maintenance_reserved_cash": ledger.maintenance_reserved_cash,
+        "maintenance_reserved_positions": scoped(&ledger.maintenance_reserved_positions),
+    }))).collect();
+    let operations: BTreeMap<_, _> = state
+        .maintenance_ops
+        .get(operation_id)
+        .map(|operation| (operation_id, operation))
+        .into_iter()
+        .collect();
+    Ok(serde_json::json!({
+        "physical_cash": state.physical_cash,
+        "physical_positions": scoped(&state.physical_positions),
+        // Reconciliation can clear residual/provisional entries outside the
+        // operation's tokens, so these small economic maps are diffed in full.
+        "unallocated_cash": state.unallocated_cash,
+        "unallocated_positions": state.unallocated_positions,
+        "provisional_position_owners": state.provisional_position_owners,
+        "instances": instances,
+        "maintenance_ops": operations,
+        "uncertain": state.uncertain,
+        "uncertain_reason": state.uncertain_reason,
+        "uncertain_since_ms": state.uncertain_since_ms,
+        "risk_blockers": state.risk_blockers,
+        "gap_replay_last_pages": state.gap_replay_last_pages,
+        "gap_replay_max_pages": state.gap_replay_max_pages,
+        "gap_replay_total_pages": state.gap_replay_total_pages,
+        "maintenance_queue_last_wait_ms": state.maintenance_queue_last_wait_ms,
+        "maintenance_queue_max_wait_ms": state.maintenance_queue_max_wait_ms,
+        "maintenance_queue_jobs": state.maintenance_queue_jobs,
+    }))
+}
+
 fn materialize_control_entry<T: Serialize>(
     state: &SharedAccountState,
     map: &str,
@@ -15851,7 +15900,10 @@ impl SharedAccount {
         }
         let authoritative_tokens =
             HashSet::from([up_token_id.to_string(), down_token_id.to_string()]);
-        let mut state = self.lock_economic_state_for_persistence(&authoritative_tokens);
+        let mut state = self.lock_economic_state(&authoritative_tokens);
+        let persistence_before = self.persistence.as_ref().map(|_| {
+            maintenance_persistence_view(&state, operation_id, &authoritative_tokens)
+        });
         if let Some(existing) = state.maintenance_ops.get(operation_id) {
             let expected_allocations: BTreeMap<String, f64> = allocations
                 .iter()
@@ -15974,7 +16026,13 @@ impl SharedAccount {
                 detail: None,
             },
         );
-        self.schedule_persist(&state);
+        if let Some(before) = persistence_before {
+            let changes = before.and_then(|before| {
+                maintenance_persistence_view(&state, operation_id, &authoritative_tokens)
+                    .map(|after| persistence_cold_transaction_diff(&before, &after))
+            });
+            self.schedule_typed_persist(&state, changes);
+        }
         drop(state);
         if flush_persistence {
             if let Err(error) = self.flush_maintenance_admission_persistence() {
@@ -16235,7 +16293,10 @@ impl SharedAccount {
             operation_scope.up_token_id.clone(),
             operation_scope.down_token_id.clone(),
         ]);
-        let mut state = self.lock_economic_state_for_persistence(&authoritative_tokens);
+        let mut state = self.lock_economic_state(&authoritative_tokens);
+        let persistence_before = self.persistence.as_ref().map(|_| {
+            maintenance_persistence_view(&state, operation_id, &authoritative_tokens)
+        });
         let Some(existing) = state.maintenance_ops.get(operation_id).cloned() else {
             return;
         };
@@ -16270,7 +16331,13 @@ impl SharedAccount {
             operation.detail = Some(detail);
         }
         recompute_reconciliation(&mut state, "maintenance operation failed");
-        self.schedule_persist(&state);
+        if let Some(before) = persistence_before {
+            let changes = before.and_then(|before| {
+                maintenance_persistence_view(&state, operation_id, &authoritative_tokens)
+                    .map(|after| persistence_cold_transaction_diff(&before, &after))
+            });
+            self.schedule_typed_persist(&state, changes);
+        }
     }
 
     pub fn confirm_maintenance_operation(
@@ -16299,7 +16366,10 @@ impl SharedAccount {
             operation_scope.up_token_id.clone(),
             operation_scope.down_token_id.clone(),
         ]);
-        let mut state = self.lock_economic_state_for_persistence(&authoritative_tokens);
+        let mut state = self.lock_economic_state(&authoritative_tokens);
+        let persistence_before = self.persistence.as_ref().map(|_| {
+            maintenance_persistence_view(&state, operation_id, &authoritative_tokens)
+        });
         let Some(existing) = state.maintenance_ops.get(operation_id).cloned() else {
             return Err(ReservationError::InvalidOrder(format!(
                 "unknown maintenance operation `{operation_id}`"
@@ -16432,7 +16502,13 @@ impl SharedAccount {
             });
         }
         recompute_reconciliation(&mut state, "confirmed maintenance operation");
-        self.schedule_persist(&state);
+        if let Some(before) = persistence_before {
+            let changes = before.and_then(|before| {
+                maintenance_persistence_view(&state, operation_id, &authoritative_tokens)
+                    .map(|after| persistence_cold_transaction_diff(&before, &after))
+            });
+            self.schedule_typed_persist(&state, changes);
+        }
         Ok(())
     }
 
@@ -33923,6 +33999,8 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         let before = run(false); let after = run(true);
         eprintln!("prepared_registration ns N={SAMPLES} history={HISTORY} before(P50/P99/P999/max)={before:?} after={after:?}; synchronous owner turn, queue_depth=0 overflow=0; includes route/mirror publication, excludes row preparation");
     }
+
+    include!("maker02_tail_tests.rs");
 
     #[test]
     #[ignore = "focused release benchmark: terminal audit uses the existing order index"]

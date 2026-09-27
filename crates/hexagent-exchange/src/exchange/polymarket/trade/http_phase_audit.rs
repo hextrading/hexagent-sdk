@@ -89,6 +89,16 @@ impl HttpPhaseRecord {
             "response_processing_ns": self.completed_ns.saturating_sub(self.response_received_ns),
             "slot_wait_ns": t.slot_wait_ns, "dns_ns": t.dns_ns, "tcp_ns": t.tcp_ns,
             "tls_ns": t.tls_ns, "ttfb_ns": t.ttfb_ns, "body_ns": t.body_ns, "total_ns": t.total_ns,
+            "first_write_offset_ns": t.io.first_write_offset_ns,
+            "write_span_ns": t.io.write_span_ns,
+            "flush_offset_ns": t.io.flush_offset_ns,
+            "first_read_offset_ns": t.io.first_read_offset_ns,
+            "response_wait_ns": t.io.response_wait_ns,
+            "header_decode_ns": t.io.header_decode_ns,
+            "written_bytes": t.io.written_bytes, "read_bytes": t.io.read_bytes,
+            "io_boundary": "plaintext_transport_observed",
+            "tcp_info_sampled": t.io.tcp_sampled, "tcp_rtt_us": t.io.tcp_rtt_us,
+            "tcp_rttvar_us": t.io.tcp_rttvar_us, "tcp_retrans_delta": t.io.tcp_retrans_delta,
             "connect_attempted": t.connect_attempted,
             "generation_before": t.connect_generation_before, "generation_after": t.connect_generation_after,
             "peer": t.peer.map(|peer| peer.to_string()), "incomplete_phase": t.incomplete_phase.name(),
@@ -182,7 +192,8 @@ mod tests {
             "probe_place"
         );
         assert_eq!(request_kind(None, "query"), "query");
-        assert!(std::mem::size_of::<HttpPhaseRecord>() <= 256);
+        // Fixed I/O observations; no owned buffer or heap growth.
+        assert!(std::mem::size_of::<HttpPhaseRecord>() <= 352);
     }
 }
 

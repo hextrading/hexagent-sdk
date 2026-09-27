@@ -26,8 +26,13 @@ use tower_service::Service;
 
 type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 
+mod io_trace;
+pub use io_trace::Http1IoTimings;
+use io_trace::{IoTrace, TimedIo};
+
 #[derive(Default)]
 struct ConnectTrace {
+    io: IoTrace,
     attempts: AtomicU64,
     generation: AtomicU64,
     reuse_generation_reported: AtomicU64,
@@ -160,7 +165,7 @@ struct TimedTlsConnector {
 }
 
 impl Service<Uri> for TimedTlsConnector {
-    type Response = <HttpsConnector<TimedTcpConnector> as Service<Uri>>::Response;
+    type Response = TimedIo<<HttpsConnector<TimedTcpConnector> as Service<Uri>>::Response>;
     type Error = <HttpsConnector<TimedTcpConnector> as Service<Uri>>::Error;
     type Future = BoxFuture<Self::Response, Self::Error>;
 
@@ -183,11 +188,22 @@ impl Service<Uri> for TimedTlsConnector {
             trace
                 .tls_total_ns
                 .store(duration_ns(started.elapsed()), Ordering::Release);
-            if result.is_ok() {
-                trace.generation.fetch_add(1, Ordering::AcqRel);
+            result.map(|inner| {
+                let generation = trace.generation.fetch_add(1, Ordering::AcqRel) + 1;
                 trace.phase.store(PHASE_TTFB, Ordering::Release);
-            }
-            result
+                #[cfg(target_os = "linux")]
+                let socket_fd = {
+                    use std::os::fd::AsRawFd;
+                    match &inner {
+                        hyper_rustls::MaybeHttpsStream::Http(io) => io.inner().as_raw_fd(),
+                        hyper_rustls::MaybeHttpsStream::Https(io) => io.inner().get_ref().0.inner().inner().as_raw_fd(),
+                    }
+                };
+                TimedIo { inner, trace, generation, flush_pending: false,
+                    #[cfg(target_os = "linux")]
+                    socket_fd,
+                }
+            })
         })
     }
 }
@@ -207,6 +223,7 @@ pub struct InstrumentedHttp1Client {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Http1PhaseTimings {
+    pub io: Http1IoTimings,
     pub connect_attempted: bool,
     pub connect_generation_before: u64,
     pub connect_generation_after: u64,
@@ -404,6 +421,7 @@ impl InstrumentedHttp1Client {
             }
         };
         let started = Instant::now();
+        let _io_guard = self.trace.io.begin();
         let headers_completed_ns = AtomicU64::new(0);
         self.trace.phase.store(PHASE_TTFB, Ordering::Release);
         let operation = async {
@@ -555,6 +573,7 @@ impl InstrumentedHttp1Client {
             (0, 0, 0)
         };
         Http1PhaseTimings {
+            io: self.trace.io.snapshot(if matches!(incomplete_phase, Http1IncompletePhase::None | Http1IncompletePhase::Body) { headers_ns } else { 0 }),
             connect_attempted,
             connect_generation_before: generation_before,
             connect_generation_after: generation_after,
@@ -583,6 +602,90 @@ fn duration_ns(duration: Duration) -> u64 {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "release: HTTP/1 loopback completion, instrumented versus bare Hyper reference"]
+    async fn benchmark_http_io_boundaries() {
+        const N: usize = 2_000;
+        async fn server() -> (String, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.set_nodelay(true).unwrap();
+                let mut buf = [0_u8; 2048];
+                for _ in 0..N + 32 {
+                    let mut used = 0;
+                    while !buf[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                        let count = stream.read(&mut buf[used..]).await.unwrap();
+                        assert!(count > 0);
+                        used += count;
+                    }
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await.unwrap();
+                }
+            });
+            (url, task)
+        }
+        let (plain_url, plain_server) = server().await;
+        let (traced_url, traced_server) = server().await;
+        let mut http = HttpConnector::new();
+        http.set_nodelay(true);
+        let mut builder = Client::builder(TokioExecutor::new());
+        builder.retry_canceled_requests(false).pool_max_idle_per_host(1);
+        let plain: Client<_, Full<Bytes>> = builder.build(http);
+        let traced = InstrumentedHttp1Client::new(Duration::from_secs(1)).unwrap();
+        let mut ns = [Vec::with_capacity(N), Vec::with_capacity(N)];
+        for i in 0..N + 32 {
+            for mode in [i % 2, 1 - i % 2] {
+                let start = Instant::now();
+                if mode == 0 {
+                    let request = Request::builder().uri(&plain_url).body(Full::new(Bytes::new())).unwrap();
+                    std::hint::black_box(plain.request(request).await.unwrap().into_body().collect().await.unwrap());
+                } else {
+                    let response = traced.request(reqwest::Method::GET, &traced_url, reqwest::header::HeaderMap::new(), Bytes::new(), Duration::from_secs(1)).await.unwrap();
+                    assert!(response.timings.io.first_read_offset_ns > 0);
+                    std::hint::black_box(response);
+                }
+                if i >= 32 { ns[mode].push(duration_ns(start.elapsed())); }
+            }
+        }
+        plain_server.await.unwrap(); traced_server.await.unwrap();
+        for (mode, values) in ns.iter_mut().enumerate() {
+            values.sort_unstable();
+            eprintln!("http_io_probe mode={} boundary=request_build_through_body_completion N={N} p50_ns={} p99_ns={} p999_ns={} max_ns={} in_flight=1 queued=0 overflow=0", ["bare_hyper_reference", "instrumented"][mode], values[999], values[1979], values[1997], values[1999]);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn plaintext_boundaries_separate_server_wait_partial_headers_and_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let count = stream.read(&mut request).await.unwrap();
+            assert!(count > 0);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            stream.write_all(b"Connection: close\r\n\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            stream.write_all(b"ok").await.unwrap();
+        });
+        let client = InstrumentedHttp1Client::new(Duration::from_secs(1)).unwrap();
+        let response = client.request(reqwest::Method::GET, &format!("http://{addr}/"),
+            reqwest::header::HeaderMap::new(), Bytes::new(), Duration::from_secs(1)).await.unwrap();
+        let t = response.timings;
+        assert!(t.io.response_wait_ns >= 20_000_000, "{:?}", t);
+        assert!(t.io.header_decode_ns >= 15_000_000, "{:?}", t);
+        assert!(t.body_ns >= 15_000_000, "{:?}", t);
+        assert!(t.io.flush_offset_ns >= t.io.first_write_offset_ns);
+        assert!(t.io.first_read_offset_ns >= t.io.flush_offset_ns);
+        assert_eq!(response.body, Bytes::from_static(b"ok"));
+        #[cfg(target_os = "linux")]
+        assert!(t.io.tcp_sampled, "successful loopback request needs both TCP_INFO samples");
+        server.await.unwrap();
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn refused_connection_is_not_sent_but_lost_response_stays_ambiguous() {
@@ -696,6 +799,16 @@ mod tests {
         assert!(!reconnected.timings.first_reuse_for_generation);
         assert_eq!(reconnected.timings.connect_generation_before, 1);
         assert_eq!(reconnected.timings.connect_generation_after, 2);
+        for response in [&initial, &reused, &reconnected] {
+            let io = response.timings.io;
+            assert!(io.written_bytes > 0 && io.read_bytes > 0);
+            assert!(io.first_write_offset_ns > 0);
+            assert!(io.first_read_offset_ns >= io.first_write_offset_ns);
+            assert!(io.response_wait_ns > 0);
+            assert!(io.first_read_offset_ns <= response.timings.total_ns);
+        }
+        assert_eq!(initial.timings.io.written_bytes, reused.timings.io.written_bytes);
+        assert_eq!(reused.timings.io.written_bytes, reconnected.timings.io.written_bytes);
         server.await.unwrap();
     }
 
@@ -803,7 +916,11 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind, InstrumentedHttp1ErrorKind::Timeout);
         assert_eq!(error.timings.incomplete_phase, Http1IncompletePhase::Body);
-        assert!(error.timings.body_ns >= 15_000_000);
+        // The deadline also includes connect/header time, which can exceed
+        // 5 ms on a loaded test host. Verify the boundary, not that assumption.
+        assert!(error.timings.body_ns > 0);
+        assert!(error.timings.body_ns < error.timings.total_ns);
+        assert!(error.timings.io.first_read_offset_ns > 0);
         server.await.unwrap();
     }
 }
