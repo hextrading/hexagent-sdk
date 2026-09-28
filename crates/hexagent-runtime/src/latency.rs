@@ -580,6 +580,11 @@ pub fn spawn_periodic_dump(
         .name("latency-dump".into())
         .spawn(move || {
             crate::os_tune::pin_background("latency-dump");
+            prepare_thread_stages(&["runtime.allocator.background_maintenance"]);
+            let mut allocator_maintenance = crate::memory::AllocatorMaintenance::new(
+                crate::memory::allocator_maintenance_provider(),
+                std::time::Instant::now(),
+            );
             // Drain independently of the reporting interval: at 60-second
             // reports a 65,536-item FIFO otherwise overflows above 1,092/s.
             // Binning stays on this existing background worker; publication,
@@ -595,6 +600,9 @@ pub fn spawn_periodic_dump(
                 for recorder in live_recorders() {
                     recorder.drain_observations();
                 }
+                // Drain lifecycle/market observations first. Allocator work is
+                // optional, once per second, on this same background thread.
+                allocator_maintenance.tick(std::time::Instant::now());
                 if std::time::Instant::now() < next_dump {
                     continue;
                 }
@@ -681,6 +689,12 @@ mod tests {
 
     #[test]
     fn periodic_dump_is_woken_by_unified_shutdown() {
+        static MAINTENANCE_CALLS: AtomicU64 = AtomicU64::new(0);
+        fn maintenance() {
+            assert_eq!(std::thread::current().name(), Some("latency-dump"));
+            MAINTENANCE_CALLS.fetch_add(1, Ordering::Release);
+        }
+        assert!(crate::memory::register_allocator_maintenance_provider(maintenance).is_ok());
         prepare_observation_stages(&["latency.test.periodic_observation"]);
         assert!(observe_ns("latency.test.periodic_observation", 123));
         let shutdown = crate::shutdown::ShutdownToken::new();
@@ -708,6 +722,13 @@ mod tests {
             0,
             "observation draining must not wait for the hourly report"
         );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while MAINTENANCE_CALLS.load(Ordering::Acquire) == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(MAINTENANCE_CALLS.load(Ordering::Acquire), 1);
         shutdown.request();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         while !handle.is_finished() && std::time::Instant::now() < deadline {
