@@ -1461,6 +1461,8 @@ struct PrivateEventDelta {
     execution: Option<FrozenTradeExecution>,
     execution_ack: Option<ExecutionAckTicket>,
     needs_execution_repair: bool,
+    archive_checked: bool,
+    needs_archive_lookup: bool,
 }
 
 impl PrivateEventDelta {
@@ -1485,7 +1487,14 @@ impl PrivateEventDelta {
             execution: None,
             execution_ack: None,
             needs_execution_repair: false,
+            archive_checked: false,
+            needs_archive_lookup: false,
         })
+    }
+
+    fn archive_identity(&self) -> &str {
+        let names: &[&str] = if self.kind == PrivateEventKind::Trade { &["id", "trade_id"] } else { &["order_id", "orderID", "id"] };
+        names.iter().find_map(|name| self.payload.get(*name).and_then(serde_json::Value::as_str)).unwrap_or("")
     }
 
     fn payload(&self) -> &serde_json::Value {
@@ -1714,10 +1723,44 @@ pub(crate) struct PrivateColdCommand {
     feedback: PrivateColdFeedback,
 }
 
+impl PrivateColdCommand {
+    fn fail_archive(self, shared: &SharedState, reason: String) {
+        shared.user_feed_health.set_recovering(true);
+        self.feedback.reconnect_generation.fetch_add(1, Ordering::AcqRel);
+        self.feedback.reconnect_notify.notify_one();
+        let reply = PrivateExecutionRepairReply { archive_feedback: Some(self.feedback.clone()), events: Vec::new(), seeds: Vec::new(), recovery_generation: self.recovery_generation, expected_recovery_certificate: self.expected_recovery_certificate, result: Err(reason), completion: self.completion };
+        if let Err(error) = self.feedback.repair_tx.try_send(reply) {
+            if let Some(completion) = error.into_inner().completion { let _ = completion.send(Err("history archive reply unavailable; replay required".into())); }
+        }
+    }
+
+    pub(crate) fn prepare_archive(mut self, shared: &SharedState, owner: &hexagent_account::account::shared_account::SharedAccountOwnerState) {
+        for event in &mut self.events {
+            if !event.needs_archive_lookup { continue; }
+            let trade = event.kind == PrivateEventKind::Trade;
+            let identity = if trade { event.archive_identity().to_owned() } else { normalize_order_id(event.archive_identity()) };
+            if let Err(error) = owner.hydrate_archived_private_event(trade,&identity) {
+                self.fail_archive(shared,error);
+                return;
+            }
+            event.archive_checked = true;
+            event.needs_archive_lookup = false;
+        }
+        let reply = PrivateExecutionRepairReply { archive_feedback: Some(self.feedback.clone()), events: self.events, seeds: Vec::new(), recovery_generation: self.recovery_generation, expected_recovery_certificate: self.expected_recovery_certificate, result: Ok(ReplayApplySummary { applied: 0, durable_skips: self.durable_skips }), completion: self.completion };
+        if let Err(error) = self.feedback.repair_tx.try_send(reply) {
+            shared.user_feed_health.set_recovering(true);
+            self.feedback.reconnect_generation.fetch_add(1, Ordering::AcqRel);
+            self.feedback.reconnect_notify.notify_one();
+            if let Some(completion) = error.into_inner().completion { let _ = completion.send(Err("history archive reply unavailable; replay required".into())); }
+        }
+    }
+}
+
 /// One batch credit is owned by `PrivateRouteDedupe::repair_inflight`.
 /// The capacity-one reply cannot be overwritten; the original replay completion
 /// crosses back with the exact historical events and is released after delivery.
 struct PrivateExecutionRepairReply {
+    archive_feedback: Option<PrivateColdFeedback>,
     events: Vec<PrivateEventDelta>,
     seeds: Vec<hexagent_account::account::shared_account::PrivateExecutionSeed>,
     recovery_generation: Option<u64>,
@@ -2650,7 +2693,12 @@ fn route_private_batch(
             && !needs_repair
             && !needs_delivery
             && trade_lifecycle_is_durably_covered(payload, shared);
-        let routed = match if durably_covered || needs_repair {
+        let needs_archive = !durably_covered && !event.archive_checked
+            && shared.account_state.archived_private_event_hint(event.kind == PrivateEventKind::Trade, event.archive_identity());
+        if needs_archive && route_dedupe.repair_inflight {
+            return Err("historical archive lookup is already in flight; replay required".into());
+        }
+        let routed = match if durably_covered || needs_repair || needs_archive {
             Ok(Vec::new())
         } else {
             route_private_event_fast_owned(
@@ -2668,6 +2716,7 @@ fn route_private_batch(
         let requires_revalidation = event.kind == PrivateEventKind::Trade
             && trade_payload_requires_revalidation(payload, shared);
         event.needs_execution_repair = needs_repair;
+        event.needs_archive_lookup = needs_archive;
         crate::latency::record("polymarket.user.validate_route", validate_started);
         let cold_already_committed = !routed.is_empty()
             && !requires_revalidation
@@ -2737,7 +2786,7 @@ fn route_private_batch(
         }
         crate::latency::record("polymarket.user.validate_route_dispatch", route_started);
     }
-    if cold_events.iter().any(|event| event.needs_execution_repair) {
+    if cold_events.iter().any(|event| event.needs_execution_repair || event.needs_archive_lookup) {
         route_dedupe.repair_inflight = true;
     }
     Ok(RoutedPrivateBatch {
@@ -2869,6 +2918,12 @@ pub(crate) fn apply_private_cold_command(
     replay: &mut PrivateReplayOwner,
     command: PrivateColdCommand,
 ) {
+    if command.events.iter().any(|event| event.needs_archive_lookup) {
+        if let Err(command) = shared.enqueue_archive_lookup(command) {
+            command.fail_archive(shared, "history archive lane unavailable; replay required".into());
+        }
+        return;
+    }
     let PrivateColdCommand {
         events,
         identities,
@@ -2955,6 +3010,7 @@ pub(crate) fn apply_private_cold_command(
             }
         }
         let reply = PrivateExecutionRepairReply {
+            archive_feedback: None,
             events: repair_events,
             seeds,
             recovery_generation,
@@ -2987,6 +3043,7 @@ fn finish_private_execution_repair(
 ) -> std::result::Result<(), String> {
     route_dedupe.repair_inflight = false;
     let PrivateExecutionRepairReply {
+        archive_feedback,
         events,
         seeds,
         recovery_generation,
@@ -2994,6 +3051,35 @@ fn finish_private_execution_repair(
         result,
         completion,
     } = reply;
+    if let Some(feedback) = archive_feedback {
+        // Re-enter the normal owner route after the cold lookup. This is
+        // required even for filter false positives: a new fill must still be
+        // delivered exactly once before its cold economic application.
+        let routed = result.and_then(|_| {
+            validate_terminal_replay_scope(&shared.user_feed_health, expected_recovery_certificate, recovery_generation)?;
+            route_private_batch(shared, update_tx, events, recovery_generation, route_dedupe, None)
+        });
+        match routed {
+            Ok(routed) if routed.events.is_empty() => {
+                if let Some(completion) = completion { let _ = completion.send(Ok(ReplayApplySummary { applied: 0, durable_skips: routed.durable_skips })); }
+                return Ok(());
+            }
+            Ok(routed) => {
+                let command = PrivateColdCommand { events: routed.events, identities: routed.identities, durable_skips: routed.durable_skips, recovery_generation, expected_recovery_certificate, completion, routed_at: crate::latency::Instant::now(), feedback };
+                if let Err(error) = shared.enqueue_private_cold(command) {
+                    let reason = "history archive resume lane unavailable; replay required".to_string();
+                    error.into_inner().fail_archive(shared,reason.clone());
+                    route_dedupe.repair_inflight = false;
+                    return Err(reason);
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                if let Some(completion) = completion { let _ = completion.send(Err(error.clone())); }
+                return Err(error);
+            }
+        }
+    }
     let result = result.and_then(|summary| {
         for seed in seeds {
             route_dedupe
@@ -3192,7 +3278,7 @@ fn spawn_private_apply_worker(
                                 routed_at: crate::latency::Instant::now(),
                                 feedback: cold_feedback.clone(),
                             };
-                            let owns_repair_credit = cold.events.iter().any(|event| event.needs_execution_repair);
+                            let owns_repair_credit = cold.events.iter().any(|event| event.needs_execution_repair || event.needs_archive_lookup);
                             if shared.enqueue_private_cold(cold).is_err() {
                                 if owns_repair_credit { route_dedupe.repair_inflight = false; }
                                 shared.user_feed_health.set_recovering(true);
@@ -3256,7 +3342,7 @@ fn spawn_private_apply_worker(
                                         routed_at: crate::latency::Instant::now(),
                                         feedback: cold_feedback.clone(),
                                     };
-                                    let owns_repair_credit = cold.events.iter().any(|event| event.needs_execution_repair);
+                                    let owns_repair_credit = cold.events.iter().any(|event| event.needs_execution_repair || event.needs_archive_lookup);
                                     if let Err(error) = shared.enqueue_private_cold(cold) {
                                         if owns_repair_credit { route_dedupe.repair_inflight = false; }
                                         if let PrivateColdCommand {
@@ -4554,6 +4640,9 @@ mod anomaly_replay_tests;
 #[cfg(test)]
 #[path = "private_execution_repair_tests.rs"]
 mod execution_repair_tests;
+#[cfg(test)]
+#[path = "private_history_archive_tests.rs"]
+mod history_archive_tests;
 #[cfg(test)]
 #[path = "private_execution_route_tests.rs"]
 mod execution_route_tests;

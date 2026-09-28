@@ -47,6 +47,9 @@ const MAINTENANCE_ADMISSION_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(
 /// attributable no-op instead of becoming an `unowned trade`.
 const RETIRED_TRADE_TOMBSTONE_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
 const MAX_RETIRED_TRADE_TOMBSTONES: usize = 100_000;
+#[path = "history_archive.rs"]
+mod history_archive;
+use history_archive::HistoryArchive;
 const PERSISTENCE_WAL_VERSION: u32 = 1;
 const ACCOUNT_PERSISTENCE_QUEUE_CAPACITY: usize = 65_536;
 const ROUTE_SHARD_COUNT: usize = 64;
@@ -274,6 +277,8 @@ pub struct SharedAccountOwnerState {
     route_retirement_pending: std::cell::RefCell<Option<RetiredRouteBatch>>,
     // Startup-installed capabilities; only this cold account thread polls them.
     inactive_settled_gc: std::cell::RefCell<Option<InactiveSettledGcOwners>>,
+    history_archive_poll_after: Cell<Instant>,
+    history_archive_reader: std::cell::RefCell<Option<rusqlite::Connection>>,
 }
 
 struct InactiveSettledGcOwners {
@@ -412,6 +417,25 @@ impl SharedAccountOwnerState {
         let index = installed.cursor;
         installed.cursor = (index + 1) % installed.owners.len();
         installed.owners[index].poll_once()
+    }
+
+    /// Lowest-priority maintenance on this existing cold owner. Backpressure
+    /// delays eviction; it never discards a proof or blocks a private producer.
+    pub fn poll_history_archive(&self) -> Result<usize, String> {
+        if Instant::now() < self.history_archive_poll_after.get() { return Ok(0); }
+        self.history_archive_poll_after.set(Instant::now() + Duration::from_secs(5));
+        self.account.archive_retired_history(wall_clock_ms())
+    }
+
+    pub fn hydrate_archived_private_event(&self, trade: bool, identity: &str) -> Result<usize, String> {
+        let Some(archive) = self.account.history_archive.as_ref() else { return Ok(0); };
+        let mut reader = self.history_archive_reader.borrow_mut();
+        if reader.is_none() {
+            let started = crate::latency::Instant::now();
+            *reader = Some(archive.connection(false)?);
+            crate::latency::record("polymarket.account.history_archive.cold_open", started);
+        }
+        self.account.hydrate_archived_private_event_with_connection(trade, identity, reader.as_ref())
     }
 
     pub fn execute_wallet_calibration(&self) {
@@ -3148,6 +3172,9 @@ struct SharedAccountState {
     retired_trade_ownership_tombstones: HashMap<String, RetiredTradeOwnershipTombstone>,
     #[serde(default)]
     retired_order_audit_tombstones: HashMap<String, RetiredOrderAuditTombstone>,
+    /// Removal of a hot proof is recoverable only with this durable archive.
+    #[serde(default)]
+    history_archive_generation: u64,
     #[serde(default)]
     verified_trade_replay_recoveries: u64,
     /// Advances only when the virtual trade/fee ledger changes.
@@ -3267,7 +3294,8 @@ struct SharedAccountState {
     initial_token_barrier_degraded_members: Vec<String>,
 }
 
-const PERSISTENCE_VERSION: u32 = 1;
+// v2 requires the cold archive for replay; older binaries must fail closed.
+const PERSISTENCE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedAccount {
@@ -3574,10 +3602,10 @@ impl AccountPersistence {
     fn start(
         path: PathBuf,
         account_id: String,
-        initial_state: SharedAccountState,
+        initial_state: &mut SharedAccountState,
         initial_generation: u64,
         queue_capacity: usize,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, HistoryArchive), String> {
         #[cfg(test)]
         let write_delay_ms = Arc::new(AtomicU64::new(0));
         #[cfg(test)]
@@ -3605,6 +3633,12 @@ impl AccountPersistence {
             )
         })?;
 
+        let history_archive = HistoryArchive::open(&path, &account_id, initial_state.history_archive_generation)?;
+        let archived = history_archive::startup_archive(&history_archive, initial_state, wall_clock_ms())?;
+        if archived != 0 {
+            validate_persisted_state(&account_id, initial_state)?;
+            log::info!("[account_history_archive] account={} boundary=startup hot_retention_ms={} archived={} trade_hot={} order_audit_hot={} generation={}", account_id, history_archive::HOT_RETENTION_MS, archived, initial_state.retired_trade_ownership_tombstones.len(), initial_state.retired_order_audit_tombstones.len(), initial_state.history_archive_generation);
+        }
         // Startup is the only full-snapshot commit. It folds every recovered
         // WAL record and any schema/reconciliation migration into one atomic
         // image, then resets the incremental log before live workers start.
@@ -3640,7 +3674,7 @@ impl AccountPersistence {
         let thread_write_last_us = Arc::clone(&write_last_us);
         let thread_write_max_us = Arc::clone(&write_max_us);
         let thread_path = path.clone();
-        let mut durable_state = serde_json::to_value(initial_state).map_err(|error| {
+        let mut durable_state = serde_json::to_value(&*initial_state).map_err(|error| {
             format!(
                 "serialize account ledger WAL baseline {}: {error}",
                 path.display()
@@ -3787,7 +3821,7 @@ impl AccountPersistence {
                 }
             })
             .map_err(|error| format!("spawn account ledger writer: {error}"))?;
-        Ok(Self {
+        Ok((Self {
             path,
             _lock_file: lock_file,
             tx,
@@ -3807,7 +3841,7 @@ impl AccountPersistence {
             #[cfg(test)]
             write_delay_ms,
             writer: Some(writer),
-        })
+        }, history_archive))
     }
 
     fn schedule_delta(&self, changes: Vec<PersistenceWalChange>) {
@@ -4109,7 +4143,7 @@ fn materialize_cold_transaction(
         seeded, seed_baseline, compacted_economic_effects, physical_cash,
         physical_positions, unallocated_cash, unallocated_positions,
         provisional_position_owners, instances, orders, oid_to_coid, trades,
-        retired_trade_ownership_tombstones, retired_order_audit_tombstones,
+        retired_trade_ownership_tombstones, retired_order_audit_tombstones, history_archive_generation,
         verified_trade_replay_recoveries, ledger_generation, uncertain,
         uncertain_reason, uncertain_since_ms, risk_blockers, external_adjustments,
         internal_adjustment_sequence, gap_replay_last_pages, gap_replay_max_pages,
@@ -6523,6 +6557,7 @@ fn write_persisted_account(path: &Path, snapshot: &PersistedAccount) -> Result<(
 #[derive(Debug)]
 pub struct SharedAccount {
     account_id: String,
+    history_archive: Option<HistoryArchive>,
     state: Arc<Mutex<SharedAccountState>>,
     account_owner_task_tx: crossbeam_channel::Sender<AccountOwnerCommand>,
     account_owner_task_rx: Mutex<Option<crossbeam_channel::Receiver<AccountOwnerCommand>>>,
@@ -6992,6 +7027,8 @@ impl SharedAccount {
             lifecycle_mirror_wake_rx,
             route_retirement_pending: std::cell::RefCell::new(None),
             inactive_settled_gc: std::cell::RefCell::new(None),
+            history_archive_poll_after: Cell::new(Instant::now()),
+            history_archive_reader: std::cell::RefCell::new(None),
         };
         Ok((handle, owner))
     }
@@ -7829,6 +7866,7 @@ impl SharedAccount {
             crossbeam_channel::bounded(WALLET_CALIBRATION_WAKE_CAPACITY);
         let account = Self {
             account_id: account_id.into(),
+            history_archive: None,
             state: Arc::new(Mutex::new(SharedAccountState::default())),
             account_owner_task_tx,
             account_owner_task_rx: Mutex::new(Some(account_owner_task_rx)),
@@ -7956,12 +7994,12 @@ impl SharedAccount {
         allow_query_repair: bool,
         persistence_queue_capacity: usize,
     ) -> Result<Self, String> {
-        let (state, initial_generation, startup_aggregate_repairs) = if path.exists() {
+        let (mut state, initial_generation, startup_aggregate_repairs) = if path.exists() {
             let bytes = std::fs::read(&path)
                 .map_err(|error| format!("read account ledger {}: {error}", path.display()))?;
             let mut persisted: PersistedAccount = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("parse account ledger {}: {error}", path.display()))?;
-            if persisted.version != PERSISTENCE_VERSION {
+            if persisted.version != 1 && persisted.version != PERSISTENCE_VERSION {
                 return Err(format!(
                     "unsupported account ledger version {} in {} (expected {})",
                     persisted.version,
@@ -8203,6 +8241,9 @@ impl SharedAccount {
             }
             (SharedAccountState::default(), 0, Vec::new())
         };
+        let (persistence, history_archive) = AccountPersistence::start(
+            path, account_id.clone(), &mut state, initial_generation, persistence_queue_capacity,
+        )?;
         let initial_retired_trade_tombstones = state
             .retired_trade_ownership_tombstones
             .values()
@@ -8237,13 +8278,6 @@ impl SharedAccount {
         let initial_retired_order_audit_tombstones = state.retired_order_audit_tombstones.clone();
         let initial_binary_pairs = published_binary_pairs(&state);
         let initial_economic_snapshot = PublishedEconomicSnapshot::from_state(&state);
-        let persistence = AccountPersistence::start(
-            path,
-            account_id.clone(),
-            state.clone(),
-            initial_generation,
-            persistence_queue_capacity,
-        )?;
         let state = Arc::new(Mutex::new(state));
         if !startup_aggregate_repairs.is_empty() {
             log::warn!(
@@ -8266,6 +8300,7 @@ impl SharedAccount {
             crossbeam_channel::bounded(WALLET_CALIBRATION_WAKE_CAPACITY);
         let account = Self {
             account_id,
+            history_archive: Some(history_archive),
             state,
             account_owner_task_tx,
             account_owner_task_rx: Mutex::new(Some(account_owner_task_rx)),
@@ -19882,6 +19917,9 @@ fn prune_retired_trade_ownership_tombstones(
     state: &mut SharedAccountState,
     now_ms: u64,
 ) -> Vec<String> {
+    // Durable accounts evict only after an archive commit. Legacy standalone
+    // accounts keep their original bounded in-memory retention behavior.
+    if state.history_archive_generation != 0 { return Vec::new(); }
     let mut removed: Vec<String> = state
         .retired_trade_ownership_tombstones
         .iter()
@@ -19916,6 +19954,7 @@ fn prune_retired_trade_ownership_tombstones_bounded(
     now_ms: u64,
     scan_limit: usize,
 ) -> Vec<String> {
+    if state.history_archive_generation != 0 { return Vec::new(); }
     if state.retired_trade_ownership_tombstones.len() > MAX_RETIRED_TRADE_TOMBSTONES {
         return prune_retired_trade_ownership_tombstones(state, now_ms);
     }
@@ -31024,11 +31063,12 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             let persistence = AccountPersistence::start(
                 path.clone(),
                 "persistence-overflow".to_string(),
-                SharedAccountState::default(),
+                &mut SharedAccountState::default(),
                 0,
                 CAPACITY,
             )
             .unwrap();
+            let (persistence, _) = persistence;
             persistence.write_delay_ms.store(250, Ordering::Relaxed);
 
             for index in 0..EVENTS {
@@ -31885,6 +31925,10 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     pub(super) fn remove_persistence_test_files(path: &Path) {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(persistence_wal_path(path));
+        for suffix in [".history.sqlite3", ".history.sqlite3-journal"] {
+            let mut archive_path = path.as_os_str().to_os_string(); archive_path.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(archive_path));
+        }
         let mut tmp_path = path.as_os_str().to_os_string();
         tmp_path.push(".tmp");
         let _ = std::fs::remove_file(PathBuf::from(tmp_path));

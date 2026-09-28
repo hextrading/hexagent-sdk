@@ -295,16 +295,16 @@ mod tests {
         let mut account = settled_gc_benchmark_account();
         let tokens = HashSet::from(["SETTLED".into()]);
         install_test_settled_gc_candidate(&account, "settled", &tokens);
-        let initial_state = account.state.lock().unwrap().clone();
+        let mut initial_state = account.state.lock().unwrap().clone();
         account.persistence = Some(
             AccountPersistence::start(
                 path.clone(),
                 account.account_id.clone(),
-                initial_state,
+                &mut initial_state,
                 0,
                 32,
             )
-            .unwrap(),
+            .unwrap().0,
         );
         let account = Arc::new(account);
         let (_, cold_owner) = account.bind_account_owner().unwrap();

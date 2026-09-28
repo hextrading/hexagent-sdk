@@ -3362,6 +3362,9 @@ pub struct SharedState {
     /// Startup-published message endpoint. Terminal REST backfill must pass
     /// through the same private owner that freezes live execution economics.
     private_apply_lane: OnceLock<super::user_feed::PrivateApplyLane>,
+    // One archive/repair credit per private owner; the existing cold worker
+    // performs disk lookup and returns the owned batch before normal routing.
+    archive_lookup_tx: OnceLock<crossbeam_channel::Sender<super::user_feed::PrivateColdCommand>>,
     private_ingress_install_tx:
         crossbeam_channel::Sender<account_owner_loop::PrivateIngressInstall>,
     // Startup-bound immutable handle to the existing bounded execution-owner
@@ -4318,6 +4321,8 @@ impl SharedState {
         // One prepared retirement plus one retained cold-side result. A full
         // lane stops further GC commits; no certificate/cleanup is dropped.
         let (gc_ready_tx, gc_ready_rx) = crossbeam_channel::bounded(1);
+        let (archive_lookup_tx, archive_lookup_rx) = crossbeam_channel::bounded::<super::user_feed::PrivateColdCommand>(1);
+        assert!(shared.archive_lookup_tx.set(archive_lookup_tx).is_ok());
 
         let cold_handle = std::thread::Builder::new()
             .name(format!("poly-account-owner-{}", shared.instance_id))
@@ -4330,6 +4335,8 @@ impl SharedState {
                 crate::latency::prepare_thread_stages(&[
                     "polymarket.account.wallet_calibration.wait_including_grace",
                     "polymarket.account.wallet_calibration.apply",
+                    "polymarket.account.history_archive.cold_lookup",
+                    "polymarket.account.history_archive.cold_commit",
                     "polymarket.account.route_reclaim.cold_drop",
                     "polymarket.account.route_reclaim.retirement_age",
                 ]);
@@ -4351,6 +4358,10 @@ impl SharedState {
                         // explicit commands before the coalesced wallet wake.
                         loop {
                             account_owner.reclaim_retired_routes();
+                            if let Ok(command) = archive_lookup_rx.try_recv() {
+                                command.prepare_archive(&_shared, &account_owner);
+                                continue;
+                            }
                             if account_owner.lifecycle_mirror_receiver().try_recv().is_ok() {
                                 account_owner.execute_lifecycle_mirror();
                                 continue;
@@ -4384,6 +4395,10 @@ impl SharedState {
                             Ok(()) => account_owner.execute_wallet_calibration(),
                             Err(_) => break,
                         },
+                        recv(archive_lookup_rx) -> command => match command {
+                            Ok(command) => command.prepare_archive(&_shared, &account_owner),
+                            Err(_) => break,
+                        },
                         recv(cold_gc_rx) -> wake => {
                             if wake.is_ok() { drive_gc(&_shared); }
                         },
@@ -4391,6 +4406,9 @@ impl SharedState {
                             if unified { drive_gc(&_shared); }
                             account_owner.execute_wallet_calibration();
                             account_owner.reclaim_retired_routes();
+                            if let Err(error) = account_owner.poll_history_archive() {
+                                log::warn!("[PolymarketTrade] history archive retained hot proofs account={}: {}", account_id, error);
+                            }
                             if let Err(error) = account_owner.poll_inactive_settled_gc() {
                                 log::warn!("[PolymarketTrade] inactive settled GC account={}: {}", account_id, error);
                             }
@@ -4684,6 +4702,11 @@ impl SharedState {
                 error,
             );
         }
+    }
+
+    pub(crate) fn enqueue_archive_lookup(&self, command: super::user_feed::PrivateColdCommand) -> std::result::Result<(), super::user_feed::PrivateColdCommand> {
+        let Some(tx) = self.archive_lookup_tx.get() else { return Err(command); };
+        tx.try_send(command).map_err(crossbeam_channel::TrySendError::into_inner)
     }
 
     pub(crate) fn enqueue_private_cold(
@@ -7140,6 +7163,7 @@ impl PolymarketTrade {
             strategy_owner_by_instance: ArcSwap::from_pointee(HashMap::new()),
             strategy_private_routes: ArcSwap::from_pointee(HashMap::new()),
             private_apply_lane: OnceLock::new(),
+            archive_lookup_tx: OnceLock::new(),
             private_ingress_install_tx,
             recovery_http: OnceLock::new(),
             execution_reset_tx: OnceLock::new(),
