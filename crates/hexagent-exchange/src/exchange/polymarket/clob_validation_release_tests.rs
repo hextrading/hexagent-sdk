@@ -85,7 +85,7 @@ fn resolved_bbo_publishes_even_when_last_frame_did_not_change_top() {
 }
 
 #[test]
-fn removed_fine_grid_level_ends_tick_wait_without_changing_tick_authority() {
+fn fine_grid_insert_and_delete_publish_without_changing_tick_authority() {
     let (mut books, tokens, now) = seeded();
     let pending = process_clob_frame(
         r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.555","size":"10","side":"BUY","best_bid":"0.555","best_ask":"0.56"}],"timestamp":"2001"}"#,
@@ -94,7 +94,7 @@ fn removed_fine_grid_level_ends_tick_wait_without_changing_tick_authority() {
         now + Duration::from_micros(100),
         2_001_000_000,
     );
-    assert!(book(&pending.events).is_none());
+    assert_eq!(book(&pending.events).unwrap().bids[0].price, 0.555);
     let restored = process_clob_frame(
         r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.555","size":"0","side":"BUY","best_bid":"0.55","best_ask":"0.56"}],"timestamp":"2001"}"#,
         &mut books,
@@ -114,7 +114,7 @@ fn removed_fine_grid_level_ends_tick_wait_without_changing_tick_authority() {
 }
 
 #[test]
-fn newer_on_grid_delta_does_not_release_surviving_fine_grid_depth() {
+fn non_top_delta_remains_coalesced_without_tick_wait() {
     let (mut books, tokens, now) = seeded();
     process_clob_frame(
         r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.555","size":"10","side":"BUY","best_bid":"0.555","best_ask":"0.56"}],"timestamp":"2001"}"#,
@@ -131,7 +131,7 @@ fn newer_on_grid_delta_does_not_release_surviving_fine_grid_depth() {
         2_002_000_000,
     );
     assert!(book(&newer.events).is_none());
-    assert!(books.pending_bbo["up"].awaiting_tick_change);
+    assert!(!books.pending_bbo.contains_key("up"));
     assert!(!books.pending_bbo.contains_key("down"));
     assert_eq!(books.current_ticks["condition"], Decimal::new(1, 2));
 }
@@ -238,8 +238,8 @@ fn benchmark_clob_validation_publication() {
             } else {
                 let deadline = books
                     .next_deferred_deadline()
-                    .map_or(ready_at + CLOB_BBO_SETTLE_INTERVAL, |at| {
-                        at.min(ready_at + CLOB_BBO_SETTLE_INTERVAL)
+                    .map_or(ready_at + CLOB_BBO_REPAIR_INTERVAL, |at| {
+                        at.min(ready_at + CLOB_BBO_REPAIR_INTERVAL)
                     });
                 let deferred = books.flush_deferred_due(deadline, 2_052_000_000, &tokens);
                 if book(&deferred.events).is_some() {
@@ -263,11 +263,12 @@ fn benchmark_clob_validation_publication() {
 }
 
 #[test]
-fn repeated_quantity_at_pending_fine_price_does_not_restart_tick_grace() {
+fn repeated_fine_grid_updates_do_not_create_a_publication_wait() {
     let (mut books, tokens, now) = seeded();
     let frame = r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.555","size":"10","side":"BUY","best_bid":"0.555","best_ask":"0.56"}],"timestamp":"2001"}"#;
-    process_clob_frame(frame, &mut books, &tokens, now, 2_001_000_000);
-    let due = books.next_deferred_deadline().unwrap();
+    let first = process_clob_frame(frame, &mut books, &tokens, now, 2_001_000_000);
+    assert_eq!(book(&first.events).unwrap().bids[0].price, 0.555);
+    assert!(books.next_deferred_deadline().is_none());
     for micros in [20_000, 40_000] {
         let batch = process_clob_frame(
             frame,
@@ -278,9 +279,9 @@ fn repeated_quantity_at_pending_fine_price_does_not_restart_tick_grace() {
         );
         assert!(
             book(&batch.events).is_none(),
-            "tick ordering still receives its original grace period"
+            "quantity-only changes retain their separate coalescing policy"
         );
-        assert_eq!(books.next_deferred_deadline(), Some(due));
+        assert!(books.next_deferred_deadline().is_none());
     }
     let new_level = process_clob_frame(
         r#"{"event_type":"price_change","price_changes":[{"asset_id":"up","price":"0.554","size":"10","side":"BUY","best_bid":"0.555","best_ask":"0.56"}],"timestamp":"2002"}"#,
@@ -290,11 +291,8 @@ fn repeated_quantity_at_pending_fine_price_does_not_restart_tick_grace() {
         2_045_000_000,
     );
     assert!(book(&new_level.events).is_none());
-    assert_eq!(
-        books.next_deferred_deadline(),
-        Some(now + Duration::from_millis(95)),
-        "new off-grid evidence retains its full validation window"
-    );
+    assert!(books.next_deferred_deadline().is_none());
+    assert!(books.pending_bbo.is_empty());
 }
 
 #[test]
@@ -338,4 +336,59 @@ fn deleting_last_level_publishes_empty_sides_without_validation_wait() {
         assert!(batch.repair_tokens.is_empty());
         assert!(batch.diagnostics.is_empty());
     }
+}
+
+#[test]
+fn continuous_mismatch_cannot_extend_first_repair_deadline() {
+    for same_timestamp in [true, false] {
+        let (mut books, tokens, now) = seeded();
+        let first = now + Duration::from_millis(1);
+        for offset in [0, 10, 20, 30, 40, 49] {
+            let ts = if same_timestamp { 2001 } else { 2001 + offset };
+            let frame = format!(r#"{{"event_type":"price_change","price_changes":[{{"asset_id":"up","price":"0.50","size":"12","side":"BUY","best_bid":"0.54","best_ask":"0.56"}}],"timestamp":"{ts}"}}"#);
+            let batch = process_clob_frame(&frame, &mut books, &tokens,
+                first + Duration::from_millis(offset), 2_001_000_000 + offset * 1_000_000);
+            assert!(book(&batch.events).is_none());
+            assert_eq!(books.next_deferred_deadline(), Some(first + Duration::from_millis(50)));
+            assert!(batch.repair_tokens.is_empty());
+        }
+        let due = books.flush_deferred_due(first + Duration::from_millis(50), 2_051_000_000, &tokens);
+        assert!(book(&due.events).is_none());
+        assert_eq!(due.repair_tokens, vec!["up"]);
+        assert!(books.quarantined_tokens.contains("up"));
+        assert!(books.pending_bbo.is_empty());
+        assert!(books.flush_deferred_due(first + Duration::from_millis(60), 2_061_000_000, &tokens).repair_tokens.is_empty());
+    }
+}
+
+#[test]
+fn continuous_valid_fine_top_updates_publish_without_wait_or_tick_inference() {
+    let (mut books, tokens, now) = seeded();
+    for i in 1..=9 {
+        let frame = format!(r#"{{"event_type":"price_change","price_changes":[{{"asset_id":"up","price":"0.55{i}","size":"12","side":"BUY","best_bid":"0.55{i}","best_ask":"0.56"}}],"timestamp":"{}"}}"#, 2000+i);
+        let batch = process_clob_frame(&frame, &mut books, &tokens, now + Duration::from_millis(i*10), 2_000_000_000+i*10_000_000);
+        assert_eq!(book(&batch.events).unwrap().bids[0].price, (550+i) as f64/1000.0);
+        assert!(books.pending_bbo.is_empty());
+        assert!(books.next_deferred_deadline().is_none());
+        assert!(batch.repair_tokens.is_empty());
+        assert_eq!(books.current_ticks["condition"], Decimal::new(1, 2));
+    }
+}
+
+#[test]
+fn continuous_fine_quotes_mirror_down_immediately_and_ignore_older_replay() {
+    let (mut books, tokens, now) = unseeded();
+    for i in 1..=9 {
+        let frame = format!(r#"{{"event_type":"best_bid_ask","asset_id":"down","best_bid":"0.44{i}","best_ask":"0.45","timestamp":"{}"}}"#, 2000+i);
+        let batch = process_clob_frame(&frame, &mut books, &tokens, now+Duration::from_millis(i*10), 2_000_000_000+i*10_000_000);
+        let MarketEvent::Quote(quote) = &batch.events[0] else { panic!("valid Down quote publishes without tick wait"); };
+        assert_eq!(quote.symbol, "up");
+        assert!((quote.bid_price-0.55).abs()<1e-12);
+        assert!((quote.ask_price-(560-i) as f64/1000.0).abs()<1e-12);
+        assert!(books.next_deferred_deadline().is_none());
+        assert_eq!(books.current_ticks["condition"], Decimal::new(1,2));
+    }
+    let stale = process_clob_frame(r#"{"event_type":"best_bid_ask","asset_id":"up","best_bid":"0.54","best_ask":"0.56","timestamp":"2000"}"#, &mut books, &tokens, now+Duration::from_millis(100), 2_100_000_000);
+    assert!(stale.events.is_empty());
+    assert!(books.next_deferred_deadline().is_none());
 }

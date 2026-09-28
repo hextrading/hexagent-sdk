@@ -1,7 +1,7 @@
 use super::*;
 
-// Exact pre-change production function from SDK acf28b5399ffa12308220e74ba42b87408688ed0.
-// Test-only behavioral and allocation/latency baseline; no mirrored new implementation.
+// Pre-scratch allocation algorithm, adapted to the current publication contract.
+// Tests scratch equivalence; this is not a historical publication-policy baseline.
 impl ClobLocalBooks {
     fn apply_price_change_before_scratch(
         &mut self,
@@ -27,7 +27,6 @@ impl ClobLocalBooks {
                 });
         let mut before: HashMap<String, (Option<Decimal>, Option<Decimal>)> = HashMap::new();
         let mut reported_bbo: HashMap<String, ReportedBbo> = HashMap::new();
-        let mut off_tick_tokens: HashSet<String> = HashSet::new();
 
         for change in fields.price_changes {
             counters.price_change_entries = counters.price_change_entries.saturating_add(1);
@@ -62,9 +61,6 @@ impl ClobLocalBooks {
                     });
                 }
                 continue;
-            }
-            if !self.price_is_on_current_tick(token.as_ref(), price) {
-                off_tick_tokens.insert(token.to_string());
             }
             let Some(current_book) = self.token_books.get(token.as_ref()) else {
                 counters.unseeded_deltas = counters.unseeded_deltas.saturating_add(1);
@@ -154,9 +150,8 @@ impl ClobLocalBooks {
         // The venue's advertised BBO describes a logical microbatch, but that
         // batch can span multiple WebSocket frames with the same millisecond
         // timestamp. Merge expectations by token+timestamp and publish only
-        // after the local top agrees (or the short quiet window expires).
-        let mut validation_tokens: HashSet<String> = reported_bbo.keys().cloned().collect();
-        validation_tokens.extend(off_tick_tokens.iter().cloned());
+        // as soon as the local top agrees, with a fixed mismatch repair deadline.
+        let validation_tokens: HashSet<String> = reported_bbo.keys().cloned().collect();
         let mut validation_tokens: Vec<_> = validation_tokens.into_iter().collect();
         validation_tokens.sort();
         for token in validation_tokens {
@@ -169,7 +164,6 @@ impl ClobLocalBooks {
                 .get(&token)
                 .map(ClobLocalBook::top)
                 .unwrap_or_default();
-            let off_tick = off_tick_tokens.contains(&token);
             let summary = subscribed_token(active_tokens, &token).then(|| BboFrameSample {
                 exchange_timestamp_ns,
                 entries: entry_counts.get(&token).copied().unwrap_or(0),
@@ -183,11 +177,9 @@ impl ClobLocalBooks {
                         exchange_timestamp_ns,
                         expected: ReportedBbo::default(),
                         first_observed_at: received_at,
-                        last_update_at: received_at,
                         saw_mismatch: false,
                         saw_newer_checkpoint: false,
                         frame_summaries: BboFrameHistory::default(),
-                        awaiting_tick_change: false,
                     });
             if exchange_timestamp_ns > pending.exchange_timestamp_ns {
                 // A newer advertised checkpoint supersedes the unfinished
@@ -195,14 +187,10 @@ impl ClobLocalBooks {
                 // latest state; never fail an old checkpoint at this boundary.
                 pending.exchange_timestamp_ns = exchange_timestamp_ns;
                 pending.expected = newer_expected;
-                pending.last_update_at = received_at;
                 pending.saw_newer_checkpoint = true;
-                pending.awaiting_tick_change = off_tick;
                 pending.saw_mismatch |= !pending.expected.matches(actual);
             } else if pending.exchange_timestamp_ns == exchange_timestamp_ns {
                 pending.expected.merge(newer_expected);
-                pending.last_update_at = received_at;
-                pending.awaiting_tick_change |= off_tick;
                 pending.saw_mismatch |= !pending.expected.matches(actual);
             }
             if let Some(summary) = summary {
@@ -413,13 +401,6 @@ fn assert_same_state(a: &ClobLocalBooks, b: &ClobLocalBooks) {
         let other = &b.pending_health_recoveries[condition];
         assert_eq!(pending.due_at, other.due_at);
         assert_eq!(pending.reason, other.reason);
-    }
-    assert_eq!(a.pending_quotes.len(), b.pending_quotes.len());
-    for (token, pending) in &a.pending_quotes {
-        assert_eq!(
-            format!("{pending:?}"),
-            format!("{:?}", b.pending_quotes[token])
-        );
     }
     assert_eq!(a.quarantined_tokens, b.quarantined_tokens);
     assert_eq!(a.degraded_tokens, b.degraded_tokens);
