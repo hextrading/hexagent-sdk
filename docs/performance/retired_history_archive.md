@@ -172,3 +172,7 @@ snapshot. Exhaustion leaves hot proofs intact (or replay incomplete on hydration
 and retries later. This prevents archive-triggered HashMap destruction on a
 private reader. No worker or quote-path operation is added. The focused test
 covers a real ArcSwap reader and both removal/hydration backpressure.
+Final reclamation source: local and Linux release account suites **359 passed /
+23 ignored**; all **3 private archive integration tests passed**. The Linux
+release suite includes ordering, replay, instance isolation and retirement-credit
+coverage. This follows the full 466-test Polymarket run recorded above.
