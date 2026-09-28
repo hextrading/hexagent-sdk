@@ -6698,6 +6698,8 @@ struct PriceChangeTokenScratch<'a> {
     reported_bbo: ReportedBbo,
     has_reported_bbo: bool,
     off_tick: bool,
+    introduced_off_tick_level: bool,
+    had_pending_bbo: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -7803,6 +7805,17 @@ impl ClobLocalBooks {
             .map_or(true, |tick| price % *tick == Decimal::ZERO)
     }
 
+    fn book_is_on_current_tick(&self, token: &str) -> bool {
+        let Some(tick) = self.current_ticks.get(self.market_key_ref(token)) else {
+            return true;
+        };
+        self.token_books.get(token).is_some_and(|book| {
+            *tick > Decimal::ZERO
+                && book.bids.keys().chain(book.asks.keys())
+                    .all(|price| *price % *tick == Decimal::ZERO)
+        })
+    }
+
     fn market_is_quarantined(&self, token: &str) -> bool {
         let key = self.market_key_ref(token);
         self.quarantined_tokens
@@ -8512,6 +8525,8 @@ impl ClobLocalBooks {
                     reported_bbo: ReportedBbo::default(),
                     has_reported_bbo: false,
                     off_tick: false,
+                    introduced_off_tick_level: false,
+                    had_pending_bbo: self.pending_bbo.contains_key(token),
                 });
             }
         }
@@ -8554,9 +8569,6 @@ impl ClobLocalBooks {
                 }
                 continue;
             }
-            if !self.price_is_on_current_tick(token, price) {
-                token_scratch.off_tick = true;
-            }
             let Some(current_book) = self.token_books.get(token) else {
                 counters.unseeded_deltas = counters.unseeded_deltas.saturating_add(1);
                 counters.ignored = counters.ignored.saturating_add(1);
@@ -8581,6 +8593,8 @@ impl ClobLocalBooks {
                 }
                 continue;
             }
+            let inserted_off_tick = size > Decimal::ZERO
+                && !self.price_is_on_current_tick(token, price);
             let sequence = self.next_sequence();
             let book = self
                 .token_books
@@ -8608,8 +8622,11 @@ impl ClobLocalBooks {
                 levels.remove(&price);
                 counters.level_deletes = counters.level_deletes.saturating_add(1);
             } else {
+                token_scratch.introduced_off_tick_level |=
+                    inserted_off_tick && !levels.contains_key(&price);
                 levels.insert(price, size);
                 counters.level_upserts = counters.level_upserts.saturating_add(1);
+                token_scratch.off_tick |= inserted_off_tick;
             }
             book.exchange_timestamp_ns = exchange_timestamp_ns;
             // Assign sequence per entry, not per token after the frame. This
@@ -8666,7 +8683,13 @@ impl ClobLocalBooks {
                 .get(token)
                 .map(ClobLocalBook::top)
                 .unwrap_or_default();
-            let off_tick = entry.off_tick;
+            // A deletion, ignored entry, or insert-then-delete does not prove
+            // that a new grid is needed. Only surviving off-grid levels keep
+            // an existing tick wait alive. Scan only the exceptional tick lane;
+            // ordinary quantity/BBO updates do not walk the depth.
+            let needs_tick_check = entry.off_tick || self.pending_bbo.get(token)
+                .is_some_and(|pending| pending.awaiting_tick_change);
+            let off_tick = needs_tick_check && !self.book_is_on_current_tick(token);
             let summary = subscribed_token(active_tokens, token).then(|| BboFrameSample {
                 exchange_timestamp_ns,
                 entries: entry.entries,
@@ -8686,21 +8709,33 @@ impl ClobLocalBooks {
                         frame_summaries: BboFrameHistory::default(),
                         awaiting_tick_change: false,
                     });
+            let previous_expected = pending.expected;
+            let was_awaiting_tick = pending.awaiting_tick_change;
             if exchange_timestamp_ns > pending.exchange_timestamp_ns {
                 // A newer advertised checkpoint supersedes the unfinished
                 // older one. Apply the newer delta first, then validate the
                 // latest state; never fail an old checkpoint at this boundary.
                 pending.exchange_timestamp_ns = exchange_timestamp_ns;
                 pending.expected = newer_expected;
-                pending.last_update_at = received_at;
                 pending.saw_newer_checkpoint = true;
                 pending.awaiting_tick_change = off_tick;
                 pending.saw_mismatch |= !pending.expected.matches(actual);
             } else if pending.exchange_timestamp_ns == exchange_timestamp_ns {
                 pending.expected.merge(newer_expected);
-                pending.last_update_at = received_at;
-                pending.awaiting_tick_change |= off_tick;
+                pending.awaiting_tick_change = off_tick;
                 pending.saw_mismatch |= !pending.expected.matches(actual);
+            }
+            // Quantity traffic at an already-known off-grid price supplies no
+            // new grid or BBO requirement. It must not keep postponing the
+            // original tick grace deadline. New levels, changed BBO evidence
+            // and unresolved depth retain the full existing quiet interval.
+            let unchanged_tick_wait = was_awaiting_tick
+                && off_tick
+                && !entry.introduced_off_tick_level
+                && previous_expected == pending.expected
+                && pending.expected.matches(actual);
+            if !unchanged_tick_wait {
+                pending.last_update_at = received_at;
             }
             if let Some(summary) = summary {
                 pending.frame_summaries.push(summary);
@@ -8760,8 +8795,11 @@ impl ClobLocalBooks {
                     )
                 })
                 .unwrap_or((false, false));
-            let _ = self.resolve_pending_if_ready(token, received_at, counters);
-            if top_changed
+            let resolved = self.resolve_pending_if_ready(token, received_at, counters);
+            // A preceding frame withheld this book. The confirming frame can
+            // leave the top unchanged; it must still release the validated
+            // snapshot now, not enter the 250 ms quantity-only coalescer.
+            if (top_changed || (entry.had_pending_bbo && resolved))
                 && semantically_valid
                 && !self.pending_bbo.contains_key(token)
                 && !self.market_is_quarantined(token)
@@ -9896,6 +9934,10 @@ mod clob_recovery_tests;
 #[cfg(test)]
 #[path = "book_protocol_capture_tests.rs"]
 mod book_protocol_capture_tests;
+
+#[cfg(test)]
+#[path = "clob_validation_release_tests.rs"]
+mod clob_validation_release_tests;
 
 #[cfg(test)]
 mod clob_event_lane_tests {

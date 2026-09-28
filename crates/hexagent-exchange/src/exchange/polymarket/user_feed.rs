@@ -6322,8 +6322,12 @@ mod tests {
         );
         assert_eq!(shared.live_position_last_match_secs(), 0);
 
-        shared.account_state.rebind_order_id("owner-1", "oid-final");
+        assert!(shared.account_state.rebind_order_id("owner-1", "oid-final"));
         shared.register_order_id("owner-1", "oid-final", "TOKEN");
+        // Repair is an asynchronous owner command. This case exercises replay
+        // after the identity is installed, not a race with its publication.
+        shared.flush_execution_state_for_test();
+        assert_eq!(shared.lookup_coid("oid-final").as_deref(), Some("owner-1"));
         let updates = parse_user_event(&event, &shared);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].client_order_id, "owner-1");

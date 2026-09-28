@@ -451,6 +451,35 @@ fn compare_apply(
     assert_same_state(a, b);
 }
 
+// The historical scratch baseline deliberately retains its old publication
+// policy. A completed BBO used to enter the quantity coalescer; compare its
+// eventual book against the new immediate book without rewriting that baseline.
+// All depth, ownership, health, recovery deadlines and counters still match.
+fn compare_recovered_publication(
+    a: &mut ClobLocalBooks,
+    b: &mut ClobLocalBooks,
+    frame: &str,
+    tokens: &[String],
+    now: Instant,
+) {
+    let mut old = run_apply(a, frame, tokens, now, true);
+    let mut new = run_apply(b, frame, tokens, now, false);
+    let delayed = a.flush_due(now + CLOB_BOOK_COALESCE_INTERVAL, 1_789_565_389_600_000_000);
+    for event in delayed {
+        push_latest_order_book(&mut old.0.0, event);
+    }
+    // Also drain unrelated normal quantity updates on both fixtures. The
+    // dedicated release tests assert the earlier publication itself; this
+    // historical oracle compares complete eventual state and health identity.
+    for event in b.flush_due(now + CLOB_BOOK_COALESCE_INTERVAL, 1_789_565_389_600_000_000) {
+        push_latest_order_book(&mut new.0.0, event);
+    }
+    old.0.1 = old.0.0.iter().filter(|event| matches!(event, MarketEvent::OrderBook(_))).count();
+    new.0.1 = new.0.0.iter().filter(|event| matches!(event, MarketEvent::OrderBook(_))).count();
+    assert_eq!(format!("{old:?}"), format!("{new:?}"));
+    assert_same_state(a, b);
+}
+
 #[test]
 fn captured_delete_frame_matches_old_apply_and_replay() {
     let tokens = captured_tokens();
@@ -502,20 +531,18 @@ fn duplicate_interleaved_tokens_keep_first_before_last_delta_and_wire_order() {
 }
 
 #[test]
-fn mismatched_off_tick_invalid_side_and_recovery_preserve_health_semantics() {
+fn mismatched_bbo_recovery_preserves_health_semantics() {
     let tokens = captured_tokens();
     let now = Instant::now();
-    for (field, value) in [
-        ("best_bid", "0.50"),
-        ("price", "0.515"),
-        ("side", "UNKNOWN"),
-    ] {
+    // Off-grid deletions and ignored invalid sides intentionally no longer
+    // follow the old wait policy; dedicated release tests cover those cases.
+    for (field, value) in [("best_bid", "0.50")] {
         let mut frame: serde_json::Value = serde_json::from_str(CAPTURE).unwrap();
         frame["price_changes"][0][field] = value.into();
         let mut old = seed_tokens(&tokens, now);
         let mut new = seed_tokens(&tokens, now);
         compare_apply(&mut old, &mut new, &frame.to_string(), &tokens, now);
-        compare_apply(
+        compare_recovered_publication(
             &mut old,
             &mut new,
             CAPTURE,
@@ -567,12 +594,13 @@ fn mixed_duplicate_fields_preserve_bbo_merge_and_per_token_stale_checks() {
     later["side"] = "UNKNOWN".into();
     later["price"] = "0.515".into();
     value["price_changes"].as_array_mut().unwrap().push(later);
-    let mut old = seed_tokens(&tokens, now);
     let mut new = seed_tokens(&tokens, now);
-    compare_apply(&mut old, &mut new, &value.to_string(), &tokens, now);
+    let (_, counters, diagnostics) = run_apply(&mut new, &value.to_string(), &tokens, now, false);
+    assert_eq!(counters.ignored, 1);
+    assert_eq!(diagnostics.len(), 1);
     assert!(
-        new.pending_bbo[&tokens[0]].awaiting_tick_change,
-        "off-tick evidence remains even when the later side is rejected"
+        new.pending_bbo.is_empty(),
+        "a rejected side cannot introduce a tick requirement"
     );
 
     let mut old = seed_tokens(&tokens, now);
@@ -634,7 +662,7 @@ fn compare_condition_fixture(specs: &[CanonicalEventSpec], tokens: &[String]) {
         change["best_bid"] = "0.40".into();
     }
     compare_apply(&mut old, &mut new, &mismatched.to_string(), tokens, now);
-    compare_apply(
+    compare_recovered_publication(
         &mut old,
         &mut new,
         &matched,
