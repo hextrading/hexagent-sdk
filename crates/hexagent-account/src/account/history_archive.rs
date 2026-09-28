@@ -532,6 +532,24 @@ impl SharedAccount {
             .is_some_and(|archive| archive.may_contain(if trade { 1 } else { 2 }, identity))
     }
 
+    // Reserve the existing bounded cold-reclamation credits before any hot
+    // mutation. One changed route produces at most one obsolete shard snapshot.
+    fn reserve_archive_route_retirement(
+        &self,
+        rows: usize,
+    ) -> Result<Vec<RouteRetirementPermit<'_>>, String> {
+        if !self.account_owner_lane_bound.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
+        (0..rows.div_ceil(route_retirement::SNAPSHOTS_PER_BATCH))
+            .map(|_| {
+                self.route_retirement
+                    .try_reserve()
+                    .ok_or_else(|| "archive route reclamation capacity busy".to_owned())
+            })
+            .collect()
+    }
+
     pub(super) fn archive_retired_history(&self, now_ms: u64) -> Result<usize, String> {
         assert!(
             !self.account_owner_lane_bound.load(Ordering::Acquire)
@@ -578,14 +596,22 @@ impl SharedAccount {
         {
             return Ok(0);
         }
+        let Ok(mut retirement) = self.reserve_archive_route_retirement(rows.trades.len()) else {
+            return Ok(0); // durable duplicate is safe; retain every hot proof
+        };
         let mut changes = Vec::new();
         let mut retired = 0;
-        for (key, row) in rows.trades {
+        for (index, (key, row)) in rows.trades.into_iter().enumerate() {
             if state.retired_trade_ownership_tombstones.get(&key) == Some(&row)
                 && trade_eligible(&state, &key, &row, now_ms)
             {
                 state.retired_trade_ownership_tombstones.remove(&key);
-                self.retired_trade_routes.remove(&key);
+                self.retired_trade_routes.apply_batch_retiring(
+                    &row.ownership.instance_id,
+                    std::slice::from_ref(&key),
+                    &[],
+                    retirement.get_mut(index / route_retirement::SNAPSHOTS_PER_BATCH),
+                );
                 changes.push(PersistenceWalChange::Remove {
                     path: vec!["retired_trade_ownership_tombstones".into(), key],
                 });
@@ -700,11 +726,16 @@ impl SharedAccount {
                 }
             }
         }
-        for (key, row) in rows.trades {
+        let mut retirement = self.reserve_archive_route_retirement(rows.trades.len())?;
+        for (index, (key, row)) in rows.trades.into_iter().enumerate() {
             // Refresh verified proofs as well: a replay can arrive after the
             // legacy hot TTL, while its exact archive proof remains permanent.
-            self.retired_trade_routes
-                .insert(key.clone(), row.ownership.instance_id.clone());
+            self.retired_trade_routes.apply_batch_retiring(
+                &row.ownership.instance_id,
+                &[],
+                &[(key.clone(), row.ownership.instance_id.clone())],
+                retirement.get_mut(index / route_retirement::SNAPSHOTS_PER_BATCH),
+            );
             persistence_wal_map_entry(
                 &mut changes,
                 "retired_trade_ownership_tombstones",
@@ -1162,6 +1193,74 @@ mod tests {
             .unwrap_err()
             .contains("archive missing"));
     }
+    #[test]
+    fn archive_route_reclamation_retains_readers_and_backpressures_before_hot_mutation() {
+        let fixture = Fixture::new();
+        let account = Arc::new(SharedAccount::new_persistent("account", &fixture.0).unwrap());
+        let now = wall_clock_ms();
+        {
+            let mut target = account.state.lock().unwrap();
+            *target = state(now);
+            target.history_archive_generation = 1;
+            target
+                .retired_trade_ownership_tombstones
+                .remove("recent-trade");
+        }
+        account
+            .retired_trade_routes
+            .insert("old-trade".into(), "owner".into());
+        let (_, cold) = account.bind_account_owner().unwrap();
+        cold.mark_current_thread().unwrap();
+        let old_reader = account.retired_trade_routes.shards
+            [ShardedRouteMap::shard_index("old-trade")]
+        .published
+        .load();
+        let mut credits = Vec::new();
+        while let Some(credit) = account.route_retirement.try_reserve() {
+            credits.push(credit);
+        }
+        assert_eq!(account.archive_retired_history(now).unwrap(), 0);
+        assert!(account
+            .state
+            .lock()
+            .unwrap()
+            .retired_trade_ownership_tombstones
+            .contains_key("old-trade"));
+        assert!(account.retired_trade_routes.contains("old-trade"));
+        drop(credits);
+        assert_eq!(account.archive_retired_history(now).unwrap(), 1);
+        assert!(!account.retired_trade_routes.contains("old-trade"));
+        cold.reclaim_retired_routes();
+        assert_eq!(account.route_retirement_metrics().0, 1);
+        assert_eq!(old_reader.get("old-trade").unwrap().as_ref(), "owner");
+        drop(old_reader);
+        cold.reclaim_retired_routes();
+        assert_eq!(account.route_retirement_metrics().0, 0);
+        let mut credits = Vec::new();
+        while let Some(credit) = account.route_retirement.try_reserve() {
+            credits.push(credit);
+        }
+        assert!(cold
+            .hydrate_archived_private_event(true, "old-trade")
+            .unwrap_err()
+            .contains("capacity busy"));
+        assert!(!account.retired_trade_routes.contains("old-trade"));
+        assert!(account
+            .state
+            .lock()
+            .unwrap()
+            .retired_trade_ownership_tombstones
+            .is_empty());
+        drop(credits);
+        assert_eq!(
+            cold.hydrate_archived_private_event(true, "old-trade")
+                .unwrap(),
+            1
+        );
+        assert!(account.retired_trade_routes.contains("old-trade"));
+        cold.reclaim_retired_routes();
+    }
+
     #[test]
     fn cold_removal_is_bounded_and_crash_before_eviction_keeps_both_sources_safe() {
         let fixture = Fixture::new();

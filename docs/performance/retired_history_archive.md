@@ -161,3 +161,14 @@ queue depth/overflow 0. A positive here has no cached negative certificate.
 Cold disk rerun P50/P99/P999/max µs (N=100, same boundary as above): hex001
 12.888/16.909/51.789/51.789; zhu03 12.897/24.764/45.432/45.432; zhu02
 13.082/20.940/49.724/49.724. Migration counts and validated economics were unchanged.
+
+### Route snapshot reclamation
+
+Archive removal and cold hydration also use the existing bounded route snapshot
+retirement queue. Credits are reserved before hot mutation; a batch of at most
+128 trade proofs needs at most four of the account's eight credits. A held
+reader retains its credit until the existing cold worker can destroy the old
+snapshot. Exhaustion leaves hot proofs intact (or replay incomplete on hydration)
+and retries later. This prevents archive-triggered HashMap destruction on a
+private reader. No worker or quote-path operation is added. The focused test
+covers a real ArcSwap reader and both removal/hydration backpressure.
