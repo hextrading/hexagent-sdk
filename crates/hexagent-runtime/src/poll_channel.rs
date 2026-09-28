@@ -93,6 +93,25 @@ impl<T> Sender<T> {
 }
 
 impl<T> Receiver<T> {
+    /// Cold shutdown/recovery only. Normal owner loops use `try_recv` and
+    /// arbitrate higher-priority lanes before waiting. An unfinished producer
+    /// reservation yields just like an empty queue; it is never spun on.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<T, crossbeam_channel::RecvTimeoutError> {
+        let started = std::time::Instant::now();
+        loop {
+            match self.try_recv() {
+                Ok(value) => return Ok(value),
+                Err(TryRecvError::Disconnected) => return Err(crossbeam_channel::RecvTimeoutError::Disconnected),
+                Err(TryRecvError::Empty) => {}
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(crossbeam_channel::RecvTimeoutError::Timeout);
+            }
+            std::thread::sleep(remaining.min(IDLE_POLL));
+        }
+    }
+
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         if let Some(value) = self.0.queue.try_pop() {
             return Ok(value);
@@ -134,6 +153,16 @@ impl<T> Drop for Receiver<T> {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[test]
+    fn cold_timeout_checks_ready_and_disconnected_before_deadline() {
+        let (tx, rx) = bounded(1);
+        assert_eq!(rx.recv_timeout(Duration::ZERO), Err(crossbeam_channel::RecvTimeoutError::Timeout));
+        tx.try_send(7).unwrap();
+        drop(tx);
+        assert_eq!(rx.recv_timeout(Duration::ZERO), Ok(7));
+        assert_eq!(rx.recv_timeout(Duration::ZERO), Err(crossbeam_channel::RecvTimeoutError::Disconnected));
+    }
 
     #[test]
     fn exact_capacity_order_and_disconnect_after_drain() {

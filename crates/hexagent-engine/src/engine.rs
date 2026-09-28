@@ -895,7 +895,7 @@ fn spawn_polymarket_supervisor(
                         snapshot.current_event_end_ns,
                     );
                     info!(
-                        "[market_dispatch_health] polls={} poll_age_us={} pending={} capacity_per_lane={} contention_drops={} alive={} phase={} max_poll_gap_us={} pending_high_water={} executor_pending_high_water={} executor_capacity={} private_pending_high_water={} private_capacity={} phase_key=0:unknown,1:supervisor,2:lifecycle,3:select,4:market,5:recorder",
+                        "[market_dispatch_health] polls={} poll_age_us={} pending={} capacity_per_lane={} contention_drops={} alive={} phase={} max_poll_gap_us={} pending_high_water={} executor_pending_high_water={} executor_capacity={} private_pending_high_water={} private_capacity={} phase_key=0:unknown,1:supervisor,2:lifecycle,3:poll,4:market,5:recorder",
                         consumer.polls, consumer.poll_age_ns / 1_000,
                         consumer.pending, consumer.capacity_per_lane,
                         consumer.contention_drops, consumer.alive, consumer.phase,
@@ -2490,9 +2490,13 @@ impl Default for LatestMarketStore {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Single root-router producer, one strategy-owner consumer, fixed capacity.
+/// Public trades/lifecycle retain FIFO; replaceable markers retain their
+/// existing epoch/generation barriers. Overflow still quarantines the owner.
+/// Publishing never locks or wakes a strategy; idle owners poll within 10us.
+#[derive(Clone)]
 struct MarketEventLane {
-    tx: Sender<QueuedMarketEvent>,
+    tx: hexagent_runtime::poll_channel::Sender<QueuedMarketEvent>,
     latest: Arc<LatestMarketStore>,
     /// Non-coverable events advance the epoch so a later book cannot replace
     /// a marker queued before an intervening trade/lifecycle event.
@@ -8832,13 +8836,13 @@ impl Engine {
         let mut direct_private_routes = HashMap::<u16, Sender<RoutedOrderUpdate>>::new();
         let mut specs: Vec<(
             Box<dyn Strategy>,
-            Receiver<QueuedMarketEvent>,
+            hexagent_runtime::poll_channel::Receiver<QueuedMarketEvent>,
             Arc<LatestMarketStore>,
             Receiver<QueuedOrderUpdate>,
             Receiver<RoutedOrderUpdate>,
         )> = Vec::with_capacity(strategies.len());
         for (owner, s) in strategies.into_iter().enumerate() {
-            let (mtx, mrx) = bounded::<QueuedMarketEvent>(CHANNEL_CAPACITY);
+            let (mtx, mrx) = hexagent_runtime::poll_channel::bounded::<QueuedMarketEvent>(CHANNEL_CAPACITY);
             let latest = Arc::new(LatestMarketStore::default());
             // One bounded lossless lane per strategy. The router retains the
             // exact head event when a lane is full and stops consuming both
@@ -8915,7 +8919,7 @@ impl Engine {
                 }
 
                 // Router runs on the fallback strategy core. Production
-                // live/paper layouts dedicate that core to the router; every
+                // live/paper layouts may share it with lower-priority workers; every
                 // configured instance uses `strategy_cores` instead.
                 // Fan-out below clones only Arc pointers, never event payloads.
                 crate::os_tune::pin_strategy("strategy-router");
@@ -8924,6 +8928,7 @@ impl Engine {
                 let _ = market_queue_monotonic_ns();
                 crate::latency::prepare_polymarket_private_stages();
                 crate::latency::prepare_thread_stages(&["market.receive_to_router"]);
+                crate::latency::prepare_observation_stages(&["market.router.dispatch"]);
                 hexagent_runtime::latency::prepare_market_queue_stages();
                 market_rx.begin_poll_measurement();
                 info!(
@@ -9032,7 +9037,7 @@ impl Engine {
                     }
                     // Owner-local timers cannot be held by a preempted FIFO
                     // peer through AtomicCell's hashed global locks. The loop
-                    // also flushes lifecycle outboxes before every select, so
+                    // also flushes lifecycle outboxes before every poll, so
                     // the <=10us idle poll replaces the old 50us retry ticker.
                     if supervisor_timer.take_due(std::time::Instant::now()) {
                         market_rx.mark_phase(1);
@@ -9076,14 +9081,6 @@ impl Engine {
                             }
                         }
                     }
-                    let market_poll_interval = if private_poll_rx.as_ref()
-                        .is_some_and(|rx| rx.front_ready())
-                        || executor_update_rx.as_ref().is_some_and(|rx| rx.front_ready())
-                    {
-                        std::time::Duration::ZERO
-                    } else {
-                        market_rx.poll_interval()
-                    };
                     market_rx.mark_phase(2);
                     if let Err(failure) = lifecycle_outboxes.try_flush_one(&update_txs) {
                         if handle_lifecycle_route_failure(
@@ -9104,14 +9101,78 @@ impl Engine {
                     // lane now drains before quote work; bounded per-owner
                     // queues and quarantine retain explicit backpressure.
                     market_rx.mark_phase(3);
-                    crossbeam_channel::select_biased! {
-                        recv(update_rx) -> msg => match msg {
-                            // Cold compatibility route. Once admitted, the
-                            // numeric owner is carried in the queue envelope.
-                            Ok(u) => {
+                    // No select registration or wake lock while market work
+                    // is ready. All control/private lanes are checked before
+                    // every event; sleep only after an actual empty market pop.
+                    match update_rx.try_recv() {
+                        // Cold compatibility route. Once admitted, the
+                        // numeric owner is carried in the queue envelope.
+                        Ok(u) => {
+                            market_rx.mark_phase(2);
+                            match Self::route_private_update(
+                                u,
+                                &iid_to_idx,
+                                &update_txs,
+                                &worker_quarantined,
+                                &mut lifecycle_outboxes,
+                            ) {
+                                Ok(()) => {},
+                                Err(failure) => {
+                                    if handle_lifecycle_route_failure(
+                                        &failure, &instance_ids, &worker_quarantined, &signal_tx,
+                                        &mut lifecycle_outboxes,
+                                    ) {
+                                        break 'router;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                        Err(crossbeam_channel::TryRecvError::Empty) => {},
+                    }
+                    if let Ok((idx, panicked)) = worker_status_rx.try_recv() {
+                        let reason = if panicked { "strategy worker panicked" }
+                            else { "strategy worker exited unexpectedly" };
+                        quarantine_strategy_worker(
+                            idx, reason, &instance_ids, &worker_quarantined, &signal_tx,
+                        );
+                        continue;
+                    }
+                    if let Some(private_rx) = private_poll_rx.as_ref() {
+                        market_rx.observe_private_depth(private_rx.len());
+                        match private_rx.try_recv() {
+                            Ok(routed) => {
                                 market_rx.mark_phase(2);
-                                match Self::route_private_update(
-                                    u,
+                                if let Err(failure) = Self::route_private_update(
+                                    routed, &iid_to_idx, &update_txs,
+                                    &worker_quarantined, &mut lifecycle_outboxes,
+                                ) {
+                                    if handle_lifecycle_route_failure(
+                                        &failure, &instance_ids, &worker_quarantined,
+                                        &signal_tx, &mut lifecycle_outboxes,
+                                    ) {
+                                        break 'router;
+                                    }
+                                }
+                                continue;
+                            }
+                            Err(crossbeam_channel::TryRecvError::Empty) => {
+                                if private_rx.has_pending() {
+                                    thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
+                                    continue;
+                                }
+                            }
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    if let Some(executor_rx) = executor_update_rx.as_ref() {
+                        market_rx.observe_executor_depth(executor_rx.len());
+                        match executor_rx.try_recv() {
+                            Ok(routed) => {
+                                market_rx.mark_phase(2);
+                                match Self::route_executor_update(
+                                    routed,
                                     &iid_to_idx,
                                     &update_txs,
                                     &worker_quarantined,
@@ -9127,179 +9188,117 @@ impl Engine {
                                         }
                                     }
                                 }
+                                continue;
                             }
-                            Err(_) => break,
-                        },
-                        default(market_poll_interval) => {
-                            if let Some(private_rx) = private_poll_rx.as_ref() {
-                                market_rx.observe_private_depth(private_rx.len());
-                                match private_rx.try_recv() {
-                                    Ok(routed) => {
-                                        market_rx.mark_phase(2);
-                                        if let Err(failure) = Self::route_private_update(
-                                            routed, &iid_to_idx, &update_txs,
-                                            &worker_quarantined, &mut lifecycle_outboxes,
-                                        ) {
-                                            if handle_lifecycle_route_failure(
-                                                &failure, &instance_ids, &worker_quarantined,
-                                                &signal_tx, &mut lifecycle_outboxes,
-                                            ) {
-                                                break 'router;
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                    Err(crossbeam_channel::TryRecvError::Empty) => {
-                                        if private_rx.has_pending() {
-                                            thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
-                                            continue;
-                                        }
-                                    }
-                                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                            Err(crossbeam_channel::TryRecvError::Empty) => {
+                                if executor_rx.has_pending() {
+                                    // An admitted lifecycle head is still being published.
+                                    // Yield to its owner, retaining private-before-market order.
+                                    thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
+                                    continue;
                                 }
                             }
-                            if let Some(executor_rx) = executor_update_rx.as_ref() {
-                                market_rx.observe_executor_depth(executor_rx.len());
-                                match executor_rx.try_recv() {
-                                    Ok(routed) => {
-                                        market_rx.mark_phase(2);
-                                        match Self::route_executor_update(
-                                            routed,
-                                            &iid_to_idx,
-                                            &update_txs,
-                                            &worker_quarantined,
-                                            &mut lifecycle_outboxes,
-                                        ) {
-                                            Ok(()) => {},
-                                            Err(failure) => {
-                                                if handle_lifecycle_route_failure(
-                                                    &failure, &instance_ids, &worker_quarantined, &signal_tx,
-                                                    &mut lifecycle_outboxes,
-                                                ) {
-                                                    break 'router;
-                                                }
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                    Err(crossbeam_channel::TryRecvError::Empty) => {
-                                        if executor_rx.has_pending() {
-                                            // An admitted lifecycle head is still being published.
-                                            // Yield to its owner, retaining private-before-market order.
-                                            thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
-                                            continue;
-                                        }
-                                    }
-                                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    match market_rx.try_recv() {
+                        Ok(MarketEvent::Exit) => {
+                            if shutdown_in_progress { continue; }
+                            forward_recorder_event(
+                                recorder_tx.as_ref(), &MarketEvent::Exit,
+                            );
+                            let mut waiting: HashSet<usize> = (0..instance_ids.len())
+                                .filter(|idx| !worker_quarantined[*idx].load(Ordering::Acquire))
+                                .collect();
+                            for idx in &waiting {
+                                worker_shutdown_requested[*idx].store(true, Ordering::Release);
+                            }
+                            // A worker acknowledges only after its current
+                            // callback has returned and on_exit has run, so
+                            // all order-producing signals are ahead of the
+                            // executor barrier.
+                            let deadline = std::time::Instant::now()
+                                + std::time::Duration::from_nanos(STRATEGY_WORKER_STALL_NS);
+                            while !waiting.is_empty() {
+                                let now = std::time::Instant::now();
+                                if now >= deadline { break; }
+                                match shutdown_ack_rx.recv_timeout(deadline.saturating_duration_since(now)) {
+                                    Ok(idx) => { waiting.remove(&idx); }
+                                    Err(_) => break,
                                 }
                             }
-                            match market_rx.try_recv() {
-                                Ok(MarketEvent::Exit) => {
-                                    if shutdown_in_progress { continue; }
-                                    forward_recorder_event(
-                                        recorder_tx.as_ref(), &MarketEvent::Exit,
-                                    );
-                                    let mut waiting: HashSet<usize> = (0..instance_ids.len())
-                                        .filter(|idx| !worker_quarantined[*idx].load(Ordering::Acquire))
-                                        .collect();
-                                    for idx in &waiting {
-                                        worker_shutdown_requested[*idx].store(true, Ordering::Release);
-                                    }
-                                    // A worker acknowledges only after its current
-                                    // callback has returned and on_exit has run, so
-                                    // all order-producing signals are ahead of the
-                                    // executor barrier.
-                                    let deadline = std::time::Instant::now()
-                                        + std::time::Duration::from_nanos(STRATEGY_WORKER_STALL_NS);
-                                    while !waiting.is_empty() {
-                                        let now = std::time::Instant::now();
-                                        if now >= deadline { break; }
-                                        match shutdown_ack_rx.recv_timeout(deadline.saturating_duration_since(now)) {
-                                            Ok(idx) => { waiting.remove(&idx); }
-                                            Err(_) => break,
-                                        }
-                                    }
-                                    for idx in waiting {
-                                        quarantine_strategy_worker(
-                                            idx,
-                                            "shutdown acknowledgement timed out",
-                                            &instance_ids,
-                                            &worker_quarantined,
-                                            &signal_tx,
-                                        );
-                                    }
-                                    shutdown_in_progress = true;
-                                    if signal_tx.send(Signal::BeginShutdown).is_err() {
-                                        warn!("[Strategy] executor disappeared before shutdown barrier");
-                                        break;
-                                    }
-                                }
-                                Ok(event) => {
-                                    market_rx.mark_phase(4);
-                                    if shutdown_in_progress { continue; }
-                                    if let Some(age) = market_receive_age_ns(&event, crate::types::now_ns()) {
-                                        crate::latency::record_ns("market.receive_to_router", age);
-                                    }
-                                    let event = Arc::new(event);
-                                    let mut dropped_mask = Self::route_market_event(
-                                        Arc::clone(&event),
-                                        &sym_to_instances,
-                                        &mut token_to_instances,
-                                        &mut latest_key_ids,
-                                        &market_lanes,
-                                    );
-                                    while dropped_mask != 0 {
-                                        let idx = dropped_mask.trailing_zeros() as usize;
-                                        dropped_mask &= dropped_mask - 1;
-                                        if let Some(drops) = market_overflow_drops.get_mut(idx) {
-                                            *drops = drops.saturating_add(1);
-                                        }
-                                        quarantine_strategy_worker(
-                                            idx,
-                                            "market queue overflow (event loss)",
-                                            &instance_ids,
-                                            &worker_quarantined,
-                                            &signal_tx,
-                                        );
-                                    }
-                                    market_rx.mark_phase(5);
-                                    forward_recorder_shared(recorder_tx.as_ref(), event);
-                                    if market_overflow_drops.iter().any(|drops| *drops > 0)
-                                        && market_overflow_log_at.elapsed()
-                                            >= std::time::Duration::from_secs(1)
-                                    {
-                                        for (idx, drops) in market_overflow_drops.iter_mut().enumerate() {
-                                            if *drops == 0 {
-                                                continue;
-                                            }
-                                            warn!(
-                                                "[market_queue_metric] instance={} router_overflow_drops={} window_ms={}",
-                                                instance_ids.get(idx).map(String::as_str).unwrap_or("<unknown>"),
-                                                *drops,
-                                                market_overflow_log_at.elapsed().as_millis(),
-                                            );
-                                            *drops = 0;
-                                        }
-                                        market_overflow_log_at = std::time::Instant::now();
-                                    }
-                                }
-                                Err(crossbeam_channel::TryRecvError::Empty) => continue,
-                                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-                            }
-                        },
-                        recv(worker_status_rx) -> msg => {
-                            if let Ok((idx, panicked)) = msg {
-                                let reason = if panicked {
-                                    "strategy worker panicked"
-                                } else {
-                                    "strategy worker exited unexpectedly"
-                                };
+                            for idx in waiting {
                                 quarantine_strategy_worker(
-                                    idx, reason, &instance_ids, &worker_quarantined, &signal_tx,
+                                    idx,
+                                    "shutdown acknowledgement timed out",
+                                    &instance_ids,
+                                    &worker_quarantined,
+                                    &signal_tx,
                                 );
                             }
+                            shutdown_in_progress = true;
+                            if signal_tx.send(Signal::BeginShutdown).is_err() {
+                                warn!("[Strategy] executor disappeared before shutdown barrier");
+                                break;
+                            }
+                        }
+                        Ok(event) => {
+                            market_rx.mark_phase(4);
+                            if shutdown_in_progress { continue; }
+                            if let Some(age) = market_receive_age_ns(&event, crate::types::now_ns()) {
+                                crate::latency::record_ns("market.receive_to_router", age);
+                            }
+                            let dispatch_started = crate::types::monotonic_now_ns();
+                            let event = Arc::new(event);
+                            let mut dropped_mask = Self::route_market_event(
+                                Arc::clone(&event),
+                                &sym_to_instances,
+                                &mut token_to_instances,
+                                &mut latest_key_ids,
+                                &market_lanes,
+                            );
+                            crate::latency::observe_ns("market.router.dispatch",
+                                crate::types::monotonic_now_ns().saturating_sub(dispatch_started));
+                            while dropped_mask != 0 {
+                                let idx = dropped_mask.trailing_zeros() as usize;
+                                dropped_mask &= dropped_mask - 1;
+                                if let Some(drops) = market_overflow_drops.get_mut(idx) {
+                                    *drops = drops.saturating_add(1);
+                                }
+                                quarantine_strategy_worker(
+                                    idx,
+                                    "market queue overflow (event loss)",
+                                    &instance_ids,
+                                    &worker_quarantined,
+                                    &signal_tx,
+                                );
+                            }
+                            market_rx.mark_phase(5);
+                            forward_recorder_shared(recorder_tx.as_ref(), event);
+                            if market_overflow_drops.iter().any(|drops| *drops > 0)
+                                && market_overflow_log_at.elapsed()
+                                    >= std::time::Duration::from_secs(1)
+                            {
+                                for (idx, drops) in market_overflow_drops.iter_mut().enumerate() {
+                                    if *drops == 0 {
+                                        continue;
+                                    }
+                                    warn!(
+                                        "[market_queue_metric] instance={} router_overflow_drops={} window_ms={}",
+                                        instance_ids.get(idx).map(String::as_str).unwrap_or("<unknown>"),
+                                        *drops,
+                                        market_overflow_log_at.elapsed().as_millis(),
+                                    );
+                                    *drops = 0;
+                                }
+                                market_overflow_log_at = std::time::Instant::now();
+                            }
+                        }
+                        Err(crossbeam_channel::TryRecvError::Empty) => {
+                            thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
+                            continue;
                         },
-
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                     }
                 }
 
@@ -9640,7 +9639,7 @@ impl Engine {
     /// to this instance without a shared client-order-id registry.
     fn run_strategy_worker(
         mut strategy: Box<dyn Strategy>,
-        market_rx: Receiver<QueuedMarketEvent>,
+        market_rx: hexagent_runtime::poll_channel::Receiver<QueuedMarketEvent>,
         latest_market: Arc<LatestMarketStore>,
         update_rx: Receiver<QueuedOrderUpdate>,
         direct_private_rx: Receiver<RoutedOrderUpdate>,
@@ -9687,6 +9686,7 @@ impl Engine {
             "strategy.private_feed.callback",
         ]);
         crate::latency::prepare_thread_stages(strategy.latency_stages());
+        crate::latency::prepare_observation_stages(&["strategy.market.pending_depth"]);
         // The sender is permanently tagged with this worker's numeric owner.
         // Normal traffic is non-blocking; overflow quarantines only this owner
         // and submits an emergency cancel on the independent control lane.
@@ -9830,13 +9830,18 @@ impl Engine {
             // Ready market/private receivers still win over this timeout.
             let watchdog_wait = watchdog_timer.remaining(watchdog_now);
             let selectable_admission_rx = admission.receiver().unwrap_or(&never_admission_rx);
-            crossbeam_channel::select_biased! {
-                recv(selectable_admission_rx) -> message => {
+            use worker_input::WorkerInput;
+            match worker_input::next_input(
+                selectable_admission_rx, selectable_private_control_rx,
+                selectable_direct_private_rx, selectable_private_update_rx,
+                selectable_compat_update_rx, &hist_result_rx, &market_rx, watchdog_wait,
+            ) {
+                WorkerInput::Admission(message) => {
                     if let Some(snapshot) = admission.receive(message) {
                         strategy.on_execution_admission(snapshot);
                     }
                 },
-                recv(selectable_private_control_rx) -> msg => match msg {
+                WorkerInput::PrivateControl(msg) => match msg {
                     Ok(control) => {
                         if quarantined.load(Ordering::Acquire) { break 'worker; }
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
@@ -9864,7 +9869,7 @@ impl Engine {
                 // was completed on the private producer, so this dedicated
                 // lossless lane bypasses the root router and is drained before
                 // every compatibility lifecycle or market-data lane.
-                recv(selectable_direct_private_rx) -> msg => match msg {
+                WorkerInput::DirectPrivate(msg) => match msg {
                     Ok(routed) => {
                         if routed.owner as usize != idx {
                             error!(
@@ -9912,7 +9917,7 @@ impl Engine {
                     }
                     Err(_) => break,
                 },
-                recv(selectable_private_update_rx) -> msg => match msg {
+                WorkerInput::PrivateUpdate(msg) => match msg {
                     Ok(update) => {
                         if quarantined.load(Ordering::Acquire) { break 'worker; }
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
@@ -9952,7 +9957,7 @@ impl Engine {
                     }
                     Err(_) => private_feed_updates_open = false,
                 },
-                recv(selectable_compat_update_rx) -> msg => match msg {
+                WorkerInput::CompatUpdate(msg) => match msg {
                     Ok(queued) => {
                         if queued.update.exchange == Exchange::Polymarket {
                             hexagent_runtime::latency::record_ns(
@@ -10003,7 +10008,7 @@ impl Engine {
                     }
                     Err(_) => break,
                 },
-                recv(hist_result_rx) -> msg => match msg {
+                WorkerInput::History(msg) => match msg {
                     Ok(result) => {
                         if result.epoch != historical_epoch || shutdown_started {
                             continue;
@@ -10025,7 +10030,7 @@ impl Engine {
                     }
                     Err(_) => break,
                 },
-                recv(market_rx) -> msg => match msg {
+                WorkerInput::Market(msg) => match msg {
                     Ok(queued) => {
                         let Some(queued) = resolve_market_event(queued, &latest_market) else {
                             continue;
@@ -10195,7 +10200,7 @@ impl Engine {
                     }
                     Err(_) => break,
                 },
-                default(watchdog_wait) => {},
+                WorkerInput::Idle => {},
             }
         }
         drop(hist_result_rx);
@@ -17155,10 +17160,12 @@ mod strategy_construction_tests;
 #[path = "router_poll_lane_tests.rs"]
 mod router_poll_lane_tests;
 
+#[path = "worker_input.rs"]
+mod worker_input;
+
 #[cfg(test)]
 mod market_router_tests {
     use super::*;
-    use crossbeam_channel::Receiver;
 
     struct WatchdogTestStrategy {
         watchdog_tx: Sender<u64>,
@@ -17707,7 +17714,7 @@ mod market_router_tests {
     }
 
     /// Drain a receiver into a count (non-blocking).
-    fn drain(rx: &Receiver<QueuedMarketEvent>) -> usize {
+    fn drain(rx: &hexagent_runtime::poll_channel::Receiver<QueuedMarketEvent>) -> usize {
         let mut n = 0;
         while rx.try_recv().is_ok() {
             n += 1;
@@ -17769,8 +17776,8 @@ mod market_router_tests {
         m
     }
 
-    fn test_market_lane(capacity: usize) -> (MarketEventLane, Receiver<QueuedMarketEvent>) {
-        let (tx, rx) = bounded(capacity);
+    fn test_market_lane(capacity: usize) -> (MarketEventLane, hexagent_runtime::poll_channel::Receiver<QueuedMarketEvent>) {
+        let (tx, rx) = hexagent_runtime::poll_channel::bounded(capacity);
         (
             MarketEventLane {
                 tx,
@@ -17793,7 +17800,7 @@ mod market_router_tests {
         assert!(enqueue_market_event(&lane, first, key));
         assert!(enqueue_market_event(&lane, Arc::clone(&second), key));
         assert_eq!(rx.len(), 1, "one latest-only marker per venue/symbol/kind");
-        let payload = resolve_market_event(rx.recv().unwrap(), &lane.latest).unwrap();
+        let payload = resolve_market_event(rx.try_recv().unwrap(), &lane.latest).unwrap();
         assert!(Arc::ptr_eq(&payload.event, &second));
         assert_eq!(lane.latest.replacements.load(Ordering::Relaxed), 1);
     }
@@ -17834,16 +17841,16 @@ mod market_router_tests {
         assert!(enqueue_market_event(&lane, Arc::clone(&second), key));
         assert_eq!(rx.len(), 3);
 
-        let before_barrier = resolve_market_event(rx.recv().unwrap(), &lane.latest).unwrap();
+        let before_barrier = resolve_market_event(rx.try_recv().unwrap(), &lane.latest).unwrap();
         assert!(Arc::ptr_eq(&before_barrier.event, &first));
-        let barrier = resolve_market_event(rx.recv().unwrap(), &lane.latest).unwrap();
+        let barrier = resolve_market_event(rx.try_recv().unwrap(), &lane.latest).unwrap();
         assert!(matches!(
             barrier.event.as_ref(),
             MarketEvent::Connected {
                 exchange: Exchange::Binance
             }
         ));
-        let after_barrier = resolve_market_event(rx.recv().unwrap(), &lane.latest).unwrap();
+        let after_barrier = resolve_market_event(rx.try_recv().unwrap(), &lane.latest).unwrap();
         assert!(Arc::ptr_eq(&after_barrier.event, &second));
     }
 
@@ -17986,7 +17993,7 @@ mod market_router_tests {
 
     #[test]
     fn single_instance_worker_runs_watchdog_without_market_events() {
-        let (market_tx, market_rx) = bounded(1);
+        let (market_tx, market_rx) = hexagent_runtime::poll_channel::bounded(1);
         let (_update_tx, update_rx) = bounded(1);
         let (routed_signal_tx, _routed_signal_rx) = bounded(1);
         let (shutdown_ack_tx, _shutdown_ack_rx) = bounded(1);
@@ -18225,7 +18232,7 @@ mod market_router_tests {
             "a full latest-value lane replaces its pending snapshot"
         );
         assert_eq!(rx0.len(), 1, "replacement must reuse the queued marker");
-        let payload = resolve_market_event(rx0.recv().unwrap(), &txs[0].latest).unwrap();
+        let payload = resolve_market_event(rx0.try_recv().unwrap(), &txs[0].latest).unwrap();
         assert!(Arc::ptr_eq(&payload.event, &second));
         assert_eq!(txs[0].latest.replacements.load(Ordering::Relaxed), 1);
     }

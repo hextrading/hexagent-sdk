@@ -97,7 +97,7 @@ fn update(coid: &str) -> OrderUpdate {
 }
 
 struct Worker {
-    market: Sender<QueuedMarketEvent>,
+    market: hexagent_runtime::poll_channel::Sender<QueuedMarketEvent>,
     direct: Sender<RoutedOrderUpdate>,
     compat: Sender<QueuedOrderUpdate>,
     direct_rx: Receiver<RoutedOrderUpdate>,
@@ -110,7 +110,7 @@ struct Worker {
 
 impl Worker {
     fn new(id: &'static str, paused: bool, pause_on_first: bool) -> Self {
-        let (market, market_rx) = bounded(8);
+        let (market, market_rx) = hexagent_runtime::poll_channel::bounded(8);
         let (direct, direct_rx) = bounded(4);
         let (compat, compat_rx) = bounded(4);
         let (observed_tx, observed) = bounded(64);
@@ -475,7 +475,7 @@ fn startup_lifecycle_intake_terminal_fault_retains_ownership_until_each_controll
             .unwrap();
         let dropped = Arc::new(AtomicBool::new(false));
         let exit_calls = Arc::new(AtomicUsize::new(0));
-        let (market_tx, market_rx) = bounded(1);
+        let (market_tx, market_rx) = hexagent_runtime::poll_channel::bounded(1);
         let mut market_tx = Some(market_tx);
         let (direct_tx, direct_rx) = bounded(1);
         let (compat_tx, compat_rx) = bounded(1);
