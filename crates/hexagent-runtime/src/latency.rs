@@ -329,10 +329,12 @@ pub fn prepare_market_queue_stages() {
     prepare_thread_stages(&[
         "market.adapter_queue.binance",
         "market.adapter_queue.coinbase",
+        "market.adapter_queue.chainlink",
         "market.adapter_queue.polymarket",
         "market.adapter_queue.other",
         "market.root_queue.binance",
         "market.root_queue.coinbase",
+        "market.root_queue.chainlink",
         "market.root_queue.polymarket",
         "market.root_queue.other",
     ]);

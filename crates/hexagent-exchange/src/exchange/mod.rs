@@ -69,14 +69,17 @@ fn queue_stage(event: &MarketEvent, adapter: bool) -> &'static str {
         MarketEvent::Quote(v) => Some(v.exchange),
         MarketEvent::Trade(v) => Some(v.exchange),
         MarketEvent::AssetCtx(v) => Some(v.exchange),
+        MarketEvent::SpotPrice(v) if matches!(v.source.as_str(), "chainlink" | "chainlink_stream") => Some(Exchange::Chainlink),
         _ => None,
     };
     match (adapter, venue) {
         (true, Some(Exchange::Binance)) => "market.adapter_queue.binance",
         (true, Some(Exchange::Coinbase)) => "market.adapter_queue.coinbase",
+        (true, Some(Exchange::Chainlink)) => "market.adapter_queue.chainlink",
         (true, Some(Exchange::Polymarket)) => "market.adapter_queue.polymarket",
         (false, Some(Exchange::Binance)) => "market.root_queue.binance",
         (false, Some(Exchange::Coinbase)) => "market.root_queue.coinbase",
+        (false, Some(Exchange::Chainlink)) => "market.root_queue.chainlink",
         (false, Some(Exchange::Polymarket)) => "market.root_queue.polymarket",
         (true, _) => "market.adapter_queue.other",
         (false, _) => "market.root_queue.other",
@@ -1124,6 +1127,19 @@ pub trait ExchangeTrade: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chainlink_queue_stages_preserve_source_identity() {
+        for source in ["chainlink", "chainlink_stream", "pyth", "chainlink_other"] {
+            let event = MarketEvent::SpotPrice(crate::types::SpotPrice {
+                source: source.into(), symbol: "btc/usd".into(), price: 1.0,
+                timestamp_ns: 1, local_timestamp_ns: 1,
+            });
+            let chainlink = matches!(source, "chainlink" | "chainlink_stream");
+            assert_eq!(queue_stage(&event, true), if chainlink { "market.adapter_queue.chainlink" } else { "market.adapter_queue.other" });
+            assert_eq!(queue_stage(&event, false), if chainlink { "market.root_queue.chainlink" } else { "market.root_queue.other" });
+        }
+    }
 
     fn private_update(sequence: usize) -> OrderUpdate {
         OrderUpdate {
