@@ -211,3 +211,29 @@ fn benchmark_live_maintenance_transaction() {
     drop(account);
     remove_persistence_test_files(&path);
 }
+
+#[test]
+#[ignore = "release registration growth boundary; --ignored --nocapture --test-threads=1"]
+fn benchmark_registration_growth_boundary() {
+    const HISTORY: usize = 26_500;
+    const N: usize = 6_000; // crosses the 28,672-row flat-table growth boundary
+    let account = seeded_account();
+    let owner = account.virtual_account("a").unwrap();
+    let template = account.prepare_order_ownership("a", "history", "history-oid", "UP", Side::Buy, 1.0, 0.5, 0).unwrap();
+    for n in 0..HISTORY {
+        let mut row = template.clone();
+        row.client_order_id = format!("old-{n}"); row.order_id = format!("old-oid-{n}");
+        row.status = OrderStatus::Cancelled; row.reserved_cash = 0.0;
+        account.lifecycle_mut(&owner).orders.insert(row.client_order_id.clone(), row);
+    }
+    let mut samples = Vec::with_capacity(N);
+    for n in 0..N {
+        let order = account.prepare_order_ownership("a", &format!("new-{n}"), &format!("new-oid-{n}"), "UP", Side::Buy, 1.0, 0.5, 0).unwrap();
+        let start = std::time::Instant::now();
+        let result = account.register_prepared_order(&order);
+        samples.push(start.elapsed().as_nanos() as u64);
+        assert!(result.is_some());
+    }
+    samples.sort_unstable();
+    eprintln!("registration_growth history={HISTORY} n={N} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0 boundary=register_prepared_order includes=row_reservation_routes_persist_enqueue excludes=preparation_execution_publication_transport", samples[N/2], samples[N*99/100], samples[N*999/1000], samples[N-1]);
+}
