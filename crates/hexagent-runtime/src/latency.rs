@@ -414,6 +414,9 @@ pub fn prepare_polymarket_clob_stages() {
         "polymarket.ws.clob_bbo_wait_deadline",
         "polymarket.ws.clob_bbo_wait_snapshot",
         "polymarket.ws.clob_deferred_timer_late",
+        "polymarket.ws.clob_live_bbo_apply",
+        "polymarket.ws.clob_price_change_source_to_receive",
+        "polymarket.ws.clob_best_bid_ask_source_to_receive",
     ]);
     prepare_thread_stages(&[
         "market.root_overflow_drop",
