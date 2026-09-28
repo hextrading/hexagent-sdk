@@ -9088,7 +9088,7 @@ impl SharedAccount {
                     pending_physical,
                     ..
                 } = &mut *lifecycle;
-                pending_physical.rebuild(trades);
+                pending_physical.rebuild(trades.values());
             }
             lifecycle.recovery_pending_orders = state
                 .recovery_pending_orders
@@ -9270,7 +9270,7 @@ impl SharedAccount {
                 pending_physical,
                 ..
             } = &mut *lifecycle;
-            pending_physical.rebuild(trades);
+            pending_physical.rebuild(trades.values());
         }
         lifecycle.recovery_pending_orders = state
             .recovery_pending_orders
@@ -21573,11 +21573,11 @@ impl PendingPhysicalTracker {
         }
     }
 
-    fn rebuild(&mut self, trades: &HashMap<String, AppliedTrade>) {
+    fn rebuild<'a>(&mut self, trades: impl Iterator<Item = &'a AppliedTrade>) {
         self.cash = 0.0;
         self.positions.clear();
         self.unsettled_trades = 0;
-        for trade in trades.values() {
+        for trade in trades {
             self.apply_trade(trade, 1.0);
         }
     }
@@ -24733,7 +24733,7 @@ mod tests {
             trades.insert(trade.ownership.trade_key.clone(), trade);
         }
         let mut tracker = PendingPhysicalTracker::default();
-        tracker.rebuild(&trades);
+        tracker.rebuild(trades.values());
 
         let mut history_scan = Vec::with_capacity(EVENTS_PER_VARIANT);
         let mut incremental_snapshot = Vec::with_capacity(EVENTS_PER_VARIANT);

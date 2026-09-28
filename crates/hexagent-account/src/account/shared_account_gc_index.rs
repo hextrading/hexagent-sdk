@@ -3,7 +3,7 @@
 //! rebuilds them via FromIterator. Mutable row access may update status/economics
 //! only: token and client-order identity change by replacing the whole row.
 use super::{AppliedTrade, OrderOwnership};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::{Bound, Deref};
 use std::sync::Arc;
 
@@ -29,7 +29,13 @@ impl IndexedRow for AppliedTrade {
 
 #[derive(Debug)]
 pub(super) struct TokenIndexedRows<V> {
-    rows: HashMap<String, V>,
+    // The lifecycle owner inserts large ownership rows while private events
+    // are waiting. A flat table reallocates/rehashes the complete retained
+    // history at growth boundaries (28,672 rows in maker02's current range).
+    // B-tree node splits move only a bounded node per level. Token/order GC
+    // indexes and persistent wire representation are unchanged; readers still
+    // consume immutable publications, never this mutable owner-local tree.
+    rows: BTreeMap<String, V>,
     by_token: HashMap<String, BTreeSet<Arc<str>>>,
     by_order: HashMap<String, HashSet<Arc<str>>>,
     /// GC-only cursors rotate past protected entries, so an ineligible prefix
@@ -41,7 +47,7 @@ pub(super) struct TokenIndexedRows<V> {
 impl<V> Default for TokenIndexedRows<V> {
     fn default() -> Self {
         Self {
-            rows: HashMap::new(),
+            rows: BTreeMap::new(),
             by_token: HashMap::new(),
             by_order: HashMap::new(),
             cursors: HashMap::new(),
@@ -50,7 +56,7 @@ impl<V> Default for TokenIndexedRows<V> {
     }
 }
 impl<V> Deref for TokenIndexedRows<V> {
-    type Target = HashMap<String, V>;
+    type Target = BTreeMap<String, V>;
     fn deref(&self) -> &Self::Target {
         &self.rows
     }
