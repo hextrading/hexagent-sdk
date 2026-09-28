@@ -35,6 +35,7 @@ fn subscription(tokens: &[&str]) -> ClobSubscription {
         protocol_routes: Vec::new(),
         tokens: tokens.iter().map(|s| s.to_string()).collect(),
         canonical_events: vec![],
+        live_bbo_only: false,
     }
 }
 

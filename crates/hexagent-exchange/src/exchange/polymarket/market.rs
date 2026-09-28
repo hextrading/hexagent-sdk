@@ -26,6 +26,13 @@ use crate::exchange::{
 use crate::recorder::{BookProtocolKind, BookProtocolRoute, BookProtocolSession, BookProtocolSink};
 use crate::types::*;
 
+#[path = "live_bbo.rs"]
+mod live_bbo;
+
+#[cfg(test)]
+#[path = "live_bbo_tests.rs"]
+mod live_bbo_tests;
+
 const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const POLYMARKET_RTDS_URL: &str = "wss://ws-live-data.polymarket.com";
 const MAX_PUBLIC_EVENT_FUTURE_SKEW_NS: u64 = 2_000_000_000;
@@ -1444,6 +1451,7 @@ struct ClobSubscription {
     tokens: Vec<String>,
     canonical_events: Vec<CanonicalEventSpec>,
     protocol_routes: Vec<BookProtocolRoute>,
+    live_bbo_only: bool,
 }
 
 /// Only an explicit event slug suffix supplies the epoch. Static/non-epoch
@@ -1828,6 +1836,7 @@ pub struct PolymarketMarket {
     clob_task_abort: Option<tokio::task::AbortHandle>,
     /// A stalled dedicated runtime is bypassed for later reconnects.
     clob_runtime_fallback: bool,
+    live_bbo_only: bool,
 }
 
 impl PolymarketMarket {
@@ -1855,6 +1864,7 @@ impl PolymarketMarket {
             liveness,
             clob_task_abort: None,
             clob_runtime_fallback: false,
+            live_bbo_only: false,
         }
     }
 
@@ -1864,6 +1874,12 @@ impl PolymarketMarket {
     /// the same execution path that just stalled.
     pub fn force_clob_runtime_fallback(&mut self) {
         self.clob_runtime_fallback = true;
+    }
+
+    /// Set before subscribing. Live execution needs prices, not reconstructed
+    /// depth; paper/record consumers retain their full-book stream by default.
+    pub fn set_live_bbo_only(&mut self, enabled: bool) {
+        self.live_bbo_only = enabled;
     }
 
     /// Startup-owned public-feed lane, independent of every strategy account.
@@ -1926,6 +1942,7 @@ impl PolymarketMarket {
         ClobSubscription {
             tokens,
             canonical_events,
+            live_bbo_only: self.live_bbo_only,
             protocol_routes: self
                 .series
                 .iter()
@@ -4083,7 +4100,7 @@ fn spawn_clob_seeded_candidate(
             protocol_binding(&protocol_sink, &subscription),
         )
         .await?;
-        let mut books = ClobLocalBooks::new(&subscription.canonical_events);
+        let mut books = ClobLocalBooks::for_subscription(&subscription);
         let mut parser = ResidentClobParser::new();
         let mut frame_batch = ClobParsedBatch::preallocated();
         let mut seed_events = Vec::with_capacity(subscription.tokens.len() * 2);
@@ -4095,10 +4112,10 @@ fn spawn_clob_seeded_candidate(
                 .ok_or_else(|| "candidate socket closed before L2 seed".to_string())?
                 .map_err(|error| format!("candidate socket read failed: {error}"))?;
             let received_at = Instant::now();
+            let receive_ns = now_ns();
             match message {
                 Message::Text(text) => {
                     if let Some(protocol) = lane.protocol.as_mut() {
-                        let receive_ns = now_ns();
                         protocol.capture_raw(text.as_bytes(), receive_ns, "candidate");
                     }
                     lane.record_raw(received_at);
@@ -4128,7 +4145,7 @@ fn spawn_clob_seeded_candidate(
                         &subscription.tokens,
                         &subscription.tokens,
                         received_at,
-                        now_ns(),
+                        receive_ns,
                         &mut frame_phases,
                         lane.protocol.as_mut(),
                         &mut frame_batch,
@@ -4330,16 +4347,16 @@ fn forward_clob_events(
     }
     diagnostics.record_queue_depth(event_tx.len());
 
-    // The local L2 must be seeded for every subscribed token before the
-    // strategy is allowed back into READY. A best_bid_ask push alone cannot
-    // establish the quantities needed to apply subsequent price deltas.
+    // Live needs a price checkpoint per condition, from either outcome. The
+    // full-depth paper/record mode still requires both token books to seed.
     if has_usable_book && books.has_all_seeded(tokens) {
         if let Some(transition) = lifecycle.valid_market_data(now) {
             let recovery_ms = transition
                 .recovery
                 .map(|duration| duration.as_secs_f64() * 1_000.0);
             info!(
-                "[Polymarket] CLOB READY after seeded local L2 recovery_ms={} reason={}",
+                "[Polymarket] CLOB READY mode={} recovery_ms={} reason={}",
+                if books.live_bbo.is_some() { "direct_bbo" } else { "local_l2" },
                 recovery_ms
                     .map(|value| format!("{value:.3}"))
                     .unwrap_or_else(|| "initial".to_string()),
@@ -4862,7 +4879,7 @@ async fn clob_ws_task(
         backoff.reset();
         let connected_at = Instant::now();
         let mut health = WsHealth::new(connected_at);
-        let mut books = ClobLocalBooks::new(&wire_subscription.canonical_events);
+        let mut books = ClobLocalBooks::for_subscription(&wire_subscription);
         let (repair_tx, mut repair_rx) = tokio::sync::mpsc::channel::<ClobBookRepairResult>(256);
         let mut repair_tx = repair_tx;
         let mut repairs_in_flight = HashSet::new();
@@ -4967,6 +4984,14 @@ async fn clob_ws_task(
                                 );
                                 repairs_in_flight.clear();
                                 repair_superseded_attempts.clear();
+                                if activate && books.live_bbo.is_some() {
+                                    let checkpoint = books.live_checkpoints(&subscription.tokens);
+                                    if !forward_clob_events(checkpoint, &event_tx, &mut lifecycle,
+                                        &mut health, &mut active.diagnostics, &books,
+                                        &subscription.tokens, Instant::now()) {
+                                        break 'outer;
+                                    }
+                                }
                                 info!(
                                     "[clob_atomic_cutover] mode=preseeded_subset wire_tokens={} logical_tokens={} activate={} not_ready_ms=0",
                                     wire_subscription.tokens.len(),
@@ -4984,7 +5009,7 @@ async fn clob_ws_task(
                                 Duration::ZERO, protocol_sink.clone(),
                             ));
                             info!(
-                                "[clob_cutover_prepare] lane_id={} current_tokens={} target_tokens={} action=keep_active_until_l2_seed",
+                                "[clob_cutover_prepare] lane_id={} current_tokens={} target_tokens={} action=keep_active_until_market_checkpoint",
                                 lane_id,
                                 subscription.tokens.len(),
                                 pending_cutover.as_ref().map_or(0, |(pending, _)| pending.tokens.len()),
@@ -5018,6 +5043,13 @@ async fn clob_ws_task(
                             let cutover_at = Instant::now();
                             active = candidate.lane;
                             books = candidate.books;
+                            if books.live_bbo.is_some() {
+                                // Publish tick metadata first, then the latest
+                                // logical BBO and its health. Candidate-only
+                                // health must not leave a new owner Settling.
+                                candidate.seed_events.retain(|event| matches!(event, MarketEvent::TickSizeChange(_)));
+                                candidate.seed_events.extend(books.live_checkpoints(&subscription.tokens));
+                            }
                             health = WsHealth::new(cutover_at);
                             repairs_in_flight.clear();
                             repair_superseded_attempts.clear();
@@ -5684,7 +5716,8 @@ async fn clob_ws_task(
                         }
                         ClobLaneRead::Active(result) => result,
                     };
-                    let protocol_receive_ns = active.protocol.as_ref().map(|_| now_ns());
+                    let receive_ns = now_ns();
+                    let protocol_receive_ns = active.protocol.as_ref().map(|_| receive_ns);
                     active.burst.record_socket_polls(active.read.take_poll_window());
                     let msg = match result {
                         Some(Ok(message)) => message,
@@ -5806,7 +5839,7 @@ async fn clob_ws_task(
                                 &wire_subscription.tokens,
                                 &subscription.tokens,
                                 received_at,
-                                now_ns(),
+                                receive_ns,
                                 &mut frame_phases,
                                 active.protocol.as_mut(),
                                 &mut frame_batch,
@@ -7516,6 +7549,9 @@ fn update_canonical_snapshot(cached: &mut OrderBookSnapshot, snapshot: &OrderBoo
 
 #[derive(Debug, Default)]
 struct ClobLocalBooks {
+    /// CLOB owner only; allocated for all subscribed conditions at setup.
+    /// In live mode no depth maps or consistency/repair state are populated.
+    live_bbo: Option<HashMap<String, live_bbo::LiveBbo>>,
     /// Startup-resident token identities. Wire strings are borrowed from the
     /// parse buffer, resolved once to a compact index, and never inserted into
     /// a hot-path growable routing map.
@@ -7550,6 +7586,10 @@ struct PendingHealthRecovery {
 
 impl ClobLocalBooks {
     fn new(specs: &[CanonicalEventSpec]) -> Self {
+        Self::new_with_depth(specs, true)
+    }
+
+    fn new_with_depth(specs: &[CanonicalEventSpec], retain_depth: bool) -> Self {
         let mut state = Self {
             canonical_versions: HashMap::with_capacity(specs.len()),
             canonical_books: HashMap::with_capacity(specs.len()),
@@ -7561,10 +7601,12 @@ impl ClobLocalBooks {
         for spec in specs {
             let condition_identity =
                 intern_clob_condition_identity(&mut condition_identities, &spec.condition_id);
-            state
-                .canonical_books
-                .entry(spec.condition_id.clone())
-                .or_insert_with(|| empty_canonical_snapshot(&spec.up_token));
+            if retain_depth {
+                state
+                    .canonical_books
+                    .entry(spec.condition_id.clone())
+                    .or_insert_with(|| empty_canonical_snapshot(&spec.up_token));
+            }
             if let Ok(tick) = Decimal::from_str(&spec.tick_size.to_string()) {
                 state.current_ticks.insert(spec.condition_id.clone(), tick);
             }
@@ -7793,6 +7835,12 @@ impl ClobLocalBooks {
     }
 
     fn has_all_seeded(&self, tokens: &[String]) -> bool {
+        if let Some(live) = self.live_bbo.as_ref() {
+            return !tokens.is_empty() && tokens.iter().all(|token| {
+                self.roles.get(token).and_then(|role| live.get(&role.condition_id))
+                    .is_some_and(|bbo| bbo.exchange_timestamp_ns != 0)
+            });
+        }
         !tokens.is_empty()
             && tokens
                 .iter()
@@ -8941,6 +8989,10 @@ fn process_clob_frame_in_place_observed_into(
                 batch.wire.books = batch.wire.books.saturating_add(1);
                 batch.recognized_topic |= books.token_index(&fields.asset_id).is_some()
                     || subscribed_token(active_tokens, &fields.asset_id);
+                if books.live_bbo.is_some() {
+                    books.apply_live_book(&fields, local_now, batch);
+                    return Ok(());
+                }
                 let emit_diagnostic = subscribed_token(active_tokens, &fields.asset_id);
                 let diagnostic_token = fields.asset_id.clone();
                 let apply_started = crate::latency::Instant::now();
@@ -8997,6 +9049,10 @@ fn process_clob_frame_in_place_observed_into(
                     books.token_index(&change.asset_id).is_some()
                         || subscribed_token(active_tokens, &change.asset_id)
                 });
+                if books.live_bbo.is_some() {
+                    books.apply_live_price_change(&fields, local_now, batch);
+                    return Ok(());
+                }
                 let apply_started = crate::latency::Instant::now();
                 let (events, bbo_snapshots, repair_tokens) = books.apply_price_change(
                     fields,
@@ -9019,6 +9075,10 @@ fn process_clob_frame_in_place_observed_into(
                 batch.wire.best_bid_asks = batch.wire.best_bid_asks.saturating_add(1);
                 batch.recognized_topic |= books.token_index(&fields.asset_id).is_some()
                     || subscribed_token(active_tokens, &fields.asset_id);
+                if books.live_bbo.is_some() {
+                    books.apply_live_best_bid_ask(&fields, local_now, batch);
+                    return Ok(());
+                }
                 let emit_diagnostic = subscribed_token(active_tokens, &fields.asset_id);
                 let diagnostic_token = fields.asset_id.clone();
                 let exchange_timestamp_ns =

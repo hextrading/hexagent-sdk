@@ -1008,6 +1008,7 @@ fn spawn_polymarket_feed_worker(
     worker_slot: Arc<PolymarketWorkerSlot>,
     epoch: PolymarketWorkerEpoch,
     protocol_sink: Option<crate::recorder::BookProtocolSink>,
+    live_bbo_only: bool,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name(format!("feed-polymarket-{}", epoch.generation))
@@ -1026,6 +1027,7 @@ fn spawn_polymarket_feed_worker(
 
             let make_feed = || {
                 let mut feed = PolymarketMarket::with_liveness(liveness.clone());
+                feed.set_live_bbo_only(live_bbo_only);
                 if let Some(sink) = protocol_sink.as_ref() { feed.set_book_protocol_sink(sink.clone()); }
                 if force_clob_runtime_fallback {
                     feed.force_clob_runtime_fallback();
@@ -1342,6 +1344,7 @@ fn spawn_polymarket_feed_manager(
     shutdown: Arc<AtomicBool>,
     feed_readiness: Arc<RwLock<HashMap<String, FeedReadiness>>>,
     protocol_sink: Option<crate::recorder::BookProtocolSink>,
+    live_bbo_only: bool,
 ) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
     let worker_slot = Arc::new(PolymarketWorkerSlot::new());
     let (rebuild_tx, rebuild_rx) = bounded::<PolymarketWorkerRebuild>(1);
@@ -1368,6 +1371,7 @@ fn spawn_polymarket_feed_manager(
                 worker_slot.clone(),
                 initial,
                 protocol_sink.clone(),
+                live_bbo_only,
             ) {
                 Ok(worker) => workers.push(worker),
                 Err(error) => {
@@ -1455,6 +1459,7 @@ fn spawn_polymarket_feed_manager(
                             worker_slot.clone(),
                             replacement,
                             protocol_sink.clone(),
+                            live_bbo_only,
                         ) {
                             Ok(worker) => workers.push(worker),
                             Err(error) => {
@@ -10444,6 +10449,7 @@ impl Engine {
                     shutdown,
                     feed_readiness,
                     self.book_protocol_lane.as_ref().map(|lane| lane.sink()),
+                    self.config.general.mode == RunMode::Live,
                 )?);
                 continue;
             }
