@@ -8,6 +8,36 @@ use std::sync::atomic::AtomicU8;
 pub(super) const HOT_RETENTION_MS: u64 = 30 * 60 * 1_000;
 const FILTER_BYTES: usize = 512 * 1024;
 const MAX_LOOKUP_ROWS: usize = 128;
+const ABSENCE_SLOTS: usize = 64;
+const ABSENCE_KEY_BYTES: usize = 128;
+
+// Single cold writer, bounded exact-key negative certificates. Atomic bytes
+// avoid allocation, locks, and last-reader destruction on a private owner.
+// SeqCst sequence + payload reads reject any overlapping slot replacement.
+#[derive(Debug)]
+struct VerifiedAbsence {
+    sequence: AtomicU64,
+    generation: AtomicU64,
+    fingerprint: AtomicU64,
+    length: AtomicUsize,
+    key: [AtomicU8; ABSENCE_KEY_BYTES],
+}
+impl VerifiedAbsence {
+    fn new() -> Self {
+        Self {
+            sequence: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            fingerprint: AtomicU64::new(0),
+            length: AtomicUsize::new(0),
+            key: std::array::from_fn(|_| AtomicU8::new(0)),
+        }
+    }
+}
+fn absence_fingerprint(key: &str) -> u64 {
+    key.bytes().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+    })
+}
 
 #[derive(Debug)]
 pub(super) struct HistoryArchive {
@@ -16,6 +46,9 @@ pub(super) struct HistoryArchive {
     // Cold owner publishes append-only bits; readers never own/drop an old
     // heap buffer on the private lane. This is advisory, not ledger authority.
     filter: Box<[AtomicU8]>,
+    generation: AtomicU64,
+    absence_cursor: AtomicUsize, // only startup / the cold account owner writes
+    absences: Box<[VerifiedAbsence]>,
 }
 
 #[derive(Default)]
@@ -126,6 +159,9 @@ impl HistoryArchive {
             path,
             account_id: account_id.to_owned(),
             filter: filter.into_iter().map(AtomicU8::new).collect(),
+            generation: AtomicU64::new(generation),
+            absence_cursor: AtomicUsize::new(0),
+            absences: (0..ABSENCE_SLOTS).map(|_| VerifiedAbsence::new()).collect(),
         })
     }
 
@@ -159,6 +195,62 @@ impl HistoryArchive {
         filter_indices(kind, key)
             .iter()
             .all(|bit| self.filter[bit / 8].load(Ordering::Acquire) & (1 << (bit % 8)) != 0)
+    }
+
+    /// Advisory positives must be resolved before ANY SDK caller can create a
+    /// new economic row. Only exact cold-verified absence at this generation
+    /// permits a Bloom false positive to proceed.
+    pub(super) fn unverified_trade_hint(&self, trade_key: &str) -> bool {
+        let key = base_trade_key(trade_key);
+        if !self.may_contain(1, key) {
+            return false;
+        }
+        let generation = self.generation.load(Ordering::SeqCst);
+        let fingerprint = absence_fingerprint(key);
+        for slot in &self.absences {
+            let sequence = slot.sequence.load(Ordering::SeqCst);
+            if sequence == 0
+                || sequence % 2 != 0
+                || slot.generation.load(Ordering::SeqCst) != generation
+                || slot.fingerprint.load(Ordering::SeqCst) != fingerprint
+                || slot.length.load(Ordering::SeqCst) != key.len()
+                || key.len() > ABSENCE_KEY_BYTES
+            {
+                continue;
+            }
+            let exact = key
+                .bytes()
+                .zip(&slot.key)
+                .all(|(byte, stored)| stored.load(Ordering::SeqCst) == byte);
+            if exact
+                && slot.sequence.load(Ordering::SeqCst) == sequence
+                && self.generation.load(Ordering::SeqCst) == generation
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    // Called only after successful exact lookup by the sole cold writer. The
+    // generation changes before newly archived proofs can leave hot memory.
+    fn record_verified_absence(&self, key: &str) -> Result<(), String> {
+        if key.len() > ABSENCE_KEY_BYTES {
+            return Err("archive absence identity exceeds bounded certificate".into());
+        }
+        let index = self.absence_cursor.fetch_add(1, Ordering::Relaxed) % ABSENCE_SLOTS;
+        let slot = &self.absences[index];
+        slot.sequence.fetch_add(1, Ordering::SeqCst);
+        slot.generation
+            .store(self.generation.load(Ordering::SeqCst), Ordering::SeqCst);
+        slot.fingerprint
+            .store(absence_fingerprint(key), Ordering::SeqCst);
+        slot.length.store(key.len(), Ordering::SeqCst);
+        for (stored, byte) in slot.key.iter().zip(key.bytes()) {
+            stored.store(byte, Ordering::SeqCst);
+        }
+        slot.sequence.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Commit proofs and membership in one FULL-synchronous transaction BEFORE
@@ -204,6 +296,7 @@ impl HistoryArchive {
         )
         .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
+        self.generation.store(generation, Ordering::SeqCst);
         for (key, _) in &rows.trades {
             for bit in filter_indices(1, base_trade_key(key)) {
                 self.filter[bit / 8].fetch_or(1 << (bit % 8), Ordering::Release);
@@ -571,6 +664,9 @@ impl SharedAccount {
             archive.load(kind, identity, wall_clock_ms())?
         };
         if rows.is_empty() {
+            if trade {
+                archive.record_verified_absence(identity)?;
+            }
             return Ok(0);
         }
         let _control = self.control_gate.write().unwrap();
@@ -605,9 +701,8 @@ impl SharedAccount {
             }
         }
         for (key, row) in rows.trades {
-            if state.retired_trade_ownership_tombstones.contains_key(&key) {
-                continue;
-            }
+            // Refresh verified proofs as well: a replay can arrive after the
+            // legacy hot TTL, while its exact archive proof remains permanent.
             self.retired_trade_routes
                 .insert(key.clone(), row.ownership.instance_id.clone());
             persistence_wal_map_entry(
@@ -621,9 +716,6 @@ impl SharedAccount {
         }
         let mut orders_changed = false;
         for (key, row) in rows.orders {
-            if state.retired_order_audit_tombstones.contains_key(&key) {
-                continue;
-            }
             persistence_wal_map_entry(
                 &mut changes,
                 "retired_order_audit_tombstones",
@@ -714,6 +806,195 @@ mod tests {
         );
         state
     }
+    #[test]
+    fn bounded_exact_absence_cannot_authorize_a_different_or_newly_archived_trade() {
+        let fixture = Fixture::new();
+        let archive = HistoryArchive::open(&fixture.0, "account", 0).unwrap();
+        // Force real advisory positives without adding any exact disk proof.
+        for byte in &archive.filter {
+            byte.store(u8::MAX, Ordering::Release);
+        }
+        let key = "new-trade";
+        assert!(archive.unverified_trade_hint(key));
+        assert!(archive.load(1, key, 1).unwrap().is_empty());
+        archive.record_verified_absence(key).unwrap();
+        assert!(!archive.unverified_trade_hint("new-trade:maker-leg"));
+        assert!(archive.unverified_trade_hint("new-trade-other"));
+        let other = Fixture::new();
+        let other_archive = HistoryArchive::open(&other.0, "other", 0).unwrap();
+        for byte in &other_archive.filter {
+            byte.store(u8::MAX, Ordering::Release);
+        }
+        assert!(other_archive.unverified_trade_hint(key));
+        assert!(archive
+            .record_verified_absence(&"x".repeat(ABSENCE_KEY_BYTES + 1))
+            .is_err());
+        // Readers refuse an in-progress slot replacement even with matching bytes.
+        archive.absences[0].sequence.fetch_add(1, Ordering::SeqCst);
+        assert!(archive.unverified_trade_hint(key));
+        archive.absences[0].sequence.fetch_add(1, Ordering::SeqCst);
+        for index in 0..ABSENCE_SLOTS {
+            archive
+                .record_verified_absence(&format!("absent-{index}"))
+                .unwrap();
+        }
+        assert!(
+            archive.unverified_trade_hint(key),
+            "FIFO eviction is bounded and fail closed"
+        );
+        archive.record_verified_absence(key).unwrap();
+        assert!(!archive.unverified_trade_hint(key));
+        archive
+            .store(&ArchiveRows {
+                trades: vec![(key.into(), proof(key, 1))],
+                orders: vec![],
+            })
+            .unwrap();
+        assert!(
+            archive.unverified_trade_hint(key),
+            "durable append invalidates old absence"
+        );
+    }
+
+    #[test]
+    fn sdk_entry_rejects_archived_trade_even_with_reconstructed_parent() {
+        let fixture = Fixture::new();
+        let account = SharedAccount::new_persistent("account", &fixture.0).unwrap();
+        account.register_instance("owner", 1.0);
+        account
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        account
+            .reserve_order(
+                "owner",
+                "old-coid",
+                "old-oid",
+                "TOKEN",
+                Side::Buy,
+                2.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        let archive = account.history_archive.as_ref().unwrap();
+        archive
+            .store(&ArchiveRows {
+                trades: vec![("old-trade".into(), proof("old-trade", 1))],
+                orders: vec![],
+            })
+            .unwrap();
+        let before = account.instance_snapshot("owner").unwrap();
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                "old-trade",
+                "CONFIRMED",
+                "old-coid",
+                "old-oid",
+                "TOKEN",
+                Side::Buy,
+                2.0,
+                0.5,
+                true,
+                1
+            ),
+            TradeTransitionResult::Rejected
+        ));
+        assert_eq!(
+            account.instance_snapshot("owner").unwrap().cash,
+            before.cash
+        );
+        assert_eq!(account.order("old-coid").unwrap().filled_quantity, 0.0);
+        account
+            .hydrate_archived_private_event(true, "old-trade")
+            .unwrap();
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                "old-trade",
+                "CONFIRMED",
+                "old-coid",
+                "old-oid",
+                "TOKEN",
+                Side::Buy,
+                2.0,
+                0.5,
+                true,
+                1
+            ),
+            TradeTransitionResult::OwnedNoop(_)
+        ));
+        assert_eq!(
+            account.instance_snapshot("owner").unwrap().cash,
+            before.cash
+        );
+    }
+
+    #[test]
+    fn sdk_entry_books_real_bloom_false_positive_once_after_cold_absence() {
+        let fixture = Fixture::new();
+        let account = SharedAccount::new_persistent("account", &fixture.0).unwrap();
+        account.register_instance("owner", 1.0);
+        account
+            .apply_physical_snapshot(100.0, HashMap::new())
+            .unwrap();
+        account
+            .reserve_order(
+                "owner",
+                "new-coid",
+                "new-oid",
+                "TOKEN",
+                Side::Buy,
+                2.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        let archive = account.history_archive.as_ref().unwrap();
+        for byte in &archive.filter {
+            byte.store(u8::MAX, Ordering::Release);
+        }
+        assert!(archive.unverified_trade_hint("new-trade"));
+        assert_eq!(
+            account
+                .hydrate_archived_private_event(true, "new-trade")
+                .unwrap(),
+            0
+        );
+        assert!(!archive.unverified_trade_hint("new-trade"));
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                "new-trade",
+                "CONFIRMED",
+                "new-coid",
+                "new-oid",
+                "TOKEN",
+                Side::Buy,
+                2.0,
+                0.5,
+                true,
+                1
+            ),
+            TradeTransitionResult::Applied(_)
+        ));
+        let cash = account.instance_snapshot("owner").unwrap().cash;
+        assert!(matches!(
+            account.apply_trade_transition_with_context(
+                "new-trade",
+                "CONFIRMED",
+                "new-coid",
+                "new-oid",
+                "TOKEN",
+                Side::Buy,
+                2.0,
+                0.5,
+                true,
+                1
+            ),
+            TradeTransitionResult::OwnedNoop(_)
+        ));
+        assert_eq!(account.instance_snapshot("owner").unwrap().cash, cash);
+        assert_eq!(account.order("new-coid").unwrap().filled_quantity, 2.0);
+    }
+
     #[test]
     fn ttl_boundary_zero_inventory_dependencies_and_rollback_clock() {
         let now = HOT_RETENTION_MS * 2;
@@ -988,6 +1269,24 @@ mod tests {
             }
             samples.sort_unstable();
             println!("archive_hint account={name} n={} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0 boundary=fixed_filter_lookup_only filter_bytes={FILTER_BYTES}",samples.len(),samples[4999],samples[9899],samples[9989],samples[9999]);
+            for (label, identity, expected) in [
+                ("positive", key.as_str(), true),
+                ("negative", "absent-benchmark-trade", false),
+            ] {
+                let mut samples = Vec::with_capacity(10000);
+                for _ in 0..10000 {
+                    let start = Instant::now();
+                    assert_eq!(
+                        std::hint::black_box(
+                            archive.unverified_trade_hint(std::hint::black_box(identity))
+                        ),
+                        expected
+                    );
+                    samples.push(start.elapsed().as_nanos() as u64);
+                }
+                samples.sort_unstable();
+                println!("archive_sdk_guard account={name} case={label} n=10000 p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0 boundary=filter+bounded_exact_absence_guard",samples[4999],samples[9899],samples[9989],samples[9999]);
+            }
             let reader = archive.connection(false).unwrap();
             let mut samples = Vec::with_capacity(100);
             for _ in 0..100 {

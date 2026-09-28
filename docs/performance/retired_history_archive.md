@@ -40,6 +40,15 @@ identity, archive generation, filter checksum, and SQLite integrity; missing or
 older required archives fail closed. Repeated archival is idempotent and
 conflicting immutable proofs cannot overwrite the original.
 
+All SDK trade-accounting entry points enforce the archived-identity guard,
+even if another caller reconstructs an old parent order. A real filter false
+positive is released only by a cold-verified exact absence certificate. Each
+account has 64 fixed 128-byte identity slots with atomic sequence validation;
+only the cold owner writes them. Slots contain exact identities, never hash-only
+proofs. Every durable archive generation invalidates older negatives. Capacity
+eviction, concurrent replacement, and overlong identities fail closed. Readers
+allocate nothing and never destroy old heap snapshots on the private lane.
+
 The hot ledger is schema v2. It accepts/migrates v1 checkpoints; old SDK binaries
 reject v2, preventing a downgrade from silently ignoring archived identities.
 The archive must be backed up and restored together with its ledger/WAL. An old
@@ -74,11 +83,11 @@ introduced; CPU placement remains unchanged.
 
 ## Validation
 
-- Account library: 355 passed, 23 ignored (including archive TTL boundary,
+- Account library: 358 passed, 23 ignored (including archive TTL boundary,
   backward clock, dust/reservation protection, crash ordering, corruption,
   missing/wrong-account archive, immutable conflict, restart, and duplicate
   replay tests).
-- Polymarket suite before the final storage hardening: 465 passed, 27 ignored.
+- Polymarket suite: 466 passed, 27 ignored.
 - Final private archive integration: 3 passed, covering a real archived maker
   proof through the cold worker, a filter false positive/new fill, and failed
   completion/repair credit recovery. No live venue requests are made.
@@ -100,7 +109,7 @@ substitute for those measurements.
 
 ### Linux release evidence (maker02, CPU 0/1, nice 19)
 
-Final account library: **355 passed, 23 ignored**. The same copied checkpoint/WAL
+Final account library: **358 passed, 23 ignored**. The same copied checkpoint/WAL
 prefixes were SHA-256 verified before the isolated migration; no live ledger was
 opened or mutated by the benchmark. Archive rows: 8,636 / 18,073 / 74,856;
 remaining trade proofs: 416 / 1,509 / 6,115 (hex001 / zhu03 / zhu02).

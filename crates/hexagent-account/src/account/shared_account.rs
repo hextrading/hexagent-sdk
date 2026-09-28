@@ -17226,7 +17226,9 @@ impl SharedAccount {
         // GC publishes this membership before releasing the owner lifecycle
         // mutex. Recheck after taking that same mutex so a concurrent retire
         // cannot leave this call with a stale pre-GC route decision.
-        if existing.is_none() && self.retired_trade_routes.get(trade_key).is_some() {
+        if existing.is_none() && (self.retired_trade_routes.get(trade_key).is_some()
+            || self.history_archive.as_ref().is_some_and(|archive|
+                archive.unverified_trade_hint(trade_key))) {
             return VirtualTradeAttempt::Fallback;
         }
 
@@ -17781,8 +17783,10 @@ impl SharedAccount {
         let coid_scope = self.coid_routes.get(client_order_id);
         let oid_scope = self.oid_routes.get(&normalize_order_id(order_id));
         let trade_scope = self.trade_routes.get(trade_key);
-        let retired_trade =
-            trade_scope.is_none() && self.retired_trade_routes.get(trade_key).is_some();
+        let retired_trade = trade_scope.is_none()
+            && (self.retired_trade_routes.get(trade_key).is_some()
+                || self.history_archive.as_ref().is_some_and(|archive|
+                    archive.unverified_trade_hint(trade_key)));
         let anomalous_trade = self.anomalous_trade_keys.load().contains(trade_key);
         // A cross-instance runtime/durable binding disagreement is an anomaly,
         // not a valid single-shard transition. Materialize the cold aggregate
@@ -18050,6 +18054,13 @@ impl SharedAccount {
                     matched_size,
                     trade_fee: None,
                 });
+            }
+            if self.history_archive.as_ref().is_some_and(|archive|
+                archive.unverified_trade_hint(trade_key)) {
+                set_ownership_anomaly(&mut state, anomaly_key.clone(),
+                    format!("trade `{trade_key}` requires exact cold archive lookup before accounting"));
+                schedule_trade_persist(&state);
+                return None;
             }
             // A bounded tombstone can expire while its process-local route
             // entry remains. Once the cold durable map proves absence, remove
