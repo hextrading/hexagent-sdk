@@ -907,6 +907,27 @@ mod tests {
         account
             .hydrate_archived_private_event(true, "old-trade")
             .unwrap();
+        // Retained dependent proofs cannot silently expire at the old 90-day
+        // standalone TTL and turn an old fill into a new economic event.
+        account
+            .state
+            .lock()
+            .unwrap()
+            .retired_trade_ownership_tombstones
+            .get_mut("old-trade")
+            .unwrap()
+            .retired_at_ms = 1;
+        assert!(account.trade_ownership("old-trade").is_some());
+        assert!(account.trade_lifecycle_covers_nonblocking(
+            "old-trade",
+            "CONFIRMED",
+            "old-oid",
+            "TOKEN",
+            Side::Buy,
+            2.0,
+            0.5,
+            true
+        ));
         assert!(matches!(
             account.apply_trade_transition_with_context(
                 "old-trade",

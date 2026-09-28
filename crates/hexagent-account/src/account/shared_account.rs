@@ -8247,7 +8247,7 @@ impl SharedAccount {
         let initial_retired_trade_tombstones = state
             .retired_trade_ownership_tombstones
             .values()
-            .filter(|tombstone| retired_trade_tombstone_is_live(tombstone, wall_clock_ms()))
+            .filter(|tombstone| retired_trade_tombstone_is_authoritative(&state, tombstone, wall_clock_ms()))
             .count();
         let initial_retired_trade_routes: Vec<(String, String)> = state
             .retired_trade_ownership_tombstones
@@ -17996,7 +17996,7 @@ impl SharedAccount {
             let retired = state
                 .retired_trade_ownership_tombstones
                 .get(trade_key)
-                .filter(|tombstone| retired_trade_tombstone_is_live(tombstone, wall_clock_ms()))
+                .filter(|tombstone| retired_trade_tombstone_is_authoritative(&state, tombstone, wall_clock_ms()))
                 .cloned();
             if let Some(tombstone) = retired {
                 let validation = validate_owned_trade_replay(
@@ -18862,7 +18862,7 @@ impl SharedAccount {
                     .map(|trade| trade.ownership.clone())
                     .or_else(|| {
                         let tombstone = state.retired_trade_ownership_tombstones.get(trade_key)?;
-                        retired_trade_tombstone_is_live(tombstone, wall_clock_ms())
+                        retired_trade_tombstone_is_authoritative(&state, tombstone, wall_clock_ms())
                             .then(|| tombstone.ownership.clone())
                     })
             });
@@ -18890,7 +18890,7 @@ impl SharedAccount {
             .map(|trade| trade.ownership.clone())
             .or_else(|| {
                 let tombstone = state.retired_trade_ownership_tombstones.get(trade_key)?;
-                retired_trade_tombstone_is_live(tombstone, wall_clock_ms())
+                retired_trade_tombstone_is_authoritative(&state, tombstone, wall_clock_ms())
                     .then(|| tombstone.ownership.clone())
             })
     }
@@ -18986,7 +18986,7 @@ impl SharedAccount {
                         .get(trade_key)
                         .map(|tombstone| {
                             covered(&tombstone.ownership, tombstone.is_maker)
-                                && retired_trade_tombstone_is_live(tombstone, wall_clock_ms())
+                                && retired_trade_tombstone_is_authoritative(&state, tombstone, wall_clock_ms())
                         })
                 })
                 .unwrap_or(false);
@@ -19028,7 +19028,7 @@ impl SharedAccount {
                     .get(trade_key)
                     .map(|tombstone| {
                         covered(&tombstone.ownership, tombstone.is_maker)
-                            && retired_trade_tombstone_is_live(tombstone, wall_clock_ms())
+                            && retired_trade_tombstone_is_authoritative(&state, tombstone, wall_clock_ms())
                     })
             })
             .unwrap_or(false)
@@ -19917,6 +19917,16 @@ fn trade_lifecycle_covers(stored: &str, incoming: &str) -> bool {
     }
 }
 
+// Archive-backed proofs remain authoritative until durable archival removes
+// them. Dependencies may protect a hot row beyond the legacy standalone TTL.
+fn retired_trade_tombstone_is_authoritative(
+    state: &SharedAccountState,
+    tombstone: &RetiredTradeOwnershipTombstone,
+    now_ms: u64,
+) -> bool {
+    state.history_archive_generation != 0 || retired_trade_tombstone_is_live(tombstone, now_ms)
+}
+
 fn retired_trade_tombstone_is_live(
     tombstone: &RetiredTradeOwnershipTombstone,
     now_ms: u64,
@@ -19934,7 +19944,7 @@ fn prune_retired_trade_ownership_tombstones(
     let mut removed: Vec<String> = state
         .retired_trade_ownership_tombstones
         .iter()
-        .filter(|(_, tombstone)| !retired_trade_tombstone_is_live(tombstone, now_ms))
+        .filter(|(_, tombstone)| !retired_trade_tombstone_is_authoritative(&state, tombstone, now_ms))
         .map(|(trade_key, _)| trade_key.clone())
         .collect();
     for trade_key in &removed {
@@ -19973,7 +19983,7 @@ fn prune_retired_trade_ownership_tombstones_bounded(
         .retired_trade_ownership_tombstones
         .iter()
         .take(scan_limit)
-        .filter(|(_, tombstone)| !retired_trade_tombstone_is_live(tombstone, now_ms))
+        .filter(|(_, tombstone)| !retired_trade_tombstone_is_authoritative(&state, tombstone, now_ms))
         .map(|(trade_key, _)| trade_key.clone())
         .collect();
     for trade_key in &removed {
@@ -20545,7 +20555,7 @@ fn terminal_trade_backfill_sources_locked(
         if !terminal_trade_id_matches(trade_key, venue_trade_id)
             || tombstone.authenticated_terminal_noop
             || !matches!(tombstone.ownership.status.as_str(), "CONFIRMED" | "FAILED")
-            || !retired_trade_tombstone_is_live(tombstone, now_ms)
+            || !retired_trade_tombstone_is_authoritative(&state, tombstone, now_ms)
         {
             continue;
         }
@@ -20594,7 +20604,7 @@ fn terminal_order_audit_complete_locked(state: &SharedAccountState, client_order
                             && trade_ownership_matches_order_root(&tombstone.ownership, order)
                             && !tombstone.authenticated_terminal_noop
                             && matches!(tombstone.ownership.status.as_str(), "CONFIRMED" | "FAILED")
-                            && retired_trade_tombstone_is_live(tombstone, now_ms)
+                            && retired_trade_tombstone_is_authoritative(&state, tombstone, now_ms)
                     });
             let retired = retired_matches.next();
             if retired_matches.next().is_some() {
@@ -21015,7 +21025,7 @@ fn failed_trade_keys_by_order_for_query(
     for (trade_key, tombstone) in &state.retired_trade_ownership_tombstones {
         if !tombstone.authenticated_terminal_noop
             && tombstone.ownership.status == "FAILED"
-            && retired_trade_tombstone_is_live(tombstone, now_ms)
+            && retired_trade_tombstone_is_authoritative(&state, tombstone, now_ms)
         {
             record(trade_key, &tombstone.ownership);
         }

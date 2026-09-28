@@ -17,7 +17,8 @@ unresolved dependencies retain the hot proof rather than losing it.
 
 Trade proofs require a terminal status, known settlement, exactly zero physical
 and instance inventory/order/maintenance reservations, no parent order/OID
-mapping, no live trade, and no unresolved trade/anomaly. Nonzero dust is protected.
+mapping, no live trade, and no unresolved trade/anomaly. Nonzero dust is protected. Protected hot proofs remain authoritative beyond the
+legacy standalone 90-day TTL; age cannot turn them into new bookable fills.
 Zero-fill retired order-audit proofs require no surviving order or anomaly.
 A surviving parent order can still depend on a trade proof for filled-quantity
 validation and cannot be separated from that proof by this cleanup.
