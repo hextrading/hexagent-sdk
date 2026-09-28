@@ -138,3 +138,26 @@ Raw evidence is retained locally in hexbot's
 `docs/evidence/maker02_startup_seed_20260928T0810Z/` with the exact source and
 fixture manifests. Live deployment results are recorded in hexbot's startup
 seed report after the observation window completes.
+
+### Final SDK-entry guard validation
+
+Final source: local and Linux release account suites **358 passed / 23 ignored**;
+full Polymarket suite **466 passed / 27 ignored**. The Linux checkpoint/WAL
+benchmark also passed after the accounting-entry and legacy-expiry hardening.
+
+The new universal accounting guard was measured separately with 10,000 samples
+per account/case. Boundary: fixed filter + bounded exact-negative lookup only;
+queue depth/overflow 0. A positive here has no cached negative certificate.
+
+| Account | Filter result | P50 µs | P99 µs | P999 µs | Max µs |
+|---|---|---:|---:|---:|---:|
+| hex001 | positive | 0.115 | 0.122 | 0.124 | 0.966 |
+| hex001 | negative | 0.065 | 0.067 | 0.068 | 8.165 |
+| zhu03 | positive | 0.115 | 0.122 | 0.125 | 5.618 |
+| zhu03 | negative | 0.066 | 0.069 | 0.069 | 1.395 |
+| zhu02 | positive | 0.114 | 0.122 | 0.123 | 1.366 |
+| zhu02 | negative | 0.065 | 0.068 | 0.068 | 0.253 |
+
+Cold disk rerun P50/P99/P999/max µs (N=100, same boundary as above): hex001
+12.888/16.909/51.789/51.789; zhu03 12.897/24.764/45.432/45.432; zhu02
+13.082/20.940/49.724/49.724. Migration counts and validated economics were unchanged.
