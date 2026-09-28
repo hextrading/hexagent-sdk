@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 
-fn fixture() -> (Arc<SharedState>, PrivateRouteDedupe, Vec<PrivateEventDelta>) {
+pub(super) fn fixture() -> (Arc<SharedState>, PrivateRouteDedupe, Vec<PrivateEventDelta>) {
     let shared = tests::test_shared();
     shared.account_state.register_instance("owner-1", 1.0);
     shared
