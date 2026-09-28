@@ -5,7 +5,7 @@
 use super::*;
 
 const BATCH_CAPACITY: usize = 8;
-const SNAPSHOTS_PER_BATCH: usize =
+pub(super) const SNAPSHOTS_PER_BATCH: usize =
     2 * SETTLED_GC_ORDERS_PER_OWNER_TURN + 2 * SETTLED_GC_TRADES_PER_OWNER_TURN;
 type Snapshot = Arc<RouteSnapshot>;
 
