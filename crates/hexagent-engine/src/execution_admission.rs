@@ -10,6 +10,7 @@ use hexagent_runtime::http1_pool::{
     BusinessHttpOutcome, BusinessHttpOutcomeSnapshot, PermitHealthSnapshot, Role,
 };
 use hexagent_types::types::{Exchange, ExecutionAdmission, ExecutionAdmissionState};
+use std::net::IpAddr;
 
 const SLOW_HTTP_NS: u64 = 500_000_000;
 
@@ -51,6 +52,7 @@ pub(crate) struct LaneObservation {
     pub cumulative_slow: u64,
     pub cumulative_no_response: u64,
     pub no_response_generation: u64,
+    pub no_response_peer: Option<IpAddr>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -122,6 +124,7 @@ pub(crate) struct AccountExecutionAdmission {
     failure_window_started_ns: u64,
     failure_window_lanes: usize,
     transport_reset_pending: bool,
+    transport_reset_peer: Option<IpAddr>,
     no_response_resets: u64,
 }
 
@@ -156,6 +159,7 @@ impl AccountExecutionAdmission {
             failure_window_started_ns: 0,
             failure_window_lanes: 0,
             transport_reset_pending: false,
+            transport_reset_peer: None,
             no_response_resets: 0,
         }
     }
@@ -164,6 +168,7 @@ impl AccountExecutionAdmission {
     /// order-endpoint request without a complete HTTP response. Old ACKs must
     /// not heal these lanes; new prewarmed generations enter normal recovery.
     pub(crate) fn retire_transport_generations(&mut self, now_ns: u64) {
+        self.transport_reset_peer = None;
         for lane in self.fast.iter_mut().chain(self.cancel.iter_mut()) {
             lane.retired_generation = Some(lane.generation);
             lane.verified = false;
@@ -176,6 +181,10 @@ impl AccountExecutionAdmission {
 
     pub(crate) fn no_response_resets(&self) -> u64 {
         self.no_response_resets
+    }
+
+    pub(crate) fn transport_reset_peer(&self) -> Option<IpAddr> {
+        self.transport_reset_peer
     }
 
     pub(crate) fn take_transport_reset(&mut self) -> bool {
@@ -316,6 +325,7 @@ impl AccountExecutionAdmission {
             // orders nor releases strategy reservations. Late failures from a
             // generation already retired by this incident cannot reset again.
             self.retire_transport_generations(now_ns);
+            self.transport_reset_peer = observation.no_response_peer;
         }
         if failure {
             self.note_failure(role, slot, now_ns);
@@ -602,7 +612,7 @@ mod tests {
                 cumulative_failures: 0,
                 cumulative_slow: 0,
                 cumulative_no_response: 0,
-                no_response_generation: 0,
+                no_response_generation: 0, no_response_peer: None,
             };
             let mut harness = Self {
                 state: AccountExecutionAdmission::new(fast, cancel, now),
@@ -772,13 +782,18 @@ mod tests {
     fn no_response_retires_idle_siblings_and_stale_failures_do_not_retire_replacements() {
         let mut account = Harness::healthy(4, 2);
         let mut sibling = Harness::healthy(4, 2);
+        let bad_peer = Some("192.0.2.1".parse().unwrap());
+        let other_peer = Some("2001:db8::1".parse().unwrap());
         account.emit(Role::Fast, 0, |observation| {
             observation.cumulative_failures += 1;
             observation.cumulative_no_response += 1;
             observation.no_response_generation = 1;
+            observation.no_response_peer = bad_peer;
         });
         assert!(account.state.take_transport_reset());
         assert!(!account.state.take_transport_reset());
+        assert_eq!(account.state.transport_reset_peer(), bad_peer);
+        assert_eq!(sibling.state.transport_reset_peer(), None);
         for slot in 0..4 {
             assert!(!account.state.lane_place_allowed(slot, account.now));
         }
@@ -797,9 +812,11 @@ mod tests {
             o.cumulative_failures += 1;
             o.cumulative_no_response += 1;
             o.no_response_generation = 1;
+            o.no_response_peer = other_peer;
         });
         assert!(!account.state.take_transport_reset());
         assert_eq!(account.state.retired_generation(Role::Fast, 0), Some(1));
+        assert_eq!(account.state.transport_reset_peer(), bad_peer);
         // Replaying the full latest snapshot is idempotent.
         account.emit(Role::Fast, 3, |_| {});
         assert!(!account.state.take_transport_reset());
@@ -808,9 +825,11 @@ mod tests {
             o.cumulative_failures += 1;
             o.cumulative_no_response += 1;
             o.no_response_generation = 2;
+            o.no_response_peer = other_peer;
         });
         assert!(account.state.take_transport_reset());
         assert_eq!(account.state.retired_generation(Role::Fast, 0), Some(2));
+        assert_eq!(account.state.transport_reset_peer(), other_peer);
         assert!(!account.state.lane_place_allowed(0, account.now));
     }
 

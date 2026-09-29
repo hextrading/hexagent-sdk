@@ -14493,7 +14493,7 @@ fn spawn_venue_execution_owner<T: ExchangeTrade + 'static>(
 /// owner.  The owner retains its exact admission slot for its whole lifetime,
 /// so a command never migrates to an arbitrary worker or completion drainer.
 enum PolyConnectionCommand {
-    RefreshTransport { prewarm_url: Arc<str>, expected_generation: u64 },
+    RefreshTransport { prewarm_url: Arc<str>, expected_generation: u64, avoid_peer: Option<std::net::IpAddr> },
     /// Existing durable RTT probe HTTP legs use the same capacity and generation
     /// fences as normal orders. The cold probe thread waits on its bounded reply.
     ProbeHttp { request: ProbeHttpRequest, expected_generation: Option<u64> },
@@ -14821,7 +14821,7 @@ struct PolyAccountConnectionRoutes {
     /// updates so the owning strategy retains and retries every intent.
     recovery: HashMap<String, Sender<PolyConnectionCommand>>,
     reset_rx: Option<Receiver<()>>,
-    reset_pending: Vec<Option<u64>>,
+    reset_pending: Vec<Option<(u64, Option<std::net::IpAddr>)>>,
     reset_prewarm_url: Arc<str>,
     fast_rr: usize,
     cancel_rr: usize,
@@ -14894,17 +14894,18 @@ impl PolyAccountConnectionRoutes {
         if health.take_transport_reset() {
             for (pending, lane) in self.reset_pending.iter_mut().zip(
                 self.fast.iter().chain(self.cancel.iter()).chain(self.safety_cancel.iter())) {
-                *pending = health.retired_generation(lane.metrics.role, lane.metrics.slot);
+                *pending = health.retired_generation(lane.metrics.role, lane.metrics.slot)
+                    .map(|generation| (generation, health.transport_reset_peer()));
             }
         }
         // The pending generation remains retained while an owner is occupied. This is a
         // bounded latest-value control lane, never a blocking dispatcher send.
         for (pending, lane) in self.reset_pending.iter_mut().zip(
             self.fast.iter().chain(self.cancel.iter()).chain(self.safety_cancel.iter())) {
-            if let Some(expected_generation) = *pending {
+            if let Some((expected_generation, avoid_peer)) = *pending {
                 if !lane.metrics.occupied.load(Ordering::Acquire)
                 && lane.try_send(PolyConnectionCommand::RefreshTransport {
-                    prewarm_url: Arc::clone(&self.reset_prewarm_url), expected_generation,
+                    prewarm_url: Arc::clone(&self.reset_prewarm_url), expected_generation, avoid_peer,
                 }).is_ok() {
                     *pending = None;
                 }
@@ -15315,6 +15316,7 @@ fn run_poly_connection_owner(
                 cumulative_failures: failures,
                 cumulative_slow: slow,
                 cumulative_no_response, no_response_generation,
+                no_response_peer: permit.business_no_response_peer(),
             });
         }
         let command = match rx.recv_timeout(HEARTBEAT) {
@@ -15326,12 +15328,12 @@ fn run_poly_connection_owner(
         let connection = permit.current_pooled_client().connection_snapshot();
         let _occupancy = PolyConnectionOccupancyGuard::new(Arc::clone(&lane_metrics), connection);
         match command {
-            PolyConnectionCommand::RefreshTransport { prewarm_url, expected_generation } => {
+            PolyConnectionCommand::RefreshTransport { prewarm_url, expected_generation, avoid_peer } => {
                 // An occupied owner may finish its own repair before this
                 // queued command arrives. Never retire that fresh replacement.
                 let client = permit.current_pooled_client();
                 if client.connection_snapshot().pool_generation == expected_generation {
-                    client.note_instrumented_transport_failure(prewarm_url.to_string());
+                    client.note_instrumented_transport_failure_avoiding(prewarm_url.to_string(), avoid_peer);
                 }
             }
             PolyConnectionCommand::ProbeHttp { request, expected_generation } => {
@@ -19007,7 +19009,7 @@ mod market_router_tests {
         routes.refresh_health(now_ns());
         assert!(fast_rx.is_empty());
         assert!(matches!(cancel_rx.try_recv().unwrap(), PolyConnectionCommand::RefreshTransport { .. }));
-        assert_eq!(routes.reset_pending, [Some(0), None]);
+        assert_eq!(routes.reset_pending, [Some((0, None)), None]);
         routes.fast[0].metrics.occupied.store(false, Ordering::Release);
         routes.refresh_health(now_ns());
         assert!(matches!(fast_rx.try_recv().unwrap(), PolyConnectionCommand::RefreshTransport { .. }));
@@ -19028,14 +19030,14 @@ mod market_router_tests {
             sequence: 1, observed_at_ns: now,
             health: PermitHealthSnapshot { pool_generation: 7, quarantined: false },
             business: None, busy: false, cumulative_failures: 0, cumulative_slow: 0,
-            cumulative_no_response: 0, no_response_generation: 0,
+            cumulative_no_response: 0, no_response_generation: 0, no_response_peer: None,
         };
         health.observe(Role::Fast, 0, observation, now);
         health.observe(Role::Cancel, 0, observation, now);
         // Saturate the owner's command lane. Failed enqueue retains the exact
         // pending generation, while another owner receives its own command.
         fast_tx.try_send(PolyConnectionCommand::RefreshTransport {
-            prewarm_url: Arc::from("https://example.invalid/"), expected_generation: 6,
+            prewarm_url: Arc::from("https://example.invalid/"), expected_generation: 6, avoid_peer: None,
         }).unwrap();
         let mut routes = PolyAccountConnectionRoutes {
             health: Some(health), health_lanes: vec![(Role::Fast, 0, receiver)],
@@ -19049,14 +19051,16 @@ mod market_router_tests {
         observation.cumulative_failures = 1;
         observation.cumulative_no_response = 1;
         observation.no_response_generation = 7;
+        observation.no_response_peer = Some("192.0.2.1".parse().unwrap());
         publisher.publish(observation);
         // Replace the queued observation; cumulative evidence survives.
         observation.sequence = 3;
         publisher.publish(observation);
         routes.refresh_health(now_ns());
-        assert_eq!(routes.reset_pending, [Some(7), None]);
+        assert_eq!(routes.reset_pending, [Some((7, observation.no_response_peer)), None]);
         assert!(matches!(cancel_rx.try_recv().unwrap(),
-            PolyConnectionCommand::RefreshTransport { expected_generation: 7, .. }));
+            PolyConnectionCommand::RefreshTransport { expected_generation: 7, avoid_peer, .. }
+                if avoid_peer == observation.no_response_peer));
         assert_eq!(routes.health.as_ref().unwrap().no_response_resets(), 1);
         assert_eq!(routes.health.as_ref().unwrap().current().available_place_slots, 0);
         assert!(matches!(fast_rx.try_recv().unwrap(),
@@ -19064,7 +19068,8 @@ mod market_router_tests {
         routes.refresh_health(now_ns());
         assert_eq!(routes.reset_pending, [None, None]);
         assert!(matches!(fast_rx.try_recv().unwrap(),
-            PolyConnectionCommand::RefreshTransport { expected_generation: 7, .. }));
+            PolyConnectionCommand::RefreshTransport { expected_generation: 7, avoid_peer, .. }
+                if avoid_peer == observation.no_response_peer));
         observation.sequence = 4;
         publisher.publish(observation);
         routes.refresh_health(now_ns());
@@ -19181,7 +19186,7 @@ mod market_router_tests {
                 sequence: 1, observed_at_ns: now,
                 health: PermitHealthSnapshot { pool_generation: 7, quarantined: false },
                 business: None, busy: false, cumulative_failures: 0, cumulative_slow: 0,
-                cumulative_no_response: 0, no_response_generation: 0,
+                cumulative_no_response: 0, no_response_generation: 0, no_response_peer: None,
             }, now);
         }
         let mut routes = PolyAccountConnectionRoutes {

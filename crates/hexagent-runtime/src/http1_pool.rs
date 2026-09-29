@@ -63,6 +63,7 @@
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::Mutex;
@@ -980,17 +981,21 @@ impl ConnectionHealth {
         // A stale repair must never release another generation's quarantine.
     }
 
-    async fn repair_instrumented(self, prewarm_url: String, failures: usize) {
+    async fn repair_instrumented(self, prewarm_url: String, failures: usize, avoid_peer: Option<IpAddr>) {
         let mut owner = self;
         let mut delay = Duration::from_millis(100);
         let mut attempt = 0_u64;
         while owner.is_current() {
             attempt += 1;
+            // Prefer other DNS peers for three bounded attempts. If every
+            // alternative is unreachable, return to ordinary DNS ordering
+            // instead of stranding the entire account in quarantine forever.
+            let preferred_avoid_peer = (attempt <= 3).then_some(avoid_peer).flatten();
             let outcome = async {
                 let candidate = Arc::new(
-                    crate::instrumented_http1::InstrumentedHttp1Client::new(Duration::from_millis(
-                        2000,
-                    ))
+                    crate::instrumented_http1::InstrumentedHttp1Client::new_avoiding_peer(
+                        Duration::from_millis(2000), preferred_avoid_peer,
+                    )
                     .map_err(|e| e.to_string())?,
                 );
                 let response = candidate
@@ -1006,17 +1011,17 @@ impl ConnectionHealth {
                 if !response.status.is_success() {
                     return Err(format!("HTTP {}", response.status));
                 }
-                Ok((candidate, response.timings.connect_generation_after))
+                Ok((candidate, response.timings.connect_generation_after, response.timings.peer))
             }
             .await;
             match outcome {
-                Ok((candidate, connect_generation)) => {
+                Ok((candidate, connect_generation, peer)) => {
                     // Publish only after successful probe AND complete body.
                     // Quarantine grants exclusive replacement ownership.
                     if let Some(generation) = owner.install_instrumented_replacement(candidate) {
                         owner.generation_at_pick = generation;
                         owner.release_quarantine();
-                        log::info!("[http1_pool] role={:?} slot={} replacement_generation={} connect_generation={} prewarm_attempts={} prior_failures={} ready=true", owner.role, owner.slot, generation, connect_generation, attempt, failures);
+                        log::info!("[http1_pool] role={:?} slot={} replacement_generation={} connect_generation={} prewarm_attempts={} prior_failures={} avoided_peer={:?} peer={:?} ready=true", owner.role, owner.slot, generation, connect_generation, attempt, failures, preferred_avoid_peer, peer);
                     }
                     return;
                 }
@@ -1051,6 +1056,41 @@ pub struct PooledClient {
 
 static NEXT_HTTP_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Fixed-size evidence under the same exclusive completion handoff as the
+/// attempt totals. The HTTP owner writes; its connection owner reads only after
+/// completion, before another command. No cross-account/global peer registry.
+#[derive(Default)]
+struct AttemptPeer {
+    family: AtomicUsize,
+    high: AtomicU64,
+    low: AtomicU64,
+}
+
+impl AttemptPeer {
+    fn store(&self, peer: Option<IpAddr>) {
+        let (family, high, low) = match peer {
+            Some(IpAddr::V4(ip)) => (4, 0, u32::from(ip) as u64),
+            Some(IpAddr::V6(ip)) => {
+                let value = u128::from(ip);
+                (6, (value >> 64) as u64, value as u64)
+            }
+            None => (0, 0, 0),
+        };
+        self.high.store(high, Ordering::SeqCst);
+        self.low.store(low, Ordering::SeqCst);
+        self.family.store(family, Ordering::SeqCst);
+    }
+
+    fn load(&self) -> Option<IpAddr> {
+        match self.family.load(Ordering::SeqCst) {
+            4 => Some(IpAddr::V4((self.low.load(Ordering::SeqCst) as u32).into())),
+            6 => Some(IpAddr::V6(((u128::from(self.high.load(Ordering::SeqCst)) << 64)
+                | u128::from(self.low.load(Ordering::SeqCst))).into())),
+            _ => None,
+        }
+    }
+}
+
 struct AttemptTraceSlot {
     role: Role,
     slot: usize,
@@ -1071,6 +1111,7 @@ struct AttemptTraceSlot {
     business_slow: AtomicU64,
     business_no_response: AtomicU64,
     business_no_response_generation: AtomicU64,
+    business_no_response_peer: AttemptPeer,
 }
 
 impl AttemptTraceSlot {
@@ -1092,6 +1133,7 @@ impl AttemptTraceSlot {
             business_slow: AtomicU64::new(0),
             business_no_response: AtomicU64::new(0),
             business_no_response_generation: AtomicU64::new(0),
+            business_no_response_peer: AttemptPeer::default(),
         }
     }
 
@@ -1255,6 +1297,11 @@ impl PooledClient {
         }
     }
 
+    /// Immutable identity of the client selected for this request.
+    pub fn pool_generation(&self) -> u64 {
+        self.health.generation_at_pick
+    }
+
     /// Allocate the process-monotonic identity used by non-admission HTTP
     /// paths. Admission-owned order attempts should call [`Self::begin_attempt`]
     /// so the same ID is also published in the slot trace.
@@ -1342,6 +1389,8 @@ impl PooledClient {
                 if status_code == 0 {
                     self.attempt_trace.business_no_response_generation
                         .store(self.health.generation_at_pick, Ordering::SeqCst);
+                    self.attempt_trace.business_no_response_peer
+                        .store(self.instrumented.connection_snapshot().peer.map(|peer| peer.ip()));
                     self.attempt_trace.business_no_response.fetch_add(1, Ordering::SeqCst);
                 }
                 self.attempt_trace
@@ -1380,12 +1429,22 @@ impl PooledClient {
     /// slot. A single transport failure already identifies the affected
     /// generation; the account's connection owner decides placement capacity.
     pub fn note_instrumented_transport_failure(&self, prewarm_url: String) -> bool {
+        self.note_instrumented_transport_failure_avoiding(
+            prewarm_url, self.instrumented.connection_snapshot().peer.map(|peer| peer.ip()),
+        )
+    }
+
+    /// Account-local recovery may supply the failed sibling's exact peer.
+    /// Selection affects only background DNS/connect, never order finality.
+    pub fn note_instrumented_transport_failure_avoiding(
+        &self, prewarm_url: String, avoid_peer: Option<IpAddr>,
+    ) -> bool {
         let Some(failures) = self.health.claim_instrumented_rebuild() else {
             return false;
         };
         let health = self.health.clone();
         crate::async_rt::order_handle().spawn(async move {
-            health.repair_instrumented(prewarm_url, failures).await;
+            health.repair_instrumented(prewarm_url, failures, avoid_peer).await;
         });
         true
     }
@@ -1458,6 +1517,11 @@ impl Permit {
     pub fn business_no_response_evidence(&self) -> (u64, u64) {
         (self.attempt_trace.business_no_response.load(Ordering::SeqCst),
          self.attempt_trace.business_no_response_generation.load(Ordering::SeqCst))
+    }
+
+    /// Read with `business_no_response_evidence` after exclusive completion.
+    pub fn business_no_response_peer(&self) -> Option<IpAddr> {
+        self.attempt_trace.business_no_response_peer.load()
     }
 
     /// Read current transport readiness without borrowing or replacing the
@@ -2171,6 +2235,17 @@ mod repair_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_peer_evidence_preserves_ipv4_ipv6_and_slot_isolation() {
+        let first = AttemptPeer::default();
+        let second = AttemptPeer::default();
+        for peer in [Some("192.0.2.1".parse().unwrap()), Some("2001:db8::1".parse().unwrap()), None] {
+            first.store(peer);
+            assert_eq!(first.load(), peer);
+            assert_eq!(second.load(), None);
+        }
+    }
 
     #[test]
     fn account_sizes_scale_with_instances() {
