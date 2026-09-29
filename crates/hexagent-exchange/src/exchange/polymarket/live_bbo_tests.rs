@@ -205,6 +205,39 @@ fn live_bbo_reconnect_and_subscription_isolation_do_not_inherit_foreign_prices()
 }
 
 #[test]
+fn live_bbo_handoff_retains_newest_cursor_and_rejects_late_candidate_updates() {
+    let sub = subscription();
+    let mut active = ClobLocalBooks::for_subscription(&sub);
+    let mut candidate = ClobLocalBooks::for_subscription(&sub);
+    apply(&mut active, r#"{"event_type":"best_bid_ask","asset_id":"up","best_bid":"0.45","best_ask":"0.65","timestamp":"9002"}"#);
+    apply(&mut candidate, r#"{"event_type":"best_bid_ask","asset_id":"down","best_bid":"0.4","best_ask":"0.6","timestamp":"9000"}"#);
+    assert_eq!(candidate.inherit_newer_live_bbo(&active), 1);
+    assert_eq!(candidate.inherit_newer_live_bbo(&active), 0, "idempotent handoff");
+    let events = candidate.live_checkpoints(&sub.tokens);
+    let MarketEvent::Quote(q) = &events[0] else { panic!("quote") };
+    assert_eq!((q.bid_price, q.ask_price), (0.45, 0.65));
+    assert_eq!((q.exchange_timestamp_ns, q.local_timestamp_ns), (9_002_000_000, 10_000_000_000));
+    assert!(apply(&mut candidate, r#"{"event_type":"best_bid_ask","asset_id":"up","best_bid":"0.4","best_ask":"0.6","timestamp":"9001"}"#).events.is_empty());
+    assert_prices(&apply(&mut candidate, r#"{"event_type":"best_bid_ask","asset_id":"up","best_bid":"0.46","best_ask":"0.66","timestamp":"9003"}"#), 0.46, 0.66, 9003);
+    assert_eq!(candidate.inherit_newer_live_bbo(&active), 0, "newer candidate wins");
+}
+
+#[test]
+fn live_bbo_handoff_isolates_conditions_and_preserves_empty_side_health() {
+    let mut sub = subscription();
+    let mut active = ClobLocalBooks::for_subscription(&sub);
+    apply(&mut active, r#"{"event_type":"best_bid_ask","asset_id":"up","best_bid":"0","best_ask":"0.6","timestamp":"9002"}"#);
+    let mut candidate = ClobLocalBooks::for_subscription(&sub);
+    apply(&mut candidate, r#"{"event_type":"best_bid_ask","asset_id":"up","best_bid":"0.4","best_ask":"0.6","timestamp":"9000"}"#);
+    assert_eq!(candidate.inherit_newer_live_bbo(&active), 1);
+    assert!(matches!(&candidate.live_checkpoints(&sub.tokens)[1], MarketEvent::MarketDataHealth(h) if h.state == MarketDataHealthState::Degraded));
+    sub.canonical_events[0].condition_id = "foreign".into();
+    let mut other = ClobLocalBooks::for_subscription(&sub);
+    assert_eq!(other.inherit_newer_live_bbo(&active), 0);
+    assert!(!other.has_all_seeded(&sub.tokens));
+}
+
+#[test]
 fn live_bbo_prewarmed_handoff_preserves_server_and_receive_clock_without_next_frame() {
     let sub = subscription();
     let mut books = ClobLocalBooks::for_subscription(&sub);

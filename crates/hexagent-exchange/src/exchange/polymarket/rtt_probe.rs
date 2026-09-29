@@ -116,6 +116,105 @@ struct ProbeHttpMetrics {
     capacity: usize,
     high_water: AtomicUsize,
     rejected: AtomicU64,
+    retried: AtomicU64,
+    retry_exhausted: AtomicU64,
+    disconnected: AtomicU64,
+    enqueue_max_ns: AtomicU64,
+}
+
+// Only cold recovery/probe producers call this. A failed reservation still
+// owns the exact, unsent request; retrying it cannot duplicate an HTTP POST.
+// The realtime consumer remains a single nonblocking try_recv. Bounded sleep
+// gives a preempted producer/consumer CPU time without spinning on either.
+fn enqueue_cold<T>(
+    mut value: T,
+    mut send: impl FnMut(T) -> Result<(), crossbeam_channel::TrySendError<T>>,
+    budget: Duration,
+) -> (Result<(), crossbeam_channel::TrySendError<T>>, bool) {
+    use crossbeam_channel::TrySendError;
+    let started = Instant::now();
+    let mut retried = false;
+    loop {
+        match send(value) {
+            Ok(()) => return (Ok(()), retried),
+            Err(TrySendError::Disconnected(value)) => return (Err(TrySendError::Disconnected(value)), retried),
+            Err(TrySendError::Full(returned)) => value = returned,
+        }
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return (Err(TrySendError::Full(value)), retried);
+        }
+        std::thread::sleep(remaining.min(hexagent_runtime::poll_channel::IDLE_POLL));
+        if started.elapsed() >= budget {
+            return (Err(TrySendError::Full(value)), retried);
+        }
+        retried = true;
+    }
+}
+
+#[cfg(test)]
+mod cold_ingress_tests {
+    use super::*;
+    use crossbeam_channel::TrySendError;
+
+    #[test]
+    fn retry_moves_exact_unsent_value_once_and_preserves_owner_order() {
+        let mut delivered = Vec::new();
+        for owner in ["a", "b"] {
+            for sequence in 0..3 {
+                let mut fail_once = true;
+                let (result, retried) = enqueue_cold((owner, sequence), |value| {
+                    if std::mem::take(&mut fail_once) {
+                        Err(TrySendError::Full(value))
+                    } else {
+                        delivered.push(value);
+                        Ok(())
+                    }
+                }, Duration::from_secs(1));
+                assert!(result.is_ok() && retried);
+            }
+        }
+        assert_eq!(delivered, [("a",0),("a",1),("a",2),("b",0),("b",1),("b",2)]);
+    }
+
+    #[test]
+    fn saturated_or_disconnected_ingress_retains_value_without_dispatch() {
+        let (result, retried) = enqueue_cold(17, |x| Err(TrySendError::Full(x)), Duration::ZERO);
+        assert_eq!(result, Err(TrySendError::Full(17)));
+        assert!(!retried);
+        let mut calls = 0;
+        let (result, retried) = enqueue_cold(19, |x| { calls += 1; Err(TrySendError::Disconnected(x)) }, Duration::from_secs(1));
+        assert_eq!(result, Err(TrySendError::Disconnected(19)));
+        assert!(!retried);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    #[ignore = "focused cold producer contention benchmark; release --ignored --nocapture"]
+    fn cold_enqueue_retry_benchmark() {
+        const N: usize = 100_000;
+        for retry in [false, true] {
+            let mut values = Vec::with_capacity(N);
+            let mut delivered = 0;
+            let mut rejected = 0;
+            for n in 0..N {
+                let mut contended = n % 500 == 0;
+                let mut send = |value| {
+                    if std::mem::take(&mut contended) { Err(TrySendError::Full(value)) }
+                    else { delivered += 1; Ok(()) }
+                };
+                let start = Instant::now();
+                let result = if retry { enqueue_cold(n, &mut send, Duration::from_millis(1)).0 }
+                    else { send(n) };
+                values.push(start.elapsed().as_nanos());
+                rejected += usize::from(result.is_err());
+            }
+            values.sort_unstable();
+            println!("cold_enqueue retry={retry} n={N} injected_reservation_contentions=200 boundary=cold_producer_enqueue_to_return p50_ns={} p99_ns={} p999_ns={} max_ns={} delivered={delivered} rejected={rejected} depth_high_water=0 capacity_exhaustions=0 transport=deterministic_reservation_seam excludes=http_and_recovery_retry_cadence",
+                values[N/2-1],values[N*99/100-1],values[N*999/1000-1],values[N-1]);
+            assert_eq!(delivered + rejected, N);
+        }
+    }
 }
 
 /// One execution dispatcher owns the receiver. Recovery/probe producers retain
@@ -136,6 +235,13 @@ impl ProbeHttpReceiver {
     pub fn queue_snapshot(&self) -> (usize, usize, u64) {
         (self.rx.len(), self.metrics.high_water.load(Ordering::Relaxed),
          self.metrics.rejected.load(Ordering::Relaxed))
+    }
+
+    pub fn retry_snapshot(&self) -> (u64, u64, u64, u64) {
+        (self.metrics.retried.load(Ordering::Relaxed),
+         self.metrics.retry_exhausted.load(Ordering::Relaxed),
+         self.metrics.disconnected.load(Ordering::Relaxed),
+         self.metrics.enqueue_max_ns.load(Ordering::Relaxed))
     }
 
     #[cfg(test)]
@@ -258,14 +364,26 @@ impl ProbeHttpTransport {
             reply,
         };
         let depth = self.tx.len();
-        if self.tx.try_send(request).is_err() {
+        let enqueue_started = Instant::now();
+        let (enqueued, retried) = enqueue_cold(request, |request| self.tx.try_send(request), Duration::from_millis(1));
+        self.metrics.enqueue_max_ns.fetch_max(enqueue_started.elapsed().as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        self.metrics.retried.fetch_add(u64::from(retried), Ordering::Relaxed);
+        if let Err(error) = enqueued {
             self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+            let reason = match error {
+                crossbeam_channel::TrySendError::Full(_) => {
+                    self.metrics.retry_exhausted.fetch_add(1, Ordering::Relaxed);
+                    "probe execution lane busy after bounded enqueue retry; not sent"
+                }
+                crossbeam_channel::TrySendError::Disconnected(_) => {
+                    self.metrics.disconnected.fetch_add(1, Ordering::Relaxed);
+                    "probe execution lane disconnected; not sent"
+                }
+            };
             // Nothing reached an execution owner. For DELETE the already
             // durable orphan retains retry ownership, so no cancel is lost.
             return ProbeHttpResponse {
-                reply: Err(HttpErr::Other(
-                    "probe execution lane unavailable before dispatch".into(),
-                )),
+                reply: Err(HttpErr::Other(reason.into())),
                 location: None,
             };
         }

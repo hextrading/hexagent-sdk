@@ -521,7 +521,7 @@ mod sim_lifecycle_router_tests {
 
 #[derive(Debug)]
 enum ExecutionDiagnostic {
-    ProbeIngress { depth: usize, high_water: usize, rejected: u64 },
+    ProbeIngress { depth: usize, high_water: usize, rejected: u64, retry: (u64, u64, u64, u64) },
     Admission {
         account: Arc<str>,
         snapshot: ExecutionAdmission,
@@ -572,9 +572,9 @@ fn spawn_execution_diagnostics(
                     Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                 };
                 match diagnostic {
-                    ExecutionDiagnostic::ProbeIngress { depth, high_water, rejected } => info!(
-                        "[execution_probe_ingress] capacity=64 depth={} sampled_high_water={} rejected_before_dispatch={}",
-                        depth, high_water, rejected,
+                    ExecutionDiagnostic::ProbeIngress { depth, high_water, rejected, retry } => info!(
+                        "[execution_probe_ingress] capacity=64 depth={} sampled_high_water={} rejected_before_dispatch={} retried_requests={} retry_exhausted={} disconnected={} enqueue_max_ns={}",
+                        depth, high_water, rejected, retry.0, retry.1, retry.2, retry.3,
                     ),
                     ExecutionDiagnostic::Admission { account, snapshot, paused_total_ns, replaced_snapshots, no_response_resets, cancel_outbox } => info!(
                         "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0 no_response_resets={} cancel_outbox_depth={} cancel_outbox_high_water={} cancel_outbox_oldest_ns={} cancel_coalesced={} cancel_outbox_overflow={}",
@@ -13059,7 +13059,7 @@ impl Engine {
                                     if probe_diagnostic_timer.take_due(std::time::Instant::now()) {
                                         let (depth, high_water, rejected) = receiver.queue_snapshot();
                                         try_submit_execution_diagnostic(&execution_diagnostic_tx,
-                                            ExecutionDiagnostic::ProbeIngress { depth, high_water, rejected });
+                                            ExecutionDiagnostic::ProbeIngress { depth, high_water, rejected, retry: receiver.retry_snapshot() });
                                     }
                                     match receiver.try_recv() {
                                         Ok(request) => {
