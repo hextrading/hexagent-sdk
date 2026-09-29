@@ -19296,6 +19296,9 @@ mod market_router_tests {
 
     #[test]
     fn saturated_cancel_lane_uses_account_outbox_without_blocking_router() {
+        // Measure the already-started router, not first-use allocation of the
+        // thread telemetry slab (which can itself exceed the 10 ms bound).
+        hexagent_runtime::latency::prepare_thread_stages(&["polymarket.cancel.account_outbox"]);
         let (cancel_tx, cancel_rx) = bounded(1);
         let (raw_update_tx, _update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
