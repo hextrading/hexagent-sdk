@@ -67,6 +67,10 @@ capacity; this patch does not claim every legacy channel is wait-free.
 ## Focused verification
 
 Release runtime suite: 88 passed, 6 intentionally ignored manual benchmarks.
+Release engine suite: 157 passed, 8 ignored. Exchange functional suite (default
+test profile): 969 passed, 48 ignored. This includes the two-null/500 ms policy,
+Filled-before/during-query suppression, exact owner routing, saturated ingress,
+ambiguous versus not-sent response classification and shutdown barriers.
 Snapshot tests cover paused publication, repeated replacement, concurrent
 non-torn/non-replayed values, independent instances and final drain before
 producer disconnect. Polling FIFO tests cover unpublished heads, saturation,
