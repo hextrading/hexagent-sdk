@@ -1069,6 +1069,8 @@ struct AttemptTraceSlot {
     business_outcome_status: AtomicU64,
     business_failures: AtomicU64,
     business_slow: AtomicU64,
+    business_no_response: AtomicU64,
+    business_no_response_generation: AtomicU64,
 }
 
 impl AttemptTraceSlot {
@@ -1088,6 +1090,8 @@ impl AttemptTraceSlot {
             business_outcome_status: AtomicU64::new(0),
             business_failures: AtomicU64::new(0),
             business_slow: AtomicU64::new(0),
+            business_no_response: AtomicU64::new(0),
+            business_no_response_generation: AtomicU64::new(0),
         }
     }
 
@@ -1335,6 +1339,11 @@ impl PooledClient {
         );
         match outcome {
             BusinessHttpOutcome::Failure => {
+                if status_code == 0 {
+                    self.attempt_trace.business_no_response_generation
+                        .store(self.health.generation_at_pick, Ordering::SeqCst);
+                    self.attempt_trace.business_no_response.fetch_add(1, Ordering::SeqCst);
+                }
                 self.attempt_trace
                     .business_failures
                     .fetch_add(1, Ordering::SeqCst);
@@ -1440,6 +1449,15 @@ impl Permit {
             self.attempt_trace.business_failures.load(Ordering::SeqCst),
             self.attempt_trace.business_slow.load(Ordering::SeqCst),
         )
+    }
+
+    /// Monotonic no-response count and the last affected pool generation.
+    /// Read only after completion on the exclusive connection owner. Retaining
+    /// this separately prevents a later successful cancel in the same sweep or
+    /// a replaced heartbeat from hiding an earlier transport incident.
+    pub fn business_no_response_evidence(&self) -> (u64, u64) {
+        (self.attempt_trace.business_no_response.load(Ordering::SeqCst),
+         self.attempt_trace.business_no_response_generation.load(Ordering::SeqCst))
     }
 
     /// Read current transport readiness without borrowing or replacing the
@@ -2459,6 +2477,33 @@ mod tests {
             (1, 1),
             "a sweep's final success must retain earlier adverse attempts"
         );
+    }
+
+    #[test]
+    fn no_response_evidence_survives_success_repair_and_duplicate_completion() {
+        let first_account = account(1);
+        let second_account = account(1);
+        let permit = first_account.fast.try_acquire().unwrap();
+        let isolated = second_account.fast.try_acquire().unwrap();
+        let client = permit.pooled_client();
+        let attempt = client.allocate_attempt_id();
+        client.record_business_outcome(attempt, 2_000_000, BusinessHttpOutcome::Failure, 0);
+        client.record_business_outcome(attempt, 2_000_000, BusinessHttpOutcome::Failure, 0);
+        client.record_business_outcome(client.allocate_attempt_id(), 20_000_000,
+            BusinessHttpOutcome::Healthy, 200);
+        client.record_business_outcome(client.allocate_attempt_id(), 20_000_000,
+            BusinessHttpOutcome::Failure, 503);
+        assert_eq!(permit.business_no_response_evidence(), (1, 0));
+        assert_eq!(isolated.business_no_response_evidence(), (0, 0));
+        let health = permit.health(permit.generation());
+        health.clone().install_replacement(health.build_replacement().unwrap(), 1);
+        let replacement = permit.current_pooled_client();
+        replacement.record_business_outcome(replacement.allocate_attempt_id(), 20_000_000,
+            BusinessHttpOutcome::Healthy, 200);
+        assert_eq!(permit.business_no_response_evidence(), (1, 0));
+        replacement.record_business_outcome(replacement.allocate_attempt_id(), 2_000_000,
+            BusinessHttpOutcome::Failure, 0);
+        assert_eq!(permit.business_no_response_evidence(), (2, 1));
     }
 
     #[test]
