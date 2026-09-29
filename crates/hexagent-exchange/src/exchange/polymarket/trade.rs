@@ -785,6 +785,13 @@ fn exact_cancel_acknowledged(json: &serde_json::Value, order_id: &str) -> bool {
         && !failed.keys().any(|id| id.eq_ignore_ascii_case(order_id))
 }
 
+/// A durable cancellation still carrying a reservation is awaiting its fill
+/// audit. Reusing that positive terminal fact does not infer zero fills.
+fn has_pending_cancel_proof(ownership: &OrderOwnership) -> bool {
+    ownership.status == OrderStatus::Cancelled
+        && (ownership.reserved_cash > 0.0 || ownership.reserved_quantity > 0.0)
+}
+
 fn combine_parallel_order_lookups(
     primary: FetchOrderResult,
     secondary: FetchOrderResult,
@@ -8086,6 +8093,26 @@ impl PolymarketTrade {
             }
 
             for (coid, order_id, ownership, is_recovered, requires_query_repair) in pending {
+                // A previous exact cancellation can outlive a failed history
+                // request or a process restart. Its durable terminal state
+                // authorizes resuming the audit even while the market is live;
+                // a query-repair row deliberately cannot supply this proof.
+                if has_pending_cancel_proof(&ownership) && !requires_query_repair {
+                    let update = if self.shared.recovery_http.get().is_some() {
+                        self.cancel_order_via_owners(&ownership, &order_id)
+                    } else {
+                        self.recover_cancelled_order_after_trade_audit_with(
+                            &ownership,
+                            &order_id,
+                            "durable_cancel_confirmed_pending_audit",
+                            |oid, stamp| self.audit_historical_order_trades(oid, stamp),
+                        )
+                    };
+                    if let Some(update) = update {
+                        replayed_updates.push(update);
+                        continue;
+                    }
+                }
                 let event_has_ended = if should_lookup_recovered_event_end(is_recovered) {
                     let event_end_started = crate::latency::Instant::now();
                     let mut ended = self
@@ -8175,6 +8202,10 @@ impl PolymarketTrade {
                     FetchOrderResult::Found(order) => {
                         match order.status.as_str() {
                             "LIVE" => {
+                                if ownership.status == OrderStatus::Cancelled {
+                                    info!("[PolymarketTrade] trade-audit coid={} returned stale LIVE after durable cancellation; retaining reservation", coid);
+                                    continue;
+                                }
                                 // A runtime Filled edge can race a stale order
                                 // lookup. Once the durable ledger has observed
                                 // Filled, never regress it to LIVE or release
@@ -8646,6 +8677,16 @@ impl PolymarketTrade {
             let status_text = fetched.status.to_ascii_uppercase();
             let status = match status_text.as_str() {
                 "LIVE" => {
+                    if has_pending_cancel_proof(&ownership) {
+                        if use_recovery_owner_transport {
+                            if let Some(update) = self.cancel_order_via_owners(&ownership, &order_id) {
+                                updates.push(update);
+                                continue;
+                            }
+                        }
+                        errors.push(format!("open order coid={coid} returned stale LIVE after durable cancellation; history audit pending"));
+                        continue;
+                    }
                     if !fetched.audit.associate_trades.is_empty() {
                         updates.extend(self.reconcile_orphans(
                             &[],
@@ -10216,6 +10257,12 @@ impl PolymarketTrade {
                             );
                             continue;
                         };
+                        if via_owners && has_pending_cancel_proof(&ownership) {
+                            if let Some(update) = self.cancel_order_via_owners(&ownership, oid) {
+                                updates.push(update);
+                            }
+                            continue;
+                        }
                         let (effective_size_matched, has_valid_size_matched) =
                             effective_audited_match(
                                 order_audit
@@ -10540,6 +10587,16 @@ impl PolymarketTrade {
             let mut retry_diagnostic: Option<String> = None;
             let status = match status_str.as_str() {
                 "LIVE" => {
+                    if via_owners {
+                        if let Some(ownership) = self.shared.account_state.order(coid) {
+                            if has_pending_cancel_proof(&ownership) {
+                                if let Some(update) = self.cancel_order_via_owners(&ownership, order_id) {
+                                    updates.push(update);
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     // The order is still active on the server — our
                     // earlier DELETE HTTP timed out but never landed.
                     // Re-issue DELETE now so the order doesn't linger
@@ -11027,7 +11084,7 @@ impl PolymarketTrade {
         ownership: &OrderOwnership,
         order_id: &str,
     ) -> Option<OrderUpdate> {
-        if ownership.status != OrderStatus::NewOrderTimeout
+        if (ownership.status != OrderStatus::NewOrderTimeout && !has_pending_cancel_proof(ownership))
             || ownership.order_id != order_id
             || ownership.instance_id.is_empty()
         {
@@ -11041,7 +11098,8 @@ impl PolymarketTrade {
     fn cancel_order_via_owners(&self, ownership: &OrderOwnership, order_id: &str) -> Option<OrderUpdate> {
         let round = RecoveryRound::new(ownership, order_id);
         if ownership.instance_id.is_empty() || ownership.order_id != order_id
-            || matches!(ownership.status, OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected) {
+            || matches!(ownership.status, OrderStatus::Filled | OrderStatus::Rejected)
+            || (ownership.status == OrderStatus::Cancelled && !has_pending_cancel_proof(ownership)) {
             round.event("cancel_admission", "ineligible", None, &format!("status={:?}", ownership.status));
             return None;
         }
@@ -11064,36 +11122,55 @@ impl PolymarketTrade {
             round.event("cancel_admission", "identity_mismatch", None, "iid/token/side/slot mismatch");
             return None;
         }
-        let body = serde_json::json!({"orderID": order_id}).to_string();
-        let response = transport.request(
-            &self.shared,
-            &ownership.instance_id,
-            "DELETE",
-            "/order",
-            &body,
-            None,
-            None,
-        );
-        if !matches!(
-            response.location,
-            Some((crate::http1_pool::Role::Cancel, _))
-        ) {
-            round.event("cancel_reply", "owner_unavailable", response.location, &format!("{:?}", response.reply.as_ref().err()));
-            return None;
-        }
-        let location = response.location;
-        let response = match response.reply {
-            Ok(response) => response,
-            Err(error) => {
-                round.event("cancel_reply", "http_error", location, &error.to_string());
+        let confirmed;
+        let ownership = if has_pending_cancel_proof(ownership) {
+            round.event("cancel_proof", "resumed", None, "durable cancellation; reservation retained pending history");
+            ownership
+        } else {
+            let body = serde_json::json!({"orderID": order_id}).to_string();
+            let response = transport.request(
+                &self.shared,
+                &ownership.instance_id,
+                "DELETE",
+                "/order",
+                &body,
+                None,
+                None,
+            );
+            if !matches!(
+                response.location,
+                Some((crate::http1_pool::Role::Cancel, _))
+            ) {
+                round.event("cancel_reply", "owner_unavailable", response.location, &format!("{:?}", response.reply.as_ref().err()));
                 return None;
             }
+            let location = response.location;
+            let response = match response.reply {
+                Ok(response) => response,
+                Err(error) => {
+                    round.event("cancel_reply", "http_error", location, &error.to_string());
+                    return None;
+                }
+            };
+            if !exact_cancel_acknowledged(&response, order_id) {
+                round.event("cancel_reply", "exact_ack_missing", location, &cancel_detail(&response, order_id));
+                return None;
+            }
+            round.event("cancel_reply", "exact_ack", location, &cancel_detail(&response, order_id));
+            confirmed = match self.shared.account_state.confirm_recovery_cancellation(ownership) {
+                Ok(order) if order.status == OrderStatus::Cancelled => order,
+                Ok(order) => {
+                    round.event("cancel_proof", "superseded", None, &format!("owner_status={:?}", order.status));
+                    return None;
+                }
+                Err(error) => {
+                    round.event("cancel_proof", "owner_commit_failed", None, &error);
+                    return None;
+                }
+            };
+            round.event("cancel_proof", "owner_committed", None, "reservation retained; asynchronous persistence queued");
+            &confirmed
         };
-        if !exact_cancel_acknowledged(&response, order_id) {
-            round.event("cancel_reply", "exact_ack_missing", location, &cancel_detail(&response, order_id));
-            return None;
-        }
-        round.event("cancel_reply", "exact_ack", location, &cancel_detail(&response, order_id));
         let market = self
             .shared
             .account_state

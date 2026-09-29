@@ -609,6 +609,10 @@ enum AccountOwnerOperation {
         expected: OrderOwnership,
         reply: crossbeam_channel::Sender<Result<FillAuditPendingTransition, String>>,
     },
+    ConfirmRecoveryCancellation {
+        expected: OrderOwnership,
+        reply: crossbeam_channel::Sender<Result<OrderOwnership, String>>,
+    },
     MarkCancelledPendingAudit {
         client_order_id: String,
         reply: crossbeam_channel::Sender<bool>,
@@ -935,6 +939,9 @@ impl AccountOwnerCommand {
             }
             ApplyZeroFillRecovery { expected, reply } => {
                 let _ = reply.send(account.apply_zero_fill_recovery(&expected));
+            }
+            ConfirmRecoveryCancellation { expected, reply } => {
+                let _ = reply.send(account.confirm_recovery_cancellation(&expected));
             }
             MarkCancelledPendingAudit {
                 client_order_id,
@@ -15141,6 +15148,66 @@ impl SharedAccount {
         )
     }
 
+    /// Retain an exact successful DELETE before attempting fallible historical
+    /// I/O. The existing Cancelled + pending-audit state is durable cancellation
+    /// evidence, not a zero-fill proof: no reservation or economics change.
+    /// This cold command revalidates the full order root on its sole lifecycle
+    /// writer, so a stale ACK cannot attach to another owner or slot generation.
+    pub fn confirm_recovery_cancellation(
+        &self,
+        expected: &OrderOwnership,
+    ) -> Result<OrderOwnership, String> {
+        if self.must_dispatch_lifecycle_to_owner() {
+            let expected = expected.clone();
+            return self.request_account_lifecycle_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::ConfirmRecoveryCancellation {
+                    expected,
+                    reply,
+                })
+            })?;
+        }
+        let account = self
+            .virtual_account_for_coid(&expected.client_order_id)
+            .ok_or_else(|| "cancellation owner is no longer tracked".to_string())?;
+        let existing = self
+            .lifecycle(&account)
+            .orders
+            .get(&expected.client_order_id)
+            .ok_or_else(|| "cancellation order is no longer tracked".to_string())?;
+        if existing.account_id != expected.account_id
+            || existing.instance_id != expected.instance_id
+            || existing.client_order_id != expected.client_order_id
+            || existing.order_id != expected.order_id
+            || existing.order_id.is_empty()
+            || existing.token_id != expected.token_id
+            || existing.side != expected.side
+            || existing.order_slot != expected.order_slot
+            || existing.quantity != expected.quantity
+            || existing.price != expected.price
+            || existing.fee_rate_bps != expected.fee_rate_bps
+            || existing.cash_fee_per_share != expected.cash_fee_per_share
+        {
+            return Err("cancellation order identity changed".into());
+        }
+        if matches!(
+            existing.status,
+            OrderStatus::Filled
+                | OrderStatus::Failed
+                | OrderStatus::Rejected
+                | OrderStatus::ExecutorRejected
+        ) {
+            return Ok(existing.clone());
+        }
+        // Stronger fill/audit evidence wins inside mark_cancelled_pending_audit.
+        // Both validation and mutation run in this same owner turn.
+        self.mark_cancelled_pending_audit(&expected.client_order_id);
+        self.lifecycle(&account)
+            .orders
+            .get(&expected.client_order_id)
+            .cloned()
+            .ok_or_else(|| "cancellation order disappeared on owner".to_string())
+    }
+
     fn apply_authoritative_order_audit_inner(
         &self,
         client_order_id: &str,
@@ -24394,6 +24461,44 @@ mod tests {
     }
 
     #[test]
+    fn recovery_cancellation_proof_owner_overflow_preserves_unknown_reservation() {
+        let account = Arc::new(seeded_account());
+        account
+            .reserve_order(
+                "a",
+                "a-full-proof",
+                "oid-full",
+                "UP",
+                Side::Buy,
+                10.0,
+                0.5,
+                0,
+            )
+            .unwrap();
+        let original = account.order("a-full-proof").unwrap();
+        let _owner = account.bind_account_lifecycle_owner().unwrap();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        for _ in 0..ACCOUNT_LIFECYCLE_TASK_QUEUE_CAPACITY {
+            account
+                .try_submit_account_lifecycle_command(AccountOwnerCommand::barrier(tx.clone()))
+                .unwrap();
+        }
+        let error = account
+            .confirm_recovery_cancellation(&original)
+            .unwrap_err();
+        assert!(error.contains("full"), "{error}");
+        assert_eq!(account.order("a-full-proof").unwrap(), original);
+        assert_eq!(
+            account.account_lifecycle_queue_metrics(),
+            (
+                ACCOUNT_LIFECYCLE_TASK_QUEUE_CAPACITY,
+                ACCOUNT_LIFECYCLE_TASK_QUEUE_CAPACITY,
+                1
+            )
+        );
+    }
+
+    #[test]
     fn concurrent_wallet_calibration_publish_keeps_every_waiter_and_latest_generation() {
         const PRODUCERS: usize = 16;
         let account = Arc::new(SharedAccount::new("wallet-calibration-cas"));
@@ -26424,6 +26529,109 @@ mod tests {
         let after = account.monitoring_snapshot();
         assert_eq!(after.physical_cash, before.physical_cash);
         assert_eq!(after.physical_positions, before.physical_positions);
+    }
+
+    #[test]
+    fn recovery_cancellation_proof_checks_identity_and_preserves_late_fill_audit() {
+        let account = seeded_account();
+        account
+            .reserve_order("a", "a-proof", "oid-proof", "UP", Side::Buy, 10.0, 0.5, 0)
+            .unwrap();
+        account
+            .reserve_order("b", "b-proof", "oid-sibling", "UP", Side::Buy, 4.0, 0.5, 0)
+            .unwrap();
+        let original = account.order("a-proof").unwrap();
+        let sibling = account.order("b-proof").unwrap();
+        for index in 0..8 {
+            let mut stale = original.clone();
+            match index {
+                0 => stale.account_id = "another-account".into(),
+                1 => stale.instance_id = "b".into(),
+                2 => stale.order_id = "another-oid".into(),
+                3 => stale.token_id = "DOWN".into(),
+                4 => stale.side = Side::Sell,
+                5 => stale.order_slot = OrderSlot::with_generation(1, 99),
+                6 => stale.quantity = 11.0,
+                _ => stale.price = 0.6,
+            }
+            assert!(account.confirm_recovery_cancellation(&stale).is_err());
+            assert_eq!(account.order("a-proof").unwrap(), original);
+        }
+        let confirmed = account.confirm_recovery_cancellation(&original).unwrap();
+        assert_eq!(confirmed.status, OrderStatus::Cancelled);
+        assert_eq!(confirmed.reserved_cash, original.reserved_cash);
+        assert_eq!(confirmed.terminal_matched_quantity, None);
+        assert!(!confirmed.terminal_trade_ids_authoritative);
+        assert_eq!(
+            account.confirm_recovery_cancellation(&original).unwrap(),
+            confirmed
+        );
+        assert_eq!(account.order("b-proof").unwrap(), sibling);
+        account
+            .apply_authoritative_order_audit(
+                "a-proof",
+                OrderStatus::Filled,
+                &AuthoritativeOrderAudit {
+                    original_size: Some("10".into()),
+                    size_matched: Some("4".into()),
+                    associate_trades: vec!["late-trade".into()],
+                },
+            )
+            .unwrap();
+        let filled = account.order("a-proof").unwrap();
+        assert_eq!(
+            account.confirm_recovery_cancellation(&original).unwrap(),
+            filled
+        );
+        assert!(account.apply_zero_fill_recovery(&confirmed).is_err());
+        assert_eq!(account.order("a-proof").unwrap(), filled);
+        assert_eq!(account.order("b-proof").unwrap(), sibling);
+    }
+
+    #[test]
+    fn recovery_cancellation_proof_and_reservation_survive_persistent_restart() {
+        let _persistence_guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!(
+            "hexagent-cancel-proof-{}-{}.json",
+            std::process::id(),
+            wall_clock_ms(),
+        ));
+        let confirmed = {
+            let account = SharedAccount::new_persistent("cancel-proof", &path).unwrap();
+            account.register_instance("a", 1.0);
+            account
+                .apply_physical_snapshot(100.0, HashMap::new())
+                .unwrap();
+            account
+                .reserve_order("a", "a-proof", "oid-proof", "UP", Side::Buy, 10.0, 0.5, 0)
+                .unwrap();
+            let original = account.order("a-proof").unwrap();
+            let confirmed = account.confirm_recovery_cancellation(&original).unwrap();
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+            confirmed
+        };
+        let restored = SharedAccount::new_persistent("cancel-proof", &path).unwrap();
+        assert_eq!(restored.order("a-proof").unwrap(), confirmed);
+        assert!(restored
+            .pending_order_audit_ids()
+            .contains(&"a-proof".to_string()));
+        assert_eq!(restored.instance_snapshot("a").unwrap().reserved_cash, 5.0);
+        assert_eq!(
+            restored.apply_zero_fill_recovery(&confirmed).unwrap(),
+            FillAuditPendingTransition::Resolved
+        );
+        assert_eq!(restored.instance_snapshot("a").unwrap().reserved_cash, 0.0);
+        assert_eq!(
+            restored.apply_zero_fill_recovery(&confirmed).unwrap(),
+            FillAuditPendingTransition::Resolved
+        );
+        restored.flush_persistence(Duration::from_secs(2)).unwrap();
+        drop(restored);
+        let replayed = SharedAccount::new_persistent("cancel-proof", &path).unwrap();
+        assert_eq!(replayed.order("a-proof").unwrap().reserved_cash, 0.0);
+        assert!(replayed.terminal_order_audit_complete("a-proof"));
+        drop(replayed);
+        remove_persistence_test_files(&path);
     }
 
     #[test]
