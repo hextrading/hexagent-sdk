@@ -1,5 +1,6 @@
 //! Bounded, replaceable execution-health snapshots. Never carries lifecycle events.
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::TryRecvError;
+use hexagent_runtime::latest_snapshot::{self, Publisher, Receiver};
 use hexagent_types::types::{Exchange, ExecutionAdmission, ExecutionAdmissionState};
 use std::time::{Duration, Instant};
 
@@ -9,33 +10,20 @@ const LEASE: Duration = Duration::from_secs(1);
 /// One producer owns replacement. The receiver consumes immutable copies only.
 /// Coalescing is safe for full snapshots; connection snapshots additionally carry
 /// cumulative fault counters so an overwritten failure cannot become a recovery.
-pub(crate) struct SnapshotPublisher<T> {
-    tx: Sender<T>,
-    replace_rx: Receiver<T>,
+pub(crate) struct SnapshotPublisher<T: Copy> {
+    tx: Publisher<T>,
     pub replaced: u64,
 }
 
-pub(crate) fn snapshot_lane<T>() -> (SnapshotPublisher<T>, Receiver<T>) {
-    let (tx, rx) = bounded(1);
-    (
-        SnapshotPublisher {
-            tx,
-            replace_rx: rx.clone(),
-            replaced: 0,
-        },
-        rx,
-    )
+pub(crate) fn snapshot_lane<T: Copy>() -> (SnapshotPublisher<T>, Receiver<T>) {
+    let (tx, rx) = latest_snapshot::channel();
+    (SnapshotPublisher { tx, replaced: 0 }, rx)
 }
 
-impl<T> SnapshotPublisher<T> {
+impl<T: Copy> SnapshotPublisher<T> {
     pub fn publish(&mut self, value: T) {
-        if let Err(TrySendError::Full(value)) = self.tx.try_send(value) {
-            if self.replace_rx.try_recv().is_ok() {
-                self.replaced = self.replaced.saturating_add(1);
-            }
-            // Only this producer can fill the slot. A concurrent consumer can
-            // only make room; this retry therefore cannot encounter Full.
-            let _ = self.tx.try_send(value);
+        if self.tx.publish(value) {
+            self.replaced = self.replaced.saturating_add(1);
         }
     }
 }
@@ -186,10 +174,10 @@ mod tests {
         a.publish(snapshot(1, ExecutionAdmissionState::Healthy));
         a.publish(snapshot(2, ExecutionAdmissionState::Paused));
         b.publish(snapshot(1, ExecutionAdmissionState::Healthy));
-        assert_eq!(arx.len(), 1);
+        assert!(!arx.is_empty());
         assert_eq!(a.replaced, 1);
-        assert_eq!(arx.recv().unwrap().state, ExecutionAdmissionState::Paused);
-        assert_eq!(brx.recv().unwrap().state, ExecutionAdmissionState::Healthy);
+        assert_eq!(arx.try_recv().unwrap().state, ExecutionAdmissionState::Paused);
+        assert_eq!(brx.try_recv().unwrap().state, ExecutionAdmissionState::Healthy);
     }
 
     #[test]

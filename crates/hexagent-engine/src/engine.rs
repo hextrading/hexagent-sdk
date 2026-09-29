@@ -25,7 +25,7 @@ use crate::exchange::hexmarket::{HexmarketMarket, HexmarketTrade};
 use crate::exchange::hyperliquid::HyperliquidTrade;
 use crate::exchange::lighter::LighterTrade;
 use crate::exchange::polymarket::trade::{PendingCancel, PendingSubmit};
-use crate::exchange::polymarket::rtt_probe::{probe_http_lane, ProbeHttpRequest};
+use crate::exchange::polymarket::rtt_probe::{probe_http_lane, ProbeHttpReceiver, ProbeHttpRequest};
 use crate::exchange::polymarket::execution_peer_failure::{PeerFailure, PeerFailureReceiver, PeerFailureSender, PeerFailureSource};
 use crate::exchange::polymarket::{
     PolymarketFeedPhase, PolymarketLiveness, PolymarketLivenessSnapshot, PolymarketMarket,
@@ -521,6 +521,7 @@ mod sim_lifecycle_router_tests {
 
 #[derive(Debug)]
 enum ExecutionDiagnostic {
+    ProbeIngress { depth: usize, high_water: usize, rejected: u64 },
     Admission {
         account: Arc<str>,
         snapshot: ExecutionAdmission,
@@ -544,7 +545,7 @@ enum ExecutionDiagnostic {
 
 #[inline]
 fn try_submit_execution_diagnostic(
-    sender: &Sender<ExecutionDiagnostic>,
+    sender: &hexagent_runtime::poll_channel::Sender<ExecutionDiagnostic>,
     diagnostic: ExecutionDiagnostic,
 ) {
     if sender.try_send(diagnostic).is_err() {
@@ -553,14 +554,28 @@ fn try_submit_execution_diagnostic(
 }
 
 fn spawn_execution_diagnostics(
-    receiver: Receiver<ExecutionDiagnostic>,
+    receiver: hexagent_runtime::poll_channel::Receiver<ExecutionDiagnostic>,
 ) -> Result<thread::JoinHandle<()>> {
     Ok(thread::Builder::new()
         .name("execution-diagnostics".into())
         .spawn(move || {
             crate::os_tune::pin_background("execution-diagnostics");
-            while let Ok(diagnostic) = receiver.recv() {
+            loop {
+                let diagnostic = match receiver.try_recv() {
+                    Ok(diagnostic) => diagnostic,
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        // Batch diagnostics on the existing cold worker. Its
+                        // cadence never imposes a wake lock on the publisher.
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                };
                 match diagnostic {
+                    ExecutionDiagnostic::ProbeIngress { depth, high_water, rejected } => info!(
+                        "[execution_probe_ingress] capacity=64 depth={} sampled_high_water={} rejected_before_dispatch={}",
+                        depth, high_water, rejected,
+                    ),
                     ExecutionDiagnostic::Admission { account, snapshot, paused_total_ns, replaced_snapshots, no_response_resets, cancel_outbox } => info!(
                         "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0 no_response_resets={} cancel_outbox_depth={} cancel_outbox_high_water={} cancel_outbox_oldest_ns={} cancel_coalesced={} cancel_outbox_overflow={}",
                         account, snapshot.state, snapshot.epoch, snapshot.available_place_slots,
@@ -4274,7 +4289,7 @@ impl Engine {
             shutdown_done_tx,
             shutdown_token.clone(),
             admission_publishers,
-            probe_http_rx,
+            Some(probe_http_rx),
         );
         let user_feed_handle =
             self.spawn_hex_user_feed(private_update_tx.clone(), shutdown.clone());
@@ -8096,7 +8111,7 @@ impl Engine {
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
         poly_states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
         shutdown_done_rx: Option<CompletionReceiver>,
-        admission_receivers: HashMap<String, Receiver<ExecutionAdmission>>,
+        admission_receivers: HashMap<String, hexagent_runtime::latest_snapshot::Receiver<ExecutionAdmission>>,
     ) -> Result<thread::JoinHandle<()>> {
         let mut strategies =
             self.build_strategies(rtt_probe_install, stale_threshold_handles, poly_states)?;
@@ -8833,7 +8848,7 @@ impl Engine {
         data_dirs: Vec<PathBuf>,
         shutdown_done_rx: Option<CompletionReceiver>,
         poly_states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
-        mut admission_receivers: HashMap<String, Receiver<ExecutionAdmission>>,
+        mut admission_receivers: HashMap<String, hexagent_runtime::latest_snapshot::Receiver<ExecutionAdmission>>,
     ) -> thread::JoinHandle<()> {
         // Static symbol → instance routing map (lowercased keys). A
         // symbol shared by several instances (e.g. two BTC timeframes on
@@ -9685,7 +9700,7 @@ impl Engine {
         shutdown_requested: Arc<AtomicBool>,
         shutdown_ack_tx: Sender<usize>,
         clock_origin: Arc<std::time::Instant>,
-        admission_rx: Option<Receiver<ExecutionAdmission>>,
+        admission_rx: Option<hexagent_runtime::latest_snapshot::Receiver<ExecutionAdmission>>,
     ) {
         // Optional venue-authenticated private feed. The lane is transferred at
         // startup and consumed only by this strategy owner. Its FIFO updates and
@@ -9745,7 +9760,6 @@ impl Engine {
             crossbeam_channel::never::<crate::exchange::PrivateFeedControl>();
         let mut last_watchdog_run = std::time::Instant::now();
         let mut admission = AdmissionConsumer::new(admission_rx);
-        let never_admission_rx = crossbeam_channel::never::<ExecutionAdmission>();
         'worker: loop {
             // Before quote/lifecycle callbacks: no shared gate reads or heap work.
             if let Some(snapshot) = admission.poll() {
@@ -9862,7 +9876,7 @@ impl Engine {
             }
             // Ready market/private receivers still win over this timeout.
             let watchdog_wait = watchdog_timer.remaining(watchdog_now);
-            let selectable_admission_rx = admission.receiver().unwrap_or(&never_admission_rx);
+            let selectable_admission_rx = admission.receiver();
             use worker_input::WorkerInput;
             match worker_input::next_input(
                 selectable_admission_rx, selectable_private_control_rx,
@@ -12215,7 +12229,7 @@ impl Engine {
             shutdown_done_tx,
             ShutdownToken::new(),
             HashMap::new(),
-            crossbeam_channel::never(),
+            None,
         )
     }
 
@@ -12228,7 +12242,7 @@ impl Engine {
         shutdown_done_tx: CompletionSender,
         shutdown_token: ShutdownToken,
         mut admission_publishers: HashMap<String, SnapshotPublisher<ExecutionAdmission>>,
-        probe_http_rx: Receiver<ProbeHttpRequest>,
+        probe_http_rx: Option<ProbeHttpReceiver>,
     ) -> thread::JoinHandle<()> {
         let config = self.config.clone();
         let hex_max_connections = config
@@ -12276,9 +12290,10 @@ impl Engine {
                     crate::os_tune::ExecutionThreadRole::Dispatcher,
                 );
                 crate::latency::prepare_polymarket_order_stages();
+                crate::latency::prepare_thread_stages(&["execution.probe_ingress_wait", "execution.diagnostic.overflow"]);
                 let execution_shutdown_rx = shutdown_token.subscribe();
                 let (execution_diagnostic_tx, execution_diagnostic_rx) =
-                    bounded::<ExecutionDiagnostic>(EXECUTION_DIAGNOSTIC_CAPACITY);
+                    hexagent_runtime::poll_channel::bounded::<ExecutionDiagnostic>(EXECUTION_DIAGNOSTIC_CAPACITY);
                 let execution_diagnostic_handle =
                     spawn_execution_diagnostics(execution_diagnostic_rx)
                         .expect("spawn execution diagnostics");
@@ -12997,61 +13012,83 @@ impl Engine {
                     .collect();
                 let mut shutdown_finalized = false;
                 let mut probe_http_rx = probe_http_rx;
+                let mut probe_diagnostic_timer = hexagent_runtime::owner_timer::OwnerTimer::new(
+                    Duration::from_secs(30), std::time::Instant::now(),
+                );
 
+                let mut maintenance_timer = hexagent_runtime::owner_timer::OwnerTimer::new(
+                    Duration::from_millis(1), std::time::Instant::now(),
+                );
+                let mut maintenance_pending = true;
                 loop {
-                    if let Some(routes_by_account) = poly_connection_routes.as_mut() {
-                        for routes in routes_by_account.values_mut() {
-                            routes.refresh_health(now_ns());
-                            flush_poly_safety_cancel_outbox(routes);
-                            flush_poly_cancel_outbox(routes);
+                    // Keep the existing 1 ms idle health/cancel cadence. Polling
+                    // ingress more often must not rescan every connection per poll.
+                    let maintenance_due = maintenance_timer.take_due(std::time::Instant::now());
+                    if maintenance_pending || maintenance_due {
+                        if let Some(routes_by_account) = poly_connection_routes.as_mut() {
+                            for routes in routes_by_account.values_mut() {
+                                routes.refresh_health(now_ns());
+                                flush_poly_safety_cancel_outbox(routes);
+                                flush_poly_cancel_outbox(routes);
+                            }
                         }
+                        maintenance_pending = false;
                     }
                     // The executor has a direct shutdown subscription. A
                     // dead strategy/router therefore cannot strand it on a
                     // blocking signal receive or prevent admission teardown.
-                    let routed = crossbeam_channel::select_biased! {
-                        recv(execution_shutdown_rx) -> _ => Some(RoutedSignal {
-                            owner: SYSTEM_SIGNAL_OWNER,
-                            signal: Signal::BeginShutdown,
-                        }),
-                        recv(hex_route_lifecycle_rx) -> lifecycle => {
-                            if let Ok(lifecycle) = lifecycle {
-                                if let Some(instance_id) = owner_instance_ids
-                                    .get(usize::from(lifecycle.owner))
-                                {
-                                    if let Some(routes) = hex_coid_routes.get_mut(instance_id) {
-                                        routes.remove_if_generation(
-                                            lifecycle.coid.as_str(),
-                                            lifecycle.order_slot,
-                                        );
-                                    }
-                                }
+                    let routed = if !shutdown_finalized && execution_shutdown_rx.try_recv().is_ok() {
+                        Some(RoutedSignal { owner: SYSTEM_SIGNAL_OWNER, signal: Signal::BeginShutdown })
+                    } else if let Ok(lifecycle) = hex_route_lifecycle_rx.try_recv() {
+                        if let Some(instance_id) = owner_instance_ids.get(usize::from(lifecycle.owner)) {
+                            if let Some(routes) = hex_coid_routes.get_mut(instance_id) {
+                                routes.remove_if_generation(lifecycle.coid.as_str(), lifecycle.order_slot);
                             }
-                            None
-                        },
-                        recv(signal_rx) -> routed => match routed {
+                        }
+                        None
+                    } else {
+                        match signal_rx.try_recv() {
                             Ok(routed) => Some(routed),
-                            Err(_) => break,
-                        },
-                        recv(probe_http_rx) -> request => {
-                            match request {
-                                Ok(request) => {
-                                    let routes = poly_states.get(&request.instance_id)
-                                        .and_then(|shared| poly_connection_routes.as_mut()
-                                            .and_then(|accounts| accounts.get_mut(shared.account_state.account_id())));
-                                    if let Some(routes) = routes {
-                                        dispatch_probe_http(request, routes);
-                                    } else {
-                                        request.reject_not_sent("probe account route unavailable");
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                            Err(crossbeam_channel::TryRecvError::Empty) => {
+                                // Never register the realtime dispatcher as a waiter on
+                                // a cold producer. A preempted publication returns Empty;
+                                // sleeping below lets same-CPU SCHED_OTHER producers run.
+                                let mut dispatched = false;
+                                if let Some(receiver) = probe_http_rx.as_ref() {
+                                    if probe_diagnostic_timer.take_due(std::time::Instant::now()) {
+                                        let (depth, high_water, rejected) = receiver.queue_snapshot();
+                                        try_submit_execution_diagnostic(&execution_diagnostic_tx,
+                                            ExecutionDiagnostic::ProbeIngress { depth, high_water, rejected });
+                                    }
+                                    match receiver.try_recv() {
+                                        Ok(request) => {
+                                            crate::latency::record_ns("execution.probe_ingress_wait",
+                                                request.enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                                            let routes = poly_states.get(&request.instance_id)
+                                                .and_then(|shared| poly_connection_routes.as_mut()
+                                                    .and_then(|accounts| accounts.get_mut(shared.account_state.account_id())));
+                                            if let Some(routes) = routes {
+                                                dispatch_probe_http(request, routes);
+                                            } else {
+                                                request.reject_not_sent("probe account route unavailable");
+                                            }
+                                            dispatched = true;
+                                            maintenance_pending = true;
+                                        }
+                                        Err(crossbeam_channel::TryRecvError::Disconnected) => probe_http_rx = None,
+                                        Err(crossbeam_channel::TryRecvError::Empty) => {},
                                     }
                                 }
-                                Err(_) => probe_http_rx = crossbeam_channel::never(),
+                                if !dispatched {
+                                    thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
+                                }
+                                None
                             }
-                            None
-                        },
-                        default(std::time::Duration::from_millis(1)) => None,
+                        }
                     };
                     let Some(routed) = routed else { continue };
+                    maintenance_pending = true;
                     let embedded_instance_id = extract_instance_id(&routed.signal);
                     let numeric_instance_id = (routed.owner != SYSTEM_SIGNAL_OWNER)
                         .then(|| owner_instance_ids.get(routed.owner as usize))
@@ -13108,7 +13145,7 @@ impl Engine {
                                 // joining coordinators: queued/in-flight reply
                                 // channels fail closed instead of waiting for
                                 // a dispatcher that is now shutting down.
-                                probe_http_rx = crossbeam_channel::never();
+                                probe_http_rx = None;
                                 poly_connection_routes = None;
                                 for h in std::mem::take(&mut poly_recovery_handles) {
                                     let _ = h.join();
@@ -13669,7 +13706,7 @@ fn execute_venue_signal_with<T: ExchangeTrade>(
     worker: &mut T,
     signal: Signal,
     stale_threshold_ms: u64,
-    diagnostics: &Sender<ExecutionDiagnostic>,
+    diagnostics: &hexagent_runtime::poll_channel::Sender<ExecutionDiagnostic>,
     emit: &mut dyn FnMut(OrderUpdate) -> bool,
 ) {
     let is_stale = |timestamp_ns: u64| {
@@ -13958,7 +13995,7 @@ fn execute_venue_signal_into<T: ExchangeTrade>(
     signal: Signal,
     stale_threshold_ms: u64,
     out: &mut OrderUpdateBatch,
-    diagnostics: &Sender<ExecutionDiagnostic>,
+    diagnostics: &hexagent_runtime::poll_channel::Sender<ExecutionDiagnostic>,
 ) -> Result<(), OrderUpdate> {
     out.clear();
     let mut overflow = None;
@@ -14417,7 +14454,7 @@ fn spawn_venue_execution_owner<T: ExchangeTrade + 'static>(
     venue: Exchange,
     mut worker: T,
     root_update_tx: ExecutionUpdateTx,
-    diagnostics: Sender<ExecutionDiagnostic>,
+    diagnostics: hexagent_runtime::poll_channel::Sender<ExecutionDiagnostic>,
 ) -> (VenueExecutionRoutes, Vec<thread::JoinHandle<()>>) {
     let (fast_tx, fast_rx) = bounded::<VenueExecutionCommand>(VENUE_FAST_OWNER_QUEUE_CAPACITY);
     let (cancel_tx, cancel_rx) =
@@ -14836,11 +14873,11 @@ struct PolyAccountConnectionRoutes {
     /// publish immutable full snapshots on dedicated capacity-one lanes.
     health: Option<AccountExecutionAdmission>,
     health_account: Arc<str>,
-    health_diagnostic: Option<Sender<ExecutionDiagnostic>>,
+    health_diagnostic: Option<hexagent_runtime::poll_channel::Sender<ExecutionDiagnostic>>,
     paused_since_ns: Option<u64>,
     paused_total_ns: u64,
     admission_last_diagnostic_ns: u64,
-    health_lanes: Vec<(hexagent_runtime::http1_pool::Role, usize, Receiver<LaneObservation>)>,
+    health_lanes: Vec<(hexagent_runtime::http1_pool::Role, usize, hexagent_runtime::latest_snapshot::Receiver<LaneObservation>)>,
     admission_publishers: Vec<SnapshotPublisher<ExecutionAdmission>>,
     admission_epoch: u64,
     admission_last_publish_ns: u64,
@@ -18036,7 +18073,7 @@ mod market_router_tests {
             shutdown_done_tx,
             shutdown.clone(),
             HashMap::new(),
-            crossbeam_channel::never(),
+            None,
         );
         let strategy = thread::spawn(|| panic!("injected strategy panic"));
         assert_thread_exits(&strategy, "injected strategy");
@@ -18105,7 +18142,7 @@ mod market_router_tests {
             shutdown_done_tx,
             shutdown.clone(),
             HashMap::new(),
-            crossbeam_channel::never(),
+            None,
         );
 
         // The strategy owns the last ingress producer. Its panic disconnects
@@ -18907,7 +18944,7 @@ mod market_router_tests {
         };
         let mut worker = FixedVenueTestTrade;
         let mut updates = OrderUpdateBatch::new();
-        let (diagnostics, _diagnostic_rx) = bounded(4);
+        let (diagnostics, _diagnostic_rx) = hexagent_runtime::poll_channel::bounded(4);
         execute_venue_signal_into(&mut worker, signal, 0, &mut updates, &diagnostics).unwrap();
         assert_eq!(updates.len(), ORDER_BATCH_CAPACITY);
         assert!(updates
@@ -18924,7 +18961,7 @@ mod market_router_tests {
             timestamp_ns: 1,
         };
         let mut worker = FixedVenueTestTrade;
-        let (diagnostics, _diagnostic_rx) = bounded(4);
+        let (diagnostics, _diagnostic_rx) = hexagent_runtime::poll_channel::bounded(4);
         let mut coids = Vec::new();
         execute_venue_signal_with(&mut worker, signal, 0, &diagnostics, &mut |update| {
             coids.push(update.client_order_id);
@@ -18945,7 +18982,7 @@ mod market_router_tests {
         };
         let mut worker = FixedVenueTestTrade;
         let mut updates = OrderUpdateBatch::new();
-        let (diagnostics, diagnostic_rx) = bounded(4);
+        let (diagnostics, diagnostic_rx) = hexagent_runtime::poll_channel::bounded(4);
         execute_venue_signal_into(&mut worker, signal, 0, &mut updates, &diagnostics).unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].status, OrderStatus::CancelUncertain);
@@ -19416,7 +19453,7 @@ mod market_router_tests {
     #[test]
     fn periodic_admission_diagnostic_keeps_last_published_strategy_epoch() {
         let (publisher, snapshots) = snapshot_lane();
-        let (diagnostic_tx, diagnostics) = bounded(4);
+        let (diagnostic_tx, diagnostics) = hexagent_runtime::poll_channel::bounded(4);
         let mut routes = PolyAccountConnectionRoutes {
             health: Some(AccountExecutionAdmission::new(1, 1, now_ns())),
             health_diagnostic: Some(diagnostic_tx),

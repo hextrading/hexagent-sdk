@@ -17,6 +17,7 @@ pub mod http1_pool;
 pub mod instrumented_http1;
 pub mod latency;
 pub mod latency_record;
+pub mod latest_snapshot;
 pub mod memory;
 pub mod os_tune;
 pub mod owner_timer;
