@@ -525,6 +525,7 @@ enum ExecutionDiagnostic {
         snapshot: ExecutionAdmission,
         paused_total_ns: u64,
         replaced_snapshots: u64,
+        no_response_resets: u64,
         cancel_outbox: CancelOutboxSnapshot,
     },
     VenueFailure {
@@ -555,10 +556,10 @@ fn spawn_execution_diagnostics(
             crate::os_tune::pin_background("execution-diagnostics");
             while let Ok(diagnostic) = receiver.recv() {
                 match diagnostic {
-                    ExecutionDiagnostic::Admission { account, snapshot, paused_total_ns, replaced_snapshots, cancel_outbox } => info!(
-                        "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0 cancel_outbox_depth={} cancel_outbox_high_water={} cancel_outbox_oldest_ns={} cancel_coalesced={} cancel_outbox_overflow={}",
+                    ExecutionDiagnostic::Admission { account, snapshot, paused_total_ns, replaced_snapshots, no_response_resets, cancel_outbox } => info!(
+                        "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0 no_response_resets={} cancel_outbox_depth={} cancel_outbox_high_water={} cancel_outbox_oldest_ns={} cancel_coalesced={} cancel_outbox_overflow={}",
                         account, snapshot.state, snapshot.epoch, snapshot.available_place_slots,
-                        paused_total_ns / 1_000_000, replaced_snapshots,
+                        paused_total_ns / 1_000_000, replaced_snapshots, no_response_resets,
                         cancel_outbox.depth, cancel_outbox.high_water, cancel_outbox.oldest_ns,
                         cancel_outbox.coalesced, cancel_outbox.overflow,
                     ),
@@ -12602,7 +12603,7 @@ impl Engine {
                         }
                         let (reset_tx, reset_rx) = bounded(1);
                         routes.reset_rx = Some(reset_rx);
-                        routes.reset_pending = vec![false; routes.fast.len() + routes.cancel.len() + routes.safety_cancel.len()];
+                        routes.reset_pending = vec![None; routes.fast.len() + routes.cancel.len() + routes.safety_cancel.len()];
                         for (instance_id, shared) in &poly_states {
                             if shared.account_state.account_id() == account_id {
                                 shared.bind_execution_reset_sender(reset_tx.clone());
@@ -14492,7 +14493,7 @@ fn spawn_venue_execution_owner<T: ExchangeTrade + 'static>(
 /// owner.  The owner retains its exact admission slot for its whole lifetime,
 /// so a command never migrates to an arbitrary worker or completion drainer.
 enum PolyConnectionCommand {
-    RefreshTransport { prewarm_url: Arc<str> },
+    RefreshTransport { prewarm_url: Arc<str>, expected_generation: u64 },
     /// Existing durable RTT probe HTTP legs use the same capacity and generation
     /// fences as normal orders. The cold probe thread waits on its bounded reply.
     ProbeHttp { request: ProbeHttpRequest, expected_generation: Option<u64> },
@@ -14820,7 +14821,7 @@ struct PolyAccountConnectionRoutes {
     /// updates so the owning strategy retains and retries every intent.
     recovery: HashMap<String, Sender<PolyConnectionCommand>>,
     reset_rx: Option<Receiver<()>>,
-    reset_pending: Vec<bool>,
+    reset_pending: Vec<Option<u64>>,
     reset_prewarm_url: Arc<str>,
     fast_rr: usize,
     cancel_rr: usize,
@@ -14889,17 +14890,24 @@ impl PolyAccountConnectionRoutes {
         let now = now_ns();
         if self.reset_rx.as_ref().is_some_and(|rx| rx.try_recv().is_ok()) {
             health.retire_transport_generations(now);
-            self.reset_pending.fill(true);
         }
-        // The pending bit remains set while an owner is occupied. This is a
+        if health.take_transport_reset() {
+            for (pending, lane) in self.reset_pending.iter_mut().zip(
+                self.fast.iter().chain(self.cancel.iter()).chain(self.safety_cancel.iter())) {
+                *pending = health.retired_generation(lane.metrics.role, lane.metrics.slot);
+            }
+        }
+        // The pending generation remains retained while an owner is occupied. This is a
         // bounded latest-value control lane, never a blocking dispatcher send.
         for (pending, lane) in self.reset_pending.iter_mut().zip(
             self.fast.iter().chain(self.cancel.iter()).chain(self.safety_cancel.iter())) {
-            if *pending && !lane.metrics.occupied.load(Ordering::Acquire)
+            if let Some(expected_generation) = *pending {
+                if !lane.metrics.occupied.load(Ordering::Acquire)
                 && lane.try_send(PolyConnectionCommand::RefreshTransport {
-                    prewarm_url: Arc::clone(&self.reset_prewarm_url),
+                    prewarm_url: Arc::clone(&self.reset_prewarm_url), expected_generation,
                 }).is_ok() {
-                *pending = false;
+                    *pending = None;
+                }
             }
         }
         let mut snapshot = health.refresh(now);
@@ -14930,6 +14938,7 @@ impl PolyAccountConnectionRoutes {
             if let Some(sender) = &self.health_diagnostic {
                 try_submit_execution_diagnostic(sender, ExecutionDiagnostic::Admission {
                     account: Arc::clone(&self.health_account), snapshot,
+                    no_response_resets: health.no_response_resets(),
                     paused_total_ns: self.paused_total_ns.saturating_add(
                         self.paused_since_ns.map_or(0, |started| now.saturating_sub(started))),
                     replaced_snapshots: self.admission_publishers.iter().map(|publisher| publisher.replaced).sum(),
@@ -15295,6 +15304,7 @@ fn run_poly_connection_owner(
         if let Some(publisher) = health_publisher.as_mut() {
             let business = permit.business_outcome();
             let (failures, slow) = permit.business_outcome_totals();
+            let (cumulative_no_response, no_response_generation) = permit.business_no_response_evidence();
             observation_sequence += 1;
             publisher.publish(LaneObservation {
                 sequence: observation_sequence,
@@ -15304,6 +15314,7 @@ fn run_poly_connection_owner(
                 busy: lane_metrics.occupied.load(Ordering::Acquire),
                 cumulative_failures: failures,
                 cumulative_slow: slow,
+                cumulative_no_response, no_response_generation,
             });
         }
         let command = match rx.recv_timeout(HEARTBEAT) {
@@ -15315,9 +15326,13 @@ fn run_poly_connection_owner(
         let connection = permit.current_pooled_client().connection_snapshot();
         let _occupancy = PolyConnectionOccupancyGuard::new(Arc::clone(&lane_metrics), connection);
         match command {
-            PolyConnectionCommand::RefreshTransport { prewarm_url } => {
-                permit.current_pooled_client()
-                    .note_instrumented_transport_failure(prewarm_url.to_string());
+            PolyConnectionCommand::RefreshTransport { prewarm_url, expected_generation } => {
+                // An occupied owner may finish its own repair before this
+                // queued command arrives. Never retire that fresh replacement.
+                let client = permit.current_pooled_client();
+                if client.connection_snapshot().pool_generation == expected_generation {
+                    client.note_instrumented_transport_failure(prewarm_url.to_string());
+                }
             }
             PolyConnectionCommand::ProbeHttp { request, expected_generation } => {
                 let current = permit.health_snapshot();
@@ -18980,7 +18995,7 @@ mod market_router_tests {
         let (cancel_tx, cancel_rx) = bounded(1);
         let mut routes = PolyAccountConnectionRoutes {
             health: Some(AccountExecutionAdmission::new(1, 1, now_ns())),
-            reset_rx: Some(reset_rx), reset_pending: vec![false; 2],
+            reset_rx: Some(reset_rx), reset_pending: vec![None; 2],
             reset_prewarm_url: Arc::from("https://example.invalid/"),
             fast: vec![PolyConnectionLane::for_test(fast_tx, Role::Fast, 0)],
             cancel: vec![PolyConnectionLane::for_test(cancel_tx, Role::Cancel, 0)],
@@ -18992,13 +19007,69 @@ mod market_router_tests {
         routes.refresh_health(now_ns());
         assert!(fast_rx.is_empty());
         assert!(matches!(cancel_rx.try_recv().unwrap(), PolyConnectionCommand::RefreshTransport { .. }));
-        assert_eq!(routes.reset_pending, [true, false]);
+        assert_eq!(routes.reset_pending, [Some(0), None]);
         routes.fast[0].metrics.occupied.store(false, Ordering::Release);
         routes.refresh_health(now_ns());
         assert!(matches!(fast_rx.try_recv().unwrap(), PolyConnectionCommand::RefreshTransport { .. }));
-        assert_eq!(routes.reset_pending, [false, false]);
+        assert_eq!(routes.reset_pending, [None, None]);
         routes.refresh_health(now_ns());
         assert!(fast_rx.is_empty() && cancel_rx.is_empty());
+    }
+
+    #[test]
+    fn no_response_snapshot_dispatches_generation_fenced_refresh_and_retains_full_lane() {
+        use hexagent_runtime::http1_pool::{PermitHealthSnapshot, Role};
+        let (mut publisher, receiver) = crate::execution_admission_lane::snapshot_lane();
+        let (fast_tx, fast_rx) = bounded(1);
+        let (cancel_tx, cancel_rx) = bounded(1);
+        let now = now_ns();
+        let mut health = AccountExecutionAdmission::new(1, 1, now);
+        let mut observation = LaneObservation {
+            sequence: 1, observed_at_ns: now,
+            health: PermitHealthSnapshot { pool_generation: 7, quarantined: false },
+            business: None, busy: false, cumulative_failures: 0, cumulative_slow: 0,
+            cumulative_no_response: 0, no_response_generation: 0,
+        };
+        health.observe(Role::Fast, 0, observation, now);
+        health.observe(Role::Cancel, 0, observation, now);
+        // Saturate the owner's command lane. Failed enqueue retains the exact
+        // pending generation, while another owner receives its own command.
+        fast_tx.try_send(PolyConnectionCommand::RefreshTransport {
+            prewarm_url: Arc::from("https://example.invalid/"), expected_generation: 6,
+        }).unwrap();
+        let mut routes = PolyAccountConnectionRoutes {
+            health: Some(health), health_lanes: vec![(Role::Fast, 0, receiver)],
+            reset_pending: vec![None; 2],
+            reset_prewarm_url: Arc::from("https://example.invalid/"),
+            fast: vec![PolyConnectionLane::for_test(fast_tx, Role::Fast, 0)],
+            cancel: vec![PolyConnectionLane::for_test(cancel_tx, Role::Cancel, 0)],
+            ..Default::default()
+        };
+        observation.sequence = 2;
+        observation.cumulative_failures = 1;
+        observation.cumulative_no_response = 1;
+        observation.no_response_generation = 7;
+        publisher.publish(observation);
+        // Replace the queued observation; cumulative evidence survives.
+        observation.sequence = 3;
+        publisher.publish(observation);
+        routes.refresh_health(now_ns());
+        assert_eq!(routes.reset_pending, [Some(7), None]);
+        assert!(matches!(cancel_rx.try_recv().unwrap(),
+            PolyConnectionCommand::RefreshTransport { expected_generation: 7, .. }));
+        assert_eq!(routes.health.as_ref().unwrap().no_response_resets(), 1);
+        assert_eq!(routes.health.as_ref().unwrap().current().available_place_slots, 0);
+        assert!(matches!(fast_rx.try_recv().unwrap(),
+            PolyConnectionCommand::RefreshTransport { expected_generation: 6, .. }));
+        routes.refresh_health(now_ns());
+        assert_eq!(routes.reset_pending, [None, None]);
+        assert!(matches!(fast_rx.try_recv().unwrap(),
+            PolyConnectionCommand::RefreshTransport { expected_generation: 7, .. }));
+        observation.sequence = 4;
+        publisher.publish(observation);
+        routes.refresh_health(now_ns());
+        assert!(fast_rx.is_empty() && cancel_rx.is_empty());
+        assert_eq!(routes.health.as_ref().unwrap().no_response_resets(), 1);
     }
 
     #[test]
@@ -19110,6 +19181,7 @@ mod market_router_tests {
                 sequence: 1, observed_at_ns: now,
                 health: PermitHealthSnapshot { pool_generation: 7, quarantined: false },
                 business: None, busy: false, cumulative_failures: 0, cumulative_slow: 0,
+                cumulative_no_response: 0, no_response_generation: 0,
             }, now);
         }
         let mut routes = PolyAccountConnectionRoutes {

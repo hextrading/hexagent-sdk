@@ -49,6 +49,8 @@ pub(crate) struct LaneObservation {
     pub busy: bool,
     pub cumulative_failures: u64,
     pub cumulative_slow: u64,
+    pub cumulative_no_response: u64,
+    pub no_response_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -62,6 +64,7 @@ struct LaneState {
     business_attempt: u64,
     cumulative_failures: u64,
     cumulative_slow: u64,
+    cumulative_no_response: u64,
     retired_generation: Option<u64>,
     verified: bool,
     delivery_fault: bool,
@@ -118,6 +121,8 @@ pub(crate) struct AccountExecutionAdmission {
     failure_window: u64,
     failure_window_started_ns: u64,
     failure_window_lanes: usize,
+    transport_reset_pending: bool,
+    no_response_resets: u64,
 }
 
 impl AccountExecutionAdmission {
@@ -150,11 +155,13 @@ impl AccountExecutionAdmission {
             failure_window: 0,
             failure_window_started_ns: 0,
             failure_window_lanes: 0,
+            transport_reset_pending: false,
+            no_response_resets: 0,
         }
     }
 
-    /// Called only by this account's dispatcher after an explicit private
-    /// transport reset message. Old generation heartbeats/business ACKs must
+    /// Called on this account's router after a private reset or an attempted
+    /// order-endpoint request without a complete HTTP response. Old ACKs must
     /// not heal these lanes; new prewarmed generations enter normal recovery.
     pub(crate) fn retire_transport_generations(&mut self, now_ns: u64) {
         for lane in self.fast.iter_mut().chain(self.cancel.iter_mut()) {
@@ -163,7 +170,20 @@ impl AccountExecutionAdmission {
         }
         self.probe = None;
         self.recovery_successes = 0;
+        self.transport_reset_pending = true;
         self.pause_for_recovery(now_ns);
+    }
+
+    pub(crate) fn no_response_resets(&self) -> u64 {
+        self.no_response_resets
+    }
+
+    pub(crate) fn take_transport_reset(&mut self) -> bool {
+        std::mem::take(&mut self.transport_reset_pending)
+    }
+
+    pub(crate) fn retired_generation(&self, role: Role, slot: usize) -> Option<u64> {
+        self.lane(role, slot).and_then(|lane| lane.retired_generation)
     }
 
     pub(crate) fn current(&self) -> ExecutionAdmission {
@@ -201,10 +221,16 @@ impl AccountExecutionAdmission {
             || observation.observed_at_ns < previous.observed_at_ns
             || observation.cumulative_failures < previous.cumulative_failures
             || observation.cumulative_slow < previous.cumulative_slow
+            || observation.cumulative_no_response < previous.cumulative_no_response
+            || observation.cumulative_no_response > observation.cumulative_failures
+            || (observation.cumulative_no_response > 0
+                && observation.no_response_generation > observation.health.pool_generation)
         {
             return self.mark_delivery_fault(role, slot, now_ns);
         }
 
+        let transport_reset = observation.cumulative_no_response > previous.cumulative_no_response
+            && previous.retired_generation.is_none_or(|retired| observation.no_response_generation > retired);
         let slow = observation.cumulative_slow > previous.cumulative_slow;
         let business = observation.business.filter(|outcome| {
             outcome.attempt_id > previous.business_attempt
@@ -238,6 +264,7 @@ impl AccountExecutionAdmission {
         lane.quarantined = observation.health.quarantined;
         lane.cumulative_failures = observation.cumulative_failures;
         lane.cumulative_slow = observation.cumulative_slow;
+        lane.cumulative_no_response = observation.cumulative_no_response;
         lane.delivery_fault = false;
         if let Some(outcome) = observation.business {
             lane.business_attempt = lane.business_attempt.max(outcome.attempt_id);
@@ -282,6 +309,14 @@ impl AccountExecutionAdmission {
             lane.verified = true;
         }
 
+        if transport_reset {
+            self.no_response_resets = self.no_response_resets.saturating_add(1);
+            // Retire the other idle sockets now: they may share the reset peer.
+            // This account-local control action neither reclassifies unknown
+            // orders nor releases strategy reservations. Late failures from a
+            // generation already retired by this incident cannot reset again.
+            self.retire_transport_generations(now_ns);
+        }
         if failure {
             self.note_failure(role, slot, now_ns);
         }
@@ -566,6 +601,8 @@ mod tests {
                 busy: false,
                 cumulative_failures: 0,
                 cumulative_slow: 0,
+                cumulative_no_response: 0,
+                no_response_generation: 0,
             };
             let mut harness = Self {
                 state: AccountExecutionAdmission::new(fast, cancel, now),
@@ -729,6 +766,82 @@ mod tests {
         account.state.retire_transport_generations(account.now);
         account.emit(Role::Fast, 0, |_| {});
         assert!(!account.state.lane_place_allowed(0, account.now));
+    }
+
+    #[test]
+    fn no_response_retires_idle_siblings_and_stale_failures_do_not_retire_replacements() {
+        let mut account = Harness::healthy(4, 2);
+        let mut sibling = Harness::healthy(4, 2);
+        account.emit(Role::Fast, 0, |observation| {
+            observation.cumulative_failures += 1;
+            observation.cumulative_no_response += 1;
+            observation.no_response_generation = 1;
+        });
+        assert!(account.state.take_transport_reset());
+        assert!(!account.state.take_transport_reset());
+        for slot in 0..4 {
+            assert!(!account.state.lane_place_allowed(slot, account.now));
+        }
+        assert!(sibling.state.can_place(sibling.now));
+        // A valid old-generation ACK and passing the recovery delay are not
+        // replacement evidence, even on a socket that never failed itself.
+        account.now = account.state.pause_until_ns + 1;
+        account.outcome(Role::Fast, 2, BusinessHttpOutcome::Healthy);
+        assert!(!account.state.lane_place_allowed(2, account.now));
+        account.emit(Role::Cancel, 0, |o| o.health.pool_generation = 2);
+        account.emit(Role::Fast, 0, |o| o.health.pool_generation = 2);
+        assert!(account.state.lane_place_allowed(0, account.now));
+        // A request already in flight at the incident returns late. Its
+        // failure must not invalidate an unrelated socket already replaced.
+        account.emit(Role::Fast, 3, |o| {
+            o.cumulative_failures += 1;
+            o.cumulative_no_response += 1;
+            o.no_response_generation = 1;
+        });
+        assert!(!account.state.take_transport_reset());
+        assert_eq!(account.state.retired_generation(Role::Fast, 0), Some(1));
+        // Replaying the full latest snapshot is idempotent.
+        account.emit(Role::Fast, 3, |_| {});
+        assert!(!account.state.take_transport_reset());
+        // A new incident on a replacement does fence that generation.
+        account.emit(Role::Fast, 0, |o| {
+            o.cumulative_failures += 1;
+            o.cumulative_no_response += 1;
+            o.no_response_generation = 2;
+        });
+        assert!(account.state.take_transport_reset());
+        assert_eq!(account.state.retired_generation(Role::Fast, 0), Some(2));
+        assert!(!account.state.lane_place_allowed(0, account.now));
+    }
+
+    #[test]
+    fn coalesced_no_response_survives_success_and_early_replacement() {
+        let mut account = Harness::healthy(4, 2);
+        account.attempt += 1;
+        let attempt = account.attempt;
+        account.emit(Role::Cancel, 0, |o| {
+            o.cumulative_failures += 1;
+            o.cumulative_no_response += 1;
+            o.no_response_generation = 1;
+            o.health.pool_generation = 2;
+            o.business = Some(BusinessHttpOutcomeSnapshot {
+                attempt_id: attempt, pool_generation: 2, elapsed_ns: 20_000_000,
+                outcome: BusinessHttpOutcome::Healthy, status_code: 200,
+            });
+        });
+        assert!(account.state.take_transport_reset());
+        for slot in 0..4 {
+            assert!(!account.state.lane_place_allowed(slot, account.now));
+        }
+    }
+
+    #[test]
+    fn http_status_failure_and_slow_success_do_not_request_account_reset() {
+        let mut account = Harness::healthy(4, 2);
+        account.outcome(Role::Fast, 0, BusinessHttpOutcome::Failure);
+        account.outcome(Role::Fast, 1, BusinessHttpOutcome::Slow);
+        assert!(!account.state.take_transport_reset());
+        assert_eq!(account.state.retired_generation(Role::Fast, 2), None);
     }
 
     #[test]
