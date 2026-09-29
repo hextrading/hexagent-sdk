@@ -5,7 +5,9 @@
 
 mod http_phase_audit;
 mod publication_observation;
+mod recovery_diagnostics;
 use http_phase_audit::{HttpPhaseAudit, HttpPhaseContext, HttpPhaseRecord};
+use recovery_diagnostics::{cancel_detail, RecoveryRound};
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -7897,6 +7899,7 @@ impl PolymarketTrade {
         evidence: &str,
         audit_history: impl FnOnce(&str, u64) -> HistoricalOrderTradeAudit,
     ) -> Option<OrderUpdate> {
+        let round = RecoveryRound::new(ownership, order_id);
         // A no-fill history cannot override already observed matched quantity
         // or a durable associated trade. Those need exact trade-id recovery.
         if ownership.filled_quantity != 0.0
@@ -7908,14 +7911,22 @@ impl PolymarketTrade {
             || ownership.quantity <= 0.0
             || ownership.order_id != order_id
         {
+            round.event("history_admission", "nonzero_or_invalid_ownership", None,
+                &format!("filled={} terminal_matched={:?} trade_ids={} quantity={} exact_oid={} evidence={}",
+                    ownership.filled_quantity, ownership.terminal_matched_quantity,
+                    ownership.terminal_trade_ids.len(), ownership.quantity, ownership.order_id == order_id, evidence));
             return None;
         }
-        let submitted_at_ms = coid_wall_clock_ms(&ownership.client_order_id)?;
+        let Some(submitted_at_ms) = coid_wall_clock_ms(&ownership.client_order_id) else {
+            round.event("history_admission", "invalid_submission_stamp", None, evidence);
+            return None;
+        };
         let history = audit_history(order_id, submitted_at_ms);
         let failed_count = match &history {
             HistoricalOrderTradeAudit::CompleteFailed { trade_ids, .. } => {
                 if !self.shared.account_state.recovery_failed_history_reconciled(ownership, trade_ids) {
                     warn!("[PolymarketTrade] failed-only historical audit is not locally reconciled coid={}; retaining reservation", ownership.client_order_id);
+                    round.event("history_audit", "failed_trades_unreconciled", None, evidence);
                     return None;
                 }
                 trade_ids.len()
@@ -7934,8 +7945,12 @@ impl PolymarketTrade {
                 // potentially lagging cold mirror after historical I/O.
                 match self.shared.account_state.apply_zero_fill_recovery(ownership) {
                     Ok(crate::account::shared_account::FillAuditPendingTransition::Resolved) => {}
-                    Ok(_) => return None,
+                    Ok(result) => {
+                        round.event("owner_commit", "not_resolved", None, &format!("{result:?}"));
+                        return None;
+                    }
                     Err(error) => {
+                        round.event("owner_commit", "superseded", None, &error);
                         info!("[PolymarketTrade] no-fill recovery superseded coid={} reason={}; retaining current owner state",
                             ownership.client_order_id, error);
                         return None;
@@ -10975,22 +10990,31 @@ impl PolymarketTrade {
         ownership: &OrderOwnership,
         order_id: &str,
     ) -> FetchOrderResult {
+        let round = RecoveryRound::new(ownership, order_id);
         let transport = self.shared.recovery_http.get().expect("startup-bound recovery transport");
         let path = format!("/data/order/{order_id}");
         let primary = transport.request(&self.shared, &ownership.instance_id,
             "GET", &path, "", None, None);
         let primary_result = self.classify_order_lookup_reply(
             &ownership.client_order_id, order_id, primary.reply);
+        round.lookup("lookup_primary", &primary_result, primary.location);
         if matches!(primary_result, FetchOrderResult::Found(_)) { return primary_result; }
         let Some(primary_location @ (crate::http1_pool::Role::Reconcile, primary_slot)) = primary.location
             else { return primary_result; };
         let secondary = transport.request(&self.shared, &ownership.instance_id,
             "GET", &path, "", None, Some(primary_slot));
         let Some(secondary_location @ (crate::http1_pool::Role::Reconcile, secondary_slot)) = secondary.location
-            else { return primary_result; };
-        if secondary_slot == primary_slot { return primary_result; }
+            else {
+                round.event("lookup_secondary", "owner_unavailable", secondary.location, &format!("{:?}", secondary.reply.as_ref().err()));
+                return primary_result;
+            };
+        if secondary_slot == primary_slot {
+            round.event("lookup_secondary", "same_slot", secondary.location, "independent owner required");
+            return primary_result;
+        }
         let secondary_result = self.classify_order_lookup_reply(
             &ownership.client_order_id, order_id, secondary.reply);
+        round.lookup("lookup_secondary", &secondary_result, secondary.location);
         combine_parallel_order_lookups(primary_result, secondary_result, primary_location, secondary_location)
     }
 
@@ -11007,26 +11031,37 @@ impl PolymarketTrade {
             || ownership.order_id != order_id
             || ownership.instance_id.is_empty()
         {
+            RecoveryRound::new(ownership, order_id).event("cancel_admission", "ineligible", None,
+                &format!("status={:?} exact_oid={} instance_present={}", ownership.status, ownership.order_id == order_id, !ownership.instance_id.is_empty()));
             return None;
         }
         self.cancel_order_via_owners(ownership, order_id)
     }
 
     fn cancel_order_via_owners(&self, ownership: &OrderOwnership, order_id: &str) -> Option<OrderUpdate> {
+        let round = RecoveryRound::new(ownership, order_id);
         if ownership.instance_id.is_empty() || ownership.order_id != order_id
             || matches!(ownership.status, OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected) {
+            round.event("cancel_admission", "ineligible", None, &format!("status={:?}", ownership.status));
             return None;
         }
-        let transport = self.shared.recovery_http.get()?;
-        let identity = self
-            .shared
-            .reconcile_order_identity(&ownership.client_order_id, order_id)
-            .ok()?;
+        let Some(transport) = self.shared.recovery_http.get() else {
+            round.event("cancel_admission", "transport_unbound", None, "");
+            return None;
+        };
+        let identity = match self.shared.reconcile_order_identity(&ownership.client_order_id, order_id) {
+            Ok(identity) => identity,
+            Err(reason) => {
+                round.event("cancel_admission", "identity_unavailable", None, reason);
+                return None;
+            }
+        };
         if identity.instance_id != ownership.instance_id
             || identity.symbol != ownership.token_id
             || identity.side != ownership.side
             || identity.order_slot != ownership.order_slot
         {
+            round.event("cancel_admission", "identity_mismatch", None, "iid/token/side/slot mismatch");
             return None;
         }
         let body = serde_json::json!({"orderID": order_id}).to_string();
@@ -11043,22 +11078,32 @@ impl PolymarketTrade {
             response.location,
             Some((crate::http1_pool::Role::Cancel, _))
         ) {
+            round.event("cancel_reply", "owner_unavailable", response.location, &format!("{:?}", response.reply.as_ref().err()));
             return None;
         }
-        let response = response.reply.ok()?;
+        let location = response.location;
+        let response = match response.reply {
+            Ok(response) => response,
+            Err(error) => {
+                round.event("cancel_reply", "http_error", location, &error.to_string());
+                return None;
+            }
+        };
         if !exact_cancel_acknowledged(&response, order_id) {
+            round.event("cancel_reply", "exact_ack_missing", location, &cancel_detail(&response, order_id));
             return None;
         }
+        round.event("cancel_reply", "exact_ack", location, &cancel_detail(&response, order_id));
         let market = self
             .shared
             .account_state
             .recovery_market_for_token(&ownership.token_id);
-        self.recover_cancelled_order_after_trade_audit_with(
+        let update = self.recover_cancelled_order_after_trade_audit_with(
             ownership,
             order_id,
             "exact_order_cancel_acknowledged",
             |oid, stamp| {
-                fetch_historical_order_trade_audit_in_market(
+                let history = fetch_historical_order_trade_audit_in_market(
                     oid,
                     stamp,
                     market.as_deref(),
@@ -11073,13 +11118,20 @@ impl PolymarketTrade {
                             None,
                         );
                         if !matches!(page.location, Some((crate::http1_pool::Role::Reconcile, _))) {
+                            round.event("history_page", "owner_unavailable", page.location, "");
                             return Err("history reply lacks Reconcile owner identity".to_string());
                         }
+                        round.event("history_page", if page.reply.is_ok() { "received" } else { "http_error" }, page.location,
+                            &format!("{:?}", page.reply.as_ref().err()));
                         page.reply.map_err(|error| error.to_string())
                     },
-                )
+                );
+                round.event("history_audit", "completed", None, &format!("{history:?}"));
+                history
             },
-        )
+        );
+        round.event("complete", if update.is_some() { "resolved" } else { "reservation_retained" }, None, "");
+        update
     }
 
     /// Reconcile an ambiguous synthetic probe without touching strategy order
