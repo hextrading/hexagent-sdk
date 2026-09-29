@@ -258,7 +258,7 @@ fn restored_one_ulp_execution_replay_preserves_frozen_economics_and_clears_false
     let original =
         FrozenTradeExecution::new(0.98, 20.0, 19.6, Side::Sell, false, basis(0.07)).unwrap();
     {
-        let account = SharedAccount::new_persistent(ACCOUNT, &path).unwrap();
+        let account = SharedAccount::new(ACCOUNT);
         setup(&account, Side::Sell, 20.0, 0.98);
         for status in ["MATCHED", "CONFIRMED"] {
             assert!(!matches!(
@@ -266,7 +266,20 @@ fn restored_one_ulp_execution_replay_preserves_frozen_economics_and_clears_false
                 TradeTransitionResult::Rejected
             ));
         }
-        account.flush_persistence(Duration::from_secs(2)).unwrap();
+        // Explicit legacy checkpoint: precise parsing no longer introduces
+        // the historical one-ULP price loss during an ordinary round trip.
+        let mut state = account.lock_state().clone();
+        state.trades.get_mut("trade").unwrap().ownership.price = 0.98;
+        write_persisted_account(
+            &path,
+            &PersistedAccount {
+                version: 1,
+                account_id: ACCOUNT.into(),
+                persistence_generation: 0,
+                state,
+            },
+        )
+        .unwrap();
     }
     {
         let account = SharedAccount::new_persistent(ACCOUNT, &path).unwrap();
@@ -438,10 +451,13 @@ fn restored_execution_exception_cannot_admit_new_or_changed_economics_or_foreign
         apply(&account, "MATCHED", Side::Sell, 20.0, original),
         TradeTransitionResult::Rejected
     ));
-    // Same serialization boundary as a retained row restored from JSON.
+    // Explicitly model the already persisted legacy price; precise parsing
+    // must not be required to reproduce the old parser's rounding defect.
     {
         let mut state = account.lock_state();
-        let raw = serde_json::to_string(&state.trades["trade"]).unwrap();
+        let mut legacy = state.trades["trade"].clone();
+        legacy.ownership.price = 0.98;
+        let raw = serde_json::to_string(&legacy).unwrap();
         state
             .trades
             .insert("trade".into(), serde_json::from_str(&raw).unwrap());

@@ -8,7 +8,9 @@ description = "hexagent-sdk: strategy-facing account bookkeeping — order manag
 hexagent-types = { path = "../hexagent-types" }
 hexagent-runtime = { path = "../hexagent-runtime" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Durable proofs compare immutable numbers across archive/checkpoint/WAL replay.
+# The default fast float parser can move an emitted binary64 value by one ULP.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 fs2 = "0.4"
 log = "0.4"
 arc-swap = "1"

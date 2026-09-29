@@ -394,16 +394,29 @@ fn store_row<T: Serialize>(
     value: &T,
 ) -> Result<(), String> {
     let payload = serde_json::to_vec(value).map_err(|e| e.to_string())?;
-    let previous: Option<Vec<u8>> = connection
+    let previous: Option<(Vec<u8>, String)> = connection
         .query_row(
-            "SELECT payload FROM proof WHERE kind=?1 AND key=?2",
+            "SELECT payload,checksum FROM proof WHERE kind=?1 AND key=?2",
             params![kind, key],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    if let Some(previous) = previous {
+    if let Some((previous, checksum)) = previous {
+        if format!("{:016x}", persistence_checksum(&previous)) != checksum {
+            return Err("history archive proof checksum mismatch".into());
+        }
         if previous != payload {
+            // Older releases rehydrated this redundant normalized price with
+            // the lossy JSON float parser. Retain the original disk proof;
+            // accept only the narrowly authenticated legacy replay below.
+            if kind == 1 {
+                let old = serde_json::from_slice(&previous).map_err(|e| e.to_string())?;
+                let new = serde_json::from_slice(&payload).map_err(|e| e.to_string())?;
+                if legacy_replayed_trade_price(&new, &old) {
+                    return Ok(());
+                }
+            }
             return Err(format!(
                 "history archive immutable proof changed kind={kind} key={key}"
             ));
@@ -418,6 +431,42 @@ fn store_row<T: Serialize>(
         )
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Compatibility for already persisted pre-float_roundtrip rehydration.
+/// Only a taker's redundant ownership price may differ by one ULP. Independently
+/// persisted execution economics, every identity/quantity/lifecycle field and
+/// the immutable archive's exact notional must agree. This is not a general
+/// approximate proof comparison and never overwrites the authoritative row.
+fn legacy_replayed_trade_price(
+    current: &RetiredTradeOwnershipTombstone,
+    archived: &RetiredTradeOwnershipTombstone,
+) -> bool {
+    let Some(pricing) = archived.execution_pricing.as_ref() else {
+        return false;
+    };
+    let original = archived.ownership.price;
+    let replayed = current.ownership.price;
+    if archived.is_maker != Some(false)
+        || !original.is_finite()
+        || !replayed.is_finite()
+        || original <= 0.0
+        || original > 1.0
+        || replayed <= 0.0
+        || replayed > 1.0
+        || original.to_bits().abs_diff(replayed.to_bits()) != 1
+        || !archived.ownership.quantity.is_finite()
+        || archived.ownership.quantity <= 0.0
+        || !pricing.raw_price.is_finite()
+        || pricing.raw_price <= 0.0
+        || pricing.raw_price > 1.0
+        || pricing.gross_notional != original * archived.ownership.quantity
+    {
+        return false;
+    }
+    let mut canonical = current.clone();
+    canonical.ownership.price = original;
+    canonical == *archived
 }
 
 fn zero_settled_token(state: &SharedAccountState, token: &str) -> bool {
@@ -712,7 +761,7 @@ impl SharedAccount {
             if let Some(current) = state.retired_trade_ownership_tombstones.get(key) {
                 let mut current = current.clone();
                 current.retired_at_ms = row.retired_at_ms;
-                if current != *row {
+                if current != *row && !legacy_replayed_trade_price(&current, row) {
                     return Err(format!("archived trade conflicts with hot proof: {key}"));
                 }
             }
@@ -1080,6 +1129,225 @@ mod tests {
         s.oid_to_coid.clear();
         s.unresolved_trade_match_times.insert("old-trade".into(), 1);
         assert!(candidates(&s, now, 128).is_empty());
+    }
+    #[test]
+    fn archive_float_roundtrip_and_legacy_rehydration_preserve_authoritative_proof() {
+        let fixture = Fixture::new();
+        let archive = HistoryArchive::open(&fixture.0, "account", 0).unwrap();
+        let key = "8739da9e-2f88-4c71-bb5c-a5cf4ca7f286";
+        let mut original = proof(key, 1);
+        original.ownership.price = 0.040000000000000036;
+        original.ownership.quantity = 15.0;
+        original.ownership.side = Side::Sell;
+        original.is_maker = Some(false);
+        original.authenticated_terminal_noop = false;
+        original.execution_pricing = Some(TradeExecutionPricing {
+            raw_price: 0.04,
+            gross_notional: 0.6000000000000005,
+        });
+        let rows = ArchiveRows {
+            trades: vec![(key.into(), original.clone())],
+            orders: vec![],
+        };
+        archive.store(&rows).unwrap();
+        for now in [99, 100, 1000] {
+            let restored = archive.load(1, key, now).unwrap();
+            assert_eq!(
+                restored.trades[0].1.ownership.price.to_bits(),
+                original.ownership.price.to_bits()
+            );
+            archive.store(&restored).unwrap();
+        }
+        // Exact old maker02 WAL value, already persisted before upgrading.
+        let mut legacy = original.clone();
+        legacy.ownership.price = 0.04000000000000003;
+        assert!(legacy_replayed_trade_price(&legacy, &original));
+        archive
+            .store(&ArchiveRows {
+                trades: vec![(key.into(), legacy.clone())],
+                orders: vec![],
+            })
+            .unwrap();
+        assert_eq!(
+            archive.load(1, key, 101).unwrap().trades[0]
+                .1
+                .ownership
+                .price
+                .to_bits(),
+            original.ownership.price.to_bits()
+        );
+        // Independent economics, identity and quantity remain strict, even
+        // when a change is far smaller than ordinary venue tick tolerances.
+        for variant in 0..9 {
+            let mut bad = legacy.clone();
+            match variant {
+                0 => bad.ownership.quantity = f64::from_bits(15.0f64.to_bits() + 1),
+                1 => bad.ownership.instance_id = "foreign".into(),
+                2 => bad.execution_pricing.as_mut().unwrap().raw_price = 0.05,
+                3 => bad.execution_pricing = None,
+                4 => bad.ownership.price = f64::from_bits(original.ownership.price.to_bits() - 2),
+                5 => bad.ownership.status = "MATCHED".into(),
+                6 => bad.execution_pricing.as_mut().unwrap().gross_notional = 0.6,
+                7 => bad.is_maker = Some(true),
+                _ => bad.ownership.account_id = "foreign-account".into(),
+            }
+            assert!(archive
+                .store(&ArchiveRows {
+                    trades: vec![(key.into(), bad)],
+                    orders: vec![]
+                })
+                .is_err());
+        }
+        drop(archive);
+        let reopened = HistoryArchive::open(&fixture.0, "account", 0).unwrap();
+        let restored = reopened.load(1, key, 102).unwrap();
+        assert_eq!(
+            restored.trades[0].1.ownership.price.to_bits(),
+            original.ownership.price.to_bits()
+        );
+        reopened.store(&restored).unwrap();
+    }
+
+    #[test]
+    fn legacy_float_checkpoint_heals_on_retirement_or_replay_without_rebooking() {
+        for expired in [false, true] {
+            let fixture = Fixture::new();
+            let now = wall_clock_ms();
+            let mut original = proof("old-trade", now);
+            original.ownership.side = Side::Sell;
+            original.ownership.quantity = 15.0;
+            original.ownership.price = 0.040000000000000036;
+            original.is_maker = Some(false);
+            original.authenticated_terminal_noop = false;
+            original.execution_pricing = Some(TradeExecutionPricing {
+                raw_price: 0.04,
+                gross_notional: 0.6000000000000005,
+            });
+            let archive = HistoryArchive::open(&fixture.0, "account", 0).unwrap();
+            let generation = archive
+                .store(&ArchiveRows {
+                    trades: vec![("old-trade".into(), original.clone())],
+                    orders: vec![],
+                })
+                .unwrap();
+            drop(archive);
+            let mut legacy = original.clone();
+            legacy.ownership.price = 0.04000000000000003;
+            if expired {
+                legacy.retired_at_ms = now - HOT_RETENTION_MS;
+            }
+            let mut initial = state(now);
+            initial.retired_trade_ownership_tombstones.clear();
+            initial
+                .retired_trade_ownership_tombstones
+                .insert("old-trade".into(), legacy);
+            initial.history_archive_generation = generation;
+            write_persisted_account(
+                &fixture.0,
+                &PersistedAccount {
+                    version: 1,
+                    account_id: "account".into(),
+                    persistence_generation: 0,
+                    state: initial,
+                },
+            )
+            .unwrap();
+            let account = SharedAccount::new_persistent("account", &fixture.0).unwrap();
+            assert_eq!(account.trade_ownership("old-trade").is_none(), expired);
+            let before = account.monitoring_snapshot();
+            assert_eq!(
+                account
+                    .hydrate_archived_private_event(true, "old-trade")
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                account
+                    .trade_ownership("old-trade")
+                    .unwrap()
+                    .price
+                    .to_bits(),
+                original.ownership.price.to_bits()
+            );
+            for status in ["MATCHED", "CONFIRMED", "CONFIRMED"] {
+                assert!(matches!(
+                    account.apply_trade_transition_with_context(
+                        "old-trade",
+                        status,
+                        "",
+                        "old-oid",
+                        "TOKEN",
+                        Side::Sell,
+                        15.0,
+                        0.04,
+                        false,
+                        1,
+                    ),
+                    TradeTransitionResult::OwnedNoop(_)
+                ));
+            }
+            let after = account.monitoring_snapshot();
+            assert_eq!(after.physical_cash, before.physical_cash);
+            assert_eq!(after.virtual_cash, before.virtual_cash);
+            assert_eq!(after.physical_positions, before.physical_positions);
+            assert_eq!(after.virtual_positions, before.virtual_positions);
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+            drop(account);
+            let reopened = SharedAccount::new_persistent("account", &fixture.0).unwrap();
+            assert_eq!(
+                reopened
+                    .trade_ownership("old-trade")
+                    .unwrap()
+                    .price
+                    .to_bits(),
+                original.ownership.price.to_bits()
+            );
+            assert_eq!(
+                reopened.monitoring_snapshot().physical_cash,
+                before.physical_cash
+            );
+        }
+    }
+
+    #[test]
+    fn archive_corrupt_checksum_or_conflicting_batch_never_commits() {
+        let fixture = Fixture::new();
+        let archive = HistoryArchive::open(&fixture.0, "account", 0).unwrap();
+        let original = proof("old-trade", 1);
+        let rows = ArchiveRows {
+            trades: vec![("old-trade".into(), original.clone())],
+            orders: vec![],
+        };
+        let generation = archive.store(&rows).unwrap();
+        let mut bad = original;
+        bad.ownership.quantity = 3.0;
+        assert!(archive
+            .store(&ArchiveRows {
+                trades: vec![
+                    ("new-trade".into(), proof("new-trade", 1)),
+                    ("old-trade".into(), bad)
+                ],
+                orders: vec![],
+            })
+            .is_err());
+        let connection = archive.connection(true).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM proof", [], |r| r.get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(archive.generation.load(Ordering::SeqCst), generation);
+        // Matching bytes are not enough: duplicate writes must validate the
+        // immutable checksum too, and must never silently repair corruption.
+        connection
+            .execute("UPDATE proof SET checksum='0000000000000000'", [])
+            .unwrap();
+        assert!(archive
+            .store(&rows)
+            .unwrap_err()
+            .contains("checksum mismatch"));
+        assert_eq!(archive.generation.load(Ordering::SeqCst), generation);
     }
     #[test]
     fn archive_commit_is_idempotent_and_conflicts_do_not_overwrite_proof() {
