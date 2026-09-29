@@ -47,7 +47,7 @@ async fn failed_probes_stay_quarantined_until_complete_warm_response(instrumente
     let repair_url = url.clone();
     let repair = tokio::spawn(async move {
         if instrumented {
-            health.repair_instrumented(repair_url, 1).await;
+            health.repair_instrumented(repair_url, 1, None).await;
         } else {
             health.rebuild_and_prewarm(repair_url, 1).await;
         }
@@ -113,7 +113,7 @@ async fn failed_probes_stay_quarantined_until_complete_warm_response(instrumente
     let current = warmed.health(warmed.generation());
     assert!(current.claim_rebuild(1, Duration::ZERO).is_some());
     if instrumented {
-        stale_health.repair_instrumented(url, 1).await;
+        stale_health.repair_instrumented(url, 1, None).await;
     } else {
         stale_health.rebuild_and_prewarm(url, 1).await;
     }

@@ -11,7 +11,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper::{Request, StatusCode, Uri};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::connect::dns::{GaiAddrs, GaiResolver, Name};
+use hyper_util::client::legacy::connect::dns::{GaiResolver, Name};
 use hyper_util::client::legacy::connect::{HttpConnector, HttpInfo};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
@@ -95,10 +95,30 @@ impl ConnectTrace {
 struct TimedResolver {
     inner: GaiResolver,
     trace: Arc<ConnectTrace>,
+    avoid_peer: Option<IpAddr>,
+    #[cfg(test)]
+    fixed_answers: Option<Vec<SocketAddr>>,
+}
+
+// Connection construction only, outside steady-state request dispatch. Use
+// current DNS answers; never pin a venue IP or change Host/SNI/TLS validation.
+// When DNS offers an alternative, do not fall back to the known failed peer
+// during this repair. A sole address remains retryable under repair backoff.
+fn repair_addresses(
+    addresses: impl Iterator<Item = SocketAddr>,
+    avoid_peer: Option<IpAddr>,
+) -> std::vec::IntoIter<SocketAddr> {
+    let mut addresses: Vec<_> = addresses.collect();
+    if let Some(avoid) = avoid_peer {
+        if addresses.iter().any(|address| address.ip() != avoid) {
+            addresses.retain(|address| address.ip() != avoid);
+        }
+    }
+    addresses.into_iter()
 }
 
 impl Service<Name> for TimedResolver {
-    type Response = GaiAddrs;
+    type Response = std::vec::IntoIter<SocketAddr>;
     type Error = std::io::Error;
     type Future = BoxFuture<Self::Response, Self::Error>;
 
@@ -107,8 +127,14 @@ impl Service<Name> for TimedResolver {
     }
 
     fn call(&mut self, name: Name) -> Self::Future {
+        #[cfg(test)]
+        if let Some(answers) = self.fixed_answers.clone() {
+            let avoid = self.avoid_peer;
+            return Box::pin(async move { Ok(repair_addresses(answers.into_iter(), avoid)) });
+        }
         let mut inner = self.inner.clone();
         let trace = Arc::clone(&self.trace);
+        let avoid_peer = self.avoid_peer;
         Box::pin(async move {
             trace.phase.store(PHASE_DNS, Ordering::Release);
             let started = Instant::now();
@@ -117,7 +143,7 @@ impl Service<Name> for TimedResolver {
                 .dns_ns
                 .store(duration_ns(started.elapsed()), Ordering::Release);
             trace.phase.store(PHASE_TCP, Ordering::Release);
-            result
+            result.map(|addresses| repair_addresses(addresses, avoid_peer))
         })
     }
 }
@@ -333,11 +359,28 @@ fn http_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 
 impl InstrumentedHttp1Client {
     pub fn new(connect_timeout: Duration) -> anyhow::Result<Self> {
+        Self::new_avoiding_peer(connect_timeout, None)
+    }
+
+    /// Cold repair preference, scoped to this client and its future reconnects.
+    pub(crate) fn new_avoiding_peer(
+        connect_timeout: Duration,
+        avoid_peer: Option<IpAddr>,
+    ) -> anyhow::Result<Self> {
         let trace = Arc::new(ConnectTrace::default());
         let resolver = TimedResolver {
             inner: GaiResolver::new(),
             trace: Arc::clone(&trace),
+            avoid_peer,
+            #[cfg(test)]
+            fixed_answers: None,
         };
+        Self::with_resolver(connect_timeout, trace, resolver)
+    }
+
+    fn with_resolver(
+        connect_timeout: Duration, trace: Arc<ConnectTrace>, resolver: TimedResolver,
+    ) -> anyhow::Result<Self> {
         let mut http = HttpConnector::new_with_resolver(resolver);
         http.enforce_http(false);
         http.set_connect_timeout(Some(connect_timeout));
@@ -602,6 +645,82 @@ fn duration_ns(duration: Duration) -> u64 {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn repair_dns_excludes_failed_peer_only_when_an_alternative_exists() {
+        let a: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let b: SocketAddr = "192.0.2.2:443".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        assert_eq!(repair_addresses([a, b, a, v6].into_iter(), Some(a.ip())).collect::<Vec<_>>(), [b, v6]);
+        assert_eq!(repair_addresses([a, b].into_iter(), None).collect::<Vec<_>>(), [a, b]);
+        assert_eq!(repair_addresses([a].into_iter(), Some(a.ip())).collect::<Vec<_>>(), [a]);
+        assert_eq!(repair_addresses([v6, b].into_iter(), Some(v6.ip())).collect::<Vec<_>>(), [b]);
+        assert_eq!(repair_addresses([].into_iter(), Some(a.ip())).count(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_client_time_success_does_not_hide_failed_peer_on_next_post() {
+        use tokio::net::TcpListener;
+        let bad = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad_addr = bad.local_addr().unwrap();
+        let good = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, bad_addr.port())).await.unwrap();
+        let good_addr = good.local_addr().unwrap();
+        async fn request(stream: &mut tokio::net::TcpStream) -> String {
+            let mut data = Vec::new();
+            loop {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await.unwrap();
+                data.push(byte[0]);
+                if data.ends_with(b"\r\n\r\n") { break; }
+                assert!(data.len() < 4096);
+            }
+            String::from_utf8(data).unwrap()
+        }
+        let bad_server = tokio::spawn(async move {
+            // Both the initial client and an ordinary fresh replacement choose
+            // this same DNS answer. /time works; the real route drops the socket.
+            for _ in 0..2 {
+                let (mut stream, _) = bad.accept().await.unwrap();
+                assert!(request(&mut stream).await.starts_with("GET /time "));
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").await.unwrap();
+                let post = request(&mut stream).await;
+                assert!(post.starts_with("POST /order "));
+                assert!(post.to_ascii_lowercase().contains("host: repair.test:"));
+                drop(stream);
+            }
+        });
+        let good_server = tokio::spawn(async move {
+            let (mut stream, _) = good.accept().await.unwrap();
+            for method in ["GET /time ", "POST /order "] {
+                assert!(request(&mut stream).await.starts_with(method));
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").await.unwrap();
+            }
+        });
+        for avoid in [None, None, Some(bad_addr.ip())] {
+            let trace = Arc::new(ConnectTrace::default());
+            let resolver = TimedResolver { inner: GaiResolver::new(), trace: Arc::clone(&trace),
+                avoid_peer: avoid, fixed_answers: Some(vec![bad_addr, good_addr]) };
+            let client = InstrumentedHttp1Client::with_resolver(Duration::from_secs(1), trace, resolver).unwrap();
+            let root = format!("http://repair.test:{}", bad_addr.port());
+            let warm = client.request(reqwest::Method::GET, &format!("{root}/time"),
+                reqwest::header::HeaderMap::new(), Bytes::new(), Duration::from_secs(2)).await.unwrap();
+            assert_eq!(warm.timings.connect_generation_after, 1);
+            let reply = client.request(reqwest::Method::POST, &format!("{root}/order"),
+                reqwest::header::HeaderMap::new(), Bytes::new(), Duration::from_secs(2)).await;
+            if avoid.is_some() {
+                let reply = reply.unwrap();
+                assert_eq!(reply.timings.peer, Some(good_addr));
+                assert!(!reply.timings.connect_attempted);
+            } else {
+                let error = reply.unwrap_err();
+                assert_eq!(error.timings.peer, Some(bad_addr));
+                assert_eq!(error.timings.io.read_bytes, 0);
+                assert!(error.timings.io.written_bytes > 0);
+            }
+        }
+        bad_server.await.unwrap();
+        good_server.await.unwrap();
+    }
 
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "release: HTTP/1 loopback completion, instrumented versus bare Hyper reference"]

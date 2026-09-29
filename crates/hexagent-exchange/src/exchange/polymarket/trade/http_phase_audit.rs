@@ -18,6 +18,7 @@ pub(super) struct HttpPhaseRecord {
     pub attempt_id: u64,
     pub role: crate::http1_pool::Role,
     pub slot: usize,
+    pub pool_generation: u64,
     pub request_started_ns: u64,
     pub response_received_ns: u64,
     pub completed_ns: u64,
@@ -82,6 +83,7 @@ impl HttpPhaseRecord {
             "attempt_id": self.attempt_id, "root_attempt_id": self.context.root_attempt_id,
             "leg": self.context.leg, "request_kind": self.context.kind,
             "role": format!("{:?}", self.role), "slot": self.slot,
+            "pool_generation": self.pool_generation,
             "request_started_ns": self.request_started_ns,
             "response_received_ns": self.response_received_ns,
             "completed_ns": self.completed_ns, "status_code": self.status, "outcome": self.outcome,
@@ -134,6 +136,7 @@ mod tests {
             attempt_id: id,
             role: crate::http1_pool::Role::Cancel,
             slot: leg as usize,
+            pool_generation: 7,
             request_started_ns: 10,
             response_received_ns: 20,
             completed_ns: 25,
@@ -164,6 +167,7 @@ mod tests {
             );
             let v = r.value("account-a");
             assert_eq!(v["account"], "account-a");
+            assert_eq!(v["pool_generation"], 7);
             assert_eq!(v["slot_wait_ns"], 3);
             assert_eq!(v["response_processing_ns"], 5);
         }
@@ -229,6 +233,7 @@ fn benchmark_http_phase_publish() {
                     attempt_id: i as u64,
                     role: crate::http1_pool::Role::Fast,
                     slot: 0,
+                    pool_generation: 7,
                     request_started_ns: 1,
                     response_received_ns: 2,
                     completed_ns: 3,
