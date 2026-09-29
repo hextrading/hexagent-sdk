@@ -38,6 +38,34 @@ fn record_source_age(stage: &'static str, server_ns: u64, receive_ns: u64) {
 }
 
 impl ClobLocalBooks {
+    /// Candidate seeding runs while the active lane keeps receiving quotes.
+    /// Do not roll a common condition's cursor back to the candidate's older
+    /// snapshot at handoff. This owner-local boundary copy preserves both
+    /// clocks; later out-of-order wire updates remain rejected by the cursor.
+    pub(super) fn inherit_newer_live_bbo(&mut self, previous: &Self) -> usize {
+        let (Some(next), Some(previous_live)) = (self.live_bbo.as_mut(), previous.live_bbo.as_ref()) else {
+            return 0;
+        };
+        let mut retained = 0;
+        for (condition, current) in next {
+            let Some(old) = previous_live.get(condition) else { continue };
+            if (old.exchange_timestamp_ns, old.local_timestamp_ns)
+                > (current.exchange_timestamp_ns, current.local_timestamp_ns)
+            {
+                *current = *old;
+                if let Some(health) = self.health_states.get_mut(condition) {
+                    *health = if old.bid > 0.0 && old.ask < 1.0 {
+                        MarketDataHealthState::Healthy
+                    } else {
+                        MarketDataHealthState::Degraded
+                    };
+                }
+                retained += 1;
+            }
+        }
+        retained
+    }
+
     pub(super) fn for_subscription(subscription: &ClobSubscription) -> Self {
         let mut state =
             Self::new_with_depth(&subscription.canonical_events, !subscription.live_bbo_only);

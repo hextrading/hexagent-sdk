@@ -408,6 +408,8 @@ pub fn prepare_polymarket_private_stages() {
 pub fn prepare_polymarket_clob_stages() {
     prepare_observation_stages(&[
         "polymarket.ws.clob_source_age_at_publish",
+        "polymarket.ws.clob_checkpoint_source_age_at_publish",
+        "polymarket.ws.clob_wire_receive_to_publish",
         "polymarket.ws.clob_quote_wait_tick",
         "polymarket.ws.clob_quote_wait_deadline",
         "polymarket.ws.clob_bbo_wait_ready",

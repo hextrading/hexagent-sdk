@@ -1692,6 +1692,10 @@ impl ClobEventSender {
     /// is saturated. The CLOB task then reconnects and re-seeds books instead
     /// of blocking the socket reader or silently losing an ordered event.
     fn send(&self, event: MarketEvent) -> bool {
+        self.send_with_origin(event, false)
+    }
+
+    fn send_with_origin(&self, event: MarketEvent, checkpoint: bool) -> bool {
         let replaceable = Self::is_replaceable(&event);
         let source_ns = match &event {
             MarketEvent::OrderBook(book) => book.local_timestamp_ns,
@@ -1701,7 +1705,13 @@ impl ClobEventSender {
         if source_ns != 0 {
             // Wall-clock source age is deliberately separate from monotonic
             // queue/hold durations. Preserve the quote's original timestamp.
-            crate::latency::observe_ns("polymarket.ws.clob_source_age_at_publish", now_ns().saturating_sub(source_ns));
+            let age = now_ns().saturating_sub(source_ns);
+            crate::latency::observe_ns("polymarket.ws.clob_source_age_at_publish", age);
+            crate::latency::observe_ns(if checkpoint {
+                "polymarket.ws.clob_checkpoint_source_age_at_publish"
+            } else {
+                "polymarket.ws.clob_wire_receive_to_publish"
+            }, age);
         }
         let event = ClobEventEnvelope {
             sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
@@ -4323,6 +4333,20 @@ fn forward_clob_events(
     tokens: &[String],
     now: Instant,
 ) -> bool {
+    forward_clob_events_with_origin(events, event_tx, lifecycle, health, diagnostics, books, tokens, now, false)
+}
+
+fn forward_clob_events_with_origin(
+    events: impl AsRef<[MarketEvent]> + IntoIterator<Item = MarketEvent>,
+    event_tx: &ClobEventSender,
+    lifecycle: &mut ClobLifecycle,
+    health: &mut WsHealth,
+    diagnostics: &mut ClobWindowMetrics,
+    books: &ClobLocalBooks,
+    tokens: &[String],
+    now: Instant,
+    checkpoint: bool,
+) -> bool {
     let forward_started = Instant::now();
     let mut forwarded = 0usize;
     let has_usable_book = events
@@ -4339,7 +4363,7 @@ fn forward_clob_events(
         }
         let was_full = event_tx.is_full();
         let send_started = Instant::now();
-        let send_result = event_tx.send(event);
+        let send_result = event_tx.send_with_origin(event, checkpoint);
         diagnostics.record_event_send(send_started.elapsed(), was_full);
         if !send_result {
             let elapsed = forward_started.elapsed();
@@ -5016,9 +5040,9 @@ async fn clob_ws_task(
                                 repair_superseded_attempts.clear();
                                 if activate && books.live_bbo.is_some() {
                                     let checkpoint = books.live_checkpoints(&subscription.tokens);
-                                    if !forward_clob_events(checkpoint, &event_tx, &mut lifecycle,
+                                    if !forward_clob_events_with_origin(checkpoint, &event_tx, &mut lifecycle,
                                         &mut health, &mut active.diagnostics, &books,
-                                        &subscription.tokens, Instant::now()) {
+                                        &subscription.tokens, Instant::now(), true) {
                                         break 'outer;
                                     }
                                 }
@@ -5072,6 +5096,7 @@ async fn clob_ws_task(
                             }
                             let cutover_at = Instant::now();
                             active = candidate.lane;
+                            let retained_newer_bbo = candidate.books.inherit_newer_live_bbo(&books);
                             books = candidate.books;
                             if books.live_bbo.is_some() {
                                 // Publish tick metadata first, then the latest
@@ -5093,7 +5118,7 @@ async fn clob_ws_task(
                             super::network_incident::update_ws_peers(active.peer_addr, None);
                             liveness.mark_subscribed();
                             liveness.record_market_data(clob_monotonic_now_ns());
-                            if !forward_clob_events(
+                            if !forward_clob_events_with_origin(
                                 std::mem::take(&mut candidate.seed_events),
                                 &event_tx,
                                 &mut lifecycle,
@@ -5102,17 +5127,19 @@ async fn clob_ws_task(
                                 &books,
                                 &subscription.tokens,
                                 cutover_at,
+                                true,
                             ) {
                                 break 'outer;
                             }
                             info!(
-                                "[clob_atomic_cutover] mode=seeded_candidate lane_id={} peer={:?} wire_tokens={} logical_tokens={} activate={} l2_seed_ms={:.3} not_ready_ms=0",
+                                "[clob_atomic_cutover] mode=seeded_candidate lane_id={} peer={:?} wire_tokens={} logical_tokens={} activate={} l2_seed_ms={:.3} retained_newer_bbo={} not_ready_ms=0",
                                 active.lane_id,
                                 active.peer_addr,
                                 wire_subscription.tokens.len(),
                                 subscription.tokens.len(),
                                 activate,
                                 candidate.warmup.as_secs_f64() * 1_000.0,
+                                retained_newer_bbo,
                             );
                             let lane_id = next_lane_id;
                             next_lane_id = next_lane_id.saturating_add(1);
@@ -10335,7 +10362,11 @@ mod clob_event_lane_tests {
     #[test]
     #[ignore = "focused bounded CLOB bridge latency benchmark"]
     fn benchmark_tiered_lane_send_receive() {
-        const EVENTS_PER_LANE: usize = 50_000;
+        // Include the production observation path without overflowing its
+        // 65536-record lane in this single-thread offline benchmark.
+        const EVENTS_PER_LANE: usize = 10_000;
+        crate::latency::prepare_polymarket_clob_stages();
+        crate::latency::prepare_observation_stages(&["polymarket.ws.clob_bridge_queue"]);
         let (tx, mut rx) = clob_event_lanes();
         let mut critical = Vec::with_capacity(EVENTS_PER_LANE);
         let mut replaceable = Vec::with_capacity(EVENTS_PER_LANE);
@@ -10381,6 +10412,8 @@ mod clob_event_lane_tests {
         );
         assert_eq!(overflows, (0, 0));
         assert_eq!(peak_depth, 1);
+        assert!(crate::latency::observe_ns("polymarket.ws.clob_source_age_at_publish", 1),
+            "the measured observation lane must retain capacity");
     }
 }
 
