@@ -1799,6 +1799,7 @@ impl ClobEventReceiver {
 }
 
 pub struct PolymarketMarket {
+    execution_peer_failure_sinks: Arc<[super::execution_peer_failure::PeerFailureSender]>,
     book_protocol_sink: Option<BookProtocolSink>,
     series: Vec<SeriesState>,
     /// Maps CLOB token_id → index into `series`, so we can tag events with the series symbol.
@@ -1846,6 +1847,7 @@ impl PolymarketMarket {
 
     pub fn with_liveness(liveness: Arc<PolymarketLiveness>) -> Self {
         Self {
+            execution_peer_failure_sinks: Arc::from([]),
             book_protocol_sink: None,
             series: Vec::new(),
             token_to_series: HashMap::new(),
@@ -1874,6 +1876,11 @@ impl PolymarketMarket {
     /// the same execution path that just stalled.
     pub fn force_clob_runtime_fallback(&mut self) {
         self.clob_runtime_fallback = true;
+    }
+
+    /// Startup-only immutable fan-out to execution owners using this CLOB feed.
+    pub fn set_execution_peer_failure_sinks(&mut self, sinks: Arc<[super::execution_peer_failure::PeerFailureSender]>) {
+        self.execution_peer_failure_sinks = sinks;
     }
 
     /// Set before subscribing. Live execution needs prices, not reconstructed
@@ -4753,8 +4760,31 @@ fn promote_clob_standby(
     true
 }
 
+fn is_hard_peer_read_error(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(error, tokio_tungstenite::tungstenite::Error::Io(error)
+        if matches!(error.kind(), ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof))
+}
+
+fn publish_clob_peer_failure(
+    error: &tokio_tungstenite::tungstenite::Error,
+    peer: Option<std::net::SocketAddr>,
+    observed_at_ns: u64,
+    sinks: &[super::execution_peer_failure::PeerFailureSender],
+) {
+    if !is_hard_peer_read_error(error) { return; }
+    let Some(peer) = peer else { return; };
+    let failure = super::execution_peer_failure::PeerFailure {
+        peer: peer.ip(), source: super::execution_peer_failure::PeerFailureSource::PublicWs,
+        observed_at_ns,
+    };
+    for sender in sinks { sender.publish(failure); }
+}
+
 async fn clob_ws_task(
     initial_subscription: ClobSubscription,
+    execution_peer_failure_sinks: Arc<[super::execution_peer_failure::PeerFailureSender]>,
     event_tx: ClobEventSender,
     mut ctrl_rx: tokio::sync::mpsc::Receiver<WsCtrl>,
     shutdown: Arc<AtomicBool>,
@@ -5663,6 +5693,11 @@ async fn clob_ws_task(
                                 .as_mut()
                                 .expect("standby read result requires a standby lane");
                             lane.burst.record_socket_polls(lane.read.take_poll_window());
+                            if !shutdown.load(Ordering::Relaxed) {
+                                if let Some(Err(error)) = &result {
+                                    publish_clob_peer_failure(error, lane.peer_addr, now_ns(), &execution_peer_failure_sinks);
+                                }
+                            }
                             let disposition = handle_clob_standby_read(
                                 lane,
                                 result,
@@ -5722,6 +5757,13 @@ async fn clob_ws_task(
                     let msg = match result {
                         Some(Ok(message)) => message,
                         Some(Err(error)) => {
+                            // A hard socket reset is earlier evidence than the
+                            // next order POST. Notify only the startup-bound
+                            // subscribed owners; normal/slow-consumer closes
+                            // do not manufacture HTTP peer failures.
+                            if !shutdown.load(Ordering::Relaxed) {
+                                publish_clob_peer_failure(&error, active.peer_addr, receive_ns, &execution_peer_failure_sinks);
+                            }
                             let failover_reason = format!("active WS read error: {error}");
                             let now = Instant::now();
                             warn!(
@@ -9462,6 +9504,7 @@ impl ExchangeMarket for PolymarketMarket {
         self.liveness.begin_connection(clob_token_count > 0);
         let task = clob_ws_task(
             clob_subscription,
+            self.execution_peer_failure_sinks.clone(),
             event_tx,
             ctrl_rx,
             shutdown,
@@ -10453,6 +10496,45 @@ mod pick_current_event_tests {
             sample_socket_unread_bytes(Some(reader.as_raw_fd())),
             Some(6)
         );
+    }
+
+    #[test]
+    fn hard_public_peer_failure_fans_out_only_to_bound_execution_owners() {
+        use super::super::execution_peer_failure::{PeerFailureMailbox, PeerFailureSource};
+        use tokio_tungstenite::tungstenite::Error;
+        let a = PeerFailureMailbox::default();
+        let b = PeerFailureMailbox::default();
+        let unrelated = PeerFailureMailbox::default();
+        let receivers = [a.claim_receiver().unwrap(), b.claim_receiver().unwrap()];
+        let sinks = [a.sender(), b.sender()];
+        let peer = "192.0.2.1:443".parse().unwrap();
+        publish_clob_peer_failure(&Error::ConnectionClosed, Some(peer), 1, &sinks);
+        for rx in &receivers { assert_eq!(rx.drain(), (None, false)); }
+        publish_clob_peer_failure(&Error::Io(std::io::ErrorKind::ConnectionReset.into()), Some(peer), 2, &sinks);
+        for rx in &receivers {
+            let (failure, overflow) = rx.drain();
+            let failure = failure.unwrap();
+            assert_eq!(failure.peer, peer.ip());
+            assert_eq!(failure.source, PeerFailureSource::PublicWs);
+            assert_eq!(failure.observed_at_ns, 2);
+            assert!(!overflow);
+        }
+        assert_eq!(unrelated.claim_receiver().unwrap().drain(), (None, false));
+    }
+
+    #[test]
+    fn only_hard_socket_failures_are_execution_peer_evidence() {
+        use std::io::ErrorKind;
+        use tokio_tungstenite::tungstenite::Error;
+        for kind in [ErrorKind::ConnectionReset, ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe, ErrorKind::UnexpectedEof] {
+            assert!(is_hard_peer_read_error(&Error::Io(kind.into())));
+        }
+        for kind in [ErrorKind::TimedOut, ErrorKind::WouldBlock, ErrorKind::InvalidData] {
+            assert!(!is_hard_peer_read_error(&Error::Io(kind.into())));
+        }
+        assert!(!is_hard_peer_read_error(&Error::ConnectionClosed));
+        assert!(!is_hard_peer_read_error(&Error::AlreadyClosed));
     }
 
     #[test]
