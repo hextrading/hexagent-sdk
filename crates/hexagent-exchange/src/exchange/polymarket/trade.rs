@@ -2777,6 +2777,20 @@ fn latency_record_status(reply: &HttpReply) -> crate::latency_record::RequestSta
     }
 }
 
+fn report_cold_http_peer_failure(
+    observer: Option<(crate::http1_pool::PooledClient, super::execution_peer_failure::PeerFailureSender)>,
+    reply: &HttpReply,
+) {
+    if !matches!(reply, Err(HttpErr::Transport(_))) { return; }
+    let Some((client, sender)) = observer else { return; };
+    let Some(peer) = client.connection_snapshot().peer else { return; };
+    sender.publish(super::execution_peer_failure::PeerFailure {
+        peer: peer.ip(),
+        source: super::execution_peer_failure::PeerFailureSource::AccountHttp,
+        observed_at_ns: now_ns(),
+    });
+}
+
 fn observe_authenticated_reply_gate(
     reply: &HttpReply,
     account_id: &str,
@@ -3385,6 +3399,9 @@ pub struct SharedState {
     /// execution dispatcher consumes. Full coalesces identical reset intent;
     /// no strategy/account mutable state is read across threads.
     execution_reset_tx: OnceLock<crossbeam_channel::Sender<()>>,
+    /// Startup-created message lanes for early hard transport evidence. The
+    /// execution router claims the sole receiver; cold HTTP/public WS only send.
+    execution_peer_failure: super::execution_peer_failure::PeerFailureMailbox,
     /// client_order_id → token_id (outcome asset). Written alongside the
     /// coid↔oid maps at registration and kept for the SAME lifetime, so the
     /// event-expiry sweep can purge an event's mappings by its outcome
@@ -3948,6 +3965,14 @@ fn reclaim_token_mappings(
 }
 
 impl SharedState {
+    pub fn execution_peer_failure_sender(&self) -> super::execution_peer_failure::PeerFailureSender {
+        self.execution_peer_failure.sender()
+    }
+
+    pub fn claim_execution_peer_failure_receiver(&self) -> Option<super::execution_peer_failure::PeerFailureReceiver> {
+        self.execution_peer_failure.claim_receiver()
+    }
+
     pub fn bind_execution_reset_sender(&self, sender: crossbeam_channel::Sender<()>) {
         let _ = self.execution_reset_tx.set(sender);
     }
@@ -6420,6 +6445,9 @@ impl SharedState {
             let phase_audit = Arc::clone(&self.http_phase_audit);
             let phase_kind = http_phase_audit::request_kind(rec_kind, stage);
             let enqueued_at = crate::latency::Instant::now();
+            let peer_failure_observer = (!matches!(request_client.role(),
+                crate::http1_pool::Role::Fast | crate::http1_pool::Role::Cancel))
+                .then(|| (request_client.clone(), self.execution_peer_failure.sender()));
             async_rt::order_handle().spawn(async move {
                 let runtime_queue_ns =
                     enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -6443,6 +6471,7 @@ impl SharedState {
                     },
                 )
                 .await;
+                report_cold_http_peer_failure(peer_failure_observer, &reply);
                 observe_authenticated_reply_gate(
                     &reply,
                     &account_id,
@@ -6582,6 +6611,12 @@ impl SharedState {
             let phase_kind = http_phase_audit::request_kind(rec_kind, stage);
             let enqueued_at = crate::latency::Instant::now();
             let timing_a = Arc::clone(&timing);
+            // Order requests already publish generation-fenced business
+            // outcomes. Only cold HTTP needs this early account-local signal;
+            // an HTTP error status or slow GET is not a peer transport fault.
+            let peer_failure_observer = (!matches!(client.role(),
+                crate::http1_pool::Role::Fast | crate::http1_pool::Role::Cancel))
+                .then(|| (client.clone(), self.execution_peer_failure.sender()));
             async_rt::order_handle().spawn(async move {
                 let runtime_queue_ns =
                     enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -6609,6 +6644,7 @@ impl SharedState {
                     },
                 )
                 .await;
+                report_cold_http_peer_failure(peer_failure_observer, &reply);
                 observe_authenticated_reply_gate(
                     &reply,
                     &account_id,
@@ -7178,6 +7214,7 @@ impl PolymarketTrade {
             private_ingress_install_tx,
             recovery_http: OnceLock::new(),
             execution_reset_tx: OnceLock::new(),
+            execution_peer_failure: super::execution_peer_failure::PeerFailureMailbox::default(),
             probe_order_ids: ProbeOrderIdRing::default(),
             probe_orphan_owner,
             auth,

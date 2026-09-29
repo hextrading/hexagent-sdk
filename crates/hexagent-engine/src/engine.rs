@@ -26,6 +26,7 @@ use crate::exchange::hyperliquid::HyperliquidTrade;
 use crate::exchange::lighter::LighterTrade;
 use crate::exchange::polymarket::trade::{PendingCancel, PendingSubmit};
 use crate::exchange::polymarket::rtt_probe::{probe_http_lane, ProbeHttpRequest};
+use crate::exchange::polymarket::execution_peer_failure::{PeerFailure, PeerFailureReceiver, PeerFailureSender, PeerFailureSource};
 use crate::exchange::polymarket::{
     PolymarketFeedPhase, PolymarketLiveness, PolymarketLivenessSnapshot, PolymarketMarket,
     PolymarketTrade,
@@ -528,6 +529,10 @@ enum ExecutionDiagnostic {
         no_response_resets: u64,
         cancel_outbox: CancelOutboxSnapshot,
     },
+    PeerFailureReset {
+        account: Arc<str>, failure: Option<PeerFailure>, overflow: bool,
+        reset_count: u64, consumed_at_ns: u64,
+    },
     VenueFailure {
         exchange: Exchange,
         operation: &'static str,
@@ -562,6 +567,14 @@ fn spawn_execution_diagnostics(
                         paused_total_ns / 1_000_000, replaced_snapshots, no_response_resets,
                         cancel_outbox.depth, cancel_outbox.high_water, cancel_outbox.oldest_ns,
                         cancel_outbox.coalesced, cancel_outbox.overflow,
+                    ),
+                    ExecutionDiagnostic::PeerFailureReset { account, failure, overflow, reset_count, consumed_at_ns } => warn!(
+                        "[execution_peer_failure] account={} source={:?} peer={:?} observed_at_ns={} notification_age_us={} queue_capacity={} overflow={} reset_count={} action=retire_old_order_generations",
+                        account, failure.map(|f| f.source), failure.map(|f| f.peer),
+                        failure.map_or(0, |f| f.observed_at_ns),
+                        failure.map_or(0, |f| consumed_at_ns.saturating_sub(f.observed_at_ns) / 1_000),
+                        crate::exchange::polymarket::execution_peer_failure::PEER_FAILURE_CAPACITY,
+                        overflow, reset_count,
                     ),
                     ExecutionDiagnostic::VenueFailure {
                         exchange,
@@ -1010,6 +1023,7 @@ fn spawn_polymarket_feed_worker(
     epoch: PolymarketWorkerEpoch,
     protocol_sink: Option<crate::recorder::BookProtocolSink>,
     live_bbo_only: bool,
+    peer_failure_sinks: Arc<[PeerFailureSender]>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name(format!("feed-polymarket-{}", epoch.generation))
@@ -1029,6 +1043,7 @@ fn spawn_polymarket_feed_worker(
             let make_feed = || {
                 let mut feed = PolymarketMarket::with_liveness(liveness.clone());
                 feed.set_live_bbo_only(live_bbo_only);
+                feed.set_execution_peer_failure_sinks(peer_failure_sinks.clone());
                 if let Some(sink) = protocol_sink.as_ref() { feed.set_book_protocol_sink(sink.clone()); }
                 if force_clob_runtime_fallback {
                     feed.force_clob_runtime_fallback();
@@ -1346,6 +1361,7 @@ fn spawn_polymarket_feed_manager(
     feed_readiness: Arc<RwLock<HashMap<String, FeedReadiness>>>,
     protocol_sink: Option<crate::recorder::BookProtocolSink>,
     live_bbo_only: bool,
+    peer_failure_sinks: Arc<[PeerFailureSender]>,
 ) -> std::io::Result<Vec<thread::JoinHandle<()>>> {
     let worker_slot = Arc::new(PolymarketWorkerSlot::new());
     let (rebuild_tx, rebuild_rx) = bounded::<PolymarketWorkerRebuild>(1);
@@ -1373,6 +1389,7 @@ fn spawn_polymarket_feed_manager(
                 initial,
                 protocol_sink.clone(),
                 live_bbo_only,
+                peer_failure_sinks.clone(),
             ) {
                 Ok(worker) => workers.push(worker),
                 Err(error) => {
@@ -1461,6 +1478,7 @@ fn spawn_polymarket_feed_manager(
                             replacement,
                             protocol_sink.clone(),
                             live_bbo_only,
+                            peer_failure_sinks.clone(),
                         ) {
                             Ok(worker) => workers.push(worker),
                             Err(error) => {
@@ -4401,7 +4419,16 @@ impl Engine {
         // synchronously. Subscribe only after it returns: otherwise the
         // bounded market queue can fill while no consumer exists, block CLOB
         // socket consumption, and leave the first tradable book stale.
-        let feed_handles = self.spawn_exchange_feeds(market_tx, shutdown.clone())?;
+        // Cold startup builds an immutable message-only fan-out. Only enabled
+        // execution instances using this Polymarket feed receive its evidence.
+        let mut bound_accounts = HashSet::new();
+        let peer_failure_sinks: Arc<[PeerFailureSender]> = required_poly_instances.iter()
+            .filter_map(|iid| poly_states.get(iid))
+            .filter(|shared| bound_accounts.insert(shared.account_state.account_id().to_string()))
+            .map(|shared| shared.execution_peer_failure_sender())
+            .collect::<Vec<_>>().into();
+        let feed_handles = self.spawn_exchange_feeds_inner(
+            market_tx, None, shutdown.clone(), peer_failure_sinks)?;
 
         let shutdown_trigger = Self::wait_for_shutdown_or_critical(
             &shutdown,
@@ -10409,7 +10436,7 @@ impl Engine {
         sim_feed_tx: Option<Sender<MarketEvent>>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Vec<thread::JoinHandle<()>>> {
-        self.spawn_exchange_feeds_inner(market_tx, sim_feed_tx, shutdown)
+        self.spawn_exchange_feeds_inner(market_tx, sim_feed_tx, shutdown, Arc::from([]))
     }
 
     pub fn spawn_exchange_feeds(
@@ -10417,7 +10444,7 @@ impl Engine {
         market_tx: PublicMarketPublisher,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Vec<thread::JoinHandle<()>>> {
-        self.spawn_exchange_feeds_inner(market_tx, None, shutdown)
+        self.spawn_exchange_feeds_inner(market_tx, None, shutdown, Arc::from([]))
     }
 
     fn spawn_exchange_feeds_inner(
@@ -10425,6 +10452,7 @@ impl Engine {
         market_tx: PublicMarketPublisher,
         sim_feed_tx: Option<Sender<MarketEvent>>,
         shutdown: Arc<AtomicBool>,
+        peer_failure_sinks: Arc<[PeerFailureSender]>,
     ) -> Result<Vec<thread::JoinHandle<()>>> {
         let mut handles = Vec::new();
 
@@ -10451,6 +10479,7 @@ impl Engine {
                     feed_readiness,
                     self.book_protocol_lane.as_ref().map(|lane| lane.sink()),
                     self.config.general.mode == RunMode::Live,
+                    peer_failure_sinks.clone(),
                 )?);
                 continue;
             }
@@ -12607,6 +12636,9 @@ impl Engine {
                         for (instance_id, shared) in &poly_states {
                             if shared.account_state.account_id() == account_id {
                                 shared.bind_execution_reset_sender(reset_tx.clone());
+                                if let Some(receiver) = shared.claim_execution_peer_failure_receiver() {
+                                    routes.peer_failure_receivers.push((receiver, 0));
+                                }
                                 routes.reset_prewarm_url = Arc::from(format!("{}/", shared.clob_base_url.trim_end_matches('/')));
                                 if let Some(publisher) = admission_publishers.remove(instance_id) {
                                     routes.admission_publishers.push(publisher);
@@ -14797,6 +14829,8 @@ impl Drop for PolyConnectionOccupancyGuard {
     }
 }
 
+const PEER_FAILURE_HINT_NS: u64 = 10_000_000_000;
+
 struct PolyAccountConnectionRoutes {
     /// Sole writer is the existing pinned execution dispatcher. Physical owners
     /// publish immutable full snapshots on dedicated capacity-one lanes.
@@ -14821,6 +14855,11 @@ struct PolyAccountConnectionRoutes {
     /// updates so the owning strategy retains and retries every intent.
     recovery: HashMap<String, Sender<PolyConnectionCommand>>,
     reset_rx: Option<Receiver<()>>,
+    /// Startup-sized inboxes, sole consumer/writer is this dispatcher. Public
+    /// feed and cold HTTP evidence never share mutable strategy/account state.
+    peer_failure_receivers: Vec<(PeerFailureReceiver, u64)>,
+    peer_failure_resets: u64,
+    last_peer_failure: Option<PeerFailure>,
     reset_pending: Vec<Option<(u64, Option<std::net::IpAddr>)>>,
     reset_prewarm_url: Arc<str>,
     fast_rr: usize,
@@ -14860,6 +14899,9 @@ impl Default for PolyAccountConnectionRoutes {
             reconcile: Vec::new(),
             recovery: HashMap::new(),
             reset_rx: None,
+            peer_failure_receivers: Vec::new(),
+            peer_failure_resets: 0,
+            last_peer_failure: None,
             reset_pending: Vec::new(),
             reset_prewarm_url: Arc::from(""),
             fast_rr: 0,
@@ -14880,7 +14922,20 @@ impl PolyAccountConnectionRoutes {
         let Some(health) = self.health.as_mut() else { return; };
         for (role, slot, receiver) in &self.health_lanes {
             match receiver.try_recv() {
-                Ok(observation) => { health.observe(*role, *slot, observation, now_ns()); }
+                Ok(observation) => {
+                    let resets = health.no_response_resets();
+                    health.observe(*role, *slot, observation, now_ns());
+                    if health.no_response_resets() != resets {
+                        if let Some(peer) = observation.no_response_peer.filter(|_|
+                            self.last_peer_failure.is_none_or(|old|
+                                observation.observed_at_ns > old.observed_at_ns)) {
+                            self.last_peer_failure = Some(PeerFailure {
+                                peer, source: PeerFailureSource::OrderHttp,
+                                observed_at_ns: observation.observed_at_ns,
+                            });
+                        }
+                    }
+                }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     health.mark_delivery_fault(*role, *slot, now_ns());
                 }
@@ -14888,8 +14943,55 @@ impl PolyAccountConnectionRoutes {
             }
         }
         let now = now_ns();
-        if self.reset_rx.as_ref().is_some_and(|rx| rx.try_recv().is_ok()) {
-            health.retire_transport_generations(now);
+        let private_reset = self.reset_rx.as_ref().is_some_and(|rx| rx.try_recv().is_ok());
+        let mut peer_failure: Option<PeerFailure> = None;
+        let mut peer_overflow = false;
+        for (receiver, last_observed_ns) in &mut self.peer_failure_receivers {
+            let (failure, overflow) = receiver.drain();
+            peer_overflow |= overflow;
+            if let Some(failure) = failure {
+                // A producer may publish after the outer refresh timestamp.
+                // Validate after receive; empty polls need no extra clock read.
+                let received_at_ns = now_ns();
+                if failure.observed_at_ns > *last_observed_ns && failure.observed_at_ns <= received_at_ns {
+                    *last_observed_ns = failure.observed_at_ns;
+                    if peer_failure.is_none_or(|old| failure.observed_at_ns > old.observed_at_ns) {
+                        peer_failure = Some(failure);
+                    }
+                } else if failure.observed_at_ns > received_at_ns {
+                    // Invalid time cannot justify a peer preference, but must
+                    // not leave previously admitted generations usable.
+                    peer_overflow = true;
+                }
+            }
+        }
+        // Business outcomes can retire the account before an older public/GET
+        // message is consumed. Fence across sources as well as within an inbox.
+        peer_failure = peer_failure.filter(|new|
+            self.last_peer_failure.is_none_or(|old| new.observed_at_ns > old.observed_at_ns));
+        if let Some(failure) = peer_failure {
+            self.last_peer_failure = Some(failure);
+        }
+        if private_reset || peer_failure.is_some() || peer_overflow {
+            // Public/HTTP and private WS failures can describe the same
+            // incident. A later private reset must not erase its known peer
+            // and immediately rebuild onto that address again. The hint is
+            // account-local and expires; it is not a persistent IP denylist.
+            let reset_at_ns = now_ns();
+            let peer = self.last_peer_failure.filter(|failure|
+                failure.observed_at_ns <= reset_at_ns
+                    && reset_at_ns - failure.observed_at_ns <= PEER_FAILURE_HINT_NS)
+                .map(|failure| failure.peer);
+            health.retire_transport_generations_avoiding(reset_at_ns, peer);
+        }
+        if peer_failure.is_some() || peer_overflow {
+            self.peer_failure_resets = self.peer_failure_resets.saturating_add(1);
+            if let Some(sender) = &self.health_diagnostic {
+                try_submit_execution_diagnostic(sender, ExecutionDiagnostic::PeerFailureReset {
+                    account: Arc::clone(&self.health_account), failure: peer_failure,
+                    overflow: peer_overflow, reset_count: self.peer_failure_resets, consumed_at_ns: now_ns(),
+                });
+            }
         }
         if health.take_transport_reset() {
             for (pending, lane) in self.reset_pending.iter_mut().zip(
@@ -18987,6 +19089,153 @@ mod market_router_tests {
                 .collect::<Vec<_>>(),
             vec!["trade-1"]
         );
+    }
+
+    fn peer_failure_routes_fixture() -> (
+        PolyAccountConnectionRoutes, PeerFailureSender,
+        Receiver<PolyConnectionCommand>, Receiver<PolyConnectionCommand>,
+    ) {
+        use hexagent_runtime::http1_pool::{PermitHealthSnapshot, Role};
+        let mailbox = crate::exchange::polymarket::execution_peer_failure::PeerFailureMailbox::default();
+        let (fast_tx, fast_rx) = bounded(1);
+        let (cancel_tx, cancel_rx) = bounded(1);
+        let now = now_ns();
+        let mut health = AccountExecutionAdmission::new(1, 1, now);
+        for role in [Role::Fast, Role::Cancel] {
+            health.observe(role, 0, LaneObservation {
+                sequence: 1, observed_at_ns: now,
+                health: PermitHealthSnapshot { pool_generation: 7, quarantined: false },
+                business: None, busy: false, cumulative_failures: 0, cumulative_slow: 0,
+                cumulative_no_response: 0, no_response_generation: 0, no_response_peer: None,
+            }, now);
+        }
+        assert!(health.can_place(now));
+        (PolyAccountConnectionRoutes {
+            health: Some(health),
+            peer_failure_receivers: vec![(mailbox.claim_receiver().unwrap(), 0)],
+            reset_pending: vec![None; 2],
+            reset_prewarm_url: Arc::from("https://example.invalid/"),
+            fast: vec![PolyConnectionLane::for_test(fast_tx, Role::Fast, 0)],
+            cancel: vec![PolyConnectionLane::for_test(cancel_tx, Role::Cancel, 0)],
+            ..Default::default()
+        }, mailbox.sender(), fast_rx, cancel_rx)
+    }
+
+    #[test]
+    fn public_or_query_peer_failure_preempts_next_post_and_keeps_exact_owner() {
+        use crate::exchange::polymarket::execution_peer_failure::PeerFailureSource;
+        for source in [PeerFailureSource::PublicWs, PeerFailureSource::AccountHttp] {
+            let (mut routes, sender, fast, cancel) = peer_failure_routes_fixture();
+            let (mut isolated, _, isolated_fast, _) = peer_failure_routes_fixture();
+            let (tx, updates) = bounded(2);
+            let peer = "192.0.2.1".parse().unwrap();
+            // Replay the live ordering: earlier WS/GET reset, then a fresh
+            // strategy POST on another socket with no business failure yet.
+            sender.publish(PeerFailure { peer, source, observed_at_ns: now_ns() });
+            assert!(dispatch_poly_signal_to_connection_owner(
+                Signal::NewOrder(order_req("btc01-after-reset", "btc01")), 0,
+                ExecutorUpdateSender { owner: 9, tx: tx.into() }, &mut routes));
+            for command in [fast.try_recv().unwrap(), cancel.try_recv().unwrap()] {
+                assert!(matches!(command, PolyConnectionCommand::RefreshTransport {
+                    expected_generation: 7, avoid_peer: Some(p), .. } if p == peer));
+            }
+            assert!(fast.is_empty());
+            let update = updates.try_recv().unwrap();
+            assert_eq!(update.owner, 9);
+            assert_eq!(update.update.client_order_id, "btc01-after-reset");
+            assert_eq!(update.update.status, OrderStatus::ExecutorRejected);
+            assert!(update.update.error.unwrap().starts_with("not_sent:"));
+            assert_eq!(routes.peer_failure_resets, 1);
+            assert_eq!(routes.health.as_ref().unwrap().no_response_resets(), 0);
+            isolated.refresh_health(now_ns());
+            assert!(isolated.health.as_mut().unwrap().can_place(now_ns()));
+            assert!(isolated_fast.is_empty());
+        }
+    }
+
+    #[test]
+    fn peer_failure_replay_does_not_retire_repaired_generation() {
+        use hexagent_runtime::http1_pool::{PermitHealthSnapshot, Role};
+        use crate::exchange::polymarket::execution_peer_failure::PeerFailureSource;
+        let (mut routes, sender, fast, cancel) = peer_failure_routes_fixture();
+        let failure = PeerFailure { peer: "192.0.2.1".parse().unwrap(),
+            source: PeerFailureSource::PublicWs, observed_at_ns: now_ns() };
+        sender.publish(failure);
+        routes.refresh_health(now_ns());
+        fast.try_recv().unwrap(); cancel.try_recv().unwrap();
+        routes.fast[0].metrics.release_for_test(); routes.cancel[0].metrics.release_for_test();
+        let now = now_ns();
+        for role in [Role::Fast, Role::Cancel] {
+            routes.health.as_mut().unwrap().observe(role, 0, LaneObservation {
+                sequence: 2, observed_at_ns: now,
+                health: PermitHealthSnapshot { pool_generation: 8, quarantined: false },
+                business: None, busy: false, cumulative_failures: 0, cumulative_slow: 0,
+                cumulative_no_response: 0, no_response_generation: 0, no_response_peer: None,
+            }, now);
+        }
+        sender.publish(failure);
+        sender.publish(PeerFailure { observed_at_ns: failure.observed_at_ns - 1, ..failure });
+        routes.refresh_health(now_ns());
+        assert_eq!(routes.peer_failure_resets, 1);
+        assert_eq!(routes.health.as_ref().unwrap().retired_generation(Role::Fast, 0), Some(7));
+        assert!(fast.is_empty() && cancel.is_empty());
+        // A newer business failure may have retired generations before this
+        // inbox is consumed. An older message from another source cannot
+        // reset those repaired generations a second time.
+        let newer = now_ns();
+        routes.last_peer_failure = Some(PeerFailure {
+            observed_at_ns: newer, source: PeerFailureSource::OrderHttp, ..failure
+        });
+        routes.peer_failure_receivers[0].1 = 0;
+        sender.publish(failure);
+        routes.refresh_health(now_ns());
+        assert_eq!(routes.peer_failure_resets, 1);
+        assert!(fast.is_empty() && cancel.is_empty());
+    }
+
+    #[test]
+    fn private_reconnect_keeps_recent_peer_hint_then_expires_it() {
+        let (mut routes, sender, fast, cancel) = peer_failure_routes_fixture();
+        let (private_tx, private_rx) = bounded(1);
+        routes.reset_rx = Some(private_rx);
+        let failure = PeerFailure { peer: "192.0.2.1".parse().unwrap(),
+            source: PeerFailureSource::PublicWs, observed_at_ns: now_ns() };
+        sender.publish(failure);
+        routes.refresh_health(now_ns());
+        fast.try_recv().unwrap(); cancel.try_recv().unwrap();
+        for expected in [Some(failure.peer), None] {
+            routes.fast[0].metrics.release_for_test(); routes.cancel[0].metrics.release_for_test();
+            if expected.is_none() {
+                routes.last_peer_failure.as_mut().unwrap().observed_at_ns = now_ns() - PEER_FAILURE_HINT_NS - 1;
+            }
+            private_tx.try_send(()).unwrap();
+            routes.refresh_health(now_ns());
+            for command in [fast.try_recv().unwrap(), cancel.try_recv().unwrap()] {
+                assert!(matches!(command, PolyConnectionCommand::RefreshTransport {
+                    avoid_peer, .. } if avoid_peer == expected));
+            }
+        }
+    }
+
+    #[test]
+    fn peer_failure_overflow_and_busy_owner_keep_retirement_pending() {
+        use crate::exchange::polymarket::execution_peer_failure::{PeerFailureSource, PEER_FAILURE_CAPACITY};
+        let (mut routes, sender, fast, cancel) = peer_failure_routes_fixture();
+        let failure = PeerFailure { peer: "192.0.2.1".parse().unwrap(),
+            source: PeerFailureSource::AccountHttp, observed_at_ns: now_ns() };
+        for _ in 0..(PEER_FAILURE_CAPACITY + 2) { sender.publish(failure); }
+        routes.fast[0].metrics.occupied.store(true, Ordering::Release);
+        routes.refresh_health(now_ns());
+        assert!(fast.is_empty());
+        assert_eq!(routes.reset_pending[0], Some((7, Some(failure.peer))));
+        assert!(matches!(cancel.try_recv().unwrap(), PolyConnectionCommand::RefreshTransport { .. }));
+        assert!(!routes.health.as_mut().unwrap().can_place(now_ns()));
+        routes.fast[0].metrics.release_for_test();
+        routes.refresh_health(now_ns());
+        assert!(matches!(fast.try_recv().unwrap(), PolyConnectionCommand::RefreshTransport {
+            expected_generation: 7, avoid_peer: Some(peer), .. } if peer == failure.peer));
+        assert!(routes.reset_pending.iter().all(Option::is_none));
+        assert_eq!(routes.peer_failure_resets, 1);
     }
 
     #[test]

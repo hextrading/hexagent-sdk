@@ -269,6 +269,7 @@ async fn actual_http_phases_keep_identity_status_peer_and_reconnect_generation()
             ("200 OK", "{}"),
             ("503 Service Unavailable", "{}"),
             ("200 OK", "not-json"),
+            ("", ""), // Request received; connection lost before any response.
         ] {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut input = vec![0u8; 8192];
@@ -281,6 +282,7 @@ async fn actual_http_phases_keep_identity_status_peer_and_reconnect_generation()
                     break;
                 }
             }
+            if status.is_empty() { continue; }
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -291,6 +293,8 @@ async fn actual_http_phases_keep_identity_status_peer_and_reconnect_generation()
     let (tx, rx) = crossbeam_channel::bounded(4);
     let sink = HttpPhaseAudit::new(tx);
     let client = crate::http1_pool::pooled_client(crate::http1_pool::Role::Query);
+    let peer_failures = super::super::execution_peer_failure::PeerFailureMailbox::default();
+    let peer_failure_rx = peer_failures.claim_receiver().unwrap();
     let auth = super::super::auth::AuthHeaders {
         api_key: "test".into(),
         address: "test".into(),
@@ -300,7 +304,7 @@ async fn actual_http_phases_keep_identity_status_peer_and_reconnect_generation()
     };
     let url: Arc<str> = format!("http://{peer}/test").into();
     let mut generation = 0;
-    for (index, expected) in ["ok", "http_error", "invalid_response"]
+    for (index, expected) in ["ok", "http_error", "invalid_response", "transport_error"]
         .into_iter()
         .enumerate()
     {
@@ -322,6 +326,16 @@ async fn actual_http_phases_keep_identity_status_peer_and_reconnect_generation()
             },
         )
         .await;
+        report_cold_http_peer_failure(Some((client.clone(), peer_failures.sender())), &reply);
+        let (failure, overflow) = peer_failure_rx.drain();
+        assert!(!overflow);
+        if index == 3 {
+            let failure = failure.expect("cold GET transport failure must notify its execution owner");
+            assert_eq!(failure.peer, peer.ip());
+            assert_eq!(failure.source, super::super::execution_peer_failure::PeerFailureSource::AccountHttp);
+        } else {
+            assert!(failure.is_none(), "HTTP status/JSON errors cannot become peer transport evidence");
+        }
         assert_eq!(reply.is_ok(), index == 0);
         let AuditJob::HttpPhase(r) = rx.try_recv().unwrap() else {
             panic!()
@@ -332,10 +346,13 @@ async fn actual_http_phases_keep_identity_status_peer_and_reconnect_generation()
         assert_eq!(r.timings.peer, Some(peer));
         assert!(r.timings.connect_generation_after > generation);
         generation = r.timings.connect_generation_after;
-        assert!(
-            r.request_started_ns <= r.response_received_ns
-                && r.response_received_ns <= r.completed_ns
-        );
+        if index < 3 {
+            assert!(r.request_started_ns <= r.response_received_ns
+                && r.response_received_ns <= r.completed_ns);
+        } else {
+            assert_eq!(r.status, 0);
+            assert_eq!(r.timings.io.read_bytes, 0);
+        }
         assert_eq!(r.context.runtime_queue_ns, 13);
     }
     server.await.unwrap();

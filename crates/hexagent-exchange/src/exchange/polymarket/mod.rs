@@ -7,6 +7,7 @@ pub mod deploy_wallet;
 pub mod deposit_wallet;
 pub mod live_position;
 pub mod market;
+pub mod execution_peer_failure;
 pub mod onchain_tx;
 pub mod platform_status;
 pub mod market_info_v2;

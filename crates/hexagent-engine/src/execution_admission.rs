@@ -179,6 +179,13 @@ impl AccountExecutionAdmission {
         self.pause_for_recovery(now_ns);
     }
 
+    /// Explicit early transport message, independent of business-success
+    /// scoring. Query/WS success can never heal or verify an order lane.
+    pub(crate) fn retire_transport_generations_avoiding(&mut self, now_ns: u64, peer: Option<IpAddr>) {
+        self.retire_transport_generations(now_ns);
+        self.transport_reset_peer = peer;
+    }
+
     pub(crate) fn no_response_resets(&self) -> u64 {
         self.no_response_resets
     }
