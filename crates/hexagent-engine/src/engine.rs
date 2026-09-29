@@ -15378,15 +15378,35 @@ fn try_send_poly_recovery(
 }
 
 fn run_poly_orphan_recovery(trade: PolymarketTrade, rx: Receiver<PolyConnectionCommand>) {
-    while let Ok(command) = rx.recv() {
+    // State and timer belong exclusively to this existing pinned cold worker.
+    let mut null_cancels = hexagent_exchange::exchange::polymarket::trade::NullCancelRecovery::new();
+    let mut retained_update_tx = None;
+    loop {
+        let now = now_ns();
+        if null_cancels.next_deadline_ns().is_some_and(|due| due <= now) {
+            let (places, cancels) = null_cancels.due_orders(now);
+            if let Some(update_tx) = retained_update_tx.as_ref() {
+                for update in trade.reconcile_orphans_with_null_backoff(&mut null_cancels, &places, &cancels, &[]) {
+                    if send_executor_update(update_tx, update).is_err() { return; }
+                }
+            }
+        }
+        let timeout = null_cancels.next_deadline_ns().map_or(Duration::from_secs(60),
+            |due| Duration::from_nanos(due.saturating_sub(now_ns())));
+        let command = match rx.recv_timeout(timeout) {
+            Ok(command) => command,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+        };
         let PolyConnectionCommand::Reconcile { pending_places, pending_cancels,
             pending_trade_ids, update_tx, enqueued_at, .. } = command else {
                 unreachable!("recovery lane accepts only typed reconciliation commands");
             };
+        retained_update_tx = Some(update_tx.clone());
         crate::latency::record_ns("polymarket.orphan.coordinator_queue",
             enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64);
-        for update in trade.reconcile_orphans_via_owners(
-            &pending_places, &pending_cancels, &pending_trade_ids) {
+        for update in trade.reconcile_orphans_with_null_backoff(
+            &mut null_cancels, &pending_places, &pending_cancels, &pending_trade_ids) {
             if send_executor_update(&update_tx, update).is_err() { return; }
         }
     }

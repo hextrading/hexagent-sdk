@@ -6,6 +6,8 @@
 mod http_phase_audit;
 mod publication_observation;
 mod recovery_diagnostics;
+mod null_cancel_recovery;
+pub use null_cancel_recovery::NullCancelRecovery;
 use http_phase_audit::{HttpPhaseAudit, HttpPhaseContext, HttpPhaseRecord};
 use recovery_diagnostics::{cancel_detail, RecoveryRound};
 
@@ -7741,6 +7743,7 @@ impl PolymarketTrade {
                         0.0
                     };
                     let ownership = OrderOwnership {
+                        inferred_cancel: false,
                         order_slot: Default::default(),
                         account_id: self.shared.account_state.account_id().to_string(),
                         instance_id: instance_id.clone(),
@@ -10132,6 +10135,16 @@ impl PolymarketTrade {
         pending_cancels: &[(String, String)],
         pending_trade_ids: &[String],
     ) -> Vec<OrderUpdate> {
+        self.reconcile_orphans_prefetched(permit, via_owners, pending_places,
+            pending_cancels, pending_trade_ids, None)
+    }
+
+    fn reconcile_orphans_prefetched(
+        &self, permit: Option<&crate::http1_pool::Permit>, via_owners: bool,
+        pending_places: &[(String, String, Side, f64, Option<String>)],
+        pending_cancels: &[(String, String)], pending_trade_ids: &[String],
+        mut prefetched: Option<FetchOrderResult>,
+    ) -> Vec<OrderUpdate> {
         let mut updates: Vec<OrderUpdate> = Vec::new();
 
         // --- Placements: deterministic per-orderID lookup ---
@@ -10171,7 +10184,7 @@ impl PolymarketTrade {
                 // next-retry deadline (set on the previous not-found). Keeps the
                 // orphan parked without re-hammering a slow PM REST endpoint.
                 if let Some(next_ns) = self.shared.placement_reconcile_next_retry_ns.get(coid) {
-                    if now_ns() < next_ns {
+                    if prefetched.is_none() && now_ns() < next_ns {
                         continue;
                     }
                 }
@@ -10180,7 +10193,7 @@ impl PolymarketTrade {
                 if self.shared.in_http_425_backoff(coid) {
                     continue;
                 }
-                let fetch_result = self.fetch_orphan_order(coid, oid, permit, via_owners, true);
+                let fetch_result = prefetched.take().unwrap_or_else(|| self.fetch_orphan_order(coid, oid, permit, via_owners, true));
                 if via_owners && order_lookup_is_absent(&fetch_result) {
                     if let Some(ownership) = self.shared.account_state.order(coid) {
                         if let Some(update) = self.cancel_unknown_order_via_owners(&ownership, oid) {
@@ -10576,7 +10589,7 @@ impl PolymarketTrade {
         for (coid, order_id) in pending_cancels {
             {
                 let now = now_ns();
-                if self
+                if prefetched.is_none() && self
                     .shared
                     .cancel_reconcile_next_retry_ns
                     .get(coid)
@@ -10599,7 +10612,7 @@ impl PolymarketTrade {
                     continue;
                 }
             };
-            let fetch_result = self.fetch_orphan_order(coid, order_id, permit, via_owners, false);
+            let fetch_result = prefetched.take().unwrap_or_else(|| self.fetch_orphan_order(coid, order_id, permit, via_owners, false));
             if via_owners && order_lookup_is_absent(&fetch_result) {
                 if let Some(ownership) = self.shared.account_state.order(coid) {
                     if let Some(update) = self.cancel_order_via_owners(&ownership, order_id) {
@@ -14754,6 +14767,7 @@ mod tests {
 
     fn runtime_ownership(order_id: &str, client_order_id: &str) -> OrderOwnership {
         OrderOwnership {
+            inferred_cancel: false,
             order_slot: Default::default(),
             account_id: "acct".into(),
             instance_id: "maker".into(),
@@ -15163,6 +15177,7 @@ mod tests {
     #[test]
     fn recovery_terminal_update_hands_authoritative_audit_to_strategy_first() {
         let ownership = OrderOwnership {
+            inferred_cancel: false,
             order_slot: Default::default(),
             account_id: "acct".into(),
             instance_id: "maker".into(),

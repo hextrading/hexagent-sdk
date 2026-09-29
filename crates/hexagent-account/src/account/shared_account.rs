@@ -609,6 +609,14 @@ enum AccountOwnerOperation {
         expected: OrderOwnership,
         reply: crossbeam_channel::Sender<Result<FillAuditPendingTransition, String>>,
     },
+    ReadRecoveryOrder {
+        client_order_id: String,
+        reply: crossbeam_channel::Sender<Option<OrderOwnership>>,
+    },
+    InferNullCancellation {
+        expected: OrderOwnership,
+        reply: crossbeam_channel::Sender<Result<OrderOwnership, String>>,
+    },
     ConfirmRecoveryCancellation {
         expected: OrderOwnership,
         reply: crossbeam_channel::Sender<Result<OrderOwnership, String>>,
@@ -939,6 +947,12 @@ impl AccountOwnerCommand {
             }
             ApplyZeroFillRecovery { expected, reply } => {
                 let _ = reply.send(account.apply_zero_fill_recovery(&expected));
+            }
+            ReadRecoveryOrder { client_order_id, reply } => {
+                let _ = reply.send(account.order(&client_order_id));
+            }
+            InferNullCancellation { expected, reply } => {
+                let _ = reply.send(account.infer_null_cancellation(&expected));
             }
             ConfirmRecoveryCancellation { expected, reply } => {
                 let _ = reply.send(account.confirm_recovery_cancellation(&expected));
@@ -2000,6 +2014,10 @@ pub struct AccountAvailability {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderOwnership {
+    /// User-selected two-null cancellation policy, not an exchange proof.
+    /// Persisted so replay retains attribution and late fills can supersede it.
+    #[serde(default)]
+    pub inferred_cancel: bool,
     /// Owner-local numeric routing slot. Durable/private replay can return the
     /// lifecycle directly to a fixed strategy table without parsing coid.
     #[serde(default)]
@@ -13736,6 +13754,7 @@ impl SharedAccount {
         }
         let reserved_quantity = if side == Side::Sell { quantity } else { 0.0 };
         let ownership = OrderOwnership {
+            inferred_cancel: false,
             order_slot,
             account_id: self.account_id.clone(),
             instance_id: instance_id.to_string(),
@@ -13972,6 +13991,7 @@ impl SharedAccount {
             }
         }
         let ownership = OrderOwnership {
+            inferred_cancel: false,
             order_slot: Default::default(),
             account_id: self.account_id.clone(),
             instance_id: instance_id.into(),
@@ -15148,6 +15168,58 @@ impl SharedAccount {
         )
     }
 
+    /// Cold-worker-only ordered read of the lifecycle owner. Published reporting
+    /// snapshots can lag a private Filled; retry admission must not use those.
+    pub fn recovery_order(&self, client_order_id: &str) -> Result<Option<OrderOwnership>, String> {
+        if self.must_dispatch_lifecycle_to_owner() {
+            let client_order_id = client_order_id.to_string();
+            return self.request_account_lifecycle_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::ReadRecoveryOrder { client_order_id, reply })
+            });
+        }
+        Ok(self.order(client_order_id))
+    }
+
+    /// Cold recovery command. Identity check, private-Filled precedence, and
+    /// reservation release run atomically on the existing lifecycle owner.
+    /// No fictitious authoritative trade IDs or zero-fill proof are installed.
+    pub fn infer_null_cancellation(&self, expected: &OrderOwnership) -> Result<OrderOwnership, String> {
+        if self.must_dispatch_lifecycle_to_owner() {
+            let expected = expected.clone();
+            return self.request_account_lifecycle_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::InferNullCancellation { expected, reply })
+            })?;
+        }
+        let account = self.virtual_account_for_coid(&expected.client_order_id)
+            .ok_or_else(|| "inferred cancel owner missing".to_string())?;
+        let lifecycle = self.lifecycle_mut(&account);
+        let order = lifecycle.orders.get_mut(&expected.client_order_id)
+            .ok_or_else(|| "inferred cancel order missing".to_string())?;
+        if order.account_id != expected.account_id || order.instance_id != expected.instance_id
+            || order.order_id != expected.order_id || order.order_id.is_empty()
+            || order.order_slot != expected.order_slot || order.token_id != expected.token_id
+            || order.side != expected.side || order.quantity != expected.quantity
+            || order.price != expected.price {
+            return Err("inferred cancel identity changed".into());
+        }
+        if matches!(order.status, OrderStatus::Filled | OrderStatus::Failed
+            | OrderStatus::Rejected | OrderStatus::ExecutorRejected) {
+            return Ok(order.clone());
+        }
+        account.adjust_reservation(&order.token_id, -order.reserved_cash, -order.reserved_quantity);
+        order.reserved_cash = 0.0;
+        order.reserved_quantity = 0.0;
+        order.inferred_cancel = true;
+        order.status = OrderStatus::Cancelled;
+        let result = order.clone();
+        lifecycle.routine_cancel_audits.remove(&expected.client_order_id);
+        lifecycle.recovery_pending_orders.remove(&expected.client_order_id);
+        lifecycle.startup_query_repair_orders.remove(&expected.client_order_id);
+        Self::record_virtual_trade_mutation(&account, lifecycle, "", &expected.client_order_id, &result.token_id);
+        self.schedule_virtual_lifecycle_persist(&account, lifecycle, &expected.client_order_id);
+        Ok(result)
+    }
+
     /// Retain an exact successful DELETE before attempting fallible historical
     /// I/O. The existing Cancelled + pending-audit state is durable cancellation
     /// evidence, not a zero-fill proof: no reservation or economics change.
@@ -15302,6 +15374,7 @@ impl SharedAccount {
                 .get_mut(client_order_id)
                 .expect("checked above");
             order.status = status;
+            order.inferred_cancel = false;
             order.terminal_matched_quantity = Some(matched.clamp(0.0, order.quantity));
             order.terminal_trade_ids = trade_ids;
             order.terminal_trade_ids_authoritative = true;
@@ -17579,7 +17652,8 @@ impl SharedAccount {
                     .unwrap_or(order.quantity)
                     .min(order.quantity);
                 if order.filled_quantity + EPS >= fill_target {
-                    if order.terminal_matched_quantity.is_none() && !cancellation_audit_pending {
+                    if (order.terminal_matched_quantity.is_none() && !cancellation_audit_pending)
+                        || (order.inferred_cancel && order.filled_quantity + EPS >= order.quantity) {
                         order.status = OrderStatus::Filled;
                     }
                     order_fully_filled = true;
@@ -17618,7 +17692,9 @@ impl SharedAccount {
                     && order.terminal_matched_quantity.is_none();
                 let off_book = order.status == OrderStatus::Rejected;
                 if should_reverse && !off_book && order.status != OrderStatus::Cancelled {
-                    order.status = if order.filled_quantity > EPS {
+                    order.status = if order.inferred_cancel {
+                        OrderStatus::Cancelled
+                    } else if order.filled_quantity > EPS {
                         OrderStatus::PartiallyFilled
                     } else {
                         OrderStatus::Accepted
@@ -18348,7 +18424,8 @@ impl SharedAccount {
                     .unwrap_or(order.quantity)
                     .min(order.quantity);
                 if order.filled_quantity + EPS >= fill_target {
-                    if order.terminal_matched_quantity.is_none() && !cancellation_audit_pending {
+                    if (order.terminal_matched_quantity.is_none() && !cancellation_audit_pending)
+                        || (order.inferred_cancel && order.filled_quantity + EPS >= order.quantity) {
                         order.status = OrderStatus::Filled;
                     }
                     order_fully_filled = true;
@@ -18404,7 +18481,9 @@ impl SharedAccount {
                     && order.terminal_matched_quantity.is_none();
                 let off_book = order.status == OrderStatus::Rejected;
                 if should_reverse && !off_book && order.status != OrderStatus::Cancelled {
-                    order.status = if order.filled_quantity > EPS {
+                    order.status = if order.inferred_cancel {
+                        OrderStatus::Cancelled
+                    } else if order.filled_quantity > EPS {
                         OrderStatus::PartiallyFilled
                     } else {
                         OrderStatus::Accepted
@@ -20809,6 +20888,7 @@ fn release_order_reservation_locked(state: &mut SharedAccountState, client_order
 }
 
 fn desired_order_reservation(order: &OrderOwnership) -> (f64, f64) {
+    if order.inferred_cancel { return (0.0, 0.0); }
     let target = order
         .terminal_matched_quantity
         .unwrap_or(order.quantity)
@@ -22436,6 +22516,8 @@ fn validate_persisted_state(account_id: &str, state: &SharedAccountState) -> Res
                 .cash_fee_per_share
                 .is_some_and(|fee| !fee.is_finite() || fee < 0.0)
             || !order.reservation_cash_per_share().is_finite()
+            || (order.inferred_cancel && (!matches!(order.status, OrderStatus::Cancelled | OrderStatus::Filled)
+                || order.reserved_cash != 0.0 || order.reserved_quantity != 0.0))
             || !order.reserved_cash.is_finite()
             || order.reserved_cash < -EPS
             || !order.reserved_quantity.is_finite()
@@ -24499,6 +24581,21 @@ mod tests {
     }
 
     #[test]
+    fn inferred_cancel_owner_queue_overflow_preserves_reservation() {
+        let account = Arc::new(seeded_account());
+        account.reserve_order("a", "a-null-full", "oid-null-full", "UP", Side::Buy, 10.0, 0.5, 0).unwrap();
+        let original = account.order("a-null-full").unwrap();
+        let _owner = account.bind_account_lifecycle_owner().unwrap();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        for _ in 0..ACCOUNT_LIFECYCLE_TASK_QUEUE_CAPACITY {
+            account.try_submit_account_lifecycle_command(AccountOwnerCommand::barrier(tx.clone())).unwrap();
+        }
+        assert!(account.infer_null_cancellation(&original).unwrap_err().contains("full"));
+        assert!(account.recovery_order(&original.client_order_id).unwrap_err().contains("full"));
+        assert_eq!(account.order(&original.client_order_id).unwrap(), original);
+    }
+
+    #[test]
     fn concurrent_wallet_calibration_publish_keeps_every_waiter_and_latest_generation() {
         const PRODUCERS: usize = 16;
         let account = Arc::new(SharedAccount::new("wallet-calibration-cas"));
@@ -24976,6 +25073,7 @@ mod tests {
                 let oid = format!("oid-{instance_id}-gc-{row}");
                 let trade_key = format!("trade-{instance_id}-gc-{row}");
                 let order = OrderOwnership {
+                    inferred_cancel: false,
                     order_slot: Default::default(),
                     account_id: "settled-gc-bench".into(),
                     instance_id: instance_id.clone(),
@@ -25327,6 +25425,7 @@ mod tests {
         state.orders.insert(
             "btc01-residual".to_string(),
             OrderOwnership {
+                inferred_cancel: false,
                 order_slot: Default::default(),
                 account_id: account_id.to_string(),
                 instance_id: "btc01".to_string(),
@@ -25839,6 +25938,7 @@ mod tests {
         state.orders.insert(
             coid.to_string(),
             OrderOwnership {
+                inferred_cancel: false,
                 order_slot: Default::default(),
                 account_id: account_id.to_string(),
                 instance_id: instance_id.to_string(),
@@ -26529,6 +26629,88 @@ mod tests {
         let after = account.monitoring_snapshot();
         assert_eq!(after.physical_cash, before.physical_cash);
         assert_eq!(after.physical_positions, before.physical_positions);
+    }
+
+    #[test]
+    fn inferred_cancel_late_fill_duplicate_replay_and_owner_isolation() {
+        for side in [Side::Buy, Side::Sell] {
+            let account = seeded_account();
+            account.reserve_order("a", "a-null", "oid-null", "UP", side, 10.0, 0.5, 0).unwrap();
+            account.reserve_order("b", "b-null", "oid-sibling", "UP", side, 4.0, 0.5, 0).unwrap();
+            let original = account.order("a-null").unwrap();
+            let sibling = account.order("b-null").unwrap();
+            let before = account.instance_snapshot("a").unwrap();
+            let mut wrong = original.clone(); wrong.instance_id = "b".into();
+            assert!(account.infer_null_cancellation(&wrong).is_err());
+            let cancelled = account.infer_null_cancellation(&original).unwrap();
+            assert!(cancelled.inferred_cancel);
+            assert_eq!(cancelled.status, OrderStatus::Cancelled);
+            assert_eq!((cancelled.reserved_cash, cancelled.reserved_quantity), (0.0, 0.0));
+            assert!(!cancelled.terminal_trade_ids_authoritative);
+            assert_eq!(account.infer_null_cancellation(&original).unwrap(), cancelled);
+            // Partial fills, settlement progression, and reconnect replay must
+            // never restore the cancelled residual or double-book economics.
+            for status in ["MATCHED", "MINED", "CONFIRMED", "MATCHED", "CONFIRMED"] {
+                account.apply_trade_transition("late-null", status, "a-null", "oid-null", "UP", side, 4.0, 0.5).unwrap();
+                let o = account.order("a-null").unwrap();
+                assert_eq!(o.filled_quantity, 4.0);
+                assert_eq!((o.reserved_cash, o.reserved_quantity), (0.0, 0.0));
+            }
+            account.apply_authoritative_order_audit("a-null", OrderStatus::Filled,
+                &AuthoritativeOrderAudit { original_size: Some("10".into()), size_matched: Some("4".into()), associate_trades: vec!["late-null".into()] }).unwrap();
+            let filled = account.order("a-null").unwrap();
+            assert_eq!(filled.status, OrderStatus::Filled);
+            assert!(!filled.inferred_cancel);
+            assert_eq!((filled.reserved_cash, filled.reserved_quantity), (0.0, 0.0));
+            // A null-policy commit queued before the private Filled cannot win later.
+            assert_eq!(account.infer_null_cancellation(&original).unwrap(), filled);
+            let after = account.instance_snapshot("a").unwrap();
+            let sign = if side == Side::Buy { 1.0 } else { -1.0 };
+            assert_eq!(after.cash, before.cash - sign * 2.0);
+            assert_eq!(after.positions["UP"], before.positions["UP"] + sign * 4.0);
+            assert_eq!(account.order("b-null").unwrap(), sibling);
+        }
+    }
+
+    #[test]
+    fn inferred_cancel_late_full_fill_failure_and_reconfirmation_do_not_reopen_order() {
+        let account = seeded_account();
+        account.reserve_order("a", "a-null-fail", "oid-null-fail", "UP", Side::Buy, 10.0, 0.5, 0).unwrap();
+        let original = account.order("a-null-fail").unwrap();
+        account.infer_null_cancellation(&original).unwrap();
+        for (trade_status, order_status, qty) in [("MATCHED", OrderStatus::Filled, 10.0),
+            ("FAILED", OrderStatus::Cancelled, 0.0), ("CONFIRMED", OrderStatus::Filled, 10.0)] {
+            account.apply_trade_transition("late-null-fail", trade_status, "a-null-fail", "oid-null-fail", "UP", Side::Buy, 10.0, 0.5).unwrap();
+            let order = account.order("a-null-fail").unwrap();
+            assert_eq!(order.status, order_status);
+            assert_eq!(order.filled_quantity, qty);
+            assert_eq!(order.reserved_cash, 0.0);
+        }
+    }
+
+    #[test]
+    fn inferred_cancel_persistent_restart_retains_zero_reservation_and_late_fill_route() {
+        let _guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!("hexagent-null-cancel-{}-{}.json", std::process::id(), wall_clock_ms()));
+        {
+            let account = SharedAccount::new_persistent("null-policy", &path).unwrap();
+            account.register_instance("a", 1.0);
+            account.apply_physical_snapshot(100.0, HashMap::new()).unwrap();
+            account.reserve_order("a", "a-null", "oid-null", "UP", Side::Buy, 10.0, 0.5, 0).unwrap();
+            account.infer_null_cancellation(&account.order("a-null").unwrap()).unwrap();
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+        let restored = SharedAccount::new_persistent("null-policy", &path).unwrap();
+        let o = restored.order("a-null").unwrap();
+        assert!(o.inferred_cancel);
+        assert_eq!(o.status, OrderStatus::Cancelled);
+        assert_eq!(o.reserved_cash, 0.0);
+        assert!(!restored.pending_order_audit_ids().contains(&"a-null".to_string()));
+        restored.apply_trade_transition("late-replay", "CONFIRMED", "a-null", "oid-null", "UP", Side::Buy, 10.0, 0.5).unwrap();
+        assert_eq!(restored.order("a-null").unwrap().status, OrderStatus::Filled);
+        assert_eq!(restored.order("a-null").unwrap().filled_quantity, 10.0);
+        restored.apply_trade_transition("late-replay", "CONFIRMED", "a-null", "oid-null", "UP", Side::Buy, 10.0, 0.5).unwrap();
+        assert_eq!(restored.order("a-null").unwrap().filled_quantity, 10.0);
     }
 
     #[test]
@@ -28105,6 +28287,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
             let oid = format!("oid-gc-{index}");
             let trade_key = format!("trade-gc-{index}");
             let order = OrderOwnership {
+                inferred_cancel: false,
                 order_slot: Default::default(),
                 account_id: "acct".into(),
                 instance_id: "a".into(),
@@ -32423,6 +32606,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             coid.to_string(),
             OrderOwnership {
+                inferred_cancel: false,
                 order_slot: Default::default(),
                 account_id: account_id.to_string(),
                 instance_id: instance_id.to_string(),
@@ -32578,6 +32762,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             coid.to_string(),
             OrderOwnership {
+                inferred_cancel: false,
                 order_slot: Default::default(),
                 account_id: account_id.to_string(),
                 instance_id: instance_id.to_string(),
@@ -32696,6 +32881,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             coid.to_string(),
             OrderOwnership {
+                inferred_cancel: false,
                 order_slot: Default::default(),
                 account_id: account_id.to_string(),
                 instance_id: instance_id.to_string(),
@@ -32808,6 +32994,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             coid.to_string(),
             OrderOwnership {
+                inferred_cancel: false,
                 order_slot: Default::default(),
                 account_id: account_id.to_string(),
                 instance_id: instance_id.to_string(),
@@ -32888,6 +33075,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             "maker-1".to_string(),
             OrderOwnership {
+                inferred_cancel: false,
                 order_slot: Default::default(),
                 account_id: "unowned".to_string(),
                 instance_id: "maker".to_string(),
@@ -32944,6 +33132,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             "maker-1".to_string(),
             OrderOwnership {
+                inferred_cancel: false,
                 order_slot: Default::default(),
                 account_id: "recoverable".to_string(),
                 instance_id: "maker".to_string(),
@@ -33008,6 +33197,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             "maker-order".to_string(),
             OrderOwnership {
+                inferred_cancel: false,
                 order_slot: Default::default(),
                 account_id: "account".to_string(),
                 instance_id: "maker".to_string(),
@@ -33085,6 +33275,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             "maker-order".to_string(),
             OrderOwnership {
+                inferred_cancel: false,
                 order_slot: Default::default(),
                 account_id: "account".to_string(),
                 instance_id: "maker".to_string(),
@@ -33169,6 +33360,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         state.orders.insert(
             "btc01-sell".to_string(),
             OrderOwnership {
+                inferred_cancel: false,
                 order_slot: Default::default(),
                 account_id: "account".to_string(),
                 instance_id: "btc01".to_string(),
