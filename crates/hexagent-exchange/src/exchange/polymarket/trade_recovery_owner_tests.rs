@@ -399,7 +399,7 @@ fn active_cancel_proof_rechecks_late_trade_and_full_queue_preserves_reservation(
         )
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while requests.is_empty() {
+    while requests.queue_snapshot().0 == 0 {
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();
     }
@@ -408,7 +408,7 @@ fn active_cancel_proof_rechecks_late_trade_and_full_queue_preserves_reservation(
         .cancel_unknown_order_via_owners(&order, &order.order_id)
         .is_none());
     requests
-        .recv()
+        .recv_timeout(Duration::from_secs(2))
         .unwrap()
         .reject_not_sent("test queue occupied");
     producer.join().unwrap();
@@ -623,11 +623,10 @@ fn benchmark_active_unknown_cancel_recovery() {
         let mut count = 0;
         let mut high_water = 0;
         loop {
-            crossbeam_channel::select_biased! {
-                recv(stop_rx) -> _ => return (count, high_water),
-                recv(requests) -> req => {
-                    let req = req.unwrap();
-                    high_water = high_water.max(requests.len() + 1);
+            if stop_rx.try_recv().is_ok() { return (count, high_water); }
+            match requests.recv_timeout(Duration::from_millis(1)) {
+                Ok(req) => {
+                    high_water = high_water.max(requests.queue_snapshot().0 + 1);
                     count += 1;
                     let (method, path, body) = req.request_parts_for_test();
                     let reply = if method == "DELETE" {
@@ -640,6 +639,8 @@ fn benchmark_active_unknown_cancel_recovery() {
                     let role = req.role;
                     req.reply_for_test(Ok(reply), Some((role, slot)));
                 }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {},
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return (count, high_water),
             }
         }
     });

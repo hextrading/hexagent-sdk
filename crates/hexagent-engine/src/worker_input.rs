@@ -25,9 +25,11 @@ fn ready<T>(rx: &Receiver<T>) -> Option<Result<T, RecvError>> {
 
 /// Priority is identical in the ready and idle paths. Every invocation handles
 /// at most one input, so queued private/lifecycle events are checked again
-/// before each market callback. Startup substitutes never receivers as before.
+/// before each market callback. Absent admission owners supply None; other
+/// disabled legacy lanes use never receivers. Admission is polled again after
+/// the bounded idle sleep, without registering a cross-thread wake lock.
 pub(super) fn next_input(
-    admission: &Receiver<ExecutionAdmission>,
+    admission: Option<&hexagent_runtime::latest_snapshot::Receiver<ExecutionAdmission>>,
     control: &Receiver<crate::exchange::PrivateFeedControl>,
     direct: &Receiver<RoutedOrderUpdate>,
     private: &Receiver<OrderUpdate>,
@@ -43,7 +45,13 @@ pub(super) fn next_input(
             }
         };
     }
-    take!(admission, Admission);
+    if let Some(admission) = admission {
+        match admission.try_recv() {
+            Ok(value) => return WorkerInput::Admission(Ok(value)),
+            Err(TryRecvError::Disconnected) => return WorkerInput::Admission(Err(RecvError)),
+            Err(TryRecvError::Empty) => {},
+        }
+    }
     take!(control, PrivateControl);
     take!(direct, DirectPrivate);
     take!(private, PrivateUpdate);
@@ -61,7 +69,6 @@ pub(super) fn next_input(
     // An unpublished market head is not permission to spin: its producer may
     // have been preempted. Timed idle parking also leaves the CPU available.
     crossbeam_channel::select_biased! {
-        recv(admission) -> message => WorkerInput::Admission(message),
         recv(control) -> message => WorkerInput::PrivateControl(message),
         recv(direct) -> message => WorkerInput::DirectPrivate(message),
         recv(private) -> message => WorkerInput::PrivateUpdate(message),
@@ -76,13 +83,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn latest_admission_precedes_ready_market_and_disconnect_fails_closed() {
+        let (mut publisher, receiver) = crate::execution_admission_lane::snapshot_lane();
+        let mut admission = crate::execution_admission_lane::AdmissionConsumer::new(Some(receiver));
+        let (market_tx, market) = hexagent_runtime::poll_channel::bounded(1);
+        market_tx.try_send(QueuedMarketEvent::Direct(QueuedMarketPayload {
+            event: Arc::new(MarketEvent::Exit), enqueued_ns: 1,
+        })).unwrap();
+        let next = |admission: &crate::execution_admission_lane::AdmissionConsumer| {
+            next_input(admission.receiver(), &crossbeam_channel::never(),
+                &crossbeam_channel::never(), &crossbeam_channel::never(),
+                &crossbeam_channel::never(), &crossbeam_channel::never(),
+                &market, std::time::Duration::ZERO)
+        };
+        for (epoch, state) in [(1, ExecutionAdmissionState::Healthy), (2, ExecutionAdmissionState::Paused)] {
+            publisher.publish(ExecutionAdmission {
+                exchange: Exchange::Polymarket, epoch, state,
+                available_place_slots: u16::from(state == ExecutionAdmissionState::Healthy),
+                observed_at_ns: crate::types::now_ns(),
+            });
+        }
+        let WorkerInput::Admission(message) = next(&admission) else { panic!("latest admission first") };
+        assert_eq!(admission.receive(message).unwrap().state, ExecutionAdmissionState::Paused);
+        assert!(matches!(next(&admission), WorkerInput::Market(Ok(_))));
+        assert!(matches!(next(&admission), WorkerInput::Idle));
+        drop(publisher);
+        let WorkerInput::Admission(message) = next(&admission) else { panic!("disconnect delivered") };
+        assert_eq!(admission.receive(message).unwrap().state, ExecutionAdmissionState::Paused);
+        assert!(admission.receiver().is_none());
+        assert!(matches!(next(&admission), WorkerInput::Idle));
+    }
+
+    #[test]
     fn control_reconnect_and_history_precede_market_without_loss_or_duplicates() {
         let (control_tx, control) = bounded(2);
         let (history_tx, history) = bounded(1);
         let (market_tx, market) = hexagent_runtime::poll_channel::bounded(2);
         let next = || {
             next_input(
-                &crossbeam_channel::never(),
+                None,
                 &control,
                 &crossbeam_channel::never(),
                 &crossbeam_channel::never(),

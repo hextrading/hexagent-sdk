@@ -107,13 +107,48 @@ const PROBE_ORPHAN_OWNER_CAPACITY: usize = 64;
 /// its account-local Fast budget and retains DELETE on its cancel outbox.
 #[derive(Clone)]
 pub struct ProbeHttpTransport {
-    tx: Sender<ProbeHttpRequest>,
+    tx: hexagent_runtime::poll_channel::Sender<ProbeHttpRequest>,
+    metrics: Arc<ProbeHttpMetrics>,
 }
 
-pub fn probe_http_lane(capacity: usize) -> (ProbeHttpTransport, Receiver<ProbeHttpRequest>) {
+#[derive(Default)]
+struct ProbeHttpMetrics {
+    capacity: usize,
+    high_water: AtomicUsize,
+    rejected: AtomicU64,
+}
+
+/// One execution dispatcher owns the receiver. Recovery/probe producers retain
+/// their durable retry responsibility on Full/Disconnected; POST never retries
+/// an admitted request. A reserved but unpublished head returns Empty promptly.
+pub struct ProbeHttpReceiver {
+    rx: hexagent_runtime::poll_channel::Receiver<ProbeHttpRequest>,
+    metrics: Arc<ProbeHttpMetrics>,
+}
+
+impl ProbeHttpReceiver {
+    pub fn try_recv(&self) -> Result<ProbeHttpRequest, crossbeam_channel::TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    /// Advisory occupancy includes unpublished reservations. Sampled high water
+    /// is taken by cold producers; it is not a risk or admission authority.
+    pub fn queue_snapshot(&self) -> (usize, usize, u64) {
+        (self.rx.len(), self.metrics.high_water.load(Ordering::Relaxed),
+         self.metrics.rejected.load(Ordering::Relaxed))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<ProbeHttpRequest, crossbeam_channel::RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+}
+
+pub fn probe_http_lane(capacity: usize) -> (ProbeHttpTransport, ProbeHttpReceiver) {
     assert!(capacity > 0, "probe HTTP lane must be bounded and nonzero");
-    let (tx, rx) = crossbeam_channel::bounded(capacity);
-    (ProbeHttpTransport { tx }, rx)
+    let (tx, rx) = hexagent_runtime::poll_channel::bounded(capacity);
+    let metrics = Arc::new(ProbeHttpMetrics { capacity, ..Default::default() });
+    (ProbeHttpTransport { tx, metrics: metrics.clone() }, ProbeHttpReceiver { rx, metrics })
 }
 
 pub(crate) struct ProbeHttpResponse {
@@ -222,7 +257,9 @@ impl ProbeHttpTransport {
             record_kind,
             reply,
         };
+        let depth = self.tx.len();
         if self.tx.try_send(request).is_err() {
+            self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
             // Nothing reached an execution owner. For DELETE the already
             // durable orphan retains retry ownership, so no cancel is lost.
             return ProbeHttpResponse {
@@ -232,6 +269,7 @@ impl ProbeHttpTransport {
                 location: None,
             };
         }
+        self.metrics.high_water.fetch_max(depth.saturating_add(1).min(self.metrics.capacity), Ordering::Relaxed);
         rx.recv_timeout(Duration::from_secs(10))
             .unwrap_or_else(|_| ProbeHttpResponse {
                 reply: Err(HttpErr::Transport(
@@ -1113,8 +1151,8 @@ mod tests {
             .unwrap_or_else(|_| panic!("first request fits"));
         let overflow = transport.request(&shared, "maker-b", "POST", "/order", "{}", None, None);
         assert!(matches!(overflow.reply, Err(HttpErr::Other(_))));
-        assert_eq!(requests.len(), 1);
-        requests.recv().unwrap().reject_not_sent("test shutdown");
+        assert_eq!(requests.queue_snapshot().0, 1);
+        requests.try_recv().unwrap().reject_not_sent("test shutdown");
         drop(requests);
         assert!(matches!(
             transport

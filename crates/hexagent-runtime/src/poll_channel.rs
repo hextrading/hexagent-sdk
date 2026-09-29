@@ -73,6 +73,15 @@ impl<T> Drop for Sender<T> {
 }
 
 impl<T> Sender<T> {
+    /// Advisory occupancy, including reserved but unpublished messages.
+    pub fn len(&self) -> usize {
+        self.0.queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.queue.is_empty()
+    }
+
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         if !self.0.receiver_alive.load(Ordering::Acquire) {
             return Err(TrySendError::Disconnected(value));
@@ -153,6 +162,79 @@ impl<T> Drop for Receiver<T> {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    /// Models a cold producer preempted after reserving its FIFO slot. The
+    /// dispatcher must be able to return to independent quote work immediately.
+    /// The old channel's public select API supplies the same reservation seam.
+    #[test]
+    #[ignore = "manual preempted-ingress benchmark; release --ignored --nocapture"]
+    fn preempted_cold_ingress_benchmark() {
+        const N: usize = 100_000;
+        const HOLD: Duration = Duration::from_millis(10);
+        fn report(label: &str, mut samples: Vec<u128>) {
+            samples.sort_unstable();
+            println!("cold_ingress mode={label} N={N} injected_preemptions=200 held_ms=10 boundary=dispatcher_try_receive_to_independent_quote_turn p50_ns={} p99_ns={} p999_ns={} max_ns={} depth_high_water=1 overflow=0",
+                samples[N / 2 - 1], samples[N * 99 / 100 - 1],
+                samples[N * 999 / 1000 - 1], samples[N - 1]);
+        }
+        let (old_tx, old_rx) = crossbeam_channel::bounded(64);
+        let mut before = Vec::with_capacity(N);
+        for n in 0..N {
+            if n % 500 == 0 {
+                let reserved = Barrier::new(2);
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        let mut select = crossbeam_channel::Select::new();
+                        select.send(&old_tx);
+                        let reservation = select.select();
+                        reserved.wait();
+                        std::thread::sleep(HOLD);
+                        reservation.send(&old_tx, n).unwrap();
+                    });
+                    reserved.wait();
+                    let start = std::time::Instant::now();
+                    assert_eq!(old_rx.try_recv(), Ok(n));
+                    before.push(start.elapsed().as_nanos());
+                });
+            } else {
+                old_tx.try_send(n).unwrap();
+                let start = std::time::Instant::now();
+                assert_eq!(old_rx.try_recv(), Ok(n));
+                before.push(start.elapsed().as_nanos());
+            }
+        }
+        report("crossbeam", before);
+        let (tx, rx) = bounded(64);
+        let mut after = Vec::with_capacity(N);
+        for n in 0..N {
+            if n % 500 == 0 {
+                let reserved = Barrier::new(2);
+                let resume = Barrier::new(2);
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        tx.0.queue.push_with(n, || {
+                            reserved.wait();
+                            std::thread::sleep(HOLD);
+                            resume.wait();
+                        }).unwrap();
+                    });
+                    reserved.wait();
+                    let start = std::time::Instant::now();
+                    assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+                    after.push(start.elapsed().as_nanos());
+                    resume.wait();
+                });
+                // The exact retained message arrives once after publication.
+                assert_eq!(rx.try_recv(), Ok(n));
+            } else {
+                tx.try_send(n).unwrap();
+                let start = std::time::Instant::now();
+                assert_eq!(rx.try_recv(), Ok(n));
+                after.push(start.elapsed().as_nanos());
+            }
+        }
+        report("poll", after);
+    }
 
     #[test]
     fn cold_timeout_checks_ready_and_disconnected_before_deadline() {
