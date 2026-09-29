@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) fn ownership(side: Side, coid: &str, oid: &str, instance: &str) -> OrderOwnership {
     OrderOwnership {
+        inferred_cancel: false,
         order_slot: OrderSlot::with_generation(8147, 18),
         account_id: "shutdown-test".into(),
         instance_id: instance.into(),
