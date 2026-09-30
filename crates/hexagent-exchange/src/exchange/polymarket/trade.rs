@@ -7933,21 +7933,31 @@ impl PolymarketTrade {
             return None;
         }
         self.recover_cancelled_order_after_trade_audit_with(
-            ownership, order_id, absence, audit_history,
+            ownership, order_id, absence, event_has_ended, audit_history,
         )
     }
 
-    /// A caller must first prove the order cannot remain live: either the
-    /// existing expiry proof or an exact successful DELETE acknowledgement.
-    /// Complete trade history and the lifecycle-owner compare/commit are
-    /// still required; a cancellation alone does not prove zero fills.
+    /// Only ended markets may use the existing scoped history recovery.
+    /// Exact DELETE acknowledgement in a live market does not make an empty
+    /// history page final execution evidence. Complete history and the
+    /// lifecycle-owner compare/commit remain required for ended markets.
     fn recover_cancelled_order_after_trade_audit_with(
         &self,
         ownership: &OrderOwnership,
         order_id: &str,
         evidence: &str,
+        event_has_ended: bool,
         audit_history: impl FnOnce(&str, u64) -> HistoricalOrderTradeAudit,
     ) -> Option<OrderUpdate> {
+        // A DELETE acknowledgement proves cancellation, not zero executions.
+        // While the market is live, authenticated history may lag the private
+        // order/trade stream (maker02: 57 ms). Never synthesize a zero-match
+        // terminal audit from that absence: retain the reservation and let the
+        // existing private/GET terminal-audit lane provide matched quantity.
+        // Ended-market recovery retains its separately established scope.
+        if !event_has_ended {
+            return None;
+        }
         let round = RecoveryRound::new(ownership, order_id);
         // A no-fill history cannot override already observed matched quantity
         // or a durable associated trade. Those need exact trade-id recovery.
@@ -8147,6 +8157,7 @@ impl PolymarketTrade {
                             &ownership,
                             &order_id,
                             "durable_cancel_confirmed_pending_audit",
+                            self.shared.account_state.token_event_has_ended(&ownership.token_id),
                             |oid, stamp| self.audit_historical_order_trades(oid, stamp),
                         )
                     };
@@ -11231,6 +11242,7 @@ impl PolymarketTrade {
             ownership,
             order_id,
             "exact_order_cancel_acknowledged",
+            self.shared.account_state.token_event_has_ended(&ownership.token_id),
             |oid, stamp| {
                 let history = fetch_historical_order_trade_audit_in_market(
                     oid,

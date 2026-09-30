@@ -114,12 +114,12 @@ fn recovery_nulls_wrong_slot_and_disconnected_mailbox_preserve_reservation() {
 }
 
 #[test]
-fn active_unknown_order_cancel_ack_and_complete_history_resolve_without_expiry() {
+fn ended_unknown_order_cancel_ack_and_complete_history_resolve() {
     exact_cancel_recovery_entry(false);
 }
 
 #[test]
-fn live_per_order_entry_cancels_unknown_order_and_audits_history_without_expiry() {
+fn ended_per_order_entry_cancels_unknown_order_and_audits_history() {
     exact_cancel_recovery_entry(true);
 }
 
@@ -139,9 +139,11 @@ fn exact_cancel_recovery_entry(per_order: bool) {
         )
         .unwrap();
     install(&trade.shared, &order);
+    trade.shared.account_state.record_settled_token_values(
+        &HashMap::from([(order.token_id.clone(), 1.0)]));
     let sibling = ownership(Side::Buy, "btc02-1789622848819", "0xsibling", "btc02");
     install(&trade.shared, &sibling);
-    assert!(!trade
+    assert!(trade
         .shared
         .account_state
         .token_event_has_ended(&order.token_id));
@@ -229,7 +231,7 @@ fn exact_cancel_recovery_entry(per_order: bool) {
 }
 
 #[test]
-fn active_unknown_cancel_requires_exact_ack_and_complete_no_fill_history() {
+fn ended_unknown_cancel_requires_exact_ack_and_complete_no_fill_history() {
     let cases = [
         (serde_json::Value::Null, None),
         (
@@ -268,6 +270,8 @@ fn active_unknown_cancel_requires_exact_ack_and_complete_no_fill_history() {
         let mut order = ownership(Side::Sell, "btc01-1789622848819", "0xmissing", "btc01");
         order.status = OrderStatus::NewOrderTimeout;
         install(&trade.shared, &order);
+        trade.shared.account_state.record_settled_token_values(
+            &HashMap::from([(order.token_id.clone(), 1.0)]));
         let (transport, requests) = super::super::rtt_probe::probe_http_lane(2);
         trade.shared.bind_recovery_http_transport(transport);
         let server = std::thread::spawn(move || {
@@ -307,6 +311,8 @@ fn exact_cancel_ack_survives_history_failure_and_resumes_without_another_delete(
     let mut order = ownership(Side::Sell, "btc01-1789622848819", "0xmissing", "btc01");
     order.status = OrderStatus::NewOrderTimeout;
     install(&trade.shared, &order);
+    trade.shared.account_state.record_settled_token_values(
+        &HashMap::from([(order.token_id.clone(), 1.0)]));
     let sibling = ownership(Side::Buy, "btc02-1789622848819", "0xsibling", "btc02");
     install(&trade.shared, &sibling);
     let (transport, requests) = super::super::rtt_probe::probe_http_lane(2);
@@ -425,6 +431,7 @@ fn active_cancel_proof_rechecks_late_trade_and_full_queue_preserves_reservation(
         &order,
         &order.order_id,
         "test exact ACK",
+        true,
         |_, _| {
             trade
                 .shared
@@ -459,7 +466,7 @@ fn active_cancel_proof_rechecks_late_trade_and_full_queue_preserves_reservation(
 }
 
 #[test]
-fn persisted_cancel_proof_resumes_startup_audit_without_market_expiry() {
+fn persisted_cancel_proof_resumes_ended_market_startup_audit() {
     let shutdown = ShutdownToken::new();
     let trade = super::tests::shutdown_test_trade(shutdown.clone());
     let mut order = ownership(Side::Sell, "btc01-1789622848819", "0xmissing", "btc01");
@@ -474,11 +481,13 @@ fn persisted_cancel_proof_resumes_startup_audit_without_market_expiry() {
         )
         .unwrap();
     install(&trade.shared, &order);
+    trade.shared.account_state.record_settled_token_values(
+        &HashMap::from([(order.token_id.clone(), 1.0)]));
     trade
         .shared
         .account_state
         .begin_order_recovery([order.client_order_id.as_str()]);
-    assert!(!trade
+    assert!(trade
         .shared
         .account_state
         .token_event_has_ended(&order.token_id));
@@ -552,7 +561,6 @@ fn stale_live_after_cancel_proof_cannot_reopen_or_release_unknown_order() {
                 "/order",
                 Ok(serde_json::json!({"canceled":["0xmissing"],"not_canceled":{}})),
             ),
-            (Role::Reconcile, 0, "/data/trades?", Err(HttpErr::Timeout)),
             (
                 Role::Reconcile,
                 0,
@@ -561,7 +569,6 @@ fn stale_live_after_cancel_proof_cannot_reopen_or_release_unknown_order() {
                     serde_json::json!({"id":"0xmissing","status":"LIVE","original_size":"16","size_matched":"0","associate_trades":[]}),
                 ),
             ),
-            (Role::Reconcile, 0, "/data/trades?", Err(HttpErr::Timeout)),
             (
                 Role::Reconcile,
                 0,
@@ -612,7 +619,7 @@ fn stale_live_after_cancel_proof_cannot_reopen_or_release_unknown_order() {
 
 #[test]
 #[ignore = "cold recovery request-to-owner-commit benchmark; mock venue, no network claims"]
-fn benchmark_active_unknown_cancel_recovery() {
+fn benchmark_ended_unknown_cancel_recovery() {
     const N: usize = 100;
     let shutdown = ShutdownToken::new();
     let trade = super::tests::shutdown_test_trade(shutdown.clone());
@@ -659,6 +666,7 @@ fn benchmark_active_unknown_cancel_recovery() {
             );
             order.status = OrderStatus::NewOrderTimeout;
             install(&trade.shared, &order);
+            trade.shared.account_state.record_settled_token_values(&HashMap::from([(order.token_id.clone(), 1.0)]));
             let start = std::time::Instant::now();
             assert!(order_lookup_is_absent(
                 &trade.fetch_recovery_order_via_owners(&order, &order.order_id)
@@ -695,6 +703,9 @@ fn cancel_transport_failure_keeps_intent_and_original_error_until_authoritative_
     trade.shared.install_runtime_order_id(&order.client_order_id, &order.order_id,
         &order.token_id, Some(&order)).unwrap();
     install(&trade.shared, &order);
+    trade.shared.account_state.record_settled_token_values(
+        &HashMap::from([(order.token_id.clone(), 1.0)]),
+    );
     for failure in [HttpErr::Transport("Connection reset by peer".into()),
         HttpErr::InvalidResponse("truncated response".into()),
         HttpErr::NotSent("slot changed generation".into())] {
@@ -783,4 +794,64 @@ fn ambiguous_null_placement_backs_off_without_releasing_or_polling_sibling() {
     shutdown.request();
     shutdown.finish();
     trade.shared.join_background_workers();
+}
+
+#[test]
+fn live_cancel_absence_never_releases_before_delayed_private_fill() {
+    for side in [Side::Buy, Side::Sell] {
+        for trade_first in [false, true] {
+            let shutdown = ShutdownToken::new();
+            let trade = super::tests::shutdown_test_trade(shutdown.clone());
+            let mut order = ownership(side, "btc02-1790702577580", "0xdelayed", "btc02");
+            order.quantity = 30.0;
+            order.price = 0.9;
+            order.reserved_cash = if side == Side::Buy { 27.0 } else { 0.0 };
+            order.reserved_quantity = if side == Side::Sell { 30.0 } else { 0.0 };
+            order.status = OrderStatus::NewOrderTimeout;
+            install(&trade.shared, &order);
+            let sibling = ownership(Side::Sell, "btc01-1790702577581", "0xsibling", "btc01");
+            install(&trade.shared, &sibling);
+            let (transport, requests) = super::super::rtt_probe::probe_http_lane(2);
+            trade.shared.bind_recovery_http_transport(transport);
+            let server = std::thread::spawn(move || {
+                let req = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert_eq!(req.instance_id, "btc02");
+                assert_eq!(req.role, Role::Cancel);
+                req.reply_for_test(Ok(serde_json::json!({"canceled":["0xdelayed"],"not_canceled":{}})), Some((Role::Cancel, 0)));
+                // On the old code this empty, fully paginated response manufactured
+                // a zero-match audit just before the private fill was delivered.
+                if let Ok(req) = requests.recv_timeout(Duration::from_millis(100)) {
+                    req.reply_for_test(Ok(serde_json::json!({"data":[],"next_cursor":"LTE="})), Some((Role::Reconcile, 0)));
+                }
+            });
+            let premature = trade.cancel_unknown_order_via_owners(&order, &order.order_id);
+            server.join().unwrap();
+            assert!(premature.is_none(), "live history absence is not a zero-fill proof");
+            let pending = trade.shared.account_state.recovery_order(&order.client_order_id).unwrap().unwrap();
+            assert_eq!((pending.reserved_cash, pending.reserved_quantity), (order.reserved_cash, order.reserved_quantity));
+            assert!(!pending.terminal_trade_ids_authoritative);
+            assert!(trade.recover_cancelled_order_after_trade_audit_with(&pending, &order.order_id,
+                "duplicate live cancellation", false, |_, _| panic!("live empty history must not be queried")).is_none());
+            let apply_fill = || trade.shared.account_state.apply_trade_transition(
+                "late-5.555556", "MATCHED", &order.client_order_id, &order.order_id,
+                &order.token_id, side, 5.555556, 0.9).unwrap();
+            if trade_first { apply_fill(); }
+            trade.shared.account_state.apply_authoritative_order_audit(&order.client_order_id,
+                OrderStatus::Cancelled, &AuthoritativeOrderAudit {
+                    original_size: Some("30".into()), size_matched: Some("5.555556".into()),
+                    associate_trades: vec!["late-5.555556".into()],
+                }).unwrap();
+            if !trade_first { apply_fill(); }
+            for status in ["MINED", "CONFIRMED", "MATCHED", "CONFIRMED"] {
+                trade.shared.account_state.apply_trade_transition("late-5.555556", status,
+                    &order.client_order_id, &order.order_id, &order.token_id, side, 5.555556, 0.9).unwrap();
+            }
+            let final_order = trade.shared.account_state.recovery_order(&order.client_order_id).unwrap().unwrap();
+            assert_eq!(final_order.filled_quantity, 5.555556);
+            assert_eq!(final_order.status, OrderStatus::Cancelled);
+            assert_eq!((final_order.reserved_cash, final_order.reserved_quantity), (0.0, 0.0));
+            assert_eq!(trade.shared.account_state.order(&sibling.client_order_id).unwrap(), sibling);
+            shutdown.request(); shutdown.finish(); trade.shared.join_background_workers();
+        }
+    }
 }
