@@ -25,6 +25,8 @@ tracing = "0.1"
 tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net", "io-util", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
