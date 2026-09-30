@@ -1529,6 +1529,58 @@ mod tests {
         cold.reclaim_retired_routes();
     }
 
+    fn replay_hydration_case(legs: usize, rounds: usize) {
+        let fixture = Fixture::new();
+        let account = Arc::new(SharedAccount::new_persistent("account", &fixture.0).unwrap());
+        account.register_instance("owner", 1.0);
+        account.apply_physical_snapshot(100.0, HashMap::new()).unwrap();
+        let archive = account.history_archive.as_ref().unwrap();
+        for event in 0..8 {
+            let trades = (0..legs).map(|leg| {
+                let key = format!("replay-{event}:leg-{leg}");
+                let row = proof(&key, 1);
+                (key, row)
+            }).collect();
+            archive.store(&ArchiveRows { trades, orders: vec![] }).unwrap();
+        }
+        let before = account.monitoring_snapshot();
+        let (_, cold) = account.bind_account_owner().unwrap();
+        cold.mark_current_thread().unwrap();
+        let mut timings = Vec::new();
+        for _ in 0..rounds { // reconnect/replay remains idempotent
+            for event in 0..8 {
+                let identity = format!("replay-{event}");
+                let started = std::time::Instant::now();
+                assert_eq!(cold.hydrate_archived_private_event(true, &identity).unwrap(), legs);
+                timings.push(started.elapsed().as_nanos() as u64);
+                assert!(account.route_retirement_metrics().0 <= 8);
+            }
+        }
+        assert_eq!(account.route_retirement_metrics().2, 0);
+        assert_eq!(account.state.lock().unwrap().retired_trade_ownership_tombstones.len(), 8 * legs);
+        let after = account.monitoring_snapshot();
+        assert_eq!(after.physical_cash, before.physical_cash);
+        assert_eq!(after.virtual_cash, before.virtual_cash);
+        assert_eq!(after.physical_positions, before.physical_positions);
+        assert_eq!(after.virtual_positions, before.virtual_positions);
+        for _ in 0..8 { cold.reclaim_retired_routes(); }
+        assert_eq!(account.route_retirement_metrics().0, 0);
+        timings.sort_unstable();
+        let percentile = |numerator: usize, denominator: usize| timings[(timings.len() * numerator).div_ceil(denominator) - 1];
+        println!("archive_hydration legs={legs} n={} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_capacity=8 depth=0 high_water={} backpressure={} boundary=cold_owner_reclaim_and_sqlite_hydrate_to_WAL_enqueue_excludes_flush", timings.len(), percentile(50,100), percentile(99,100), percentile(999,1000), timings.last().unwrap(), account.route_retirement_metrics().1, account.route_retirement_metrics().2);
+    }
+
+    #[test]
+    fn archive_replay_batch_reclaims_between_multi_leg_identities() {
+        for legs in [1, MAX_LOOKUP_ROWS] { replay_hydration_case(legs, 2); }
+    }
+
+    #[test]
+    #[ignore = "focused cold hydration benchmark; no venue or quote-path latency claims"]
+    fn benchmark_archive_replay_hydration() {
+        for legs in [1, MAX_LOOKUP_ROWS] { replay_hydration_case(legs, 32); }
+    }
+
     #[test]
     fn cold_removal_is_bounded_and_crash_before_eviction_keeps_both_sources_safe() {
         let fixture = Fixture::new();

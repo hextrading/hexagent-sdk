@@ -428,6 +428,12 @@ impl SharedAccountOwnerState {
     }
 
     pub fn hydrate_archived_private_event(&self, trade: bool, identity: &str) -> Result<usize, String> {
+        // This capability is confined to the cold account owner. Reclaim at
+        // each archive identity boundary, before borrowing the SQLite reader
+        // or account locks, so a batch cannot exhaust its own return credits.
+        self.account.route_retirement.reclaim_ready(
+            &mut self.route_retirement_pending.borrow_mut(),
+        );
         let Some(archive) = self.account.history_archive.as_ref() else { return Ok(0); };
         let mut reader = self.history_archive_reader.borrow_mut();
         if reader.is_none() {
