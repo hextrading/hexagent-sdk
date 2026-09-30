@@ -2764,6 +2764,15 @@ impl ClobWindowMetrics {
         )
     }
 
+    fn drain_runtime_scheduler(&mut self, pending: &AtomicU64) {
+        // One socket-loop consumer; the sibling probe publishes maxima. Swap
+        // transfers each observation into one window instead of replaying a
+        // process-lifetime maximum into every later 30-second window.
+        self.runtime_scheduler_max_us = self.runtime_scheduler_max_us.max(
+            pending.swap(0, Ordering::Relaxed),
+        );
+    }
+
     fn log_and_reset(&mut self, now: Instant, queue_depth_now: usize) {
         let window_secs = now
             .saturating_duration_since(self.window_started_at)
@@ -4806,6 +4815,45 @@ fn publish_clob_peer_failure(
     for sender in sinks { sender.publish(failure); }
 }
 
+// An unavailable/backward CPU clock must not be labeled as off-CPU time.
+fn scheduler_span_split(wall_ns: u64, previous_cpu: u64, cpu_now: u64) -> Option<(u64, u64)> {
+    if previous_cpu == 0 || cpu_now < previous_cpu { return None; }
+    let cpu_ns = cpu_now - previous_cpu;
+    Some((cpu_ns, wall_ns.saturating_sub(cpu_ns)))
+}
+
+#[cfg(test)]
+mod scheduler_span_tests {
+    use super::*;
+
+    #[test]
+    fn distinguishes_work_from_off_cpu_without_fabricating_unsupported_samples() {
+        assert_eq!(scheduler_span_split(250_000_000, 100, 10_000_100), Some((10_000_000, 240_000_000)));
+        assert_eq!(scheduler_span_split(250_000_000, 100, 245_000_100), Some((245_000_000, 5_000_000)));
+        assert_eq!(scheduler_span_split(10, 100, 111), Some((11, 0)));
+        assert_eq!(scheduler_span_split(250, 0, 0), None);
+        assert_eq!(scheduler_span_split(250, 100, 99), None);
+    }
+
+    #[test]
+    fn stalled_maximum_is_consumed_once_and_does_not_leak_into_next_window() {
+        let pending = AtomicU64::new(241_438);
+        let mut window = ClobWindowMetrics::new(Instant::now());
+        window.drain_runtime_scheduler(&pending);
+        assert_eq!(window.runtime_scheduler_max_us, 241_438);
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        pending.fetch_max(1_500, Ordering::Relaxed);
+        window.drain_runtime_scheduler(&pending);
+        assert_eq!(window.runtime_scheduler_max_us, 241_438);
+        let mut next = ClobWindowMetrics::new(Instant::now());
+        next.drain_runtime_scheduler(&pending);
+        assert_eq!(next.runtime_scheduler_max_us, 0);
+        pending.fetch_max(1_700, Ordering::Relaxed);
+        next.drain_runtime_scheduler(&pending);
+        assert_eq!(next.runtime_scheduler_max_us, 1_700);
+    }
+}
+
 async fn clob_ws_task(
     initial_subscription: ClobSubscription,
     execution_peer_failure_sinks: Arc<[super::execution_peer_failure::PeerFailureSender]>,
@@ -4819,8 +4867,9 @@ async fn clob_ws_task(
     // A sibling task on the same runtime distinguishes runtime-wide timer
     // starvation from delay inside this socket loop's biased select. If only
     // `clob_loop_scheduler_lag` rises, a ready higher-priority branch is
-    // starving the inline timer; if both rise, the runtime/core itself was not
-    // scheduled. Subtracting 1 ms exposes actionable lag above Tokio/Linux
+    // starving the inline timer; if both rise, the entire runtime was delayed.
+    // The probe-span CPU split distinguishes work from off-CPU time (which
+    // also includes intentional idle). Subtracting 1 ms exposes lag above Tokio/Linux
     // timer-wheel granularity while retaining the raw series for comparison.
     let runtime_scheduler_max_us = Arc::new(AtomicU64::new(0));
     let runtime_probe_max = runtime_scheduler_max_us.clone();
@@ -4829,10 +4878,28 @@ async fn clob_ws_task(
         let mut probe = tokio::time::interval(CLOB_SCHEDULER_PROBE_INTERVAL);
         probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         probe.tick().await;
+        let mut previous_wall = std::time::Instant::now();
+        let mut previous_cpu = crate::latency::thread_cpu_ns();
         while !runtime_probe_shutdown.load(Ordering::Relaxed) {
             let scheduled_at = probe.tick().await;
             let lag = scheduled_at.elapsed();
             let lag_ns = lag.as_nanos().min(u64::MAX as u128) as u64;
+            let wall_now = std::time::Instant::now();
+            let cpu_now = crate::latency::thread_cpu_ns();
+            let span_ns = wall_now.duration_since(previous_wall).as_nanos().min(u64::MAX as u128) as u64;
+            if let Some((cpu_ns, off_cpu_ns)) = scheduler_span_split(span_ns, previous_cpu, cpu_now) {
+                // Boundary is previous actual probe completion -> this one,
+                // not just timer lateness. Off-CPU includes intentional idle.
+                // A stalled span records both values on the existing bounded
+                // telemetry lane; no formatting, I/O, or new worker is added.
+                if lag_ns >= 20_000_000 {
+                    crate::latency::observe_ns("polymarket.ws.clob_stalled_probe_span_cpu", cpu_ns);
+                    crate::latency::observe_ns("polymarket.ws.clob_stalled_probe_span_off_cpu", off_cpu_ns);
+                    crate::latency::observe_ns("polymarket.ws.clob_stalled_probe_span_wall", span_ns);
+                }
+            }
+            previous_wall = wall_now;
+            previous_cpu = cpu_now;
             crate::latency::record_ns("polymarket.ws.clob_runtime_scheduler_lag", lag_ns);
             crate::latency::record_ns(
                 "polymarket.ws.clob_runtime_scheduler_over_1ms",
@@ -5456,9 +5523,7 @@ async fn clob_ws_task(
                 scheduled_at = scheduler_probe.tick() => {
                     let lag = scheduled_at.elapsed();
                     active.diagnostics.record_loop_scheduler(lag);
-                    active.diagnostics.runtime_scheduler_max_us = active.diagnostics.runtime_scheduler_max_us.max(
-                        runtime_scheduler_max_us.load(Ordering::Relaxed),
-                    );
+                    active.diagnostics.drain_runtime_scheduler(&runtime_scheduler_max_us);
                     let lag_ns = lag.as_nanos().min(u64::MAX as u128) as u64;
                     crate::latency::record_ns(
                         "polymarket.ws.clob_scheduler_lag",
@@ -5649,6 +5714,7 @@ async fn clob_ws_task(
 
                 _ = health_interval.tick() => {
                     let now = Instant::now();
+                    active.diagnostics.drain_runtime_scheduler(&runtime_scheduler_max_us);
                     active.diagnostics.log_and_reset(now, event_tx.len());
                     if health.topic_is_stale(now, TOPIC_STALE_WARNING_THRESHOLD) {
                         warn!(
@@ -6059,9 +6125,7 @@ async fn clob_ws_task(
                             active.diagnostics.record_read_handler(received_at.elapsed());
                         }
                         Message::Close(reason) => {
-                            active.diagnostics.runtime_scheduler_max_us = active.diagnostics
-                                .runtime_scheduler_max_us
-                                .max(runtime_scheduler_max_us.load(Ordering::Relaxed));
+                            active.diagnostics.drain_runtime_scheduler(&runtime_scheduler_max_us);
                             let mut server_slow_consumer = false;
                             match reason.as_ref() {
                                 Some(frame) => {

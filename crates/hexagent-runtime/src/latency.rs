@@ -407,6 +407,9 @@ pub fn prepare_polymarket_private_stages() {
 /// Prewarm the dedicated public CLOB reader stages before socket polling.
 pub fn prepare_polymarket_clob_stages() {
     prepare_observation_stages(&[
+        "polymarket.ws.clob_stalled_probe_span_cpu",
+        "polymarket.ws.clob_stalled_probe_span_off_cpu",
+        "polymarket.ws.clob_stalled_probe_span_wall",
         "polymarket.ws.clob_source_age_at_publish",
         "polymarket.ws.clob_checkpoint_source_age_at_publish",
         "polymarket.ws.clob_wire_receive_to_publish",
