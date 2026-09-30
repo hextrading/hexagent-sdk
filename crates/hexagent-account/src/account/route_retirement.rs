@@ -107,6 +107,20 @@ impl RouteRetirementQueue {
         }
     }
 
+    /// Archive hydration runs on this same cold consumer. A replay command
+    /// can need several credits for each of its bounded multi-leg identities;
+    /// waiting until the outer timer turn would reject every retry of it.
+    /// Drain only ready batches, at most the fixed capacity, and stop at a
+    /// reader-held head. Never wait for a reader or move destruction to it.
+    pub(super) fn reclaim_ready(&self, pending: &mut Option<RetiredRouteBatch>) {
+        for _ in 0..BATCH_CAPACITY {
+            let before = self.outstanding.load(Ordering::Acquire);
+            if before == 0 { break; }
+            self.reclaim(pending);
+            if self.outstanding.load(Ordering::Acquire) >= before { break; }
+        }
+    }
+
     pub(super) fn metrics(&self) -> (usize, usize, u64, u64) {
         (
             self.outstanding.load(Ordering::Acquire),
@@ -153,6 +167,25 @@ impl Drop for RouteRetirementPermit<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ready_drain_stops_at_reader_then_recovers_all_bounded_credits() {
+        let queue = RouteRetirementQueue::new();
+        let held = Arc::new(RouteSnapshot::default());
+        queue.try_reserve().unwrap().push(held.clone());
+        for _ in 1..BATCH_CAPACITY {
+            queue.try_reserve().unwrap().push(Arc::new(RouteSnapshot::default()));
+        }
+        let mut pending = None;
+        queue.reclaim_ready(&mut pending);
+        assert_eq!(queue.metrics().0, BATCH_CAPACITY);
+        assert!(queue.try_reserve().is_none());
+        drop(held);
+        queue.reclaim_ready(&mut pending);
+        assert_eq!(queue.metrics().0, 0);
+        assert!(pending.is_none());
+        assert!(queue.try_reserve().is_some());
+    }
 
     #[test]
     fn retirement_is_bounded_including_reader_held_batch() {
