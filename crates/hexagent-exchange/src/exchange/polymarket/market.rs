@@ -29,6 +29,10 @@ use crate::types::*;
 #[path = "live_bbo.rs"]
 mod live_bbo;
 
+#[path = "clob_tls.rs"]
+mod clob_tls;
+use clob_tls::ClobTlsConfig;
+
 #[cfg(test)]
 #[path = "live_bbo_tests.rs"]
 mod live_bbo_tests;
@@ -1809,6 +1813,8 @@ impl ClobEventReceiver {
 }
 
 pub struct PolymarketMarket {
+    // Loaded once by the feed owner before starting any CLOB socket tasks.
+    clob_tls: Option<ClobTlsConfig>,
     execution_peer_failure_sinks: Arc<[super::execution_peer_failure::PeerFailureSender]>,
     book_protocol_sink: Option<BookProtocolSink>,
     series: Vec<SeriesState>,
@@ -1857,6 +1863,7 @@ impl PolymarketMarket {
 
     pub fn with_liveness(liveness: Arc<PolymarketLiveness>) -> Self {
         Self {
+            clob_tls: None,
             execution_peer_failure_sinks: Arc::from([]),
             book_protocol_sink: None,
             series: Vec::new(),
@@ -4014,13 +4021,19 @@ where
 }
 
 async fn connect_clob_lane(
+    tls: &ClobTlsConfig,
     tokens: &[String],
     lane_id: u64,
     protocol: Option<(BookProtocolSink, Vec<BookProtocolRoute>)>,
 ) -> std::result::Result<ClobConnection, String> {
     let stream = match tokio::time::timeout(
         WS_CONNECT_TIMEOUT,
-        tokio_tungstenite::connect_async(POLYMARKET_WS_URL),
+        tokio_tungstenite::connect_async_tls_with_config(
+            POLYMARKET_WS_URL,
+            None,
+            false,
+            Some(tls.connector()),
+        ),
     )
     .await
     {
@@ -4089,6 +4102,7 @@ async fn connect_clob_lane(
 }
 
 fn spawn_clob_standby_connect(
+    tls: ClobTlsConfig,
     tokens: Vec<String>,
     lane_id: u64,
     delay: Duration,
@@ -4098,7 +4112,7 @@ fn spawn_clob_standby_connect(
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        connect_clob_lane(&tokens, lane_id, protocol).await
+        connect_clob_lane(&tls, &tokens, lane_id, protocol).await
     })
 }
 
@@ -4110,6 +4124,7 @@ struct ClobSeededCandidate {
 }
 
 fn spawn_clob_seeded_candidate(
+    tls: ClobTlsConfig,
     subscription: ClobSubscription,
     lane_id: u64,
     delay: Duration,
@@ -4121,6 +4136,7 @@ fn spawn_clob_seeded_candidate(
         }
         let started = Instant::now();
         let mut lane = connect_clob_lane(
+            &tls,
             &subscription.tokens,
             lane_id,
             protocol_binding(&protocol_sink, &subscription),
@@ -4677,6 +4693,7 @@ async fn handle_clob_standby_read(
 
 #[allow(clippy::too_many_arguments)]
 fn promote_clob_standby(
+    tls: &ClobTlsConfig,
     active: &mut ClobConnection,
     standby: &mut Option<ClobConnection>,
     standby_connect: &mut Option<
@@ -4771,6 +4788,7 @@ fn promote_clob_standby(
     let replacement_lane_id = *next_lane_id;
     *next_lane_id = (*next_lane_id).saturating_add(1);
     *standby_connect = Some(spawn_clob_standby_connect(
+        tls.clone(),
         subscription.tokens.clone(),
         replacement_lane_id,
         Duration::ZERO,
@@ -4855,6 +4873,7 @@ mod scheduler_span_tests {
 }
 
 async fn clob_ws_task(
+    tls: ClobTlsConfig,
     initial_subscription: ClobSubscription,
     execution_peer_failure_sinks: Arc<[super::execution_peer_failure::PeerFailureSender]>,
     event_tx: ClobEventSender,
@@ -4973,6 +4992,7 @@ async fn clob_ws_task(
         let active_lane_id = next_lane_id;
         next_lane_id = next_lane_id.saturating_add(1);
         let mut active = match connect_clob_lane(
+            &tls,
             &wire_subscription.tokens,
             active_lane_id,
             protocol_binding(&protocol_sink, &wire_subscription),
@@ -5011,6 +5031,7 @@ async fn clob_ws_task(
         let mut standby_ready_at: Option<Instant> = None;
         let mut standby_slow_consumer_streak = 0_u32;
         let mut standby_connect = Some(spawn_clob_standby_connect(
+            tls.clone(),
             wire_subscription.tokens.clone(),
             standby_lane_id,
             Duration::ZERO,
@@ -5125,6 +5146,7 @@ async fn clob_ws_task(
                             next_lane_id = next_lane_id.saturating_add(1);
                             pending_cutover = Some((new_subscription.clone(), activate));
                             candidate_connect = Some(spawn_clob_seeded_candidate(
+                                tls.clone(),
                                 new_subscription,
                                 lane_id,
                                 Duration::ZERO, protocol_sink.clone(),
@@ -5211,6 +5233,7 @@ async fn clob_ws_task(
                             let lane_id = next_lane_id;
                             next_lane_id = next_lane_id.saturating_add(1);
                             standby_connect = Some(spawn_clob_standby_connect(
+                                tls.clone(),
                                 wire_subscription.tokens.clone(),
                                 lane_id,
                                 Duration::ZERO, protocol_binding(&protocol_sink, &wire_subscription),
@@ -5222,6 +5245,7 @@ async fn clob_ws_task(
                                 let lane_id = next_lane_id;
                                 next_lane_id = next_lane_id.saturating_add(1);
                                 candidate_connect = Some(spawn_clob_seeded_candidate(
+                                    tls.clone(),
                                     target,
                                     lane_id,
                                     CLOB_STANDBY_RECONNECT_DELAY, protocol_sink.clone(),
@@ -5234,6 +5258,7 @@ async fn clob_ws_task(
                                 let lane_id = next_lane_id;
                                 next_lane_id = next_lane_id.saturating_add(1);
                                 candidate_connect = Some(spawn_clob_seeded_candidate(
+                                    tls.clone(),
                                     target,
                                     lane_id,
                                     CLOB_STANDBY_RECONNECT_DELAY, protocol_sink.clone(),
@@ -5259,7 +5284,7 @@ async fn clob_ws_task(
                             let lane_id = next_lane_id;
                             next_lane_id = next_lane_id.saturating_add(1);
                             standby_connect = Some(spawn_clob_standby_connect(
-                                wire_subscription.tokens.clone(), lane_id, CLOB_STANDBY_RECONNECT_DELAY, protocol_binding(&protocol_sink, &wire_subscription),
+                                tls.clone(), wire_subscription.tokens.clone(), lane_id, CLOB_STANDBY_RECONNECT_DELAY, protocol_binding(&protocol_sink, &wire_subscription),
                             ));
                         }
                         Ok(Ok(lane)) if clob_peers_are_anti_affine(active.peer_addr, lane.peer_addr) => {
@@ -5292,6 +5317,7 @@ async fn clob_ws_task(
                             let lane_id = next_lane_id;
                             next_lane_id = next_lane_id.saturating_add(1);
                             standby_connect = Some(spawn_clob_standby_connect(
+                                tls.clone(),
                                 wire_subscription.tokens.clone(),
                                 lane_id,
                                 CLOB_STANDBY_RECONNECT_DELAY, protocol_binding(&protocol_sink, &wire_subscription),
@@ -5302,6 +5328,7 @@ async fn clob_ws_task(
                             let lane_id = next_lane_id;
                             next_lane_id = next_lane_id.saturating_add(1);
                             standby_connect = Some(spawn_clob_standby_connect(
+                                tls.clone(),
                                 wire_subscription.tokens.clone(),
                                 lane_id,
                                 CLOB_STANDBY_RECONNECT_DELAY, protocol_binding(&protocol_sink, &wire_subscription),
@@ -5312,6 +5339,7 @@ async fn clob_ws_task(
                             let lane_id = next_lane_id;
                             next_lane_id = next_lane_id.saturating_add(1);
                             standby_connect = Some(spawn_clob_standby_connect(
+                                tls.clone(),
                                 wire_subscription.tokens.clone(),
                                 lane_id,
                                 CLOB_STANDBY_RECONNECT_DELAY, protocol_binding(&protocol_sink, &wire_subscription),
@@ -5608,6 +5636,7 @@ async fn clob_ws_task(
                             let lane_id = next_lane_id;
                             next_lane_id = next_lane_id.saturating_add(1);
                             standby_connect = Some(spawn_clob_standby_connect(
+                                tls.clone(),
                                 wire_subscription.tokens.clone(),
                                 lane_id,
                                 CLOB_STANDBY_RECONNECT_DELAY, protocol_binding(&protocol_sink, &wire_subscription),
@@ -5835,6 +5864,7 @@ async fn clob_ws_task(
                                 let lane_id = next_lane_id;
                                 next_lane_id = next_lane_id.saturating_add(1);
                                 standby_connect = Some(spawn_clob_standby_connect(
+                                    tls.clone(),
                                     wire_subscription.tokens.clone(),
                                     lane_id,
                                     reconnect_delay, protocol_binding(&protocol_sink, &wire_subscription),
@@ -5868,6 +5898,7 @@ async fn clob_ws_task(
                                 protocol.gap("active_socket_read_error", protocol_receive_ns.expect("enabled protocol receive clock"));
                             }
                             if promote_clob_standby(
+                                &tls,
                                 &mut active,
                                 &mut standby,
                                 &mut standby_connect,
@@ -5904,6 +5935,7 @@ async fn clob_ws_task(
                                 protocol.gap("active_socket_stream_closed", protocol_receive_ns.expect("enabled protocol receive clock"));
                             }
                             if promote_clob_standby(
+                                &tls,
                                 &mut active,
                                 &mut standby,
                                 &mut standby_connect,
@@ -6190,6 +6222,7 @@ async fn clob_ws_task(
                                 protocol.gap("active_socket_close_frame", protocol_receive_ns.expect("enabled protocol receive clock"));
                             }
                             if promote_clob_standby(
+                                &tls,
                                 &mut active,
                                 &mut standby,
                                 &mut standby_connect,
@@ -9563,6 +9596,10 @@ fn make_inline_rtds_event(r: InlineRtdsFields<'_>, local_now: u64) -> Option<Mar
 
 impl ExchangeMarket for PolymarketMarket {
     fn connect(&mut self) -> Result<()> {
+        if self.clob_tls.is_none() {
+            self.clob_tls = Some(ClobTlsConfig::load_native()?);
+        }
+        let tls = self.clob_tls.as_ref().expect("initialized above");
         crate::latency::prepare_observation_stages(&["polymarket.ws.clob_bridge_queue"]);
         // Per-task shutdown Arc: each connect() creates a FRESH Arc
         // rather than reusing the struct field. Old tasks (still
@@ -9594,6 +9631,7 @@ impl ExchangeMarket for PolymarketMarket {
         }
         self.liveness.begin_connection(clob_token_count > 0);
         let task = clob_ws_task(
+            tls.clone(),
             clob_subscription,
             self.execution_peer_failure_sinks.clone(),
             event_tx,
