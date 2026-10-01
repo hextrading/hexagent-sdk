@@ -481,8 +481,11 @@ fn persisted_cancel_proof_resumes_ended_market_startup_audit() {
         )
         .unwrap();
     install(&trade.shared, &order);
-    trade.shared.account_state.record_settled_token_values(
-        &HashMap::from([(order.token_id.clone(), 1.0)]));
+    // This fixture needs the cold owner's published ended-token proof, not
+    // merely acceptance of its asynchronous settlement command.
+    trade.shared.account_state.submit_settled_token_values(
+        HashMap::from([(order.token_id.clone(), 1.0)]))
+        .unwrap().recv_timeout(Duration::from_secs(2)).unwrap();
     trade
         .shared
         .account_state

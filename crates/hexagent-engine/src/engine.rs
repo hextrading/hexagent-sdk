@@ -529,6 +529,7 @@ enum ExecutionDiagnostic {
         replaced_snapshots: u64,
         no_response_resets: u64,
         cancel_outbox: CancelOutboxSnapshot,
+        event_audit_queue: (usize, usize, u64),
     },
     PeerFailureReset {
         account: Arc<str>, failure: Option<PeerFailure>, overflow: bool,
@@ -576,12 +577,13 @@ fn spawn_execution_diagnostics(
                         "[execution_probe_ingress] capacity=64 depth={} sampled_high_water={} rejected_before_dispatch={} retried_requests={} retry_exhausted={} disconnected={} enqueue_max_ns={}",
                         depth, high_water, rejected, retry.0, retry.1, retry.2, retry.3,
                     ),
-                    ExecutionDiagnostic::Admission { account, snapshot, paused_total_ns, replaced_snapshots, no_response_resets, cancel_outbox } => info!(
-                        "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0 no_response_resets={} cancel_outbox_depth={} cancel_outbox_high_water={} cancel_outbox_oldest_ns={} cancel_coalesced={} cancel_outbox_overflow={}",
+                    ExecutionDiagnostic::Admission { account, snapshot, paused_total_ns, replaced_snapshots, no_response_resets, cancel_outbox, event_audit_queue } => info!(
+                        "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0 no_response_resets={} cancel_outbox_depth={} cancel_outbox_high_water={} cancel_outbox_oldest_ns={} cancel_coalesced={} cancel_outbox_overflow={} event_audit_depth={} event_audit_sampled_high_water={} event_audit_rejected={} event_audit_capacity=512",
                         account, snapshot.state, snapshot.epoch, snapshot.available_place_slots,
                         paused_total_ns / 1_000_000, replaced_snapshots, no_response_resets,
                         cancel_outbox.depth, cancel_outbox.high_water, cancel_outbox.oldest_ns,
                         cancel_outbox.coalesced, cancel_outbox.overflow,
+                        event_audit_queue.0, event_audit_queue.1, event_audit_queue.2,
                     ),
                     ExecutionDiagnostic::PeerFailureReset { account, failure, overflow, reset_count, consumed_at_ns } => warn!(
                         "[execution_peer_failure] account={} source={:?} peer={:?} observed_at_ns={} notification_age_us={} queue_capacity={} overflow={} reset_count={} action=retire_old_order_generations",
@@ -12650,6 +12652,20 @@ impl Engine {
                         poly_connection_handles.push(h);
                     }
                     for (account_id, routes) in &mut poly_connection_routes {
+                        // Audit/GC control must never run beside Fast/Cancel
+                        // owners at FIFO priority: retaining an event locks the
+                        // cold account and builds its durable publication.
+                        let (audit_tx, audit_rx) = hexagent_runtime::poll_channel::bounded(
+                            POLY_EVENT_AUDIT_CAPACITY,
+                        );
+                        routes.event_audit = Some(audit_tx);
+                        let router = LiveRouter::new_with_poly_map(&config, &poly_states);
+                        let thread_name = format!("poly-event-audit-{account_id}");
+                        poly_connection_handles.push(thread::Builder::new()
+                            .name(thread_name.clone()).spawn(move || {
+                                crate::os_tune::pin_background(&thread_name);
+                                run_poly_event_audit_owner(router, audit_rx);
+                            }).expect("spawn Polymarket event audit owner"));
                         routes.health_account = Arc::from(account_id.as_str());
                         routes.health_diagnostic = Some(execution_diagnostic_tx.clone());
                         routes.health = Some(AccountExecutionAdmission::new(
@@ -14881,6 +14897,14 @@ impl Drop for PolyConnectionOccupancyGuard {
 const PEER_FAILURE_HINT_NS: u64 = 10_000_000_000;
 
 struct PolyAccountConnectionRoutes {
+    /// Dispatcher -> one account-scoped SCHED_OTHER audit owner. FIFO across
+    /// retain/release, independent of HTTP admission and cancel backpressure.
+    /// Full/disconnected is returned as typed control retry feedback. Private
+    /// and order lifecycle messages use their existing lossless lanes.
+    event_audit: Option<hexagent_runtime::poll_channel::Sender<PolyConnectionCommand>>,
+    // Sole writer: dispatcher. Export compact values on the existing cold lane.
+    event_audit_high_water: usize,
+    event_audit_rejected: u64,
     /// Sole writer is the existing pinned execution dispatcher. Physical owners
     /// publish immutable full snapshots on dedicated capacity-one lanes.
     health: Option<AccountExecutionAdmission>,
@@ -14931,6 +14955,9 @@ struct PolyAccountConnectionRoutes {
 impl Default for PolyAccountConnectionRoutes {
     fn default() -> Self {
         Self {
+            event_audit: None,
+            event_audit_high_water: 0,
+            event_audit_rejected: 0,
             health: None,
             health_account: Arc::from(""),
             health_diagnostic: None,
@@ -15091,6 +15118,8 @@ impl PolyAccountConnectionRoutes {
                 try_submit_execution_diagnostic(sender, ExecutionDiagnostic::Admission {
                     account: Arc::clone(&self.health_account), snapshot,
                     no_response_resets: health.no_response_resets(),
+                    event_audit_queue: (self.event_audit.as_ref().map_or(0, |tx| tx.len()),
+                        self.event_audit_high_water, self.event_audit_rejected),
                     paused_total_ns: self.paused_total_ns.saturating_add(
                         self.paused_since_ns.map_or(0, |started| now.saturating_sub(started))),
                     replaced_snapshots: self.admission_publishers.iter().map(|publisher| publisher.replaced).sum(),
@@ -15461,6 +15490,48 @@ fn run_poly_orphan_recovery(trade: PolymarketTrade, rx: Receiver<PolyConnectionC
     }
 }
 
+// Same bounded order of capacity as the previous compatibility cancel outbox.
+const POLY_EVENT_AUDIT_CAPACITY: usize = 512;
+
+fn run_poly_event_audit_owner(
+    mut router: LiveRouter,
+    rx: hexagent_runtime::poll_channel::Receiver<PolyConnectionCommand>,
+) {
+    crate::latency::prepare_thread_stages(&[
+        "polymarket.event_audit.owner_queue", "polymarket.event_audit.apply",
+    ]);
+    loop {
+        let command = match rx.try_recv() {
+            Ok(command) => command,
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+        };
+        let PolyConnectionCommand::Fallback { signal, update_tx, enqueued_at, .. } = command
+            else { unreachable!("event audit lane accepts only audit controls"); };
+        crate::latency::record_ns("polymarket.event_audit.owner_queue",
+            enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        let started = crate::latency::Instant::now();
+        let result = match &signal {
+            Signal::RetainPolymarketEventAudit { condition_id, asset_ids, instance_id } =>
+                router.poly_route_mut(instance_id).and_then(|route|
+                    route.retain_event_audit(condition_id, asset_ids)),
+            Signal::RetirePolymarketEventAudit { condition_id, asset_ids, instance_id } =>
+                router.poly_route_mut(instance_id).and_then(|route|
+                    route.retire_event_audit_on_owner(condition_id, asset_ids)),
+            _ => unreachable!("non-audit signal in event audit lane"),
+        };
+        crate::latency::record("polymarket.event_audit.apply", started);
+        if let Err(error) = result {
+            error!("[Executor] event audit control failed: {error}");
+            if send_executor_update(&update_tx, control_lane_rejected(&signal,
+                format!("event_audit_control_failure: apply failed; retry required: {error}"))).is_err() { break; }
+        }
+    }
+}
+
 fn run_poly_connection_owner(
     mut router: LiveRouter,
     permit: hexagent_runtime::http1_pool::Permit,
@@ -15471,6 +15542,7 @@ fn run_poly_connection_owner(
 ) {
     use hexagent_runtime::http1_pool::Role;
     crate::latency::prepare_polymarket_order_stages();
+    crate::latency::prepare_thread_stages(&["polymarket.order.owner_preflight"]);
     let mut observation_sequence = 0u64;
     loop {
         if let Some(publisher) = health_publisher.as_mut() {
@@ -15495,6 +15567,12 @@ fn run_poly_connection_owner(
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
+        let received_at = crate::latency::Instant::now();
+        if let PolyConnectionCommand::Place { enqueued_at, .. } = &command {
+            // Stop at dequeue, before connection metadata/admission work.
+            crate::latency::record_ns("polymarket.order.connection_owner_queue",
+                enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        }
         lane_metrics.queue_depth.store(0, Ordering::Release);
         let connection = permit.current_pooled_client().connection_snapshot();
         let _occupancy = PolyConnectionOccupancyGuard::new(Arc::clone(&lane_metrics), connection);
@@ -15524,13 +15602,9 @@ fn run_poly_connection_owner(
                 order,
                 stale_ms,
                 update_tx,
-                enqueued_at,
+                enqueued_at: _,
             } => {
                 debug_assert_eq!(role, Role::Fast);
-                crate::latency::record_ns(
-                    "polymarket.order.connection_owner_queue",
-                    enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                );
                 if order.timestamp_ns > 0 {
                     crate::latency::record_ns(
                         if order.post_only {
@@ -15565,6 +15639,7 @@ fn run_poly_connection_owner(
                     continue;
                 }
                 let client = permit.current_pooled_client();
+                crate::latency::record("polymarket.order.owner_preflight", received_at);
                 let pending = match router.poly_route_mut(&instance_id) {
                     Ok(route) => route.submit_fire(&order, client),
                     Err(error) => {
@@ -16289,6 +16364,27 @@ fn dispatch_poly_signal_to_connection_owner(
                 if send_executor_update(&update_tx, update).is_err() {
                     return false;
                 }
+            }
+        }
+        audit @ (Signal::RetainPolymarketEventAudit { .. }
+            | Signal::RetirePolymarketEventAudit { .. }) => {
+            let command = PolyConnectionCommand::Fallback {
+                signal: audit, stale_ms, update_tx: update_tx.clone(),
+                enqueued_at: std::time::Instant::now(),
+            };
+            let result = match routes.event_audit.as_ref() {
+                Some(tx) => tx.try_send(command).map_err(crossbeam_channel::TrySendError::into_inner),
+                None => Err(command),
+            };
+            if let Err(PolyConnectionCommand::Fallback { signal, .. }) = result {
+                routes.event_audit_rejected += 1;
+                if send_executor_update(&update_tx, control_lane_rejected(&signal,
+                    "event_audit_control_failure: bounded lane unavailable; retry required")).is_err() {
+                    return false;
+                }
+            } else {
+                routes.event_audit_high_water = routes.event_audit_high_water.max(
+                    routes.event_audit.as_ref().map_or(0, |tx| tx.len()).max(1));
             }
         }
         control => {
@@ -20003,42 +20099,129 @@ mod market_router_tests {
     }
 
     #[test]
-    fn compatibility_fallback_saturation_returns_typed_retry_feedback() {
-        let (cancel_tx, _cancel_rx) = bounded(1);
+    fn event_audit_is_fifo_and_independent_of_cancel_or_http_admission() {
+        use hexagent_runtime::http1_pool::Role;
+        let (audit_tx, audit_rx) = hexagent_runtime::poll_channel::bounded(4);
+        let (cancel_tx, cancel_rx) = bounded(1);
+        let (raw_update_tx, update_rx) = bounded(4);
+        let update_tx = ExecutorUpdateSender { owner: 11, tx: raw_update_tx.into() };
+        let mut routes = PolyAccountConnectionRoutes {
+            event_audit: Some(audit_tx),
+            cancel: vec![PolyConnectionLane::for_test(cancel_tx, Role::Cancel, 0)],
+            ..Default::default()
+        };
+        // No Fast or Reconcile slot exists. The Cancel lane is occupied too.
+        assert!(try_send_poly_owner(&mut routes, Role::Cancel, PolyConnectionCommand::Fallback {
+            signal: Signal::Exit, stale_ms: 0, update_tx: update_tx.clone(),
+            enqueued_at: Instant::now(),
+        }).is_ok());
+        for retain in [true, false, true, true] {
+            let signal = if retain {
+                Signal::RetainPolymarketEventAudit { condition_id: "event".into(),
+                    asset_ids: vec!["up".into(), "down".into()], instance_id: "zhu-03".into() }
+            } else {
+                Signal::RetirePolymarketEventAudit { condition_id: "event".into(),
+                    asset_ids: vec!["up".into(), "down".into()], instance_id: "zhu-03".into() }
+            };
+            assert!(dispatch_poly_signal_to_connection_owner(signal, 150, update_tx.clone(), &mut routes));
+        }
+        for retain in [true, false, true, true] {
+            let PolyConnectionCommand::Fallback { signal, update_tx: routed, .. } =
+                audit_rx.try_recv().unwrap() else { panic!("wrong command"); };
+            assert_eq!(routed.owner, 11);
+            assert_eq!(extract_instance_id(&signal), "zhu-03");
+            assert_eq!(matches!(signal, Signal::RetainPolymarketEventAudit { .. }), retain);
+        }
+        assert!(update_rx.is_empty());
+        assert_eq!(cancel_rx.len(), 1);
+        assert!(routes.cancel_outbox.is_empty());
+        // Disconnect fails visibly to the same owner, without fallback to FIFO.
+        drop(audit_rx);
+        dispatch_poly_signal_to_connection_owner(Signal::RetirePolymarketEventAudit {
+            condition_id: "event".into(), asset_ids: vec!["up".into(), "down".into()],
+            instance_id: "zhu-03".into(),
+        }, 150, update_tx, &mut routes);
+        let failure = update_rx.try_recv().unwrap();
+        assert_eq!(failure.owner, 11);
+        assert_eq!(failure.update.status, OrderStatus::ExecutorRejected);
+        assert_eq!(cancel_rx.len(), 1);
+        assert_eq!(routes.event_audit_high_water, 4);
+        assert_eq!(routes.event_audit_rejected, 1);
+        // Another account has its own receiver/capacity; the failed account
+        // cannot consume its audit admission or redirect a control to it.
+        let (other_tx, other_rx) = hexagent_runtime::poll_channel::bounded(1);
+        let (other_update_tx, other_updates) = bounded(1);
+        let mut other = PolyAccountConnectionRoutes {
+            event_audit: Some(other_tx), ..Default::default()
+        };
+        dispatch_poly_signal_to_connection_owner(Signal::RetainPolymarketEventAudit {
+            condition_id: "other-event".into(), asset_ids: vec!["other-token".into()],
+            instance_id: "other-instance".into(),
+        }, 150, ExecutorUpdateSender { owner: 12, tx: other_update_tx.into() }, &mut other);
+        let PolyConnectionCommand::Fallback { signal, update_tx, .. } =
+            other_rx.try_recv().unwrap() else { panic!("wrong other-account command"); };
+        assert_eq!(extract_instance_id(&signal), "other-instance");
+        assert_eq!(update_tx.owner, 12);
+        assert!(other_updates.is_empty());
+    }
+
+    #[test]
+    #[ignore = "focused control admission benchmark; run with --ignored --nocapture"]
+    fn event_audit_admission_latency_profile() {
+        use hexagent_runtime::http1_pool::Role;
+        const EVENTS: usize = 100_000;
+        let (raw_update_tx, _update_rx) = bounded(4);
+        let update_tx = ExecutorUpdateSender { owner: 11, tx: raw_update_tx.into() };
+        for cold_lane in [false, true] {
+            let (audit_tx, audit_rx) = hexagent_runtime::poll_channel::bounded(POLY_EVENT_AUDIT_CAPACITY);
+            let (cancel_tx, cancel_rx) = bounded(1);
+            let mut routes = PolyAccountConnectionRoutes {
+                event_audit: Some(audit_tx),
+                cancel: vec![PolyConnectionLane::for_test(cancel_tx, Role::Cancel, 0)],
+                ..Default::default()
+            };
+            let mut latencies = Vec::with_capacity(EVENTS);
+            for _ in 0..EVENTS {
+                let signal = Signal::RetainPolymarketEventAudit { condition_id: "event".into(),
+                    asset_ids: vec!["up".into(), "down".into()], instance_id: "instance".into() };
+                let command = PolyConnectionCommand::Fallback { signal, stale_ms: 150,
+                    update_tx: update_tx.clone(), enqueued_at: Instant::now() };
+                let started = Instant::now();
+                if cold_lane {
+                    assert!(routes.event_audit.as_ref().unwrap().try_send(command).is_ok());
+                } else {
+                    assert!(send_poly_owner_lossless(&mut routes, Role::Cancel, command).is_ok());
+                }
+                latencies.push(started.elapsed().as_nanos());
+                if cold_lane { drop(audit_rx.try_recv().unwrap()); }
+                else { drop(cancel_rx.try_recv().unwrap()); routes.cancel[0].metrics.release_for_test(); }
+            }
+            latencies.sort_unstable();
+            eprintln!("event audit admission cold_lane={cold_lane} boundary=prepared command enqueue call n={EVENTS} median_ns={} p99_ns={} p999_ns={} max_ns={} queue_peak=1 overflow=0 excludes=cold_apply,OS_FIFO_scheduling,HTTP",
+                latencies[EVENTS/2], latencies[EVENTS*99/100-1], latencies[EVENTS*999/1000-1], latencies[EVENTS-1]);
+        }
+    }
+
+    #[test]
+    fn event_audit_saturation_returns_typed_retry_feedback() {
+        let (audit_tx, _audit_rx) = hexagent_runtime::poll_channel::bounded(POLY_EVENT_AUDIT_CAPACITY);
         let (raw_update_tx, update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
             owner: 11,
             tx: raw_update_tx.into(),
         };
         let mut routes = PolyAccountConnectionRoutes {
-            cancel: vec![PolyConnectionLane::for_test(
-                cancel_tx.clone(),
-                hexagent_runtime::http1_pool::Role::Cancel,
-                0,
-            )],
+            event_audit: Some(audit_tx.clone()),
             ..Default::default()
         };
-        cancel_tx
-            .try_send(PolyConnectionCommand::Fallback {
-                signal: Signal::Exit,
-                stale_ms: 0,
-                update_tx: update_tx.clone(),
-                enqueued_at: std::time::Instant::now(),
-            })
-            .unwrap();
-        for _ in 0..POLY_CANCEL_OUTBOX_CAPACITY {
+        for _ in 0..POLY_EVENT_AUDIT_CAPACITY {
             let command = PolyConnectionCommand::Fallback {
                 signal: Signal::Exit,
                 stale_ms: 0,
                 update_tx: update_tx.clone(),
                 enqueued_at: std::time::Instant::now(),
             };
-            assert!(send_poly_owner_lossless(
-                &mut routes,
-                hexagent_runtime::http1_pool::Role::Cancel,
-                command,
-            )
-            .is_ok());
+            assert!(audit_tx.try_send(command).is_ok());
         }
 
         dispatch_poly_signal_to_connection_owner(
