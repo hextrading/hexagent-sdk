@@ -40,7 +40,7 @@ fn steady_bbo_reuses_batch_storage_and_preserves_canonical_versions() {
 #[test]
 fn warm_bbo_canonicalization_does_not_clone_role_strings() {
     let (_, mut books, _, _) = fixture();
-    let quote = || QuoteTick { exchange: Exchange::Polymarket,
+    let quote = || QuoteTick { delivery: Default::default(), exchange: Exchange::Polymarket,
         symbol: "resident-token-up".into(), bid_price: 0.41, bid_qty: 0.0,
         ask_price: 0.42, ask_qty: 0.0, exchange_timestamp_ns: 1, local_timestamp_ns: 1 };
     books.canonicalize_quote_ready(quote());

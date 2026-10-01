@@ -97,6 +97,42 @@ struct ThreadTelemetry {
     bins: Box<[AtomicU64]>,
     maxima: Box<[AtomicU64]>,
     observations: OnceLock<ObservationQueue>,
+    scheduler_tails: OnceLock<SchedulerTailQueue>,
+}
+
+/// Compact advisory evidence. The CLOB owner is the sole producer; the
+/// existing latency-dump worker is the consumer. Capacity64, FIFO, drop-new on
+/// overflow with a counter. Never shares capacity with private events.
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerTail {
+    pub probe: &'static str,
+    pub observed_unix_ns: u64,
+    pub lag_ns: u64,
+    pub span_wall_ns: u64,
+    pub span_cpu_ns: Option<u64>,
+    pub expirations: u64,
+    pub error_code: Option<i32>,
+}
+
+struct SchedulerTailQueue {
+    queue: crate::try_queue::TryQueue<SchedulerTail>,
+    owner: String,
+    dropped: AtomicU64,
+    high_water: AtomicU64,
+}
+
+impl SchedulerTailQueue {
+    fn new(capacity: usize) -> Self {
+        Self { queue: crate::try_queue::TryQueue::new(capacity),
+            owner: std::thread::current().name().unwrap_or("unnamed").into(),
+            dropped: AtomicU64::new(0), high_water: AtomicU64::new(0) }
+    }
+
+    fn publish(&self, tail: SchedulerTail) -> bool {
+        self.high_water.fetch_max(self.queue.len().saturating_add(1).min(self.queue.capacity()) as u64, Ordering::Relaxed);
+        if self.queue.try_push(tail).is_err() { self.dropped.fetch_add(1, Ordering::Relaxed); return false; }
+        true
+    }
 }
 
 const OBSERVATION_CAPACITY: usize = 65_536;
@@ -155,6 +191,7 @@ impl ThreadTelemetry {
             bins,
             maxima,
             observations: OnceLock::new(),
+            scheduler_tails: OnceLock::new(),
         }
     }
 
@@ -168,6 +205,14 @@ impl ThreadTelemetry {
     /// Only latency-dump consumes this FIFO. Bound one pass to the observed
     /// depth so a continuously active producer cannot starve other threads.
     fn drain_observations(&self) {
+        if let Some(tails) = self.scheduler_tails.get() {
+            for _ in 0..tails.queue.len().min(tails.queue.capacity()) {
+                let Some(tail) = tails.queue.try_pop() else { break; };
+                log::warn!("[scheduler_tail] owner={} probe={} observed_unix_ns={} lag_ns={} span_wall_ns={} span_cpu_ns={:?} span_off_cpu_ns={:?} expirations={} error_code={:?} boundary=previous_actual_probe_to_current includes_idle=true",
+                    tails.owner, tail.probe, tail.observed_unix_ns, tail.lag_ns, tail.span_wall_ns,
+                    tail.span_cpu_ns, tail.span_cpu_ns.map(|cpu| tail.span_wall_ns.saturating_sub(cpu)), tail.expirations, tail.error_code);
+            }
+        }
         let Some(queue) = self.observations.get() else {
             return;
         };
@@ -323,6 +368,22 @@ pub fn observe_ns(stage: &'static str, ns: u64) -> bool {
     })
 }
 
+/// Startup-only allocation. Calls from unprepared owners drop evidence rather
+/// than registering or allocating on their critical path.
+pub fn prepare_scheduler_tail_queue() {
+    prepare_thread_stages(&[]);
+    THREAD_RECORDER.with(|slot| {
+        slot.borrow().as_ref().unwrap().telemetry.scheduler_tails
+            .get_or_init(|| SchedulerTailQueue::new(64));
+    });
+}
+
+#[inline]
+pub fn observe_scheduler_tail(tail: SchedulerTail) -> bool {
+    THREAD_RECORDER.with(|slot| slot.borrow().as_ref()
+        .and_then(|r| r.telemetry.scheduler_tails.get()).is_some_and(|q| q.publish(tail)))
+}
+
 /// Fixed queue stages: parser-to-adapter and adapter-to-router use message
 /// enqueue timestamps from the same process monotonic clock, never wall time.
 pub fn prepare_market_queue_stages() {
@@ -406,7 +467,9 @@ pub fn prepare_polymarket_private_stages() {
 
 /// Prewarm the dedicated public CLOB reader stages before socket polling.
 pub fn prepare_polymarket_clob_stages() {
+    prepare_scheduler_tail_queue();
     prepare_observation_stages(&[
+        "polymarket.ws.clob_runtime_deadline_lag",
         "polymarket.ws.clob_stalled_probe_span_cpu",
         "polymarket.ws.clob_stalled_probe_span_off_cpu",
         "polymarket.ws.clob_stalled_probe_span_wall",
@@ -499,6 +562,10 @@ fn snapshot_and_reset() -> Vec<(&'static str, StageSnapshot)> {
         .collect::<Vec<_>>();
     for recorder in telemetry {
         recorder.drain_observations();
+        if let Some(queue) = recorder.scheduler_tails.get() {
+            log::info!("[scheduler_tail_queue] owner={} capacity={} depth={} high_water={} dropped={}",
+                queue.owner, queue.queue.capacity(), queue.queue.len(), queue.high_water.load(Ordering::Relaxed), queue.dropped.load(Ordering::Relaxed));
+        }
         if let Some(queue) = recorder.observations.get() {
             let drained = queue.drained.swap(0, Ordering::Relaxed);
             let high_water = queue.high_water.load(Ordering::Relaxed);
@@ -848,6 +915,27 @@ mod tests {
             assert!(bucket < BUCKETS);
             previous = bucket;
         }
+    }
+
+    #[test]
+    fn scheduler_evidence_is_bounded_fifo_and_owner_isolated() {
+        let first = SchedulerTailQueue::new(2);
+        let second = SchedulerTailQueue::new(2);
+        let sample = |id| SchedulerTail { probe: "test", observed_unix_ns: id,
+            lag_ns: 100, span_wall_ns: 200, span_cpu_ns: Some(50), expirations: 1, error_code: None };
+        assert!(first.publish(sample(1)));
+        assert!(first.publish(sample(2)));
+        assert!(!first.publish(sample(3)));
+        assert!(second.publish(sample(4)));
+        assert_eq!(first.queue.try_pop().unwrap().observed_unix_ns, 1);
+        assert_eq!(first.queue.try_pop().unwrap().observed_unix_ns, 2);
+        assert!(first.queue.try_pop().is_none());
+        assert_eq!(first.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(first.high_water.load(Ordering::Relaxed), 2);
+        assert_eq!(second.queue.try_pop().unwrap().observed_unix_ns, 4);
+        assert_eq!(second.dropped.load(Ordering::Relaxed), 0);
+        assert!(first.publish(sample(5)), "overflow must recover after drain");
+        assert_eq!(first.queue.try_pop().unwrap().observed_unix_ns, 5);
     }
 
     #[test]

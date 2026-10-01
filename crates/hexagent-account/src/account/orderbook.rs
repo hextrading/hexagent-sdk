@@ -452,6 +452,7 @@ mod tests {
 
     fn quote(symbol: &str, bid: f64, ask: f64, ts_ns: u64) -> QuoteTick {
         QuoteTick {
+            delivery: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: symbol.to_string(),
             bid_price: bid,

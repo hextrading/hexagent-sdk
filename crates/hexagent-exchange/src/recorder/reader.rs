@@ -70,7 +70,8 @@ const REPLAYER_BOOTSTRAP_MAX_ROWS: usize = REPLAYER_BATCH_ROWS * 2;
 // plus one final batch (observed 22,792 rows on legacy Polymarket tapes).
 const REPLAY_CACHE_MAX_BATCH_ROWS: usize = REPLAYER_BOOTSTRAP_MAX_ROWS + REPLAYER_BATCH_ROWS;
 const REPLAY_CACHE_MAGIC: [u8; 8] = *b"HXRPLY01";
-const REPLAY_CACHE_VERSION: u32 = 2;
+// QuoteDelivery adds positional MessagePack fields; rebuild caches from source.
+const REPLAY_CACHE_VERSION: u32 = 3;
 const REPLAY_CACHE_HEADER_BYTES: usize = 48;
 const REPLAY_CACHE_MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -319,7 +320,7 @@ fn replay_cache_fingerprint(
     options: ReplayOptions,
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"hexagent-replay-cache-v2-batched-market-event-rmp");
+    hash.update(b"hexagent-replay-cache-v3-quote-delivery-batched-market-event-rmp");
     hash.update(source.as_bytes());
     hash.update(start_ns.to_le_bytes());
     hash.update(end_ns.to_le_bytes());
@@ -2011,6 +2012,7 @@ fn stream_parquet_event_batches_selected(
                     })
                 }
                 "quote" => MarketEvent::Quote(QuoteTick {
+                    delivery: Default::default(),
                     exchange,
                     symbol: symbol.to_string(),
                     bid_price: bid_price_col.map(|c| c.value(i)).unwrap_or(0.0),
@@ -2605,6 +2607,7 @@ mod tests {
         for index in 0..20_000_u64 {
             recorder
                 .write_event(&MarketEvent::Quote(QuoteTick {
+                    delivery: Default::default(),
                     exchange: Exchange::Binance,
                     symbol: "BTCUSDT".to_string(),
                     bid_price: 100.0,
@@ -2830,6 +2833,17 @@ mod tests {
     }
 
     #[test]
+    fn quote_delivery_compact_replay_accepts_legacy_and_preserves_checkpoint() {
+        let legacy = rmp_serde::to_vec(&(Exchange::Polymarket, "token", 0.4, 1.0, 0.6, 1.0, 100_u64, 200_u64)).unwrap();
+        let mut quote: QuoteTick = rmp_serde::from_slice(&legacy).unwrap();
+        assert_eq!(quote.delivery.origin, crate::types::QuoteOrigin::Unspecified);
+        quote.delivery = crate::types::QuoteDelivery { origin: crate::types::QuoteOrigin::SubscriptionCheckpoint, published_timestamp_ns: 400 };
+        let restored: QuoteTick = rmp_serde::from_slice(&rmp_serde::to_vec(&quote).unwrap()).unwrap();
+        assert_eq!(restored.delivery, quote.delivery);
+        assert_eq!(restored.local_timestamp_ns, 200);
+    }
+
+    #[test]
     fn binary_replay_cache_roundtrips_events_and_rejects_foreign_fingerprint() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source.replay.bin");
@@ -2838,6 +2852,7 @@ mod tests {
             ReplayRow {
                 local_timestamp_ns: 101,
                 event: MarketEvent::Quote(QuoteTick {
+                    delivery: Default::default(),
                     exchange: Exchange::Binance,
                     symbol: "BTCUSDT".to_string(),
                     bid_price: 70_000.25,
@@ -2892,6 +2907,7 @@ mod tests {
             .map(|index| ReplayRow {
                 local_timestamp_ns: index as u64,
                 event: MarketEvent::Quote(QuoteTick {
+                    delivery: Default::default(),
                     exchange: Exchange::Binance,
                     symbol: "BTCUSDT".to_string(),
                     bid_price: 70_000.25,

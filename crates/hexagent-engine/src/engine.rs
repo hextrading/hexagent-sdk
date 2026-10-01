@@ -1968,6 +1968,16 @@ fn market_receive_age_ns(event: &MarketEvent, now_ns: u64) -> Option<u64> {
     (received != 0 && received <= now_ns).then(|| now_ns - received)
 }
 
+/// A checkpoint retains an older receipt clock for freshness. Its age is not
+/// current wire backlog, even when its immutable envelope crosses the router.
+fn market_source_age_stage(event: &MarketEvent, live: &'static str, checkpoint: &'static str) -> &'static str {
+    if matches!(event, MarketEvent::Quote(q) if q.delivery.origin == QuoteOrigin::SubscriptionCheckpoint) {
+        checkpoint
+    } else {
+        live
+    }
+}
+
 const QUOTE_TRIGGER_SLOW_NS: u64 = 10_000_000;
 const QUOTE_EXECUTOR_QUEUE_SLOW_NS: u64 = 5_000_000;
 const LIFECYCLE_SLOW_LOG_INTERVAL_NS: u64 = 10_000_000_000;
@@ -8976,7 +8986,7 @@ impl Engine {
                 let _ = market_queue_monotonic_ns();
                 crate::latency::prepare_polymarket_private_stages();
                 crate::latency::prepare_thread_stages(&["market.receive_to_router"]);
-                crate::latency::prepare_observation_stages(&["market.router.dispatch"]);
+                crate::latency::prepare_observation_stages(&["market.router.dispatch", "market.checkpoint_source_age_at_router"]);
                 hexagent_runtime::latency::prepare_market_queue_stages();
                 market_rx.begin_poll_measurement();
                 info!(
@@ -9294,7 +9304,8 @@ impl Engine {
                             market_rx.mark_phase(4);
                             if shutdown_in_progress { continue; }
                             if let Some(age) = market_receive_age_ns(&event, crate::types::now_ns()) {
-                                crate::latency::record_ns("market.receive_to_router", age);
+                                crate::latency::observe_ns(market_source_age_stage(&event,
+                                    "market.receive_to_router", "market.checkpoint_source_age_at_router"), age);
                             }
                             let dispatch_started = crate::types::monotonic_now_ns();
                             let event = Arc::new(event);
@@ -9734,7 +9745,7 @@ impl Engine {
             "strategy.private_feed.callback",
         ]);
         crate::latency::prepare_thread_stages(strategy.latency_stages());
-        crate::latency::prepare_observation_stages(&["strategy.market.pending_depth"]);
+        crate::latency::prepare_observation_stages(&["strategy.market.pending_depth", "strategy.market.checkpoint_source_age_at_callback"]);
         // The sender is permanently tagged with this worker's numeric owner.
         // Normal traffic is non-blocking; overflow quarantines only this owner
         // and submits an emergency cancel on the independent control lane.
@@ -10099,7 +10110,8 @@ impl Engine {
                         );
                         let event = queued.event;
                         if let Some(age) = market_receive_age_ns(&event, crate::types::now_ns()) {
-                            crate::latency::record_ns("strategy.market.receive_to_callback", age);
+                            crate::latency::observe_ns(market_source_age_stage(&event,
+                                "strategy.market.receive_to_callback", "strategy.market.checkpoint_source_age_at_callback"), age);
                         }
                         let callback_started = crate::latency::Instant::now();
                         callback_signal_batch.clear();
@@ -17630,6 +17642,18 @@ mod market_router_tests {
         assert_eq!(market_receive_age_ns(&MarketEvent::Connected { exchange: Exchange::Binance }, 828_000_001), None);
     }
 
+    #[test]
+    fn checkpoint_routing_retains_source_age_without_polluting_wire_latency() {
+        let mut event = quote(Exchange::Polymarket, "token-a");
+        assert_eq!(market_source_age_stage(&event, "wire", "checkpoint"), "wire");
+        if let MarketEvent::Quote(q) = &mut event {
+            q.delivery = QuoteDelivery { origin: QuoteOrigin::SubscriptionCheckpoint, published_timestamp_ns: 1_000_000 };
+        }
+        assert_eq!(market_source_age_stage(&event, "wire", "checkpoint"), "checkpoint");
+        assert_eq!(market_receive_age_ns(&event, 1_000_001), Some(1_000_000));
+        if let MarketEvent::Quote(q) = &event { assert_eq!(q.publication_age_ns(1_000_001), Some(1)); }
+    }
+
     fn trade(exchange: Exchange, symbol: &str) -> MarketEvent {
         MarketEvent::Trade(TradeTick {
             exchange,
@@ -17645,6 +17669,7 @@ mod market_router_tests {
 
     fn quote(exchange: Exchange, symbol: &str) -> MarketEvent {
         MarketEvent::Quote(QuoteTick {
+            delivery: Default::default(),
             exchange,
             symbol: symbol.into(),
             bid_price: 0.4,
@@ -17985,6 +18010,26 @@ mod market_router_tests {
         let payload = resolve_market_event(rx.try_recv().unwrap(), &lane.latest).unwrap();
         assert!(Arc::ptr_eq(&payload.event, &second));
         assert_eq!(lane.latest.replacements.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn latest_quote_replacement_preserves_delivery_origin_and_both_clocks() {
+        let (lane, rx) = test_market_lane(8);
+        let key = Some(LatestMarketKeyHandle { id: 0, generation: 1 });
+        for origin in [QuoteOrigin::Wire, QuoteOrigin::SubscriptionCheckpoint] {
+            let mut event = quote(Exchange::Polymarket, "token");
+            if let MarketEvent::Quote(q) = &mut event {
+                q.delivery = QuoteDelivery { origin, published_timestamp_ns: 100 };
+            }
+            assert!(enqueue_market_event(&lane, Arc::new(event), key));
+        }
+        assert_eq!(rx.len(), 1);
+        let payload = resolve_market_event(rx.try_recv().unwrap(), &lane.latest).unwrap();
+        let MarketEvent::Quote(q) = payload.event.as_ref() else { panic!("quote expected"); };
+        assert_eq!(q.delivery.origin, QuoteOrigin::SubscriptionCheckpoint);
+        assert_eq!(q.source_age_ns(120), Some(119));
+        assert_eq!(q.publication_age_ns(120), Some(20));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

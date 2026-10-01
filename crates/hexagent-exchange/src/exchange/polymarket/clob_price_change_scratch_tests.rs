@@ -211,6 +211,7 @@ impl ClobLocalBooks {
                 if let Some((bid, ask)) = advertised_l1 {
                     if let (Some(bid_price), Some(ask_price)) = (bid.to_f64(), ask.to_f64()) {
                         let quote = QuoteTick {
+                            delivery: Default::default(),
                             exchange: Exchange::Polymarket,
                             symbol: token.clone(),
                             bid_price,
