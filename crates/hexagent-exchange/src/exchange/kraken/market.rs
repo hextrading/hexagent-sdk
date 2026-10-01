@@ -124,6 +124,7 @@ async fn kraken_ws_task(
                                 let bid_qty = item.get("bid_qty").and_then(|v| v.as_f64()).unwrap_or(0.0);
                                 let ask_qty = item.get("ask_qty").and_then(|v| v.as_f64()).unwrap_or(0.0);
                                 let event = MarketEvent::Quote(QuoteTick {
+                                    delivery: Default::default(),
                                     exchange: Exchange::Kraken,
                                     symbol,
                                     bid_price: bid,

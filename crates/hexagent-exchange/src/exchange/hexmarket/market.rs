@@ -261,6 +261,7 @@ fn parse_ws_message(text: &str) -> Vec<MarketEvent> {
             let (bp, bq) = best_bid.unwrap_or((0.0, 0.0));
             let (ap, aq) = best_ask.unwrap_or((0.0, 0.0));
             events.push(MarketEvent::Quote(QuoteTick {
+                delivery: Default::default(),
                 exchange: Exchange::Hexmarket,
                 symbol: asset_id.to_string(),
                 bid_price: bp,
@@ -306,6 +307,7 @@ fn parse_ws_message(text: &str) -> Vec<MarketEvent> {
             };
             let now = now_ns();
             vec![MarketEvent::Quote(QuoteTick {
+                delivery: Default::default(),
                 exchange: Exchange::Hexmarket,
                 symbol: asset_id.to_string(),
                 bid_price: price,
@@ -537,6 +539,7 @@ impl ExchangeMarket for HexmarketMarket {
                     self.last_heartbeat_ns = now;
                     if let Some(outcome_id) = self.outcomes.keys().next() {
                         return Ok(Some(MarketEvent::Quote(QuoteTick {
+                            delivery: Default::default(),
                             exchange: Exchange::Hexmarket,
                             symbol: outcome_id.clone(),
                             bid_price: 0.0,

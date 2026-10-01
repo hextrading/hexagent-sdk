@@ -1448,6 +1448,7 @@ mod tests {
         let base = tempdir.path().join("quotes.parquet");
         let mut buffer = ParquetBuffer::new(base);
         let quote = crate::types::QuoteTick {
+            delivery: Default::default(),
             exchange: crate::types::Exchange::Binance,
             symbol: "BTCUSDT".to_string(),
             bid_price: 100.0,

@@ -174,6 +174,7 @@ impl ClobLocalBooks {
             role.up_token.clone()
         };
         batch.events.push(MarketEvent::Quote(QuoteTick {
+            delivery: Default::default(),
             exchange: Exchange::Polymarket,
             symbol,
             bid_price: bid,
@@ -296,6 +297,7 @@ impl ClobLocalBooks {
                 continue;
             }
             events.push(MarketEvent::Quote(QuoteTick {
+                delivery: Default::default(),
                 exchange: Exchange::Polymarket,
                 symbol: role.up_token.clone(),
                 bid_price: bbo.bid,

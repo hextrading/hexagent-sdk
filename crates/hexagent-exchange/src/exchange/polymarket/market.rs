@@ -33,6 +33,10 @@ mod live_bbo;
 mod clob_tls;
 use clob_tls::ClobTlsConfig;
 
+#[path = "clob_cooperative.rs"]
+mod clob_cooperative;
+use clob_cooperative::ClobCooperativeBudget;
+
 #[cfg(test)]
 #[path = "live_bbo_tests.rs"]
 mod live_bbo_tests;
@@ -1699,8 +1703,15 @@ impl ClobEventSender {
         self.send_with_origin(event, false)
     }
 
-    fn send_with_origin(&self, event: MarketEvent, checkpoint: bool) -> bool {
+    fn send_with_origin(&self, mut event: MarketEvent, checkpoint: bool) -> bool {
         let replaceable = Self::is_replaceable(&event);
+        let published_ns = if matches!(&event, MarketEvent::Quote(_) | MarketEvent::OrderBook(_)) { now_ns() } else { 0 };
+        if let MarketEvent::Quote(quote) = &mut event {
+            quote.delivery = QuoteDelivery {
+                origin: if checkpoint { QuoteOrigin::SubscriptionCheckpoint } else { QuoteOrigin::Wire },
+                published_timestamp_ns: published_ns,
+            };
+        }
         let source_ns = match &event {
             MarketEvent::OrderBook(book) => book.local_timestamp_ns,
             MarketEvent::Quote(quote) => quote.local_timestamp_ns,
@@ -1709,7 +1720,7 @@ impl ClobEventSender {
         if source_ns != 0 {
             // Wall-clock source age is deliberately separate from monotonic
             // queue/hold durations. Preserve the quote's original timestamp.
-            let age = now_ns().saturating_sub(source_ns);
+            let age = published_ns.saturating_sub(source_ns);
             crate::latency::observe_ns("polymarket.ws.clob_source_age_at_publish", age);
             crate::latency::observe_ns(if checkpoint {
                 "polymarket.ws.clob_checkpoint_source_age_at_publish"
@@ -4147,7 +4158,9 @@ fn spawn_clob_seeded_candidate(
         let mut frame_batch = ClobParsedBatch::preallocated();
         let mut seed_events = Vec::with_capacity(subscription.tokens.len() * 2);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut cooperative = ClobCooperativeBudget::new();
         loop {
+            cooperative.checkpoint().await;
             let message = tokio::time::timeout_at(deadline, lane.read.next())
                 .await
                 .map_err(|_| "candidate L2 seed timed out".to_string())?
@@ -4883,51 +4896,72 @@ async fn clob_ws_task(
     liveness: Arc<PolymarketLiveness>,
     protocol_sink: Option<BookProtocolSink>,
 ) {
-    // A sibling task on the same runtime distinguishes runtime-wide timer
-    // starvation from delay inside this socket loop's biased select. If only
-    // `clob_loop_scheduler_lag` rises, a ready higher-priority branch is
-    // starving the inline timer; if both rise, the entire runtime was delayed.
-    // The probe-span CPU split distinguishes work from off-CPU time (which
-    // also includes intentional idle). Subtracting 1 ms exposes lag above Tokio/Linux
-    // timer-wheel granularity while retaining the raw series for comparison.
+    // Retain the portable interval series for before/after comparisons. The
+    // second deadline source measures kernel-monotonic lateness independently
+    // of Tokio timer-wheel rounding. Both run on this existing owner thread.
     let runtime_scheduler_max_us = Arc::new(AtomicU64::new(0));
     let runtime_probe_max = runtime_scheduler_max_us.clone();
     let runtime_probe_shutdown = shutdown.clone();
     let runtime_probe = tokio::spawn(async move {
+        use hexagent_runtime::precise_interval::PreciseInterval;
+        let mut precise = match PreciseInterval::new(CLOB_SCHEDULER_PROBE_INTERVAL) {
+            Ok(timer) => { info!("[clob_deadline_probe] backend=timerfd interval_ms=10 threshold_us=1000"); Some(timer) }
+            Err(error) => { warn!("[clob_deadline_probe] backend=unavailable legacy_probe_retained=true error={error}"); None }
+        };
         let mut probe = tokio::time::interval(CLOB_SCHEDULER_PROBE_INTERVAL);
         probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         probe.tick().await;
-        let mut previous_wall = std::time::Instant::now();
-        let mut previous_cpu = crate::latency::thread_cpu_ns();
+        let mut previous_wall = [Instant::now(); 2];
+        let mut previous_cpu = [crate::latency::thread_cpu_ns(); 2];
         while !runtime_probe_shutdown.load(Ordering::Relaxed) {
-            let scheduled_at = probe.tick().await;
-            let lag = scheduled_at.elapsed();
-            let lag_ns = lag.as_nanos().min(u64::MAX as u128) as u64;
-            let wall_now = std::time::Instant::now();
+            let (index, lag_ns, expirations) = tokio::select! {
+                scheduled_at = probe.tick() => (0, scheduled_at.elapsed().as_nanos().min(u64::MAX as u128) as u64, 1),
+                result = async {
+                    match precise.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => match result {
+                    Ok(tick) => (1, tick.lag_ns(), tick.expirations),
+                    Err(error) => {
+                        crate::latency::observe_scheduler_tail(crate::latency::SchedulerTail {
+                            probe: "timerfd_error", observed_unix_ns: now_ns(), lag_ns: 0,
+                            span_wall_ns: 0, span_cpu_ns: None, expirations: 0,
+                            error_code: error.raw_os_error(),
+                        });
+                        precise = None;
+                        continue;
+                    }
+                },
+            };
+            let wall_now = Instant::now();
             let cpu_now = crate::latency::thread_cpu_ns();
-            let span_ns = wall_now.duration_since(previous_wall).as_nanos().min(u64::MAX as u128) as u64;
-            if let Some((cpu_ns, off_cpu_ns)) = scheduler_span_split(span_ns, previous_cpu, cpu_now) {
-                // Boundary is previous actual probe completion -> this one,
-                // not just timer lateness. Off-CPU includes intentional idle.
-                // A stalled span records both values on the existing bounded
-                // telemetry lane; no formatting, I/O, or new worker is added.
-                if lag_ns >= 20_000_000 {
+            let span_ns = wall_now.duration_since(previous_wall[index]).as_nanos().min(u64::MAX as u128) as u64;
+            let split = scheduler_span_split(span_ns, previous_cpu[index], cpu_now);
+            let threshold = if index == 0 { 5_000_000 } else { 1_000_000 };
+            if lag_ns >= threshold {
+                crate::latency::observe_scheduler_tail(crate::latency::SchedulerTail {
+                    probe: if index == 0 { "tokio_interval" } else { "timerfd" },
+                    observed_unix_ns: now_ns(), lag_ns, span_wall_ns: span_ns,
+                    span_cpu_ns: split.map(|(cpu, _)| cpu), expirations, error_code: None,
+                });
+                if let Some((cpu_ns, off_cpu_ns)) = split {
                     crate::latency::observe_ns("polymarket.ws.clob_stalled_probe_span_cpu", cpu_ns);
                     crate::latency::observe_ns("polymarket.ws.clob_stalled_probe_span_off_cpu", off_cpu_ns);
                     crate::latency::observe_ns("polymarket.ws.clob_stalled_probe_span_wall", span_ns);
                 }
             }
-            previous_wall = wall_now;
-            previous_cpu = cpu_now;
-            crate::latency::record_ns("polymarket.ws.clob_runtime_scheduler_lag", lag_ns);
-            crate::latency::record_ns(
-                "polymarket.ws.clob_runtime_scheduler_over_1ms",
-                lag_ns.saturating_sub(1_000_000),
-            );
-            runtime_probe_max.fetch_max(
-                lag.as_micros().min(u64::MAX as u128) as u64,
-                Ordering::Relaxed,
-            );
+            previous_wall[index] = wall_now;
+            previous_cpu[index] = cpu_now;
+            if index == 0 {
+                crate::latency::record_ns("polymarket.ws.clob_runtime_scheduler_lag", lag_ns);
+                // Historical diagnostic only: subtracting1ms is not an exact
+                // estimate of OS runnable wait or kernel-deadline lateness.
+                crate::latency::record_ns("polymarket.ws.clob_runtime_scheduler_over_1ms", lag_ns.saturating_sub(1_000_000));
+                runtime_probe_max.fetch_max(lag_ns / 1_000, Ordering::Relaxed);
+            } else {
+                crate::latency::observe_ns("polymarket.ws.clob_runtime_deadline_lag", lag_ns);
+            }
         }
     });
     let mut subscription = initial_subscription;
@@ -5080,8 +5114,10 @@ async fn clob_ws_task(
         scheduler_probe.tick().await;
         let mut immediate_reconnect = false;
         let mut dual_silence_windows = 0_u8;
+        let mut cooperative = ClobCooperativeBudget::new();
 
         loop {
+            cooperative.checkpoint().await;
             let deferred_deadline = books
                 .next_deferred_deadline()
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
@@ -8804,6 +8840,7 @@ impl ClobLocalBooks {
                 if let Some((bid, ask)) = advertised_l1 {
                     if let (Some(bid_price), Some(ask_price)) = (bid.to_f64(), ask.to_f64()) {
                         let quote = QuoteTick {
+                            delivery: Default::default(),
                             exchange: Exchange::Polymarket,
                             symbol: token.to_owned(),
                             bid_price,
@@ -9475,6 +9512,7 @@ fn make_quote_event(
         return None;
     }
     Some(MarketEvent::Quote(QuoteTick {
+        delivery: Default::default(),
         exchange: Exchange::Polymarket,
         symbol: asset_id,
         bid_price,
@@ -10395,6 +10433,7 @@ mod clob_event_lane_tests {
 
     fn quote(sequence: u64) -> MarketEvent {
         MarketEvent::Quote(QuoteTick {
+            delivery: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: "token".to_string(),
             bid_price: 0.4,
@@ -10420,6 +10459,8 @@ mod clob_event_lane_tests {
             let MarketEvent::Quote(quote) = rx.recv_timeout(Duration::ZERO).unwrap() else {
                 panic!("replaceable lane returned a non-quote event");
             };
+            assert_eq!(quote.delivery.origin, QuoteOrigin::Wire);
+            assert!(quote.delivery.published_timestamp_ns > quote.local_timestamp_ns);
             newest = newest.max(quote.local_timestamp_ns);
         }
         assert_eq!(
@@ -10427,6 +10468,24 @@ mod clob_event_lane_tests {
             CLOB_REPLACEABLE_EVENT_CAPACITY as u64 + 16,
             "the most recent snapshot must survive overflow",
         );
+    }
+
+    #[test]
+    fn checkpoint_origin_survives_lane_delivery_without_refreshing_source_clock() {
+        let (tx, mut rx) = clob_event_lanes();
+        assert!(tx.send_with_origin(quote(123), true));
+        assert!(tx.send(quote(124)));
+        for (source_ns, origin) in [(123, QuoteOrigin::SubscriptionCheckpoint), (124, QuoteOrigin::Wire)] {
+            let MarketEvent::Quote(q) = rx.recv_timeout(Duration::ZERO).unwrap() else { panic!("quote expected"); };
+            assert_eq!(q.local_timestamp_ns, source_ns);
+            assert_eq!(q.exchange_timestamp_ns, source_ns);
+            assert_eq!(q.delivery.origin, origin);
+            let published = q.delivery.published_timestamp_ns;
+            assert!(published > source_ns);
+            assert_eq!(q.publication_age_ns(published + 10), Some(10));
+            assert_eq!(q.source_age_ns(published + 10), Some(published + 10 - source_ns));
+        }
+        assert!(rx.recv_timeout(Duration::ZERO).is_err());
     }
 
     #[test]

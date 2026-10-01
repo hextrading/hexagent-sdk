@@ -129,6 +129,24 @@ pub struct TradeTick {
     pub local_timestamp_ns: u64,
 }
 
+/// Immutable provenance carried with a quote through coalescing and routing.
+/// Missing metadata in old recordings is unknown, never guessed from age.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuoteOrigin {
+    #[default]
+    Unspecified,
+    Wire,
+    SubscriptionCheckpoint,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuoteDelivery {
+    pub origin: QuoteOrigin,
+    /// Source-owner publication time. Does not replace the original receipt
+    /// timestamp used by freshness, ordering and replay guards.
+    pub published_timestamp_ns: u64,
+}
+
 /// Best bid/ask quote tick (from bookTicker stream)
 #[derive(
     Debug, Clone, Serialize, Deserialize,
@@ -142,6 +160,21 @@ pub struct QuoteTick {
     pub ask_qty: f64,
     pub exchange_timestamp_ns: u64,
     pub local_timestamp_ns: u64,
+    // Append and always serialize: compact MessagePack uses positional fields.
+    // serde(default) also accepts old JSON/MessagePack recordings as unknown.
+    #[serde(default)]
+    pub delivery: QuoteDelivery,
+}
+
+impl QuoteTick {
+    pub fn source_age_ns(&self, now_ns: u64) -> Option<u64> {
+        (self.local_timestamp_ns != 0).then(|| now_ns.checked_sub(self.local_timestamp_ns)).flatten()
+    }
+
+    pub fn publication_age_ns(&self, now_ns: u64) -> Option<u64> {
+        let published = self.delivery.published_timestamp_ns;
+        (published != 0).then(|| now_ns.checked_sub(published)).flatten()
+    }
 }
 
 /// OHLCV kline/candlestick bar
@@ -478,5 +511,31 @@ mod tests {
         assert!((ob.mid_price() - 79624.065).abs() < 1e-6);
         // spread = 79624.07 - 79624.06 = 0.01, NOT 79626.01 - 79622.33 = 3.68.
         assert!((ob.spread().unwrap() - 0.01).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod quote_delivery_tests {
+    use super::*;
+
+    #[test]
+    fn old_recordings_remain_unknown_and_new_provenance_roundtrips() {
+        let old = r#"{"exchange":"polymarket","symbol":"token","bid_price":0.4,"bid_qty":1.0,"ask_price":0.6,"ask_qty":1.0,"exchange_timestamp_ns":100,"local_timestamp_ns":200}"#;
+        let mut q: QuoteTick = serde_json::from_str(old).unwrap();
+        assert_eq!(q.delivery, QuoteDelivery::default());
+        assert_eq!(serde_json::to_value(&q).unwrap()["delivery"]["origin"], "Unspecified");
+        assert_eq!(q.publication_age_ns(500), None);
+        for origin in [QuoteOrigin::Wire, QuoteOrigin::SubscriptionCheckpoint] {
+            q.delivery = QuoteDelivery { origin, published_timestamp_ns: 400 };
+            let copy: QuoteTick = serde_json::from_value(serde_json::to_value(&q).unwrap()).unwrap();
+            assert_eq!(copy.delivery, q.delivery);
+            assert_eq!(copy.local_timestamp_ns, 200);
+            assert_eq!(copy.source_age_ns(500), Some(300));
+            assert_eq!(copy.publication_age_ns(500), Some(100));
+            assert_eq!(copy.source_age_ns(199), None);
+            assert_eq!(copy.publication_age_ns(399), None);
+        }
+        q.local_timestamp_ns = 0;
+        assert_eq!(q.source_age_ns(500), None);
     }
 }

@@ -529,6 +529,7 @@ fn parse_book_ticker_message(data: &serde_json::Value) -> Option<MarketEvent> {
         .unwrap_or_else(now_ns);
 
     Some(MarketEvent::Quote(QuoteTick {
+        delivery: Default::default(),
         exchange: Exchange::Binance,
         symbol: symbol.to_uppercase(),
         bid_price,
