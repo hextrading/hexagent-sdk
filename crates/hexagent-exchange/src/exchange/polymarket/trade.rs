@@ -9502,6 +9502,17 @@ impl PolymarketTrade {
         Ok(())
     }
 
+    /// Ordered cold-control consumer only. Finish the release on that owner
+    /// before consuming a later retain; another background job could otherwise
+    /// release the newly retained reference out of order.
+    pub fn retire_event_audit_on_owner(&self, condition_id: &str, asset_ids: &[String]) -> Result<()> {
+        self.shared.account_state.release_settled_event_audit(
+            &self.instance_id, condition_id, asset_ids,
+        )?;
+        self.shared.request_settled_gc();
+        Ok(())
+    }
+
     /// Destroy event-scoped mappings and durable audit rows only when the
     /// strategy confirms its settled-event FIFO has evicted that event.
     pub fn retire_event_audit(&self, condition_id: &str, asset_ids: &[String]) {
