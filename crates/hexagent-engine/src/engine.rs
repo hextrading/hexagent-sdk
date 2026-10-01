@@ -12708,7 +12708,8 @@ impl Engine {
                                 run_poly_orphan_recovery(trade, rx);
                             }).expect("spawn per-instance orphan recovery"));
                     }
-                    let owner_count = poly_connection_handles.len();
+                    // Join handles also contain the non-HTTP event audit owners.
+                    let owner_count = poly_connection_metrics.len();
                     info!(
                         "[Executor] Polymarket physical connection owners: accounts={} owners={}",
                         poly_connection_routes.len(), owner_count,
