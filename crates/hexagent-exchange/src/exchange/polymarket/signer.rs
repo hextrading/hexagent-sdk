@@ -310,19 +310,14 @@ fn compute_domain_separator(exchange_address: &str) -> [u8; 32] {
 ///   makerAmount = round(size * 1e6)
 ///   takerAmount = round(size * price * 1e6)
 pub fn compute_amounts(price: f64, size: f64, side: crate::types::Side) -> (String, String) {
-    let scale = 1_000_000.0; // 6 decimals
-    match side {
-        crate::types::Side::Buy => {
-            let maker = (size * price * scale).round() as u128;
-            let taker = (size * scale).round() as u128;
-            (maker.to_string(), taker.to_string())
-        }
-        crate::types::Side::Sell => {
-            let maker = (size * scale).round() as u128;
-            let taker = (size * price * scale).round() as u128;
-            (maker.to_string(), taker.to_string())
-        }
-    }
+    let (maker, taker) = compute_amounts_numeric(price, size, side);
+    (maker.to_string(), taker.to_string())
+}
+
+pub(super) fn compute_amounts_numeric(price: f64, size: f64, side: crate::types::Side) -> (u128, u128) {
+    let shares = (size * 1_000_000.0).round() as u128;
+    let notional = (size * price * 1_000_000.0).round() as u128;
+    match side { crate::types::Side::Buy => (notional, shares), crate::types::Side::Sell => (shares, notional) }
 }
 
 const U256_MAX_DECIMAL: &str =
@@ -350,6 +345,10 @@ pub(super) fn validate_u256_decimal(name: &str, value: &str, allow_zero: bool) -
 
 pub(super) fn validate_signing_inputs(token_id: &str, price: f64, size: f64) -> Result<()> {
     validate_u256_decimal("token_id", token_id, false)?;
+    validate_price_size(price, size)
+}
+
+pub(super) fn validate_price_size(price: f64, size: f64) -> Result<()> {
     if !price.is_finite() || price <= 0.0 || price >= 1.0 {
         return Err(anyhow!("Invalid price: {}", price));
     }
@@ -428,9 +427,12 @@ impl AccountSaltSequence {
 
     #[inline]
     pub(crate) fn next_decimal(&self) -> String {
+        self.next_u64().to_string()
+    }
+
+    pub(crate) fn next_u64(&self) -> u64 {
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
-        let salt = ((startup_secs() as u64) << 32) | (counter & 0xFFFF_FFFF);
-        salt.to_string()
+        ((startup_secs() as u64) << 32) | (counter & 0xFFFF_FFFF)
     }
 }
 

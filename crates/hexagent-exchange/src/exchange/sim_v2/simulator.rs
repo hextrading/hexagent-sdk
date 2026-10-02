@@ -4311,6 +4311,7 @@ mod tests {
 
     fn place_signal(coid: &str) -> Signal {
         Signal::NewOrder(OrderRequest {
+            prepared_token: None,
             client_order_id: coid.to_string(),
             exchange: Exchange::Polymarket,
             symbol: "tok".into(),

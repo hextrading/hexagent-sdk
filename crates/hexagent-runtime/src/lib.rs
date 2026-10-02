@@ -25,3 +25,5 @@ pub mod poll_channel;
 pub mod precise_interval;
 pub mod shutdown;
 pub mod try_queue;
+
+pub mod reply_slots;

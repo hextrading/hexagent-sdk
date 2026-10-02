@@ -5882,6 +5882,7 @@ mod tests {
         ot: OrderType,
     ) -> OrderRequest {
         OrderRequest {
+            prepared_token: None,
             client_order_id: coid.into(),
             exchange: Exchange::Polymarket,
             symbol: symbol.into(),

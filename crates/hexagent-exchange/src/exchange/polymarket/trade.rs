@@ -2171,9 +2171,39 @@ fn instance_owned_open_coids<'a>(
 type HttpReply = std::result::Result<serde_json::Value, HttpErr>;
 
 #[derive(Debug, Default)]
-struct HttpCompletionTiming {
+pub(crate) struct HttpCompletionTiming {
     response_ready_ns: AtomicU64,
     reply_enqueued_ns: AtomicU64,
+}
+
+type ReplyPool = hexagent_runtime::reply_slots::Pool<HttpReply, HttpCompletionTiming>;
+type PooledReply = (hexagent_runtime::reply_slots::Sender<HttpReply, HttpCompletionTiming>,
+    hexagent_runtime::reply_slots::Receiver<HttpReply, HttpCompletionTiming>, Arc<HttpCompletionTiming>);
+fn new_reply_pool() -> ReplyPool {
+    ReplyPool::new(2, HttpCompletionTiming::default,
+        || Err(HttpErr::Transport("async reply dropped".to_string())))
+}
+fn reset_reply_timing(timing: &HttpCompletionTiming) {
+    timing.response_ready_ns.store(0, Ordering::Relaxed);
+    timing.reply_enqueued_ns.store(0, Ordering::Relaxed);
+}
+pub(crate) enum HttpReplyReceiver {
+    Dedicated(crossbeam_channel::Receiver<HttpReply>),
+    Reused(hexagent_runtime::reply_slots::Receiver<HttpReply, HttpCompletionTiming>),
+}
+impl HttpReplyReceiver {
+    pub(crate) fn recv(&self) -> Result<HttpReply, crossbeam_channel::RecvError> {
+        match self { Self::Dedicated(rx) => rx.recv(), Self::Reused(rx) => rx.recv() }
+    }
+}
+enum HttpReplySender {
+    Dedicated(crossbeam_channel::Sender<HttpReply>),
+    Reused(hexagent_runtime::reply_slots::Sender<HttpReply, HttpCompletionTiming>),
+}
+impl HttpReplySender {
+    fn try_send(self, value: HttpReply) -> Result<(), HttpReply> {
+        match self { Self::Dedicated(tx) => tx.try_send(value).map_err(|e| e.into_inner()), Self::Reused(tx) => tx.try_send(value) }
+    }
 }
 
 #[derive(Debug)]
@@ -3300,17 +3330,40 @@ pub(crate) struct WireOrderV2 {
     #[serde(rename = "tokenId")]
     pub token_id: String,
     #[serde(rename = "makerAmount")]
-    pub maker_amount: String,
+    #[serde(serialize_with = "decimal_string")]
+    pub maker_amount: u128,
     #[serde(rename = "takerAmount")]
-    pub taker_amount: String,
+    #[serde(serialize_with = "decimal_string")]
+    pub taker_amount: u128,
     pub side: &'static str,
     #[serde(rename = "signatureType")]
     pub signature_type: u8,
-    pub timestamp: String,
+    #[serde(serialize_with = "decimal_string")]
+    pub timestamp: u64,
     pub expiration: String,
     pub metadata: String,
     pub builder: String,
     pub signature: String,
+}
+
+fn decimal_string<T: std::fmt::Display, S: serde::Serializer>(value: &T, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(value)
+}
+
+#[cfg(test)]
+#[test]
+fn numeric_live_wire_preserves_clob_json_field_types_and_full_u128_values() {
+    let order = WireOrderV2 {
+        salt: u64::MAX, maker: "maker".into(), signer: "signer".into(), taker: "taker".into(),
+        token_id: "42".into(), maker_amount: u128::MAX, taker_amount: 1,
+        side: "SELL", signature_type: 3, timestamp: 1790924400000,
+        expiration: "0".into(), metadata: "metadata".into(), builder: "builder".into(), signature: "signature".into(),
+    };
+    let value = serde_json::to_value(order).unwrap();
+    assert_eq!(value["salt"].as_u64(), Some(u64::MAX));
+    assert_eq!(value["makerAmount"], "340282366920938463463374607431768211455");
+    assert_eq!(value["takerAmount"], "1"); assert_eq!(value["timestamp"], "1790924400000");
+    assert_eq!(value["signatureType"], 3); assert_eq!(value["tokenId"], "42");
 }
 
 /// User-feed gap-replay tuning (sourced from `exchanges[polymarket]`). All
@@ -6514,7 +6567,7 @@ impl SharedState {
         method: &str,
         path: &str,
         body: &str,
-    ) -> crossbeam_channel::Receiver<HttpReply> {
+    ) -> HttpReplyReceiver {
         self.http_call_async_on_timed(client, method, path, body).0
     }
 
@@ -6525,7 +6578,7 @@ impl SharedState {
         path: &str,
         body: &str,
     ) -> (
-        crossbeam_channel::Receiver<HttpReply>,
+        HttpReplyReceiver,
         Arc<HttpCompletionTiming>,
     ) {
         let attempt_id = client.allocate_attempt_id();
@@ -6546,7 +6599,7 @@ impl SharedState {
         path: &str,
         body: Bytes,
     ) -> (
-        crossbeam_channel::Receiver<HttpReply>,
+        HttpReplyReceiver,
         Arc<HttpCompletionTiming>,
     ) {
         self.http_call_async_on_timed_bytes_rec(client, attempt_id, method, path, body, None)
@@ -6561,21 +6614,30 @@ impl SharedState {
         body: Bytes,
         rec_kind_override: Option<crate::latency_record::RequestKind>,
     ) -> (
-        crossbeam_channel::Receiver<HttpReply>,
+        HttpReplyReceiver,
         Arc<HttpCompletionTiming>,
     ) {
-        let timing = Arc::new(HttpCompletionTiming::default());
+        self.http_call_async_on_completion(client, attempt_id, method, path, body, rec_kind_override, None)
+    }
+
+    fn http_call_async_on_completion(
+        &self, client: crate::http1_pool::PooledClient, attempt_id: u64,
+        method: &str, path: &str, body: Bytes,
+        rec_kind_override: Option<crate::latency_record::RequestKind>, completion: Option<PooledReply>,
+    ) -> (HttpReplyReceiver, Arc<HttpCompletionTiming>) {
+        let (reply_tx, reply_rx, timing) = if let Some((tx, rx, timing)) = completion {
+            (HttpReplySender::Reused(tx), HttpReplyReceiver::Reused(rx), timing)
+        } else {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            (HttpReplySender::Dedicated(tx), HttpReplyReceiver::Dedicated(rx), Arc::new(HttpCompletionTiming::default()))
+        };
         let method = match method {
             "POST" => reqwest::Method::POST,
             "DELETE" => reqwest::Method::DELETE,
             "GET" => reqwest::Method::GET,
             other => {
-                let (tx, rx) = crossbeam_channel::bounded(1);
-                let _ = tx.send(Err(HttpErr::Other(format!(
-                    "unsupported method: {}",
-                    other
-                ))));
-                return (rx, timing);
+                let _ = reply_tx.try_send(Err(HttpErr::Other(format!("unsupported method: {}", other))));
+                return (reply_rx, timing);
             }
         };
         let stage = http_stage(method.as_str(), path);
@@ -6591,7 +6653,6 @@ impl SharedState {
             Arc::<str>::from(format!("{}{}", self.clob_base_url, path))
         };
         let auth_path = canonical_l2_auth_path(path);
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
 
         // Single request on the reserved connection.
         {
@@ -6760,7 +6821,7 @@ impl SharedState {
 /// the engine holds it opaquely (never touching `HttpReply`).
 pub struct PendingSubmit {
     local_oid: String,
-    rx: crossbeam_channel::Receiver<HttpReply>,
+    rx: HttpReplyReceiver,
     timing: Arc<HttpCompletionTiming>,
     attempt: crate::http1_pool::AttemptTraceHandle,
 }
@@ -6771,7 +6832,7 @@ pub struct PendingSubmit {
 /// [`PolymarketTrade::complete_cancel`].
 pub struct PendingCancel {
     ctx: CancelCtx,
-    rx: Option<crossbeam_channel::Receiver<HttpReply>>,
+    rx: Option<HttpReplyReceiver>,
     timing: Option<Arc<HttpCompletionTiming>>,
     attempt: Option<crate::http1_pool::AttemptTraceHandle>,
 }
@@ -6808,6 +6869,8 @@ pub struct PolymarketTrade {
     /// (place lines carry `order.timestamp_ns` directly). 0 = unknown
     /// (heartbeat/CLI/reconcile paths that don't originate from a quote).
     gen_ns_hint: u64,
+    /// Connection-owner local; initialized before signals can reach this worker.
+    reply_slots: ReplyPool,
 }
 
 impl PolymarketTrade {
@@ -7335,6 +7398,7 @@ impl PolymarketTrade {
             // rebuilt via `from_shared(.., instance_id)`.
             instance_id: String::new(),
             gen_ns_hint: 0,
+            reply_slots: new_reply_pool(),
         })
     }
 
@@ -7498,6 +7562,7 @@ impl PolymarketTrade {
             owner: owner.to_string(),
             instance_id: instance_id.to_string(),
             gen_ns_hint: 0,
+            reply_slots: new_reply_pool(),
         }
     }
 
@@ -7511,6 +7576,7 @@ impl PolymarketTrade {
             owner: self.owner.clone(),
             instance_id: self.instance_id.clone(),
             gen_ns_hint: self.gen_ns_hint,
+            reply_slots: new_reply_pool(),
         }
     }
 
@@ -9781,50 +9847,21 @@ impl PolymarketTrade {
             self.shared.signer_v2.as_ref().ok_or_else(|| {
                 anyhow!("clob_version=v2 but signer_v2 is None — constructor bug")
             })?;
-        let signed = signer_v2.build_signed_order_dispatch(
-            &order.symbol,
-            price,
-            order.quantity,
-            order.side,
-        )?;
-
-        let salt_u64: u64 = signed
-            .order
-            .salt
-            .parse::<u128>()
-            .map(|v| v as u64)
-            .unwrap_or(0);
-
-        // v2 wire body — field set matches `orderToJsonV2` in
-        // clob-client-v2/src/types/ordersV2.ts exactly. No `nonce`, no
-        // `feeRateBps` (both removed in v2). `taker` and `expiration`
-        // are wire-only (NOT in the signed struct). Typed struct →
-        // one-pass serialization at dispatch; strings move, no clones.
-        let o = signed.order;
+        let signed = signer_v2.build_signed_order_numeric(
+            &order.symbol, order.prepared_token.as_deref(), price, order.quantity, order.side)?;
         let body = PolyOrderBody::V2(WireBodyV2 {
-            owner: self.owner.clone(),
-            order_type: Self::poly_order_type_str(order.order_type),
-            post_only: order.post_only,
-            defer_exec: false,
+            owner: self.owner.clone(), order_type: Self::poly_order_type_str(order.order_type),
+            post_only: order.post_only, defer_exec: false,
             order: WireOrderV2 {
-                salt: salt_u64,
-                maker: o.maker,
-                signer: o.signer,
-                taker: o.taker,
-                token_id: o.token_id,
-                maker_amount: o.maker_amount,
-                taker_amount: o.taker_amount,
-                side: if order.side == Side::Buy {
-                    "BUY"
-                } else {
-                    "SELL"
-                },
-                signature_type: o.signature_type,
-                timestamp: o.timestamp,
-                expiration: o.expiration,
-                metadata: o.metadata,
-                builder: o.builder,
-                signature: signed.signature,
+                salt: signed.salt, maker: signed.maker, signer: signed.signer,
+                taker: "0x0000000000000000000000000000000000000000".to_string(),
+                token_id: order.symbol.clone(), maker_amount: signed.maker_amount,
+                taker_amount: signed.taker_amount,
+                side: if order.side == Side::Buy { "BUY" } else { "SELL" },
+                signature_type: signed.signature_type, timestamp: signed.timestamp,
+                expiration: "0".to_string(),
+                metadata: super::signer_v2::METADATA_ZERO_HEX.to_string(),
+                builder: signed.builder, signature: signed.signature,
             },
         });
         Ok((signed.order_hash, body))
@@ -11504,6 +11541,11 @@ impl PolymarketTrade {
         order: &OrderRequest,
         client: crate::http1_pool::PooledClient,
     ) -> std::result::Result<PendingSubmit, OrderUpdate> {
+        let Some(completion) = self.reply_slots.checkout(reset_reply_timing) else {
+            let update = Self::make_rejected(order, "completion slots exhausted before dispatch");
+            self.shared.log_preflight_rejected(&order.client_order_id, None, &update);
+            return Err(update);
+        };
         let prepared = match self.submit_prep(order, false) {
             Ok(prepared) => prepared,
             Err(update) => {
@@ -11521,12 +11563,12 @@ impl PolymarketTrade {
             prepared.signed_ns,
             prepared.account_recorded_ns,
         );
-        let (rx, timing) = self.shared.http_call_async_on_timed_bytes(
+        let (rx, timing) = self.shared.http_call_async_on_completion(
             client,
             attempt.attempt_id(),
             "POST",
             "/order",
-            prepared.body,
+            prepared.body, None, Some(completion),
         );
         let dispatched_ns = now_ns();
         attempt.mark_dispatched(dispatched_ns);
@@ -11617,16 +11659,27 @@ impl PolymarketTrade {
     ) -> PendingCancel {
         let signal_ns = self.gen_ns_hint;
         let prep_ns = now_ns();
+        let completion = self.reply_slots.checkout(reset_reply_timing);
         let (ctx, body) = self.cancel_prep(client_order_id, false);
+        let completion_unavailable = completion.is_none();
+        let body = match body {
+            PreparedCancelBody::Ready(bytes) if completion_unavailable => {
+                if let Ok(mut buffer) = bytes.try_into_mut() {
+                    buffer.clear(); let _ = self.shared.request_buffers.push(buffer);
+                }
+                PreparedCancelBody::BufferUnavailable
+            }
+            other => other,
+        };
         let (rx, timing, attempt) = match body {
             PreparedCancelBody::Ready(body_bytes) => {
                 let attempt = client.begin_attempt(signal_ns, prep_ns, 0, 0);
-                let (rx, timing) = self.shared.http_call_async_on_timed_bytes(
+                let (rx, timing) = self.shared.http_call_async_on_completion(
                     client,
                     attempt.attempt_id(),
                     "DELETE",
                     "/order",
-                    body_bytes,
+                    body_bytes, None, completion,
                 );
                 (Some(rx), Some(timing), Some(attempt))
             }
@@ -11634,9 +11687,10 @@ impl PolymarketTrade {
             PreparedCancelBody::BufferUnavailable => {
                 let (tx, rx) = crossbeam_channel::bounded(1);
                 let _ = tx.send(Err(HttpErr::Transport(
-                    "cancel request buffer pool exhausted before dispatch".to_string(),
+                    if completion_unavailable { "cancel completion slots exhausted before dispatch" }
+                    else { "cancel request buffer pool exhausted before dispatch" }.to_string(),
                 )));
-                (Some(rx), None, None)
+                (Some(HttpReplyReceiver::Dedicated(rx)), None, None)
             }
         };
         let dispatched_ns = rx.as_ref().map(|_| now_ns()).unwrap_or(0);

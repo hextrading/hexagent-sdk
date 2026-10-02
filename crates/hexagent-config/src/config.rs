@@ -1565,6 +1565,10 @@ pub fn venue_symbol(asset: &str, exchange: &str) -> String {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExchangeConfig {
     pub name: String,
+    /// Empty-adapter sleep in microseconds. A positive bounded delay prevents
+    /// SCHED_FIFO busy loops; live spot feeds can select 25 instead of 100.
+    #[serde(default = "default_idle_poll_us", deserialize_with = "deserialize_idle_poll_us")]
+    pub idle_poll_us: u64,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -2694,4 +2698,20 @@ fn default_sim_v2_network_outbound_fraction_bps() -> u16 {
 }
 fn default_sim_v2_cancel_timing_mode() -> String {
     "legacy_l2_multiplier".into()
+}
+
+fn default_idle_poll_us() -> u64 { 100 }
+fn deserialize_idle_poll_us<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    let value = <u64 as serde::Deserialize>::deserialize(d)?;
+    if !(10..=1000).contains(&value) { return Err(serde::de::Error::custom("idle_poll_us must be in 10..=1000")); }
+    Ok(value)
+}
+
+#[cfg(test)]
+#[test]
+fn feed_idle_poll_defaults_and_fifo_safe_bounds() {
+    let parse = |s: &str| toml::from_str::<ExchangeConfig>(s);
+    assert_eq!(parse("name = 'binance'").unwrap().idle_poll_us, 100);
+    assert_eq!(parse("name = 'coinbase'\nidle_poll_us = 25").unwrap().idle_poll_us, 25);
+    for value in [0, 9, 1001] { assert!(parse(&format!("name = 'binance'\nidle_poll_us = {value}")).is_err()); }
 }
