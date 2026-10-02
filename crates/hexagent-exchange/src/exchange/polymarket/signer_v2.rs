@@ -148,6 +148,8 @@ pub struct OrderSignerV2 {
     /// so the hot order path pays 0 instead of 8 keccaks for it (it was
     /// recomputed once for the signature and once for the orderID).
     domain_sep: [u8; 32],
+    maker_word: [u8; 32],
+    signer_word: [u8; 32],
     /// `builder_code` in wire form (`0x…` hex), formatted once.
     builder_hex: String,
     /// Shared with the account route's v1 signer. The order hot path performs
@@ -198,10 +200,12 @@ impl OrderSignerV2 {
         let domain_sep = compute_domain_separator_v2(&exchange_address);
         let builder_hex = format!("0x{}", hex::encode(builder_code));
         Ok(Self {
-            signing_key, signer_address, maker_address,
+            signing_key,
             exchange_address, builder_code, signature_type: sig_type,
             funder: None,
-            domain_sep, builder_hex, salt_sequence,
+            maker_word: address_to_bytes32(&maker_address),
+            signer_word: address_to_bytes32(&signer_address),
+            domain_sep, builder_hex, salt_sequence, signer_address, maker_address,
         })
     }
 
@@ -227,6 +231,7 @@ impl OrderSignerV2 {
     pub fn with_funder(mut self, funder: &str) -> Self {
         if !funder.trim().is_empty() {
             let f = funder.trim().to_string();
+            self.maker_word = address_to_bytes32(&f);
             self.maker_address = f.clone();
             self.funder = Some(f);
         }
@@ -269,22 +274,15 @@ impl OrderSignerV2 {
         let mut sig_bytes = [0u8; 65];
         sig_bytes[..64].copy_from_slice(&sig.to_bytes());
         sig_bytes[64] = recid.to_byte() + 27;
-        Ok(format!("0x{}", hex::encode(sig_bytes)))
+        Ok(prefixed_hex(&sig_bytes))
     }
 
     pub fn order_digest(&self, order: &OrderV2) -> [u8; 32] {
-        let domain_sep = self.domain_separator();
-        let struct_hash = order_v2_struct_hash(order);
-        let mut buf = Vec::with_capacity(2 + 32 + 32);
-        buf.push(0x19);
-        buf.push(0x01);
-        buf.extend_from_slice(&domain_sep);
-        buf.extend_from_slice(&struct_hash);
-        keccak256(&buf)
+        eip712_digest(&self.domain_sep, &order_v2_struct_hash(order))
     }
 
     pub fn order_hash_hex(&self, order: &OrderV2) -> String {
-        format!("0x{}", hex::encode(self.order_digest(order)))
+        prefixed_hex(&self.order_digest(order))
     }
 
     /// Build + sign a v2 order from a price/size/side triple.
@@ -326,9 +324,10 @@ impl OrderSignerV2 {
         };
         validate_order_v2_numbers(&order)?;
 
-        let digest = self.order_digest(&order);
+        let digest = eip712_digest(&self.domain_sep, &order_v2_struct_hash_prepared(
+            &order, self.maker_word, self.signer_word, self.builder_code));
         let signature = self.sign_digest(&digest)?;
-        let order_hash = format!("0x{}", hex::encode(digest));
+        let order_hash = prefixed_hex(&digest);
         Ok(SignedOrderV2 { order, signature, order_hash })
     }
 
@@ -377,14 +376,15 @@ impl OrderSignerV2 {
         // The ERC-7739 signature and the orderID share the same struct
         // hash — compute it once (previously the whole struct was hashed
         // a second time inside `order_hash_hex`).
-        let contents_hash = order_v2_struct_hash(&order);
-        let signature = self.sign_order_poly1271(&order, contents_hash)?;
-        let mut digest_in = Vec::with_capacity(2 + 64);
-        digest_in.push(0x19);
-        digest_in.push(0x01);
-        digest_in.extend_from_slice(&self.domain_sep);
-        digest_in.extend_from_slice(&contents_hash);
-        let order_hash = format!("0x{}", hex::encode(keccak256(&digest_in)));
+        // The cached word belongs to this immutable signer; public callers
+        // may also supply another wallet, which must retain its own identity.
+        let funder_word = if self.funder.as_deref() == Some(funder) {
+            self.maker_word
+        } else { address_to_bytes32(funder) };
+        let contents_hash = order_v2_struct_hash_prepared(
+            &order, funder_word, funder_word, self.builder_code);
+        let signature = self.sign_order_poly1271(contents_hash, funder_word)?;
+        let order_hash = prefixed_hex(&eip712_digest(&self.domain_sep, &contents_hash));
         Ok(SignedOrderV2 { order, signature, order_hash })
     }
 
@@ -394,25 +394,14 @@ impl OrderSignerV2 {
     /// `0x || inner(65) || appDomainSep(32) || contentsHash(32) ||
     ///  ORDER_TYPE_STRING || uint16(len)`. The wallet "app domain"
     /// verifyingContract is `order.signer` (= the deposit wallet).
-    fn sign_order_poly1271(&self, order: &OrderV2, contents_hash: [u8; 32]) -> Result<String> {
+    fn sign_order_poly1271(&self, contents_hash: [u8; 32], funder_word: [u8; 32]) -> Result<String> {
         let app_domain_sep = self.domain_separator();
 
-        let mut tds = Vec::with_capacity(7 * 32);
-        tds.extend_from_slice(&solady_order_type_hash());
-        tds.extend_from_slice(&contents_hash);
-        tds.extend_from_slice(&deposit_wallet_name_hash());
-        tds.extend_from_slice(&deposit_wallet_version_hash());
-        tds.extend_from_slice(&u256_bytes(CHAIN_ID as u128));
-        tds.extend_from_slice(&address_to_bytes32(&order.signer));
-        tds.extend_from_slice(&[0u8; 32]);
-        let tds_hash = keccak256(&tds);
-
-        let mut digest_in = Vec::with_capacity(2 + 64);
-        digest_in.push(0x19);
-        digest_in.push(0x01);
-        digest_in.extend_from_slice(&app_domain_sep);
-        digest_in.extend_from_slice(&tds_hash);
-        let digest = keccak256(&digest_in);
+        let tds_hash = hash_words(&[
+            solady_order_type_hash(), contents_hash, deposit_wallet_name_hash(),
+            deposit_wallet_version_hash(), u256_bytes(CHAIN_ID as u128), funder_word, [0; 32],
+        ]);
+        let digest = eip712_digest(&app_domain_sep, &tds_hash);
 
         let (sig, recid) = self
             .signing_key
@@ -425,12 +414,13 @@ impl OrderSignerV2 {
         let type_str = ORDER_TYPE_STRING.as_bytes();
         let type_len = u16::try_from(type_str.len()).expect("order type string fits u16");
 
-        let mut wrapped = String::from("0x");
-        wrapped.push_str(&hex::encode(inner));
-        wrapped.push_str(&hex::encode(app_domain_sep));
-        wrapped.push_str(&hex::encode(contents_hash));
-        wrapped.push_str(&hex::encode(type_str));
-        wrapped.push_str(&hex::encode(type_len.to_be_bytes()));
+        let mut wrapped = String::with_capacity(2 + 2 * (65 + 32 + 32 + type_str.len() + 2));
+        wrapped.push_str("0x");
+        append_hex(&mut wrapped, &inner);
+        append_hex(&mut wrapped, &app_domain_sep);
+        append_hex(&mut wrapped, &contents_hash);
+        append_hex(&mut wrapped, type_str);
+        append_hex(&mut wrapped, &type_len.to_be_bytes());
         Ok(wrapped)
     }
 
@@ -463,21 +453,48 @@ fn compute_domain_separator_v2(exchange_address: &str) -> [u8; 32] {
 // ════════════════════════════════════════════════════════════════
 
 fn order_v2_struct_hash(order: &OrderV2) -> [u8; 32] {
-    let type_hash = order_v2_type_hash();
-    let mut buf = Vec::with_capacity(12 * 32);
-    buf.extend_from_slice(&type_hash);
-    buf.extend_from_slice(&u256_from_decimal(&order.salt));
-    buf.extend_from_slice(&address_to_bytes32(&order.maker));
-    buf.extend_from_slice(&address_to_bytes32(&order.signer));
-    buf.extend_from_slice(&u256_from_decimal(&order.token_id));
-    buf.extend_from_slice(&u256_from_decimal(&order.maker_amount));
-    buf.extend_from_slice(&u256_from_decimal(&order.taker_amount));
-    buf.extend_from_slice(&u256_bytes(order.side as u128));
-    buf.extend_from_slice(&u256_bytes(order.signature_type as u128));
-    buf.extend_from_slice(&u256_from_decimal(&order.timestamp));
-    buf.extend_from_slice(&parse_bytes32(&order.metadata).unwrap_or([0u8; 32]));
-    buf.extend_from_slice(&parse_bytes32(&order.builder).unwrap_or([0u8; 32]));
-    keccak256(&buf)
+    hash_order_words(order, address_to_bytes32(&order.maker), address_to_bytes32(&order.signer),
+        parse_bytes32(&order.metadata).unwrap_or([0; 32]), parse_bytes32(&order.builder).unwrap_or([0; 32]))
+}
+
+/// Built orders use constructor-validated immutable addresses/builder and zero
+/// metadata. Arbitrary prebuilt orders continue through the compatibility hash.
+fn order_v2_struct_hash_prepared(order: &OrderV2, maker: [u8; 32], signer: [u8; 32], builder: [u8; 32]) -> [u8; 32] {
+    hash_order_words(order, maker, signer, [0; 32], builder)
+}
+
+fn hash_order_words(order: &OrderV2, maker: [u8; 32], signer: [u8; 32], metadata: [u8; 32], builder: [u8; 32]) -> [u8; 32] {
+    hash_words(&[
+        order_v2_type_hash(), u256_from_decimal(&order.salt), maker, signer,
+        u256_from_decimal(&order.token_id), u256_from_decimal(&order.maker_amount),
+        u256_from_decimal(&order.taker_amount), u256_bytes(order.side as u128),
+        u256_bytes(order.signature_type as u128), u256_from_decimal(&order.timestamp), metadata, builder,
+    ])
+}
+
+fn hash_words<const N: usize>(words: &[[u8; 32]; N]) -> [u8; 32] {
+    let mut h = Keccak256::new();
+    for word in words { h.update(word); }
+    h.finalize().into()
+}
+
+fn eip712_digest(domain: &[u8; 32], contents: &[u8; 32]) -> [u8; 32] {
+    let mut bytes = [0u8; 66];
+    bytes[..2].copy_from_slice(&[0x19, 0x01]);
+    bytes[2..34].copy_from_slice(domain);
+    bytes[34..].copy_from_slice(contents);
+    keccak256(&bytes)
+}
+
+fn append_hex(target: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes { target.push(HEX[(byte >> 4) as usize] as char); target.push(HEX[(byte & 15) as usize] as char); }
+}
+fn prefixed_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("0x");
+    append_hex(&mut out, bytes);
+    out
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -497,29 +514,30 @@ fn u256_bytes(val: u128) -> [u8; 32] {
 }
 
 fn address_to_bytes32(addr: &str) -> [u8; 32] {
-    let hex_str = addr.strip_prefix("0x").unwrap_or(addr);
-    let addr_bytes = hex::decode(hex_str).unwrap_or_else(|_| vec![0u8; 20]);
-    let mut bytes = [0u8; 32];
-    let start = 32 - addr_bytes.len().min(32);
-    bytes[start..].copy_from_slice(&addr_bytes[..addr_bytes.len().min(32)]);
-    bytes
+    let text = addr.strip_prefix("0x").unwrap_or(addr);
+    let mut word = [0; 32];
+    // Preserve the compatibility parser's zero fallback and first-32-byte
+    // truncation, without allocating a temporary decoded Vec.
+    if text.len() % 2 != 0 || !text.bytes().all(|b| b.is_ascii_hexdigit()) { return word; }
+    let n = (text.len() / 2).min(32);
+    let _ = hex::decode_to_slice(&text[..n * 2], &mut word[32 - n..]);
+    word
 }
 
 fn u256_from_decimal(s: &str) -> [u8; 32] {
-    if s.is_empty() || s == "0" { return [0u8; 32]; }
+    let s = s.trim_start_matches('0');
+    if s.is_empty() { return [0; 32]; }
     if let Ok(val) = s.parse::<u128>() { return u256_bytes(val); }
     let mut result = [0u8; 32];
-    let mut digits: Vec<u8> = s.bytes().map(|b| b - b'0').collect();
-    for i in (0..32).rev() {
-        let mut remainder = 0u32;
-        for d in digits.iter_mut() {
-            let val = remainder * 10 + *d as u32;
-            *d = (val / 256) as u8;
-            remainder = val % 256;
+    // Validated decimal -> base-256 directly. No heap digits or remove(0).
+    // Existing arbitrary prebuilt digest callers retain modulo-uint256 behavior.
+    for digit in s.bytes() {
+        let mut carry = (digit - b'0') as u16;
+        for byte in result.iter_mut().rev() {
+            carry += *byte as u16 * 10;
+            *byte = carry as u8;
+            carry >>= 8;
         }
-        result[i] = remainder as u8;
-        while digits.first() == Some(&0) && digits.len() > 1 { digits.remove(0); }
-        if digits.len() == 1 && digits[0] == 0 { break; }
     }
     result
 }
@@ -560,6 +578,69 @@ fn parse_bytes32(s: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Independent decimal long division used by the previous implementation.
+    fn reference_decimal(s: &str) -> [u8; 32] {
+        let mut out = [0; 32];
+        let mut digits: Vec<u8> = s.bytes().map(|b| b - b'0').collect();
+        for byte in out.iter_mut().rev() {
+            let mut remainder = 0u32;
+            for digit in &mut digits {
+                let value = remainder * 10 + *digit as u32;
+                *digit = (value / 256) as u8;
+                remainder = value % 256;
+            }
+            *byte = remainder as u8;
+        }
+        out
+    }
+
+    #[test]
+    fn allocation_free_decimal_encoding_matches_full_uint256_reference() {
+        for text in ["0", "0000", "1", "000340282366920938463463374607431768211455",
+            "340282366920938463463374607431768211456",
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935"] {
+            assert_eq!(u256_from_decimal(text), reference_decimal(text));
+        }
+        let mut seed = 0x123456789abcdefu64;
+        for _ in 0..512 {
+            let mut text = String::from("1");
+            for _ in 0..75 {
+                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                text.push((b'0' + (seed % 10) as u8) as char);
+            }
+            assert_eq!(u256_from_decimal(&text), reference_decimal(&text));
+        }
+    }
+
+    #[test]
+    fn prepared_signer_words_preserve_wallet_identity_digest_and_signature() {
+        let key = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let token = "50303916472381649224674364401111317755258653723694532482715411789597335197187";
+        for kind in [SignatureType::Eoa, SignatureType::Poly1271] {
+            for neg_risk in [false, true] {
+                let signer = OrderSignerV2::new(key, neg_risk, kind, "0x1111111111111111111111111111111111111111111111111111111111111111")
+                    .unwrap().with_funder("0x1234567890123456789012345678901234567890");
+                for side in [crate::types::Side::Buy, crate::types::Side::Sell] {
+                    let signed = signer.build_signed_order_dispatch(token, 0.37, 20.0, side).unwrap();
+                    assert_eq!(signed.order_hash, signer.order_hash_hex(&signed.order));
+                    if matches!(kind, SignatureType::Eoa) {
+                        assert_eq!(signed.signature, signer.sign_order(&signed.order).unwrap());
+                    } else {
+                        let alternate = signer.build_signed_order_poly1271(
+                            "0x9999999999999999999999999999999999999999", token, 0.37, 20.0, side).unwrap();
+                        assert_eq!(alternate.order_hash, signer.order_hash_hex(&alternate.order));
+                        assert_ne!(alternate.order.maker, signed.order.maker);
+                        let bytes = hex::decode(&alternate.signature[2..]).unwrap();
+                        assert_eq!(&bytes[65..97], &signer.domain_sep);
+                        assert_eq!(&bytes[97..129], &order_v2_struct_hash(&alternate.order));
+                        assert_eq!(&bytes[129..bytes.len() - 2], ORDER_TYPE_STRING.as_bytes());
+                        assert_eq!(&bytes[bytes.len() - 2..], &(ORDER_TYPE_STRING.len() as u16).to_be_bytes());
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_build_signed_order_shape() {
