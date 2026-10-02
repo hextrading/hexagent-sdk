@@ -310,6 +310,7 @@ impl OrderManager {
 
     fn cancel_signal(&self, client_order_id: &str, timestamp_ns: u64) -> Signal {
         Signal::CancelOrder {
+            cancel_trigger: Default::default(),
             exchange: self.exchange,
             client_order_id: client_order_id.to_string(),
             instance_id: self.instance_id.clone(),
@@ -750,6 +751,7 @@ impl OrderManager {
                         order.status = LocalOrderStatus::Cancelling;
                     }
                     let signal = Signal::CancelOrder {
+                        cancel_trigger: Default::default(),
                         exchange: self.exchange,
                         client_order_id: coid,
                         instance_id: self.instance_id.clone(),

@@ -1286,6 +1286,11 @@ impl PooledClient {
         self.attempt_trace.slot
     }
 
+    /// Driver-published retirement of this client, without network I/O.
+    pub fn instrumented_transport_closed(&self) -> bool {
+        self.instrumented.transport_closed()
+    }
+
     /// Current logical-pool and physical-socket generations for diagnostics.
     /// The snapshot is lock-free and does not acquire or create a connection.
     pub fn connection_snapshot(&self) -> PooledConnectionSnapshot {
@@ -1522,6 +1527,12 @@ impl Permit {
     /// Read with `business_no_response_evidence` after exclusive completion.
     pub fn business_no_response_peer(&self) -> Option<IpAddr> {
         self.attempt_trace.business_no_response_peer.load()
+    }
+
+    /// Inspect the currently installed driver via an ArcSwap guard; no full
+    /// pooled-client/health clone is needed on the owner polling path.
+    pub fn instrumented_transport_closed(&self) -> bool {
+        self.slot_instrumented.load().transport_closed()
     }
 
     /// Read current transport readiness without borrowing or replacing the

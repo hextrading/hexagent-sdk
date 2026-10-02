@@ -259,11 +259,21 @@ pub enum MarketEvent {
     Exit,
 }
 
+/// Causal origin of this cancellation, never the old order's placement.
+/// Copy-only metadata travels with the bounded signal and pending completion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CancelTrigger {
+    pub source: super::order::QuoteTriggerSource,
+    pub exchange_ns: u64,
+    pub local_ns: u64,
+}
+
 /// Signals from strategy to execution (internal only, no serialization needed)
 #[derive(Debug, Clone)]
 pub enum Signal {
     NewOrder(OrderRequest),
     CancelOrder {
+        cancel_trigger: CancelTrigger,
         exchange: Exchange,
         client_order_id: String,
         #[allow(dead_code)]
@@ -294,6 +304,7 @@ pub enum Signal {
     },
     /// Batch cancel orders for the same market (single API call).
     BatchCancelOrders {
+        cancel_trigger: CancelTrigger,
         exchange: Exchange,
         market_id: String,
         client_order_ids: OrderIdBatch,
@@ -302,6 +313,7 @@ pub enum Signal {
     },
     /// Batch update: cancel + place in a single atomic request.
     BatchUpdateOrders {
+        cancel_trigger: CancelTrigger,
         exchange: Exchange,
         market_id: String,
         cancel_client_order_ids: OrderIdBatch,
@@ -317,6 +329,7 @@ pub enum Signal {
     /// them — see `ExchangeTrade::replace_order`). Same field shape as
     /// `BatchUpdateOrders`; processed identically by the sim fill path.
     ReplaceOrder {
+        cancel_trigger: CancelTrigger,
         exchange: Exchange,
         market_id: String,
         cancel_client_order_ids: OrderIdBatch,
@@ -401,6 +414,18 @@ pub enum Signal {
     BeginShutdown,
     /// Terminal executor stop after the coordinated barrier and final report.
     Exit,
+}
+
+impl Signal {
+    pub fn set_cancel_trigger(&mut self, origin: CancelTrigger) {
+        match self {
+            Self::CancelOrder { cancel_trigger, .. }
+            | Self::BatchCancelOrders { cancel_trigger, .. }
+            | Self::BatchUpdateOrders { cancel_trigger, .. }
+            | Self::ReplaceOrder { cancel_trigger, .. } => *cancel_trigger = origin,
+            _ => {}
+        }
+    }
 }
 
 impl MarketEvent {

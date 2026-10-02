@@ -206,6 +206,7 @@ fn config(
 fn signal(command: &Command, ordinal: usize) -> Result<Signal> {
     if command.kind == "cancel" {
         return Ok(Signal::CancelOrder {
+            cancel_trigger: Default::default(),
             exchange: Exchange::Polymarket,
             client_order_id: command.coid.clone(),
             instance_id: command.iid.clone(),

@@ -407,6 +407,7 @@ pub fn prepare_market_queue_stages() {
 pub fn prepare_polymarket_order_stages() {
     prepare_thread_stages(&[
         "polymarket.cancel.prep_to_http_dispatch",
+        "polymarket.cancel.trigger_to_dispatch",
         "polymarket.cancel.completion_queue",
         "polymarket.cancel.response_classify",
         "polymarket.cancel.response_handler",

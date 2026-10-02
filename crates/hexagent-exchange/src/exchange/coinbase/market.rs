@@ -139,7 +139,7 @@ async fn coinbase_ws_task(
     event_tx: crate::exchange::PublicMarketPublisher,
     shutdown: Arc<AtomicBool>,
 ) {
-    let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
+    let mut backoff = crate::exchange::ReconnectBackoff::new(25, 30_000);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -160,7 +160,6 @@ async fn coinbase_ws_task(
                 continue;
             }
         };
-        backoff.reset();
         let (mut write, mut read) = stream.split();
 
         let sub = serde_json::json!({
@@ -328,6 +327,9 @@ async fn coinbase_ws_task(
                                     }
                                 }
                                 book.ready = true;
+                                // Only usable market state resets reconnect backoff;
+                                // TCP success followed by another close must not spin.
+                                if !book.bids.is_empty() && !book.asks.is_empty() { backoff.reset(); }
                                 let (bids, asks) = book.snapshot(MAX_DEPTH);
                                 if bids.is_empty() || asks.is_empty() { continue; }
                                 let event = MarketEvent::OrderBook(OrderBookSnapshot {
