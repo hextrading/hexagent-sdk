@@ -102,6 +102,17 @@ impl<T> Sender<T> {
 }
 
 impl<T> Receiver<T> {
+    /// Cold owners/tests only. Wait without spinning on an unpublished slot.
+    pub fn recv(&self) -> Result<T, crossbeam_channel::RecvError> {
+        loop {
+            match self.recv_timeout(Duration::from_secs(60)) {
+                Ok(value) => return Ok(value),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Err(crossbeam_channel::RecvError),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
     /// Cold shutdown/recovery only. Normal owner loops use `try_recv` and
     /// arbitrate higher-priority lanes before waiting. An unfinished producer
     /// reservation yields just like an empty queue; it is never spun on.
@@ -162,6 +173,43 @@ impl<T> Drop for Receiver<T> {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[test]
+    fn timed_owner_receive_yields_for_preempted_publication_and_keeps_fifo() {
+        let (tx, rx) = bounded(2);
+        let second = tx.clone();
+        let reserved = Barrier::new(2);
+        let release = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                tx.0.queue.push_with((7_u32, 1_u32), || {
+                    reserved.wait();
+                    // A bounded escape also makes a broken spinning receiver
+                    // fail this test, rather than hanging the whole test suite.
+                    let started = std::time::Instant::now();
+                    while !release.load(Ordering::Acquire)
+                        && started.elapsed() < Duration::from_millis(250)
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }).unwrap();
+            });
+            reserved.wait();
+            second.try_send((9, 2)).unwrap();
+            assert!(rx.has_pending());
+            assert!(!rx.front_ready());
+            assert_eq!(second.try_send((7, 3)), Err(TrySendError::Full((7, 3))));
+            let received = rx.recv_timeout(Duration::from_millis(5));
+            release.store(true, Ordering::Release);
+            assert_eq!(received, Err(crossbeam_channel::RecvTimeoutError::Timeout));
+            assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok((7, 1)));
+            assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok((9, 2)));
+            assert!(rx.is_empty());
+        });
+        drop(tx);
+        drop(second);
+        assert_eq!(rx.recv(), Err(crossbeam_channel::RecvError));
+    }
 
     /// Models a cold producer preempted after reserving its FIFO slot. The
     /// dispatcher must be able to return to independent quote work immediately.
