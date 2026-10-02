@@ -277,7 +277,7 @@ impl PreparedToken {
 pub struct OrderRequest {
     /// Immutable registration-time cache; replay/legacy requests may omit it.
     #[serde(skip)]
-    pub prepared_token: Option<PreparedToken>,
+    pub prepared_token: Option<std::sync::Arc<PreparedToken>>,
     /// Fixed owner-local routing identity, echoed by execution and lifecycle.
     #[serde(default)]
     pub order_slot: OrderSlot,
@@ -566,7 +566,7 @@ mod tests {
 #[test]
 fn prepared_token_cache_is_not_restored_from_untrusted_replay_fields() {
     let mut order = OrderRequest::new_limit(Exchange::Polymarket, "42".into(), Side::Buy, 0.5, 10.0);
-    order.prepared_token = PreparedToken::parse("42");
+    order.prepared_token = PreparedToken::parse("42").map(std::sync::Arc::new);
     let text = serde_json::to_string(&order).unwrap();
     assert!(!text.contains("prepared_token"));
     let restored: OrderRequest = serde_json::from_str(&text).unwrap();

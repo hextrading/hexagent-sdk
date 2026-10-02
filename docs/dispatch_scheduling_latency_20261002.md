@@ -38,7 +38,9 @@ CPU utilization and feed/router/private tails are checked during observation.
 ## Numeric signing and completion slots
 
 The strategy parses each token into an immutable checked uint256 during market
-registration, then copies it into its order messages. The signer checks original
+registration, then clones its immutable Arc handle into order messages. The
+handle is pointer-sized so bounded signal arrays do not multiply token storage
+on strategy stacks. The signer checks original
 decimal identity against the order symbol before using that word. Missing caches
 (legacy callers or replay) use the validated compatibility path. Cache fields
 are excluded from serialization. Numeric salt, amounts, and timestamp remain
@@ -70,3 +72,8 @@ regressions also run. `signing_latency` compares the compatibility and numeric
 build paths with 20,000 samples per kind; `completion_slots_latency` compares
 100,000 checkout/send/receive/release cycles in ABBA order. Both are local CPU
 benchmarks with no network; live end-to-end tails require the one-hour rollout.
+
+Completed SDK regression: account 371, config 10, runtime 93, engine 169,
+exchange 985, types 18 passing tests (1,646 total); pre-existing manual/live
+cases remain ignored. Compact token handles also pass the consumer's real
+registration/finalization test with two strategy instances on its bounded stack.

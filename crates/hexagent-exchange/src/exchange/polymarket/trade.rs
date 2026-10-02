@@ -9848,7 +9848,7 @@ impl PolymarketTrade {
                 anyhow!("clob_version=v2 but signer_v2 is None — constructor bug")
             })?;
         let signed = signer_v2.build_signed_order_numeric(
-            &order.symbol, order.prepared_token.as_ref(), price, order.quantity, order.side)?;
+            &order.symbol, order.prepared_token.as_deref(), price, order.quantity, order.side)?;
         let body = PolyOrderBody::V2(WireBodyV2 {
             owner: self.owner.clone(), order_type: Self::poly_order_type_str(order.order_type),
             post_only: order.post_only, defer_exec: false,
