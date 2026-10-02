@@ -77,3 +77,37 @@ Completed SDK regression: account 371, config 10, runtime 93, engine 169,
 exchange 985, types 18 passing tests (1,646 total); pre-existing manual/live
 cases remain ignored. Compact token handles also pass the consumer's real
 registration/finalization test with two strategy instances on its bounded stack.
+
+### Local focused measurements
+
+macOS x86_64, release, unpinned, concurrent host/test workloads. These samples
+measure CPU functions, not network or strategy decisions. The numeric signing
+function and benchmark source are identical across the compact-handle follow-up;
+the cached handle is resolved before this function boundary. No tail improvement
+is inferred from these noisy local signing runs.
+
+| Signing trial / kind / numeric | N | Median µs | P99 µs | P999 µs | Maximum µs |
+|---|---:|---:|---:|---:|---:|
+| A / eoa / false | 20000 | 135.073 | 192.039 | 269.461 | 1711.745 |
+| A / eoa / true | 20000 | 128.802 | 186.197 | 251.485 | 741.410 |
+| A / poly1271 / false | 20000 | 141.087 | 448.178 | 2588.932 | 6274.529 |
+| A / poly1271 / true | 20000 | 136.337 | 559.286 | 3907.201 | 12722.053 |
+| B / eoa / false | 20000 | 136.237 | 834.785 | 4908.762 | 10393.827 |
+| B / eoa / true | 20000 | 130.329 | 279.105 | 1650.666 | 5481.920 |
+| B / poly1271 / false | 20000 | 139.948 | 452.028 | 2344.561 | 6307.764 |
+| B / poly1271 / true | 20000 | 139.720 | 359.013 | 2502.108 | 7916.094 |
+| C / eoa / false | 20000 | 141.675 | 343.811 | 2560.689 | 12128.536 |
+| C / eoa / true | 20000 | 142.638 | 596.868 | 10714.004 | 20151.137 |
+| C / poly1271 / false | 20000 | 150.955 | 437.828 | 2035.444 | 4892.234 |
+| C / poly1271 / true | 20000 | 143.065 | 505.803 | 2382.401 | 6853.259 |
+
+Signing has no queues (depth/overflow zero). Completion envelope ABBA,
+100,000 cycles each, boundary checkout→send→receive→release, channel high
+water one, pool capacity two, overflow zero:
+
+| Reused | Median µs | P99 µs | P999 µs | Maximum µs |
+|---|---:|---:|---:|---:|
+| false | 1.617 | 2.129 | 3.245 | 994.708 |
+| true | 0.187 | 0.243 | 0.437 | 136.330 |
+| true | 0.187 | 0.244 | 0.485 | 862.350 |
+| false | 1.630 | 2.084 | 5.355 | 1294.508 |
