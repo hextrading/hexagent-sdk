@@ -117,6 +117,13 @@ impl<T> Receiver<T> {
     /// arbitrate higher-priority lanes before waiting. An unfinished producer
     /// reservation yields just like an empty queue; it is never spun on.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<T, crossbeam_channel::RecvTimeoutError> {
+        self.recv_timeout_with_poll(timeout, IDLE_POLL)
+    }
+
+    /// Co-located FIFO owners need an explicit polling budget so their idle
+    /// wakeups leave lower-priority producers runnable on the same CPU.
+    pub fn recv_timeout_with_poll(&self, timeout: Duration, poll: Duration) -> Result<T, crossbeam_channel::RecvTimeoutError> {
+        assert!(!poll.is_zero(), "owner polling must yield the CPU");
         let started = std::time::Instant::now();
         loop {
             match self.try_recv() {
@@ -128,7 +135,7 @@ impl<T> Receiver<T> {
             if remaining.is_zero() {
                 return Err(crossbeam_channel::RecvTimeoutError::Timeout);
             }
-            std::thread::sleep(remaining.min(IDLE_POLL));
+            std::thread::sleep(remaining.min(poll));
         }
     }
 
@@ -199,7 +206,7 @@ mod tests {
             assert!(rx.has_pending());
             assert!(!rx.front_ready());
             assert_eq!(second.try_send((7, 3)), Err(TrySendError::Full((7, 3))));
-            let received = rx.recv_timeout(Duration::from_millis(5));
+            let received = rx.recv_timeout_with_poll(Duration::from_millis(5), Duration::from_micros(50));
             release.store(true, Ordering::Release);
             assert_eq!(received, Err(crossbeam_channel::RecvTimeoutError::Timeout));
             assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok((7, 1)));

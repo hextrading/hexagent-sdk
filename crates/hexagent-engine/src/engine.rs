@@ -15834,7 +15834,10 @@ fn run_poly_connection_owner(
                 no_response_peer: permit.business_no_response_peer(),
             });
         }
-        let command = match rx.recv_timeout(HEARTBEAT) {
+        // Twelve Cancel owners share a core with a lower-priority dispatcher.
+        // A 10 us idle poll saturated that core in the Linux FIFO probe; 50 us
+        // leaves publication time for the producer while bounding pickup delay.
+        let command = match rx.recv_timeout_with_poll(HEARTBEAT, Duration::from_micros(50)) {
             Ok(command) => command,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
