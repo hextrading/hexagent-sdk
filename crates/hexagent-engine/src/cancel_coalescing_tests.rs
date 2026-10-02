@@ -1,5 +1,6 @@
 use super::*;
 use hexagent_runtime::http1_pool::Role;
+use hexagent_runtime::poll_channel::Receiver;
 
 fn fixture(
     slots: usize,
@@ -11,7 +12,7 @@ fn fixture(
     let mut routes = PolyAccountConnectionRoutes::default();
     let mut receivers = vec![];
     for slot in 0..slots {
-        let (tx, rx) = bounded(1);
+        let (tx, rx) = hexagent_runtime::poll_channel::bounded(1);
         routes
             .cancel
             .push(PolyConnectionLane::for_test(tx, Role::Cancel, slot));

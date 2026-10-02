@@ -12765,7 +12765,11 @@ impl Engine {
                                 account_id, role, slot,
                             )
                         });
-                        let (tx, rx) = bounded::<PolyConnectionCommand>(capacity);
+                        // A FIFO-priority receiver can preempt its same-core
+                        // producer after reservation but before message publish.
+                        // Crossbeam array recv spins in that state; this lane
+                        // sleeps instead, so the producer can finish publishing.
+                        let (tx, rx) = hexagent_runtime::poll_channel::bounded::<PolyConnectionCommand>(capacity);
                         let lane_metrics = Arc::new(PolyConnectionLaneMetrics::new(
                             &account_id,
                             role,
@@ -15020,7 +15024,7 @@ impl PolyConnectionLaneMetrics {
 
 #[derive(Clone)]
 struct PolyConnectionLane {
-    tx: Sender<PolyConnectionCommand>,
+    tx: hexagent_runtime::poll_channel::Sender<PolyConnectionCommand>,
     metrics: Arc<PolyConnectionLaneMetrics>,
     preparation: Option<crate::preparation_schedule::Route>,
 }
@@ -15028,7 +15032,7 @@ struct PolyConnectionLane {
 impl PolyConnectionLane {
     #[cfg(test)]
     fn for_test(
-        tx: Sender<PolyConnectionCommand>,
+        tx: hexagent_runtime::poll_channel::Sender<PolyConnectionCommand>,
         role: hexagent_runtime::http1_pool::Role,
         slot: usize,
     ) -> Self {
@@ -15794,7 +15798,7 @@ fn run_poly_connection_owner(
     mut router: LiveRouter,
     permit: hexagent_runtime::http1_pool::Permit,
     role: hexagent_runtime::http1_pool::Role,
-    rx: Receiver<PolyConnectionCommand>,
+    rx: hexagent_runtime::poll_channel::Receiver<PolyConnectionCommand>,
     lane_metrics: Arc<PolyConnectionLaneMetrics>,
     mut health_publisher: Option<SnapshotPublisher<LaneObservation>>,
     mut preparation_completion: Option<crate::preparation_schedule::Completion>,
@@ -19665,12 +19669,12 @@ mod market_router_tests {
 
     fn peer_failure_routes_fixture() -> (
         PolyAccountConnectionRoutes, PeerFailureSender,
-        Receiver<PolyConnectionCommand>, Receiver<PolyConnectionCommand>,
+        hexagent_runtime::poll_channel::Receiver<PolyConnectionCommand>, hexagent_runtime::poll_channel::Receiver<PolyConnectionCommand>,
     ) {
         use hexagent_runtime::http1_pool::{PermitHealthSnapshot, Role};
         let mailbox = crate::exchange::polymarket::execution_peer_failure::PeerFailureMailbox::default();
-        let (fast_tx, fast_rx) = bounded(1);
-        let (cancel_tx, cancel_rx) = bounded(1);
+        let (fast_tx, fast_rx) = hexagent_runtime::poll_channel::bounded(1);
+        let (cancel_tx, cancel_rx) = hexagent_runtime::poll_channel::bounded(1);
         let now = now_ns();
         let mut health = AccountExecutionAdmission::new(1, 1, now);
         for role in [Role::Fast, Role::Cancel] {
@@ -19814,8 +19818,8 @@ mod market_router_tests {
     fn private_reset_is_coalesced_and_retries_busy_connection_owners() {
         use hexagent_runtime::http1_pool::Role;
         let (reset_tx, reset_rx) = bounded(1);
-        let (fast_tx, fast_rx) = bounded(1);
-        let (cancel_tx, cancel_rx) = bounded(1);
+        let (fast_tx, fast_rx) = hexagent_runtime::poll_channel::bounded(1);
+        let (cancel_tx, cancel_rx) = hexagent_runtime::poll_channel::bounded(1);
         let mut routes = PolyAccountConnectionRoutes {
             health: Some(AccountExecutionAdmission::new(1, 1, now_ns())),
             reset_rx: Some(reset_rx), reset_pending: vec![None; 2],
@@ -19843,8 +19847,8 @@ mod market_router_tests {
     fn no_response_snapshot_dispatches_generation_fenced_refresh_and_retains_full_lane() {
         use hexagent_runtime::http1_pool::{PermitHealthSnapshot, Role};
         let (mut publisher, receiver) = crate::execution_admission_lane::snapshot_lane();
-        let (fast_tx, fast_rx) = bounded(1);
-        let (cancel_tx, cancel_rx) = bounded(1);
+        let (fast_tx, fast_rx) = hexagent_runtime::poll_channel::bounded(1);
+        let (cancel_tx, cancel_rx) = hexagent_runtime::poll_channel::bounded(1);
         let now = now_ns();
         let mut health = AccountExecutionAdmission::new(1, 1, now);
         let mut observation = LaneObservation {
@@ -19901,7 +19905,7 @@ mod market_router_tests {
     #[test]
     fn live_reconcile_dispatch_uses_instance_coordinator_and_defers_overflow() {
         let (cold_tx, cold_rx) = bounded(1);
-        let (physical_tx, physical_rx) = bounded(1);
+        let (physical_tx, physical_rx) = hexagent_runtime::poll_channel::bounded(1);
         let (raw_tx, replies) = bounded(8);
         let tx = ExecutorUpdateSender { owner: 7, tx: raw_tx.into() };
         let mut routes = PolyAccountConnectionRoutes {
@@ -19997,8 +20001,8 @@ mod market_router_tests {
     #[test]
     fn recovery_routes_one_place_and_returns_exact_not_sent_lifecycle_for_the_rest() {
         use hexagent_runtime::http1_pool::{PermitHealthSnapshot, Role};
-        let (fast_a_tx, fast_a_rx) = bounded(1);
-        let (fast_b_tx, fast_b_rx) = bounded(1);
+        let (fast_a_tx, fast_a_rx) = hexagent_runtime::poll_channel::bounded(1);
+        let (fast_b_tx, fast_b_rx) = hexagent_runtime::poll_channel::bounded(1);
         let (update_tx, updates) = bounded(8);
         let now = now_ns();
         let mut health = AccountExecutionAdmission::new(2, 1, now);
@@ -20037,8 +20041,8 @@ mod market_router_tests {
     #[test]
     fn paused_account_rejects_place_but_preserves_cancel_dispatch() {
         use hexagent_runtime::http1_pool::Role;
-        let (fast_tx, fast_rx) = bounded(1);
-        let (cancel_tx, cancel_rx) = bounded(1);
+        let (fast_tx, fast_rx) = hexagent_runtime::poll_channel::bounded(1);
+        let (cancel_tx, cancel_rx) = hexagent_runtime::poll_channel::bounded(1);
         let (update_tx, updates) = bounded(8);
         let mut routes = PolyAccountConnectionRoutes {
             health: Some(AccountExecutionAdmission::new(1, 1, now_ns())),
@@ -20064,8 +20068,8 @@ mod market_router_tests {
 
     #[test]
     fn saturated_replace_sheds_place_but_retains_cancel_lane_work() {
-        let (fast_tx, _fast_rx) = bounded(1);
-        let (cancel_tx, cancel_rx) = bounded(8);
+        let (fast_tx, _fast_rx) = hexagent_runtime::poll_channel::bounded(1);
+        let (cancel_tx, cancel_rx) = hexagent_runtime::poll_channel::bounded(8);
         let (raw_update_tx, update_rx) = bounded(8);
         let update_tx = ExecutorUpdateSender {
             owner: 3,
@@ -20127,7 +20131,7 @@ mod market_router_tests {
         // Measure the already-started router, not first-use allocation of the
         // thread telemetry slab (which can itself exceed the 10 ms bound).
         hexagent_runtime::latency::prepare_thread_stages(&["polymarket.cancel.account_outbox"]);
-        let (cancel_tx, cancel_rx) = bounded(1);
+        let (cancel_tx, cancel_rx) = hexagent_runtime::poll_channel::bounded(1);
         let (raw_update_tx, _update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
             owner: 4,
@@ -20188,7 +20192,7 @@ mod market_router_tests {
         for account in 0..3 {
             let mut routes = PolyAccountConnectionRoutes::default();
             for (slot, core) in [5, 14].into_iter().enumerate() {
-                let (tx, rx) = bounded(1);
+                let (tx, rx) = hexagent_runtime::poll_channel::bounded(1);
                 let mut lane = PolyConnectionLane::for_test(tx, Role::Fast, slot);
                 let (route, completion) = crate::preparation_schedule::Schedule::register(&schedule, core);
                 lane.preparation = Some(route); routes.fast.push(lane);
@@ -20221,8 +20225,8 @@ mod market_router_tests {
 
     #[test]
     fn connection_owner_slots_expose_age_and_skip_busy_slots_without_hol() {
-        let (slot_zero_tx, slot_zero_rx) = bounded(1);
-        let (slot_one_tx, slot_one_rx) = bounded(1);
+        let (slot_zero_tx, slot_zero_rx) = hexagent_runtime::poll_channel::bounded(1);
+        let (slot_one_tx, slot_one_rx) = hexagent_runtime::poll_channel::bounded(1);
         let (raw_update_tx, _update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
             owner: 4,
@@ -20321,8 +20325,8 @@ mod market_router_tests {
 
     #[test]
     fn cancel_owner_cools_slow_slot_without_dropping_lossless_fallback() {
-        let (slow_tx, slow_rx) = bounded(1);
-        let (healthy_tx, healthy_rx) = bounded(1);
+        let (slow_tx, slow_rx) = hexagent_runtime::poll_channel::bounded(1);
+        let (healthy_tx, healthy_rx) = hexagent_runtime::poll_channel::bounded(1);
         let (raw_update_tx, _update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
             owner: 9,
@@ -20407,8 +20411,8 @@ mod market_router_tests {
 
     #[test]
     fn safety_cancel_uses_its_independent_physical_lane() {
-        let (cancel_tx, cancel_rx) = bounded(1);
-        let (safety_tx, safety_rx) = bounded(1);
+        let (cancel_tx, cancel_rx) = hexagent_runtime::poll_channel::bounded(1);
+        let (safety_tx, safety_rx) = hexagent_runtime::poll_channel::bounded(1);
         let (raw_update_tx, update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
             owner: 9,
@@ -20453,7 +20457,7 @@ mod market_router_tests {
 
     #[test]
     fn safety_cancel_outbox_saturation_returns_typed_retry_feedback() {
-        let (safety_tx, _safety_rx) = bounded(1);
+        let (safety_tx, _safety_rx) = hexagent_runtime::poll_channel::bounded(1);
         let (raw_update_tx, update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
             owner: 10,
@@ -20519,7 +20523,7 @@ mod market_router_tests {
     fn event_audit_is_fifo_and_independent_of_cancel_or_http_admission() {
         use hexagent_runtime::http1_pool::Role;
         let (audit_tx, audit_rx) = hexagent_runtime::poll_channel::bounded(4);
-        let (cancel_tx, cancel_rx) = bounded(1);
+        let (cancel_tx, cancel_rx) = hexagent_runtime::poll_channel::bounded(1);
         let (raw_update_tx, update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender { owner: 11, tx: raw_update_tx.into() };
         let mut routes = PolyAccountConnectionRoutes {
@@ -20591,7 +20595,7 @@ mod market_router_tests {
         let update_tx = ExecutorUpdateSender { owner: 11, tx: raw_update_tx.into() };
         for cold_lane in [false, true] {
             let (audit_tx, audit_rx) = hexagent_runtime::poll_channel::bounded(POLY_EVENT_AUDIT_CAPACITY);
-            let (cancel_tx, cancel_rx) = bounded(1);
+            let (cancel_tx, cancel_rx) = hexagent_runtime::poll_channel::bounded(1);
             let mut routes = PolyAccountConnectionRoutes {
                 event_audit: Some(audit_tx),
                 cancel: vec![PolyConnectionLane::for_test(cancel_tx, Role::Cancel, 0)],
@@ -20682,7 +20686,7 @@ mod market_router_tests {
     #[test]
     fn cancel_account_outbox_enqueue_latency_profile() {
         const EVENTS: usize = POLY_CANCEL_OUTBOX_CAPACITY;
-        let (cancel_tx, _cancel_rx) = bounded(1);
+        let (cancel_tx, _cancel_rx) = hexagent_runtime::poll_channel::bounded(1);
         let (raw_update_tx, _update_rx) = bounded(1);
         let update_tx = ExecutorUpdateSender {
             owner: 5,
@@ -20749,8 +20753,8 @@ mod market_router_tests {
 
     #[test]
     fn batch_replace_uses_only_typed_physical_connection_lanes() {
-        let (fast_tx, fast_rx) = bounded(4);
-        let (cancel_tx, cancel_rx) = bounded(4);
+        let (fast_tx, fast_rx) = hexagent_runtime::poll_channel::bounded(4);
+        let (cancel_tx, cancel_rx) = hexagent_runtime::poll_channel::bounded(4);
         let (raw_update_tx, update_rx) = bounded(4);
         let update_tx = ExecutorUpdateSender {
             owner: 2,
