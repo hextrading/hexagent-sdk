@@ -146,6 +146,7 @@ pub enum QuoteTriggerSource {
     OrderUpdateRequote,
     CancelAckLegRequote,
     ClobHealthRecovery,
+    ExecutionCapacityResume,
 }
 
 impl QuoteTriggerSource {
@@ -154,6 +155,7 @@ impl QuoteTriggerSource {
             "order_update_requote" => Self::OrderUpdateRequote,
             "cancel_ack_leg_requote" => Self::CancelAckLegRequote,
             "clob_health_recovery" => Self::ClobHealthRecovery,
+            "execution_capacity_resume" => Self::ExecutionCapacityResume,
             _ => Self::StrategyCallback,
         }
     }
@@ -172,6 +174,7 @@ impl fmt::Display for QuoteTriggerSource {
             Self::OrderUpdateRequote => f.write_str("order_update_requote"),
             Self::CancelAckLegRequote => f.write_str("cancel_ack_leg_requote"),
             Self::ClobHealthRecovery => f.write_str("clob_health_recovery"),
+            Self::ExecutionCapacityResume => f.write_str("execution_capacity_resume"),
         }
     }
 }
