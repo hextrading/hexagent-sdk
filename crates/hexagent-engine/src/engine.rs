@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, ExchangeConfig, RunMode};
-use crate::execution_admission::{AccountExecutionAdmission, LaneObservation};
+use crate::execution_admission::{AccountExecutionAdmission, AdmissionCapacityDetail, LaneObservation};
 use crate::execution_admission_lane::{snapshot_lane, AdmissionConsumer, SnapshotPublisher, HEARTBEAT};
 use crate::exchange::aster::AsterTrade;
 use crate::exchange::binance::{BinanceMarket, BinanceTrade};
@@ -526,6 +526,8 @@ enum ExecutionDiagnostic {
         account: Arc<str>,
         snapshot: ExecutionAdmission,
         paused_total_ns: u64,
+        place_blocked_total_ns: u64,
+        capacity: AdmissionCapacityDetail,
         replaced_snapshots: u64,
         no_response_resets: u64,
         cancel_outbox: CancelOutboxSnapshot,
@@ -577,13 +579,17 @@ fn spawn_execution_diagnostics(
                         "[execution_probe_ingress] capacity=64 depth={} sampled_high_water={} rejected_before_dispatch={} retried_requests={} retry_exhausted={} disconnected={} enqueue_max_ns={}",
                         depth, high_water, rejected, retry.0, retry.1, retry.2, retry.3,
                     ),
-                    ExecutionDiagnostic::Admission { account, snapshot, paused_total_ns, replaced_snapshots, no_response_resets, cancel_outbox, event_audit_queue } => info!(
-                        "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0 no_response_resets={} cancel_outbox_depth={} cancel_outbox_high_water={} cancel_outbox_oldest_ns={} cancel_coalesced={} cancel_outbox_overflow={} event_audit_depth={} event_audit_sampled_high_water={} event_audit_rejected={} event_audit_capacity=512",
+                    ExecutionDiagnostic::Admission { account, snapshot, paused_total_ns, place_blocked_total_ns, capacity, replaced_snapshots, no_response_resets, cancel_outbox, event_audit_queue } => info!(
+                        "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0 no_response_resets={} cancel_outbox_depth={} cancel_outbox_high_water={} cancel_outbox_oldest_ns={} cancel_coalesced={} cancel_outbox_overflow={} event_audit_depth={} event_audit_sampled_high_water={} event_audit_rejected={} event_audit_capacity=512 place_blocked_total_ms={} reason={} ready_fast={} verified_free={} probation_free={} probation_busy={} eligible_cancel={} ready_mask={} verified_mask={} busy_mask={}",
                         account, snapshot.state, snapshot.epoch, snapshot.available_place_slots,
                         paused_total_ns / 1_000_000, replaced_snapshots, no_response_resets,
                         cancel_outbox.depth, cancel_outbox.high_water, cancel_outbox.oldest_ns,
                         cancel_outbox.coalesced, cancel_outbox.overflow,
                         event_audit_queue.0, event_audit_queue.1, event_audit_queue.2,
+                        place_blocked_total_ns / 1_000_000, capacity.reason,
+                        capacity.ready_fast, capacity.verified_free, capacity.probation_free,
+                        capacity.probation_busy, capacity.eligible_cancel,
+                        capacity.ready_mask, capacity.verified_mask, capacity.busy_mask,
                     ),
                     ExecutionDiagnostic::PeerFailureReset { account, failure, overflow, reset_count, consumed_at_ns } => warn!(
                         "[execution_peer_failure] account={} source={:?} peer={:?} observed_at_ns={} notification_age_us={} queue_capacity={} overflow={} reset_count={} action=retire_old_order_generations",
@@ -2091,6 +2097,27 @@ fn stamp_quote_trigger(signals: &mut [Signal], trigger: &OrderBookSnapshot, log_
                 for order in orders {
                     stamp(order);
                 }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Recovery calculates at current owner-processing time. The original
+/// publication delay has its own metric and is never a replayable order price.
+fn stamp_execution_requote(signals: &mut [Signal], processing_ns: u64) {
+    let stamp = |order: &mut OrderRequest| {
+        order.quote_trigger_exchange_timestamp_ns = 0;
+        order.quote_trigger_local_timestamp_ns = processing_ns;
+        order.quote_trigger_source = QuoteTriggerSource::ExecutionCapacityResume;
+    };
+    for signal in signals {
+        match signal {
+            Signal::NewOrder(order) => stamp(order),
+            Signal::BatchNewOrders { orders, .. }
+            | Signal::BatchUpdateOrders { place_orders: orders, .. }
+            | Signal::ReplaceOrder { place_orders: orders, .. } => {
+                for order in orders { stamp(order); }
             }
             _ => {}
         }
@@ -9745,6 +9772,9 @@ impl Engine {
             "strategy.private_update.callback",
             "strategy.watchdog.callback",
             "strategy.private_feed.callback",
+            "strategy.execution_capacity.publish_to_apply",
+            "strategy.execution_capacity.resume_to_quote",
+            "strategy.execution_capacity.requote",
         ]);
         crate::latency::prepare_thread_stages(strategy.latency_stages());
         crate::latency::prepare_observation_stages(&["strategy.market.pending_depth", "strategy.market.checkpoint_source_age_at_callback"]);
@@ -9776,6 +9806,8 @@ impl Engine {
         'worker: loop {
             // Before quote/lifecycle callbacks: no shared gate reads or heap work.
             if let Some(snapshot) = admission.poll() {
+                crate::latency::record_ns("strategy.execution_capacity.publish_to_apply",
+                    now_ns().saturating_sub(snapshot.observed_at_ns));
                 strategy.on_execution_admission(snapshot);
             }
             if !shutdown_started && shutdown_requested.load(Ordering::Acquire) {
@@ -9807,6 +9839,38 @@ impl Engine {
             } else {
                 &never_private_control_rx
             };
+            // Recovery is bounded to one edge. Apply already queued private,
+            // lifecycle/history messages and queued latest market snapshots
+            // before looking at inventory and pricing the recovery edge.
+            let private_pending = !selectable_private_update_rx.is_empty()
+                || !selectable_direct_private_rx.is_empty()
+                || !selectable_compat_update_rx.is_empty()
+                || !selectable_private_control_rx.is_empty()
+                || !hist_result_rx.is_empty()
+                || !market_rx.is_empty();
+            if let Some(published_ns) = worker_input::take_execution_requote(
+                strategy.as_mut(), lifecycle_intake_paused, shutdown_started, private_pending,
+            ) {
+                if quarantined.load(Ordering::Acquire) { break 'worker; }
+                let processing_ns = now_ns();
+                heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
+                crate::latency::record_ns("strategy.execution_capacity.resume_to_quote",
+                    processing_ns.saturating_sub(published_ns));
+                let started = crate::latency::Instant::now();
+                quote_signal_batch.clear();
+                if let Err(overflow) = strategy.on_quote_into(processing_ns, &mut quote_signal_batch) {
+                    quote_signal_batch.clear();
+                    handle_signal_batch_overflow(overflow, &signal_tx, &quarantined, instance_id);
+                    break 'worker;
+                }
+                last_quote_ns = processing_ns;
+                stamp_execution_requote(&mut quote_signal_batch, processing_ns);
+                for sig in quote_signal_batch.drain(..) {
+                    if !emit(sig) { break 'worker; }
+                }
+                crate::latency::record("strategy.execution_capacity.requote", started);
+                continue;
+            }
             // No timer receiver: AtomicCell<Instant> can fall back to global
             // hashed locks shared with lower-priority FIFO peers. Check an
             // owner-local deadline only after all lifecycle lanes are empty.
@@ -9898,6 +9962,10 @@ impl Engine {
             ) {
                 WorkerInput::Admission(message) => {
                     if let Some(snapshot) = admission.receive(message) {
+                        crate::latency::record_ns(
+                            "strategy.execution_capacity.publish_to_apply",
+                            now_ns().saturating_sub(snapshot.observed_at_ns),
+                        );
                         strategy.on_execution_admission(snapshot);
                     }
                 },
@@ -10233,6 +10301,14 @@ impl Engine {
                                     ts.saturating_sub(last_quote_ns) >= threshold_ns
                                 };
                                 if fire {
+                                    // A fresh normal quote also satisfies the pending
+                                    // recovery edge; avoid a second idle callback.
+                                    if let Some(published_ns) = strategy.take_execution_requote() {
+                                        crate::latency::record_ns(
+                                            "strategy.execution_capacity.resume_to_quote",
+                                            now_ns().saturating_sub(published_ns),
+                                        );
+                                    }
                                     last_quote_ns = ts;
                                     quote_signal_batch.clear();
                                     if let Err(overflow) =
@@ -14913,6 +14989,9 @@ struct PolyAccountConnectionRoutes {
     health_diagnostic: Option<hexagent_runtime::poll_channel::Sender<ExecutionDiagnostic>>,
     paused_since_ns: Option<u64>,
     paused_total_ns: u64,
+    // Dispatcher-owned total includes zero-capacity Degraded/Recovering too.
+    place_blocked_since_ns: Option<u64>,
+    place_blocked_total_ns: u64,
     admission_last_diagnostic_ns: u64,
     health_lanes: Vec<(hexagent_runtime::http1_pool::Role, usize, hexagent_runtime::latest_snapshot::Receiver<LaneObservation>)>,
     admission_publishers: Vec<SnapshotPublisher<ExecutionAdmission>>,
@@ -14964,6 +15043,8 @@ impl Default for PolyAccountConnectionRoutes {
             health_diagnostic: None,
             paused_since_ns: None,
             paused_total_ns: 0,
+            place_blocked_since_ns: None,
+            place_blocked_total_ns: 0,
             admission_last_diagnostic_ns: 0,
             health_lanes: Vec::new(),
             admission_publishers: Vec::new(),
@@ -15094,6 +15175,14 @@ impl PolyAccountConnectionRoutes {
         let value = (snapshot.state, snapshot.available_place_slots);
         let previous_state = self.admission_last_value.map(|value| value.0);
         let transitioned = previous_state != Some(snapshot.state);
+        let availability_changed = self.admission_last_value
+            .is_none_or(|(_, slots)| (slots > 0) != snapshot.allows_place());
+        if !snapshot.allows_place() {
+            self.place_blocked_since_ns.get_or_insert(now);
+        } else if let Some(started) = self.place_blocked_since_ns.take() {
+            self.place_blocked_total_ns = self.place_blocked_total_ns
+                .saturating_add(now.saturating_sub(started));
+        }
         if snapshot.state == ExecutionAdmissionState::Paused {
             self.paused_since_ns.get_or_insert(now);
         } else if let Some(started) = self.paused_since_ns.take() {
@@ -15111,7 +15200,8 @@ impl PolyAccountConnectionRoutes {
             self.admission_last_value = Some(value);
             self.admission_last_publish_ns = now;
         }
-        if transitioned || now.saturating_sub(self.admission_last_diagnostic_ns) >= 30_000_000_000 {
+        if transitioned || availability_changed
+            || now.saturating_sub(self.admission_last_diagnostic_ns) >= 30_000_000_000 {
             // Diagnostics must use the same epoch namespace as strategy
             // messages, including ticks that do not publish a heartbeat.
             snapshot.epoch = self.admission_epoch;
@@ -15123,6 +15213,9 @@ impl PolyAccountConnectionRoutes {
                         self.event_audit_high_water, self.event_audit_rejected),
                     paused_total_ns: self.paused_total_ns.saturating_add(
                         self.paused_since_ns.map_or(0, |started| now.saturating_sub(started))),
+                    place_blocked_total_ns: self.place_blocked_total_ns.saturating_add(
+                        self.place_blocked_since_ns.map_or(0, |started| now.saturating_sub(started))),
+                    capacity: health.capacity_detail(now),
                     replaced_snapshots: self.admission_publishers.iter().map(|publisher| publisher.replaced).sum(),
                     cancel_outbox: CancelOutboxSnapshot {
                         depth: self.cancel_outbox.len(),

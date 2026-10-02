@@ -15,6 +15,19 @@ pub(super) enum WorkerInput {
     Idle,
 }
 
+/// Merely receiving admission cannot mutate positions ahead of queued fills.
+/// The pending edge stays in the strategy until all higher-priority input is
+/// drained; shutdown/startup never consume it to manufacture a quote.
+pub(super) fn take_execution_requote(
+    strategy: &mut dyn Strategy,
+    lifecycle_paused: bool,
+    shutting_down: bool,
+    private_pending: bool,
+) -> Option<u64> {
+    if lifecycle_paused || shutting_down || private_pending { None }
+    else { strategy.take_execution_requote() }
+}
+
 fn ready<T>(rx: &Receiver<T>) -> Option<Result<T, RecvError>> {
     match rx.try_recv() {
         Ok(value) => Some(Ok(value)),
@@ -81,6 +94,28 @@ pub(super) fn next_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_input_defers_requote_without_losing_or_duplicating_the_edge() {
+        struct Owner { edge: Option<u64>, position: u64 }
+        impl Strategy for Owner {
+            fn name(&self) -> &str { "recovery-owner" }
+            fn take_execution_requote(&mut self) -> Option<u64> { self.edge.take() }
+        }
+        let mut owner = Owner { edge: Some(123), position: 0 };
+        let mut sibling = Owner { edge: None, position: 0 };
+        let (private_tx, private_rx) = crossbeam_channel::bounded(1);
+        private_tx.try_send(5_u64).unwrap();
+        assert_eq!(take_execution_requote(&mut owner, false, false, !private_rx.is_empty()), None);
+        owner.position += private_rx.try_recv().unwrap();
+        assert_eq!(take_execution_requote(&mut owner, true, false, false), None);
+        assert_eq!(take_execution_requote(&mut owner, false, true, false), None);
+        assert_eq!(take_execution_requote(&mut sibling, false, false, false), None);
+        assert_eq!(take_execution_requote(&mut owner, false, false, !private_rx.is_empty()), Some(123));
+        assert_eq!(owner.position, 5, "inventory applied before recovery quote");
+        assert_eq!(take_execution_requote(&mut owner, false, false, false), None);
+        assert_eq!(sibling.position, 0);
+    }
 
     #[test]
     fn latest_admission_precedes_ready_market_and_disconnect_fails_closed() {

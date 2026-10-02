@@ -106,6 +106,19 @@ struct RecoveryProbe {
     dispatched_at_ns: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AdmissionCapacityDetail {
+    pub ready_fast: u16,
+    pub verified_free: u16,
+    pub probation_free: u16,
+    pub probation_busy: u16,
+    pub eligible_cancel: u16,
+    pub ready_mask: u64,
+    pub verified_mask: u64,
+    pub busy_mask: u64,
+    pub reason: &'static str,
+}
+
 /// Sole writer: the existing account execution router, never a strategy thread.
 /// Each account receives a separate instance, including separate failure windows
 /// and recovery probes. `Fast` and `Cancel` slots form the complete registry;
@@ -429,11 +442,12 @@ impl AccountExecutionAdmission {
             .filter(|lane| !lane.reserved_cancel)
             .count();
         let busy_fast = self.fast.iter().filter(|lane| lane.busy).count();
-        let eligible_busy_fast = self
+        let probation_busy = self
             .fast
             .iter()
             .filter(|lane| {
-                lane.fresh(now_ns, self.config.stale_after_ns) && lane.ready() && lane.busy
+                lane.fresh(now_ns, self.config.stale_after_ns)
+                    && lane.ready() && !lane.verified && lane.busy
             })
             .count();
         let free_fast = self
@@ -443,6 +457,10 @@ impl AccountExecutionAdmission {
                 lane.fresh(now_ns, self.config.stale_after_ns) && lane.ready() && !lane.busy
             })
             .count();
+        let verified_free = self.fast.iter().filter(|lane| {
+            lane.fresh(now_ns, self.config.stale_after_ns)
+                && lane.ready() && lane.verified && !lane.busy
+        }).count();
         let paused = ready_fast == 0 || eligible_cancel == 0 || now_ns < self.pause_until_ns;
         if ready_cancel == 0 {
             // A failed cancel route becomes only a limited recovery candidate
@@ -467,15 +485,16 @@ impl AccountExecutionAdmission {
         {
             (ExecutionAdmissionState::Healthy, free_fast)
         } else {
-            // A partial pool continues quoting at reduced concurrency. Slow
-            // generations stay excluded while a repaired generation is eligible
-            // for real business evidence, never healed by its /time warmup.
-            // An isolated busy lane keeps its own dispatch/unknown ownership,
-            // but must not also consume this remaining eligible pool's budget.
-            let budget = (ready_fast / 2).max(1);
+            // Isolate eligibility by lane: a repaired or stale sibling must
+            // not halve already verified capacity. Prewarmed generations may
+            // obtain real business evidence, with at most one unverified lane
+            // in flight. This probation budget is separate from healthy work.
+            // Account-wide recovery above remains one request in flight,
+            // including unknown requests on unavailable old generations.
+            let probation_free = free_fast.saturating_sub(verified_free);
             (
                 ExecutionAdmissionState::Degraded,
-                budget.saturating_sub(eligible_busy_fast).min(free_fast),
+                verified_free + usize::from(probation_busy == 0 && probation_free > 0),
             )
         };
         let slots = slots.min(u16::MAX as usize) as u16;
@@ -496,7 +515,41 @@ impl AccountExecutionAdmission {
         self.can_place(now_ns)
             && self.fast.get(slot).is_some_and(|lane| {
                 lane.fresh(now_ns, self.config.stale_after_ns) && lane.ready() && !lane.busy
+                    && (self.recovery_required || lane.verified || !self.fast.iter().any(|other| {
+                        other.fresh(now_ns, self.config.stale_after_ns)
+                            && other.ready() && !other.verified && other.busy
+                    }))
             })
+    }
+
+    /// Compact diagnostic copy. The router is the sole writer; formatting and
+    /// export run on the existing background diagnostic owner.
+    pub(crate) fn capacity_detail(&self, now_ns: u64) -> AdmissionCapacityDetail {
+        let mut detail = AdmissionCapacityDetail::default();
+        for (slot, lane) in self.fast.iter().enumerate() {
+            let ready = lane.fresh(now_ns, self.config.stale_after_ns) && lane.ready();
+            detail.ready_fast += u16::from(ready);
+            detail.verified_free += u16::from(ready && lane.verified && !lane.busy);
+            detail.probation_free += u16::from(ready && !lane.verified && !lane.busy);
+            detail.probation_busy += u16::from(ready && !lane.verified && lane.busy);
+            // Masks cover the first 64 lanes; counts cover the entire pool.
+            if slot < 64 {
+                detail.ready_mask |= u64::from(ready) << slot;
+                detail.verified_mask |= u64::from(ready && lane.verified) << slot;
+                detail.busy_mask |= u64::from(lane.busy) << slot;
+            }
+        }
+        detail.eligible_cancel = self.cancel.iter().filter(|lane| {
+            !lane.reserved_cancel && lane.fresh(now_ns, self.config.stale_after_ns)
+                && lane.cancel_probe_eligible(now_ns)
+        }).count().min(u16::MAX as usize) as u16;
+        detail.reason = if self.admission.allows_place() { "open" }
+            else if detail.ready_fast == 0 { "no_ready_fast" }
+            else if detail.eligible_cancel == 0 { "no_ordinary_cancel" }
+            else if now_ns < self.pause_until_ns { "recovery_backoff" }
+            else if self.recovery_required { "recovery_inflight" }
+            else { "eligible_capacity_inflight" };
+        detail
     }
 
     pub(crate) fn lane_generation(&self, slot: usize) -> Option<u64> {
@@ -878,7 +931,7 @@ mod tests {
             harness.state.current().state,
             ExecutionAdmissionState::Degraded
         );
-        assert_eq!(harness.state.current().available_place_slots, 1);
+        assert_eq!(harness.state.current().available_place_slots, 3);
         assert!(!harness.state.lane_place_allowed(0, harness.now));
         assert!(harness.state.lane_place_allowed(1, harness.now));
         // Neither a warmup nor a fast result on that retired generation heals it.
@@ -910,7 +963,7 @@ mod tests {
             harness.state.current().state,
             ExecutionAdmissionState::Degraded
         );
-        assert_eq!(harness.state.current().available_place_slots, 2);
+        assert_eq!(harness.state.current().available_place_slots, 4);
         assert!(!harness.state.lane_place_allowed(0, harness.now));
         assert!(!harness.state.lane_place_allowed(1, harness.now));
         assert!(harness.state.lane_place_allowed(2, harness.now));
@@ -951,6 +1004,37 @@ mod tests {
             harness.state.current().state,
             ExecutionAdmissionState::Degraded
         );
+    }
+
+    #[test]
+    fn repaired_probation_does_not_block_verified_idle_siblings() {
+        let mut account = Harness::healthy(4, 2);
+        let mut sibling = Harness::healthy(4, 2);
+        account.outcome(Role::Fast, 0, BusinessHttpOutcome::Slow);
+        account.outcome(Role::Fast, 1, BusinessHttpOutcome::Slow);
+        account.emit(Role::Fast, 0, |o| o.health.pool_generation += 1);
+        account.emit(Role::Fast, 1, |o| o.health.pool_generation += 1);
+        assert_eq!(account.state.current().available_place_slots, 3);
+        account.state.place_dispatched(0, account.now);
+        assert_eq!(account.state.current().available_place_slots, 2);
+        assert!(!account.state.lane_place_allowed(1, account.now), "one probation request only");
+        assert!(account.state.lane_place_allowed(2, account.now));
+        assert!(account.state.lane_place_allowed(3, account.now));
+        account.state.place_dispatched(2, account.now);
+        assert_eq!(account.state.current().available_place_slots, 1);
+        // Completing a slow verified lane used to shrink the whole budget
+        // and leave the spare idle lane unusable behind the probation request.
+        account.outcome(Role::Fast, 2, BusinessHttpOutcome::Slow);
+        assert_eq!(account.state.current().available_place_slots, 1);
+        assert!(account.state.lane_place_allowed(3, account.now));
+        assert_eq!(sibling.state.refresh(sibling.now).available_place_slots, 4);
+        let detail = account.state.capacity_detail(account.now);
+        assert_eq!((detail.verified_free, detail.probation_free, detail.probation_busy), (1, 1, 1));
+        // Replaying the full snapshot cannot clear ownership or grant another probe.
+        account.state.observe(Role::Fast, 0, account.fast[0], account.now);
+        assert!(!account.state.lane_place_allowed(1, account.now));
+        account.outcome(Role::Fast, 0, BusinessHttpOutcome::Healthy);
+        assert!(account.state.lane_place_allowed(1, account.now));
     }
 
     #[test]
@@ -1309,25 +1393,25 @@ mod tests {
             harness.state.current().state,
             ExecutionAdmissionState::Degraded
         );
-        assert_eq!(harness.state.current().available_place_slots, 1);
+        assert_eq!(harness.state.current().available_place_slots, 3);
         assert!(harness.state.fast[0].busy);
         assert!(harness.state.fast[0].dispatched_at_ns.is_some());
         assert!(!harness.state.lane_place_allowed(0, harness.now));
         assert!(harness.state.lane_place_allowed(1, harness.now));
 
-        // A new real request consumes the one eligible degraded permit. The
+        // A new real request consumes one verified permit without blocking the other two. The
         // unknown old request is neither completed nor replayed by admission.
         harness.state.place_dispatched(1, harness.now);
-        assert_eq!(harness.state.current().available_place_slots, 0);
-        assert!(!harness.state.lane_place_allowed(2, harness.now));
+        assert_eq!(harness.state.current().available_place_slots, 2);
+        assert!(harness.state.lane_place_allowed(2, harness.now));
         harness.outcome(Role::Fast, 1, BusinessHttpOutcome::Healthy);
-        assert_eq!(harness.state.current().available_place_slots, 1);
+        assert_eq!(harness.state.current().available_place_slots, 3);
         assert!(harness.state.fast[0].busy);
 
         harness
             .state
             .mark_delivery_fault(Role::Fast, 0, harness.now);
-        assert_eq!(harness.state.current().available_place_slots, 1);
+        assert_eq!(harness.state.current().available_place_slots, 3);
         harness
             .state
             .observe(Role::Fast, 0, harness.fast[0], harness.now);
@@ -1348,9 +1432,9 @@ mod tests {
             harness.state.current().state,
             ExecutionAdmissionState::Degraded
         );
-        // Four eligible lanes give budget two, but the returned busy lane still
-        // consumes one. Its new warm generation does not complete the request.
-        assert_eq!(harness.state.current().available_place_slots, 1);
+        // Three verified free lanes remain usable. The returned probation
+        // lane still owns its unknown request; warmup cannot complete it.
+        assert_eq!(harness.state.current().available_place_slots, 3);
         assert!(harness.state.fast[0].busy);
         assert!(!harness.state.lane_place_allowed(0, harness.now));
         let mut old_generation = harness.fast[0];
@@ -1362,9 +1446,9 @@ mod tests {
             .observe(Role::Fast, 0, old_generation, harness.now);
         assert!(harness.state.fast[0].busy);
         harness.state.place_dispatched(1, harness.now);
-        assert_eq!(harness.state.current().available_place_slots, 0);
+        assert_eq!(harness.state.current().available_place_slots, 2);
         harness.outcome(Role::Fast, 1, BusinessHttpOutcome::Healthy);
-        assert_eq!(harness.state.current().available_place_slots, 1);
+        assert_eq!(harness.state.current().available_place_slots, 3);
         harness.outcome(Role::Fast, 0, BusinessHttpOutcome::Healthy);
         assert!(!harness.state.fast[0].busy);
         assert!(harness.state.fast[0].dispatched_at_ns.is_none());

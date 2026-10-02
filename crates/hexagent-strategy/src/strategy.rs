@@ -147,6 +147,13 @@ pub trait Strategy: Send {
     /// a local epoch/state and suppress fresh placement before creating order
     /// IDs or reservations; cancels and private-event processing remain live.
     fn on_execution_admission(&mut self, _admission: ExecutionAdmission) {}
+    /// Optional owner-local recovery edge. The live worker polls this only
+    /// after queued private/control/lifecycle/history messages have drained.
+    /// Return the original admission publication time once; no order or
+    /// reservation may be created by the admission callback itself. The worker
+    /// then runs ordinary on_quote_into with current processing time and
+    /// advances its outer cadence. Default keeps existing strategies unchanged.
+    fn take_execution_requote(&mut self) -> Option<u64> { None }
     /// Wall-clock safety callback for live workers. It runs even when every
     /// market-data source is silent, allowing a strategy to cancel resting
     /// orders without using a stale quote event as the trigger.
