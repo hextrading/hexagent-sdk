@@ -15808,6 +15808,14 @@ fn run_poly_connection_owner(
     crate::latency::prepare_polymarket_order_stages();
     crate::latency::prepare_thread_stages(&["polymarket.order.owner_preflight"]);
     let mut observation_sequence = 0u64;
+    // Only Fast/Cancel need sub-millisecond idle pickup. Six background
+    // Reconcile owners at 50 us consumed 28% of the live shared core during
+    // startup; budget their cold requests separately from quote/cancel work.
+    let idle_poll = if matches!(role, Role::Fast | Role::Cancel) {
+        Duration::from_micros(50)
+    } else {
+        Duration::from_millis(1)
+    };
     loop {
         // The socket driver publishes retirement even while no business is in
         // flight. Repair on the existing runtime before the next quote needs
@@ -15837,7 +15845,7 @@ fn run_poly_connection_owner(
         // Twelve Cancel owners share a core with a lower-priority dispatcher.
         // A 10 us idle poll saturated that core in the Linux FIFO probe; 50 us
         // leaves publication time for the producer while bounding pickup delay.
-        let command = match rx.recv_timeout_with_poll(HEARTBEAT, Duration::from_micros(50)) {
+        let command = match rx.recv_timeout_with_poll(HEARTBEAT, idle_poll) {
             Ok(command) => command,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
