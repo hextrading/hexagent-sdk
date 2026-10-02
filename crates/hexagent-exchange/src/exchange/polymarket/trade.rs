@@ -367,9 +367,9 @@ fn retired_market_terminalization_allowed(
 fn retired_local_empty_fast_path_allowed(
     retired_market: bool,
     open_orders: usize,
-    recovery_pending: usize,
+    recovery_pending: Option<usize>,
 ) -> bool {
-    retired_market && open_orders == 0 && recovery_pending == 0
+    retired_market && open_orders == 0 && recovery_pending == Some(0)
 }
 
 fn retired_market_parallel_absence_fast_path_allowed(
@@ -9156,13 +9156,13 @@ impl PolymarketTrade {
                 }
             }
             let open_orders = self.shared.execution_snapshot().open_orders.len();
-            let monitoring = self.shared.account_state.monitoring_snapshot();
-            let recovery_pending = monitoring.recovery_pending_orders;
-            let routine_cancel_audits = monitoring.routine_cancel_audits;
+            let monitoring = self.shared.account_state.try_monitoring_snapshot();
+            let recovery_pending = monitoring.as_ref().ok().map(|snapshot| snapshot.recovery_pending_orders);
+            let routine_cancel_audits = monitoring.as_ref().ok().map(|snapshot| snapshot.routine_cancel_audits);
             let local_clean = audit.errors.is_empty()
                 && open_orders == 0
-                && recovery_pending == 0
-                && routine_cancel_audits == 0;
+                && recovery_pending == Some(0)
+                && routine_cancel_audits == Some(0);
 
             if remote_clean && local_clean {
                 info!(
@@ -9173,13 +9173,14 @@ impl PolymarketTrade {
             }
 
             warn!(
-                "[PolymarketTrade] shutdown cancel barrier retry attempt={} remote_clean={} remote={} open_orders={} recovery_pending={} routine_cancel_audits={} audit_errors={:?}",
+                "[PolymarketTrade] shutdown cancel barrier retry attempt={} remote_clean={} remote={} open_orders={} recovery_pending={:?} routine_cancel_audits={:?} monitoring_error={:?} audit_errors={:?}",
                 attempt,
                 remote_clean,
                 remote_detail,
                 open_orders,
                 recovery_pending,
                 routine_cancel_audits,
+                monitoring.as_ref().err(),
                 audit.errors,
             );
         }
@@ -9310,12 +9311,15 @@ impl PolymarketTrade {
             let recovery_pending = self
                 .shared
                 .account_state
-                .monitoring_snapshot()
-                .recovery_pending_orders;
+                .try_monitoring_snapshot()
+                .map(|snapshot| snapshot.recovery_pending_orders);
+            if let Err(error) = &recovery_pending {
+                warn!("[PolymarketTrade] retired market account snapshot unavailable; retaining authenticated cancel/audit path: {}", error);
+            }
             if retired_local_empty_fast_path_allowed(
                 allow_expired_market_terminalization,
                 open_orders,
-                recovery_pending,
+                recovery_pending.ok(),
             ) {
                 let _ = self
                     .shared
@@ -16035,10 +16039,11 @@ mod tests {
 
     #[test]
     fn retired_local_empty_fast_path_requires_retirement_and_both_empty_authorities() {
-        assert!(retired_local_empty_fast_path_allowed(true, 0, 0));
-        assert!(!retired_local_empty_fast_path_allowed(false, 0, 0));
-        assert!(!retired_local_empty_fast_path_allowed(true, 1, 0));
-        assert!(!retired_local_empty_fast_path_allowed(true, 0, 1));
+        assert!(retired_local_empty_fast_path_allowed(true, 0, Some(0)));
+        assert!(!retired_local_empty_fast_path_allowed(false, 0, Some(0)));
+        assert!(!retired_local_empty_fast_path_allowed(true, 1, Some(0)));
+        assert!(!retired_local_empty_fast_path_allowed(true, 0, Some(1)));
+        assert!(!retired_local_empty_fast_path_allowed(true, 0, None));
     }
 
     #[test]

@@ -13250,15 +13250,25 @@ impl SharedAccount {
     }
 
     pub fn monitoring_snapshot(&self) -> AccountMonitoringSnapshot {
+        self.try_monitoring_snapshot().unwrap_or_else(|error| {
+            panic!("account owner monitoring snapshot failed: {error}")
+        })
+    }
+
+    /// Cold control callers must propagate owner saturation/disconnection
+    /// instead of unwinding a long-lived cancellation or probe worker.
+    /// An unavailable snapshot is not an empty/zero-risk account.
+    pub fn try_monitoring_snapshot(&self) -> Result<AccountMonitoringSnapshot, String> {
         if self.must_dispatch_to_account_owner() {
             return self
                 .request_account_owner(|reply| {
                     AccountOwnerCommand(AccountOwnerOperation::MonitoringSnapshot(reply))
-                })
-                .unwrap_or_else(|error| {
-                    panic!("account owner monitoring snapshot failed: {error}")
                 });
         }
+        Ok(self.monitoring_snapshot_on_owner())
+    }
+
+    fn monitoring_snapshot_on_owner(&self) -> AccountMonitoringSnapshot {
         self.refresh_trade_persistence_blocker();
         let settled_gc_metrics = self.settled_gc_metrics();
         let state = self.lock_state();
@@ -24025,6 +24035,40 @@ mod persistence_regression_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallible_monitoring_snapshot_survives_timeout_and_retries_on_owner() {
+        let account = Arc::new(seeded_account());
+        let (_, owner) = account.bind_account_owner().unwrap();
+        let caller = Arc::clone(&account);
+        let timeout = std::thread::spawn(move || caller.try_monitoring_snapshot()).join().unwrap();
+        assert!(timeout.unwrap_err().contains("completion timed out"));
+        owner.mark_current_thread().unwrap();
+        owner.execute(owner.receiver().try_recv().unwrap()); // late reply is harmless
+        let caller = Arc::clone(&account);
+        let retry = std::thread::spawn(move || caller.try_monitoring_snapshot());
+        owner.execute(owner.receiver().recv_timeout(Duration::from_secs(1)).unwrap());
+        let snapshot = retry.join().unwrap().unwrap();
+        assert_eq!(snapshot.account_id, "acct");
+        assert_eq!(snapshot.physical_cash, 400.0);
+        assert_eq!(snapshot.recovery_pending_orders, 0);
+        assert!(owner.receiver().is_empty());
+    }
+
+    #[test]
+    fn fallible_monitoring_snapshot_preserves_full_and_disconnected_errors() {
+        let account = Arc::new(seeded_account());
+        let (_, owner) = account.bind_account_owner().unwrap();
+        let (reply, _completion) = crossbeam_channel::bounded(ACCOUNT_OWNER_TASK_QUEUE_CAPACITY);
+        for _ in 0..ACCOUNT_OWNER_TASK_QUEUE_CAPACITY {
+            account.account_owner_task_tx.try_send(AccountOwnerCommand::barrier(reply.clone())).unwrap();
+        }
+        assert!(account.try_monitoring_snapshot().unwrap_err().contains("enqueue unavailable"));
+        drop(owner);
+        assert!(account.try_monitoring_snapshot().unwrap_err().contains("enqueue unavailable"));
+        let independent = seeded_account();
+        assert_eq!(independent.try_monitoring_snapshot().unwrap().physical_cash, 400.0);
+    }
 
     #[test]
     fn bound_cold_operations_execute_on_single_account_owner() {

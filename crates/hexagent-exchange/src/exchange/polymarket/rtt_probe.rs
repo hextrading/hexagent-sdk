@@ -1011,12 +1011,18 @@ fn fire_full_probe(
         .map(|v| v as u64)
         .unwrap_or(0);
     let probe_coid = format!("probe:{}:{}", instance_id, signed.order_hash);
-    if shared.account_state.is_seeded()
-        && shared.account_state.monitoring_snapshot().unallocated_cash
-            < FULL_PROBE_PRICE * FULL_PROBE_SIZE * 2.0
-    {
-        debug!("[RttProbe] insufficient operational cash slack; probe skipped");
-        return None;
+    if shared.account_state.is_seeded() {
+        let monitoring = match shared.account_state.try_monitoring_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!("[RttProbe] account snapshot unavailable; full probe skipped: {}", error);
+                return None;
+            }
+        };
+        if monitoring.unallocated_cash < FULL_PROBE_PRICE * FULL_PROBE_SIZE * 2.0 {
+            debug!("[RttProbe] insufficient operational cash slack; probe skipped");
+            return None;
+        }
     }
 
     // Wire body mirrors `sign_and_build_body_v2`, but `postOnly: true`
