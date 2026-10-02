@@ -676,6 +676,10 @@ enum AccountOwnerOperation {
         operation_id: String,
         detail: String,
     },
+    AbortMaintenanceAdmission {
+        operation_id: String,
+        detail: String,
+    },
     ConfirmMaintenanceOperation {
         operation_id: String,
         reply: crossbeam_channel::Sender<Result<(), ReservationError>>,
@@ -1042,6 +1046,18 @@ impl AccountOwnerCommand {
                 detail,
             } => {
                 account.fail_maintenance_operation(&operation_id, detail);
+            }
+            AbortMaintenanceAdmission { operation_id, detail } => {
+                // The requesting wallet worker timed out before receiving
+                // admission and therefore never entered its submit path.
+                // Preserve any stronger durable submission/finality evidence.
+                if account.maintenance_operation(&operation_id).is_some_and(|operation| {
+                    operation.status == MaintenanceOperationStatus::Reserved
+                        && operation.tx_id.is_none()
+                        && operation.wallet_submission.is_none()
+                }) {
+                    account.fail_maintenance_operation(&operation_id, detail);
+                }
             }
             ConfirmMaintenanceOperation {
                 operation_id,
@@ -16093,7 +16109,8 @@ impl SharedAccount {
             let up_token_id = up_token_id.to_string();
             let down_token_id = down_token_id.to_string();
             let allocations = allocations.clone();
-            self.request_account_owner(|reply| {
+            let (reply, completion) = crossbeam_channel::bounded(1);
+            self.account_owner_task_tx.try_send(
                 AccountOwnerCommand(AccountOwnerOperation::ReserveMaintenanceOperation {
                     operation_id,
                     kind,
@@ -16103,8 +16120,36 @@ impl SharedAccount {
                     allocations,
                     reply,
                 })
-            })
-            .map_err(ReservationError::InvalidOrder)??;
+            ).map_err(|error| ReservationError::InvalidOrder(format!(
+                "account {} maintenance admission enqueue unavailable: {error}", self.account_id,
+            )))?;
+            match completion.recv_timeout(ACCOUNT_OWNER_REQUEST_TIMEOUT) {
+                Ok(result) => result?,
+                Err(error) => {
+                    let detail = format!(
+                        "account {} maintenance admission completion timed out before submission: {error}",
+                        self.account_id,
+                    );
+                    // This cold wallet worker has not submitted anything. A
+                    // delayed owner can still commit the accepted reservation;
+                    // enqueue compensation behind it on the same FIFO lane.
+                    // Retain the exact command under bounded backpressure;
+                    // never use this blocking cold path from a quote callback.
+                    if let Err(enqueue_error) = self.account_owner_task_tx.send(AccountOwnerCommand(
+                        AccountOwnerOperation::AbortMaintenanceAdmission {
+                            operation_id: failed_operation_id,
+                            detail: detail.clone(),
+                        },
+                    )) {
+                        self.uncertain_fast.store(true, Ordering::Release);
+                        self.admission_fast.store(false, Ordering::Release);
+                        return Err(ReservationError::InvalidOrder(format!(
+                            "{detail}; admission cleanup unavailable: {enqueue_error}",
+                        )));
+                    }
+                    return Err(ReservationError::InvalidOrder(detail));
+                }
+            }
             if let Err(error) = self.flush_maintenance_admission_persistence() {
                 self.fail_maintenance_operation(
                     &failed_operation_id,
@@ -29389,6 +29434,107 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         // Recovery may observe the same terminal chain state more than once.
         account.confirm_maintenance_operation("split-op-1").unwrap();
         assert_eq!(account.monitoring_snapshot().physical_cash, 360.0);
+    }
+
+    #[test]
+    fn maintenance_admission_timeout_cleans_late_reservation_once_on_owner() {
+        let _guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!("late-maintenance-{}-{}.json", std::process::id(), wall_clock_ms()));
+        let account = Arc::new(SharedAccount::new_persistent("late-maintenance", &path).unwrap());
+        account.register_instance("a", 1.0);
+        account.register_instance("b", 3.0);
+        account.apply_physical_snapshot(400.0, HashMap::new()).unwrap();
+        let (_, owner) = account.bind_account_owner().unwrap();
+        let caller = Arc::clone(&account);
+        let result = std::thread::spawn(move || caller.reserve_maintenance_operation(
+            "late-admission", MaintenanceOperationKind::Split, "late-condition", "L-UP", "L-DOWN",
+            &HashMap::from([("a".into(), 10.0)]),
+        )).join().unwrap();
+        assert!(result.unwrap_err().to_string().contains("timed out before submission"));
+        owner.mark_current_thread().unwrap();
+        owner.execute(owner.receiver().try_recv().unwrap());
+        assert_eq!(account.maintenance_operation("late-admission").unwrap().status, MaintenanceOperationStatus::Reserved);
+        assert_eq!(account.virtual_account("a").unwrap().maintenance_reserved_cash.load(), 10.0);
+        owner.execute(owner.receiver().try_recv().unwrap());
+        assert_eq!(account.maintenance_operation("late-admission").unwrap().status, MaintenanceOperationStatus::Failed);
+        assert_eq!(account.virtual_account("a").unwrap().maintenance_reserved_cash.load(), 0.0);
+        assert_eq!(account.instance_snapshot("a").unwrap().cash, 100.0);
+        assert_eq!(account.instance_snapshot("b").unwrap().cash, 300.0);
+        AccountOwnerCommand(AccountOwnerOperation::AbortMaintenanceAdmission {
+            operation_id: "late-admission".into(), detail: "duplicate cleanup".into(),
+        }).execute(&account);
+        assert_eq!(account.virtual_account("a").unwrap().maintenance_reserved_cash.load(), 0.0);
+        assert!(owner.receiver().try_recv().is_err());
+        account.flush_persistence(Duration::from_secs(2)).unwrap();
+        drop(owner);
+        drop(account);
+        let restored = SharedAccount::new_persistent("late-maintenance", &path).unwrap();
+        assert_eq!(restored.maintenance_operation("late-admission").unwrap().status, MaintenanceOperationStatus::Failed);
+        assert_eq!(restored.instance_snapshot("a").unwrap().cash, 100.0);
+        assert_eq!(restored.monitoring_snapshot().reserved_cash, 0.0);
+        assert!(restored.pending_maintenance_operations().is_empty());
+    }
+
+    #[test]
+    fn maintenance_admission_timeout_retains_cleanup_behind_full_owner_lane() {
+        let account = Arc::new(seeded_account());
+        let (_, owner) = account.bind_account_owner().unwrap();
+        owner.mark_current_thread().unwrap();
+        let caller = Arc::clone(&account);
+        let (finished, result) = crossbeam_channel::bounded(1);
+        let producer = std::thread::spawn(move || {
+            finished.send(caller.reserve_maintenance_operation("full-late", MaintenanceOperationKind::Split,
+                "full-condition", "FULL-UP", "FULL-DOWN", &HashMap::from([("a".into(), 10.0)]))).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while owner.receiver().is_empty() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let (barrier, _barriers) = crossbeam_channel::bounded(ACCOUNT_OWNER_TASK_QUEUE_CAPACITY);
+        for _ in 1..ACCOUNT_OWNER_TASK_QUEUE_CAPACITY {
+            account.account_owner_task_tx.try_send(AccountOwnerCommand::barrier(barrier.clone())).unwrap();
+        }
+        assert!(matches!(result.recv_timeout(ACCOUNT_OWNER_REQUEST_TIMEOUT * 3), Err(crossbeam_channel::RecvTimeoutError::Timeout)));
+        for _ in 0..=ACCOUNT_OWNER_TASK_QUEUE_CAPACITY {
+            owner.execute(owner.receiver().recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        producer.join().unwrap();
+        assert!(owner.receiver().is_empty());
+        assert_eq!(account.maintenance_operation("full-late").unwrap().status, MaintenanceOperationStatus::Failed);
+        assert_eq!(account.virtual_account("a").unwrap().maintenance_reserved_cash.load(), 0.0);
+    }
+
+    #[test]
+    fn maintenance_admission_abort_preserves_submission_and_uncertain_evidence() {
+        for (id, status, with_intent) in [
+            ("submitted", MaintenanceOperationStatus::Submitted, false),
+            ("uncertain", MaintenanceOperationStatus::Uncertain, false),
+            ("intent", MaintenanceOperationStatus::Reserved, true),
+        ] {
+            let account = seeded_account();
+            account.reserve_maintenance_operation(id, MaintenanceOperationKind::Split,
+                id, &format!("{id}-UP"), &format!("{id}-DOWN"),
+                &HashMap::from([("a".into(), 10.0)])).unwrap();
+            {
+                let mut state = account.lock_state_for_persistence();
+                let op = state.maintenance_ops.get_mut(id).unwrap();
+                op.status = status;
+                if status == MaintenanceOperationStatus::Submitted { op.tx_id = Some("accepted".into()); }
+                if with_intent {
+                    op.wallet_submission = Some(MaintenanceWalletSubmission {
+                        signer: "signer".into(), deposit_wallet: "wallet".into(), nonce: "7".into(),
+                        body_hash: "body".into(), deadline_secs: 99,
+                    });
+                }
+            }
+            AccountOwnerCommand(AccountOwnerOperation::AbortMaintenanceAdmission {
+                operation_id: id.into(), detail: "late cleanup".into(),
+            }).execute(&account);
+            assert_eq!(account.maintenance_operation(id).unwrap().status, status);
+            assert_eq!(account.virtual_account("a").unwrap().maintenance_reserved_cash.load(), 10.0);
+        }
     }
 
     #[test]
