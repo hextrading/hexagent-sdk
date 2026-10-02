@@ -124,6 +124,8 @@ pub struct CorePlan {
     pub private_route_cores: HashMap<String, usize>,
     pub private_owner_cores: HashMap<String, usize>,
     pub allow_shared_private_cold_core: bool,
+    pub allow_private_cold_on_background_core: bool,
+    pub allow_cancel_on_execution_core: bool,
     /// Per-account private order/trade application cores.
     pub private_apply_cores: HashMap<String, usize>,
     /// Per-account cold ledger/lifecycle cores. These stay SCHED_OTHER and
@@ -143,6 +145,7 @@ pub struct CorePlan {
     pub fifo_async_rt: u8,
     pub fifo_strategy: u8,
     pub fifo_execution: u8,
+    pub fifo_cancel: u8,
     pub fifo_polymarket_feed: u8,
     pub fifo_completion: u8,
     pub fifo_private_apply: u8,
@@ -165,6 +168,8 @@ impl CorePlan {
             private_route_cores: HashMap::new(),
             private_owner_cores: HashMap::new(),
             allow_shared_private_cold_core: false,
+            allow_private_cold_on_background_core: false,
+            allow_cancel_on_execution_core: false,
             private_apply_cores: HashMap::new(),
             private_cold_cores: HashMap::new(),
             execution: DEFAULT_EXECUTION_CORE,
@@ -177,6 +182,7 @@ impl CorePlan {
             fifo_async_rt: DEFAULT_PRIO_ASYNC_RT,
             fifo_strategy: DEFAULT_PRIO_STRATEGY,
             fifo_execution: DEFAULT_PRIO_EXECUTION,
+            fifo_cancel: DEFAULT_PRIO_EXECUTION,
             fifo_polymarket_feed: DEFAULT_PRIO_EXECUTION,
             fifo_completion: DEFAULT_PRIO_EXECUTION,
             fifo_private_apply: DEFAULT_PRIO_EXECUTION,
@@ -216,6 +222,8 @@ impl CorePlan {
             private_route_cores: cfg.private_route_cores.clone(),
             private_owner_cores: cfg.private_owner_cores.clone(),
             allow_shared_private_cold_core: cfg.allow_shared_private_cold_core,
+            allow_private_cold_on_background_core: cfg.allow_private_cold_on_background_core,
+            allow_cancel_on_execution_core: cfg.allow_cancel_on_execution_core,
             private_apply_cores: cfg.private_apply_cores.clone(),
             private_cold_cores: cfg.private_cold_cores.clone(),
             execution: cfg.execution_core.unwrap_or(DEFAULT_EXECUTION_CORE),
@@ -228,6 +236,7 @@ impl CorePlan {
             fifo_async_rt: cfg.fifo_async_rt.unwrap_or(DEFAULT_PRIO_ASYNC_RT),
             fifo_strategy: cfg.fifo_strategy.unwrap_or(DEFAULT_PRIO_STRATEGY),
             fifo_execution: cfg.fifo_execution.unwrap_or(DEFAULT_PRIO_EXECUTION),
+            fifo_cancel: cfg.fifo_cancel.or(cfg.fifo_execution).unwrap_or(DEFAULT_PRIO_EXECUTION),
             fifo_polymarket_feed: cfg
                 .fifo_polymarket_feed
                 .or(cfg.fifo_execution)
@@ -479,7 +488,15 @@ impl CorePlan {
             let cold_core = self.private_cold_cores.get(*account_id).copied().ok_or_else(|| {
                 format!("strict_core_isolation requires private_cold_cores entry for account `{account_id}`")
             })?;
-            if self.allow_shared_private_cold_core && cold_cores.contains(&cold_core) {
+            if cold_cores.contains(&cold_core) {
+                if self.allow_shared_private_cold_core { continue; }
+                return Err(format!("private cold core {cold_core} is shared without allow_shared_private_cold_core"));
+            }
+            let background_cold = self.allow_private_cold_on_background_core
+                && self.background_cores.contains(&cold_core)
+                && (cold_core != self.execution || self.allow_background_on_execution_core);
+            if background_cold && cold_core == self.execution {
+                cold_cores.insert(cold_core);
                 continue;
             }
             claim(
@@ -544,7 +561,12 @@ impl CorePlan {
                 let allowed_private_completion = pool_name == "poly_completion_cores"
                     && self.allow_private_apply_on_completion_core
                     && role.starts_with("private_account_apply:");
-                if !allowed_private_completion {
+                let allowed_cancel_dispatcher = pool_name == "poly_cancel_cores"
+                    && self.allow_cancel_on_execution_core
+                    && core == self.execution
+                    && self.fifo_cancel > self.fifo_execution
+                    && (self.strategy != self.execution || self.fifo_cancel < self.fifo_strategy);
+                if !allowed_private_completion && !allowed_cancel_dispatcher {
                     return Err(format!("poly-exec/done core {} overlaps {}", core, role));
                 }
             }
@@ -575,6 +597,11 @@ impl CorePlan {
         latency_cores.extend(hex_cores);
         for &core in &self.background_cores {
             if latency_cores.contains(&core) {
+                if self.allow_private_cold_on_background_core
+                    && exclusive.get(&core).is_some_and(|role| role.starts_with("private_account_cold:"))
+                {
+                    continue;
+                }
                 if self.allow_background_on_execution_core && core == self.execution {
                     continue;
                 }
@@ -652,6 +679,8 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
         "[os_tune] unified private owners={:?} shared_cold={}",
         plan.private_owner_cores, plan.allow_shared_private_cold_core
     );
+    info!("[os_tune] dispatch sharing: cold_on_background={} cancel_on_execution={} fifo_cancel={}",
+        plan.allow_private_cold_on_background_core, plan.allow_cancel_on_execution_core, plan.fifo_cancel);
     let _ = CORE_PLAN.set(plan);
 }
 
@@ -1225,6 +1254,8 @@ pub fn pin_execution(thread_name: &str) {
         p.fifo_polymarket_feed
     } else if thread_name.starts_with("poly-done-") {
         p.fifo_completion
+    } else if thread_name.starts_with("poly-cancel-") {
+        p.fifo_cancel
     } else {
         p.fifo_execution
     };
@@ -1245,6 +1276,7 @@ pub fn pin_execution_role(thread_name: &str, role: ExecutionThreadRole) {
         ExecutionThreadRole::VenueCompletion | ExecutionThreadRole::PolymarketCompletion => {
             p.fifo_completion
         }
+        ExecutionThreadRole::PolymarketCancel => p.fifo_cancel,
         _ => p.fifo_execution,
     };
     set_fifo(priority, thread_name);
@@ -1371,6 +1403,49 @@ pub fn mlockall_best_effort() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_fast_cores_keep_cancel_priority_and_cold_background_explicit() {
+        let mut cfg = OsTuneConfig::default();
+        cfg.strict_core_isolation = true;
+        cfg.allow_strategy_router_on_execution_core = true;
+        cfg.allow_background_on_execution_core = true;
+        cfg.allow_shared_private_cold_core = true;
+        cfg.allow_private_cold_on_background_core = true;
+        cfg.allow_cancel_on_execution_core = true;
+        cfg.async_ord_core = Some(2);
+        cfg.async_rt_core = Some(3);
+        cfg.async_clob_core = Some(8);
+        cfg.execution_core = Some(4);
+        cfg.strategy_core = Some(4);
+        cfg.background_cores = vec![4];
+        cfg.strategy_cores = HashMap::from([("btc01".into(), 9), ("btc02".into(), 11), ("btc03".into(), 6)]);
+        cfg.private_owner_cores = HashMap::from([("zhu02".into(), 10), ("zhu03".into(), 12), ("hex001".into(), 13)]);
+        cfg.private_cold_cores = HashMap::from([("zhu02".into(), 4), ("zhu03".into(), 4), ("hex001".into(), 4)]);
+        cfg.feed_cores = HashMap::from([("polymarket".into(), 7)]);
+        cfg.poly_exec_cores = vec![5, 14];
+        cfg.poly_cancel_cores = vec![4];
+        cfg.poly_completion_cores = vec![15];
+        cfg.fifo_execution = Some(50);
+        cfg.fifo_cancel = Some(55);
+        cfg.fifo_strategy = Some(60);
+        let enabled = vec!["btc01".into(), "btc02".into(), "btc03".into()];
+        assert!(CorePlan::from_config(&cfg).validate_strategy_isolation(&enabled).is_ok());
+        for case in 0..8 {
+            let mut bad = cfg.clone();
+            match case {
+                0 => bad.allow_private_cold_on_background_core = false,
+                1 => bad.allow_cancel_on_execution_core = false,
+                2 => bad.fifo_cancel = Some(50),
+                3 => bad.fifo_cancel = Some(60),
+                4 => bad.poly_exec_cores.push(4),
+                5 => bad.private_cold_cores.insert("hex001".into(), 6).map(|_| ()).unwrap(),
+                6 => bad.allow_background_on_execution_core = false,
+                _ => bad.allow_shared_private_cold_core = false,
+            }
+            assert!(CorePlan::from_config(&bad).validate_strategy_isolation(&enabled).is_err(), "case {case}");
+        }
+    }
 
     #[test]
     fn unified_three_account_plan_fits_16_cpus_without_sharing_critical_owners() {

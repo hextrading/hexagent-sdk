@@ -95,6 +95,14 @@ pub struct OsTuneConfig {
     /// They remain separate owners; sharing with any critical role is forbidden.
     #[serde(default)]
     pub allow_shared_private_cold_core: bool,
+    /// Allow SCHED_OTHER cold writers on a configured background CPU. Sharing
+    /// execution_core also requires allow_background_on_execution_core.
+    #[serde(default)]
+    pub allow_private_cold_on_background_core: bool,
+    /// Allow short cancel owners beside the dispatcher, with a higher FIFO
+    /// priority. Fast signing and completion remain on separate CPUs.
+    #[serde(default)]
+    pub allow_cancel_on_execution_core: bool,
     /// Shared-account id -> dedicated private event application core.  These
     /// lifecycle owners apply authenticated order/trade updates to their
     /// account-local state. Keeping them off the ingress and housekeeping
@@ -145,6 +153,8 @@ pub struct OsTuneConfig {
     pub fifo_async_rt: Option<u8>,
     pub fifo_strategy: Option<u8>,
     pub fifo_execution: Option<u8>,
+    /// Cancel priority; unset inherits fifo_execution.
+    pub fifo_cancel: Option<u8>,
     /// Priority for the synchronous Polymarket CLOB bridge/drain thread.
     /// Unset keeps `fifo_execution` for backwards compatibility.
     pub fifo_polymarket_feed: Option<u8>,
@@ -175,6 +185,8 @@ impl Default for OsTuneConfig {
             private_route_cores: HashMap::new(),
             private_owner_cores: HashMap::new(),
             allow_shared_private_cold_core: false,
+            allow_private_cold_on_background_core: false,
+            allow_cancel_on_execution_core: false,
             private_apply_cores: HashMap::new(),
             private_cold_cores: HashMap::new(),
             execution_core: None,
@@ -187,6 +199,7 @@ impl Default for OsTuneConfig {
             fifo_async_rt: None,
             fifo_strategy: None,
             fifo_execution: None,
+            fifo_cancel: None,
             fifo_polymarket_feed: None,
             fifo_completion: None,
             fifo_private_apply: None,

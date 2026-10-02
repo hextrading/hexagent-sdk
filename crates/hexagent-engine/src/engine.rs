@@ -521,6 +521,7 @@ mod sim_lifecycle_router_tests {
 
 #[derive(Debug)]
 enum ExecutionDiagnostic {
+    SignalIngress { owners: usize, depth: usize, control_depth: usize, sampled_high_water: usize },
     ProbeIngress { depth: usize, high_water: usize, rejected: u64, retry: (u64, u64, u64, u64) },
     Admission {
         account: Arc<str>,
@@ -575,6 +576,9 @@ fn spawn_execution_diagnostics(
                     Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                 };
                 match diagnostic {
+                    ExecutionDiagnostic::SignalIngress { owners, depth, control_depth, sampled_high_water } => info!(
+                        "[execution_signal_ingress] direct=1 owners={} owner_capacity=1024 root_capacity={} control_capacity=8 depth={} control_depth={} sampled_high_water={} sample_interval_ms=1",
+                        owners, CHANNEL_CAPACITY, depth, control_depth, sampled_high_water),
                     ExecutionDiagnostic::ProbeIngress { depth, high_water, rejected, retry } => info!(
                         "[execution_probe_ingress] capacity=64 depth={} sampled_high_water={} rejected_before_dispatch={} retried_requests={} retry_exhausted={} disconnected={} enqueue_max_ns={}",
                         depth, high_water, rejected, retry.0, retry.1, retry.2, retry.3,
@@ -2910,19 +2914,117 @@ impl ExecutionUpdateTx {
 const SYSTEM_SIGNAL_OWNER: u16 = SYSTEM_STRATEGY_OWNER;
 const INSTANCE_SIGNAL_LANE_CAPACITY: usize = 1024;
 
+/// Compatibility senders are retained for paper/public SDK entry points.
+/// Live producers use bounded nonblocking publication to the execution owner.
+#[derive(Clone)]
+enum SignalTx {
+    Compatibility(Sender<RoutedSignal>),
+    Poll(hexagent_runtime::poll_channel::Sender<RoutedSignal>),
+}
+impl SignalTx {
+    fn try_send(&self, value: RoutedSignal) -> Result<(), crossbeam_channel::TrySendError<RoutedSignal>> {
+        match self { Self::Compatibility(tx) => tx.try_send(value), Self::Poll(tx) => tx.try_send(value) }
+    }
+    fn send(&self, value: RoutedSignal) -> Result<(), crossbeam_channel::SendError<RoutedSignal>> {
+        match self { Self::Compatibility(tx) => tx.send(value), Self::Poll(tx) => tx.send(value) }
+    }
+}
+impl From<Sender<RoutedSignal>> for SignalTx {
+    fn from(tx: Sender<RoutedSignal>) -> Self { Self::Compatibility(tx) }
+}
+impl From<hexagent_runtime::poll_channel::Sender<RoutedSignal>> for SignalTx {
+    fn from(tx: hexagent_runtime::poll_channel::Sender<RoutedSignal>) -> Self { Self::Poll(tx) }
+}
+
+/// One execution-thread consumer, no forwarding thread or notification lock.
+/// Owner lanes: 1024 each; control: 8; root: CHANNEL_CAPACITY. Commands retain
+/// reservations and are never replaced. Full owner publication fails closed in
+/// emit_strategy_signal; emergency cancellation has its independent lane.
+/// A control barrier drains earlier root/owner commands, including reserved but
+/// unpublished slots, before it may advance. Normal ingress is round-robin.
+struct LiveSignalIngress {
+    lanes: Vec<hexagent_runtime::poll_channel::Receiver<RoutedSignal>>,
+    control: hexagent_runtime::poll_channel::Receiver<RoutedSignal>,
+    pending_control: Option<RoutedSignal>,
+    cursor: usize,
+    live: Vec<bool>,
+    control_live: bool,
+    sampled_high_water: usize,
+}
+impl LiveSignalIngress {
+    fn new(root: hexagent_runtime::poll_channel::Receiver<RoutedSignal>,
+        owners: Vec<hexagent_runtime::poll_channel::Receiver<RoutedSignal>>,
+        control: hexagent_runtime::poll_channel::Receiver<RoutedSignal>) -> Self {
+        let mut lanes = Vec::with_capacity(owners.len() + 1);
+        lanes.push(root);
+        lanes.extend(owners);
+        Self { live: vec![true; lanes.len()], lanes, control, pending_control: None, cursor: 0, control_live: true, sampled_high_water: 0 }
+    }
+    // Called by the existing idle maintenance timer, not per quote/order.
+    fn sample_depth(&mut self) -> ExecutionDiagnostic {
+        let depth = self.lanes.iter().map(|lane| lane.len()).sum::<usize>();
+        let control_depth = self.control.len() + usize::from(self.pending_control.is_some());
+        self.sampled_high_water = self.sampled_high_water.max(depth + control_depth);
+        ExecutionDiagnostic::SignalIngress { owners: self.lanes.len() - 1, depth, control_depth,
+            sampled_high_water: self.sampled_high_water }
+    }
+    fn try_recv(&mut self) -> Result<RoutedSignal, crossbeam_channel::TryRecvError> {
+        use crossbeam_channel::TryRecvError;
+        if self.pending_control.is_none() {
+            match self.control.try_recv() {
+                Ok(value) => self.pending_control = Some(value),
+                Err(TryRecvError::Disconnected) => self.control_live = false,
+                Err(TryRecvError::Empty) => {},
+            }
+            // Let a same-CPU control producer finish a reserved publication;
+            // never run ordinary orders ahead of that higher-priority lane.
+            if self.pending_control.is_none() && self.control.has_pending() {
+                return Err(TryRecvError::Empty);
+            }
+        }
+        for _ in 0..self.lanes.len() {
+            let index = self.cursor;
+            self.cursor = (index + 1) % self.lanes.len();
+            match self.lanes[index].try_recv() {
+                Ok(value) => return Ok(value),
+                Err(TryRecvError::Disconnected) => self.live[index] = false,
+                Err(TryRecvError::Empty) => {},
+            }
+        }
+        if !self.lanes.iter().any(|lane| lane.has_pending()) {
+            if let Some(control) = self.pending_control.take() { return Ok(control); }
+        }
+        if !self.control_live && !self.live.iter().any(|live| *live) {
+            Err(TryRecvError::Disconnected)
+        } else { Err(TryRecvError::Empty) }
+    }
+}
+enum ExecutionSignalIngress {
+    Compatibility(Receiver<RoutedSignal>),
+    Live(LiveSignalIngress),
+}
+impl From<Receiver<RoutedSignal>> for ExecutionSignalIngress {
+    fn from(rx: Receiver<RoutedSignal>) -> Self { Self::Compatibility(rx) }
+}
+impl ExecutionSignalIngress {
+    fn try_recv(&mut self) -> Result<RoutedSignal, crossbeam_channel::TryRecvError> {
+        match self { Self::Compatibility(rx) => rx.try_recv(), Self::Live(rx) => rx.try_recv() }
+    }
+}
+
 #[derive(Clone)]
 struct SignalSender {
     owner: u16,
-    tx: Sender<RoutedSignal>,
-    owner_lanes: Option<Arc<Vec<Sender<RoutedSignal>>>>,
-    arbiter_control_tx: Option<Sender<RoutedSignal>>,
+    tx: SignalTx,
+    owner_lanes: Option<Arc<Vec<SignalTx>>>,
+    arbiter_control_tx: Option<SignalTx>,
 }
 
 impl SignalSender {
-    fn system(tx: Sender<RoutedSignal>) -> Self {
+    fn system(tx: impl Into<SignalTx>) -> Self {
         Self {
             owner: SYSTEM_SIGNAL_OWNER,
-            tx,
+            tx: tx.into(),
             owner_lanes: None,
             arbiter_control_tx: None,
         }
@@ -2935,10 +3037,20 @@ impl SignalSender {
     ) -> Self {
         Self {
             owner: SYSTEM_SIGNAL_OWNER,
-            tx,
-            owner_lanes: Some(Arc::new(owner_lanes)),
-            arbiter_control_tx: Some(arbiter_control_tx),
+            tx: tx.into(),
+            owner_lanes: Some(Arc::new(owner_lanes.into_iter().map(Into::into).collect())),
+            arbiter_control_tx: Some(arbiter_control_tx.into()),
         }
+    }
+
+    fn system_with_poll_owner_lanes(
+        tx: hexagent_runtime::poll_channel::Sender<RoutedSignal>,
+        owner_lanes: Vec<hexagent_runtime::poll_channel::Sender<RoutedSignal>>,
+        control: hexagent_runtime::poll_channel::Sender<RoutedSignal>,
+    ) -> Self {
+        Self { owner: SYSTEM_SIGNAL_OWNER, tx: tx.into(),
+            owner_lanes: Some(Arc::new(owner_lanes.into_iter().map(Into::into).collect())),
+            arbiter_control_tx: Some(control.into()) }
     }
 
     fn with_owner(&self, owner: usize) -> Self {
@@ -4154,26 +4266,17 @@ impl Engine {
         // Strategy↔executor control traffic must not stall quote processing or
         // HTTP completion threads. Venue-specific queues below enforce the
         // actual place/cancel/reconcile admission policy.
-        let (signal_tx_raw, signal_rx) = bounded::<RoutedSignal>(CHANNEL_CAPACITY);
+        let (signal_tx_raw, signal_rx) = hexagent_runtime::poll_channel::bounded::<RoutedSignal>(CHANNEL_CAPACITY);
         let strategy_count = self.config.strategies.iter().filter(|s| s.enabled).count();
         let (owner_signal_txs, owner_signal_rxs): (Vec<_>, Vec<_>) = (0..strategy_count)
-            .map(|_| bounded::<RoutedSignal>(INSTANCE_SIGNAL_LANE_CAPACITY))
+            .map(|_| hexagent_runtime::poll_channel::bounded::<RoutedSignal>(INSTANCE_SIGNAL_LANE_CAPACITY))
             .unzip();
-        let (signal_control_tx, signal_control_rx) = bounded::<RoutedSignal>(8);
-        let signal_arbiter_handle = spawn_strategy_signal_arbiter(
-            signal_tx_raw.clone(),
-            owner_signal_rxs,
-            signal_control_rx,
-        );
-        let signal_tx = if strategy_count == 0 {
-            SignalSender::system(signal_tx_raw)
-        } else {
-            SignalSender::system_with_owner_lanes(
-                signal_tx_raw,
-                owner_signal_txs,
-                signal_control_tx,
-            )
-        };
+        let (signal_control_tx, signal_control_rx) = hexagent_runtime::poll_channel::bounded::<RoutedSignal>(8);
+        let signal_rx = ExecutionSignalIngress::Live(LiveSignalIngress::new(
+            signal_rx, owner_signal_rxs, signal_control_rx));
+        let signal_arbiter_handle: Option<thread::JoinHandle<()>> = None;
+        let signal_tx = SignalSender::system_with_poll_owner_lanes(
+            signal_tx_raw, owner_signal_txs, signal_control_tx);
         let (executor_update_tx, executor_update_rx) =
             hexagent_runtime::poll_channel::bounded::<RoutedOrderUpdate>(CHANNEL_CAPACITY);
         // Authenticated user feeds are independent producers and may need
@@ -12325,7 +12428,7 @@ impl Engine {
 
     fn spawn_execution_thread_with_poly_shutdown(
         &self,
-        signal_rx: Receiver<RoutedSignal>,
+        signal_rx: impl Into<ExecutionSignalIngress>,
         update_tx: ExecutionUpdateTx,
         poly_states: HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
         stale_threshold_handles: HashMap<String, Arc<std::sync::atomic::AtomicU64>>,
@@ -12334,6 +12437,7 @@ impl Engine {
         mut admission_publishers: HashMap<String, SnapshotPublisher<ExecutionAdmission>>,
         probe_http_rx: Option<ProbeHttpReceiver>,
     ) -> thread::JoinHandle<()> {
+        let mut signal_rx = signal_rx.into();
         let config = self.config.clone();
         let hex_max_connections = config
             .exchanges
@@ -13125,10 +13229,20 @@ impl Engine {
                     Duration::from_millis(1), std::time::Instant::now(),
                 );
                 let mut maintenance_pending = true;
+                let mut signal_diagnostic_timer = hexagent_runtime::owner_timer::OwnerTimer::new(
+                    Duration::from_secs(30), std::time::Instant::now());
                 loop {
                     // Keep the existing 1 ms idle health/cancel cadence. Polling
                     // ingress more often must not rescan every connection per poll.
                     let maintenance_due = maintenance_timer.take_due(std::time::Instant::now());
+                    if maintenance_due {
+                        if let ExecutionSignalIngress::Live(ingress) = &mut signal_rx {
+                            let diagnostic = ingress.sample_depth();
+                            if signal_diagnostic_timer.take_due(std::time::Instant::now()) {
+                                try_submit_execution_diagnostic(&execution_diagnostic_tx, diagnostic);
+                            }
+                        }
+                    }
                     if maintenance_pending || maintenance_due {
                         if let Some(routes_by_account) = poly_connection_routes.as_mut() {
                             for routes in routes_by_account.values_mut() {
@@ -18285,6 +18399,28 @@ mod market_router_tests {
         Engine::new(config, StrategyRegistry::new())
     }
 
+    #[test]
+    fn direct_live_signal_ingress_completes_shutdown_without_forwarder() {
+        let engine = shutdown_test_engine();
+        let (system, ingress) = direct_signal_fixture(4);
+        let (updates, _rx) = bounded(8);
+        let (done_tx, done_rx) = completion_lane();
+        let shutdown = ShutdownToken::new();
+        let execution = engine.spawn_execution_thread_with_poly_shutdown(
+            ExecutionSignalIngress::Live(ingress), updates.into(), HashMap::new(),
+            HashMap::new(), done_tx, shutdown.clone(), HashMap::new(), None);
+        system.send(Signal::BeginShutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !done_rx.is_complete() && Instant::now() < deadline {
+            thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
+        }
+        assert!(done_rx.is_complete());
+        system.send(Signal::Exit).unwrap();
+        assert_thread_exits(&execution, "direct execution");
+        execution.join().unwrap();
+        shutdown.finish();
+    }
+
     fn assert_thread_exits(handle: &thread::JoinHandle<()>, label: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !handle.is_finished() && std::time::Instant::now() < deadline {
@@ -19276,6 +19412,56 @@ mod market_router_tests {
                 QuoteTriggerSource::OrderBook(Exchange::Binance),
             );
         }
+    }
+
+    fn direct_signal_fixture(capacity: usize) -> (SignalSender, LiveSignalIngress) {
+        let (root_tx, root_rx) = hexagent_runtime::poll_channel::bounded(capacity);
+        let (txs, rxs) = (0..3).map(|_| hexagent_runtime::poll_channel::bounded(capacity)).unzip();
+        let (control_tx, control_rx) = hexagent_runtime::poll_channel::bounded(8);
+        (SignalSender::system_with_poll_owner_lanes(root_tx, txs, control_tx),
+            LiveSignalIngress::new(root_rx, rxs, control_rx))
+    }
+
+    #[test]
+    fn direct_signal_lanes_preserve_owner_order_and_shutdown_barrier() {
+        let (system, mut ingress) = direct_signal_fixture(4);
+        for owner in 0..3 {
+            let tx = system.with_owner(owner);
+            tx.try_send(Signal::BeginShutdown).unwrap();
+            tx.try_send(Signal::Exit).unwrap();
+        }
+        system.try_send(Signal::BeginShutdown).unwrap();
+        let mut seen = [0usize; 3];
+        for _ in 0..6 {
+            let message = ingress.try_recv().unwrap();
+            let owner = message.owner as usize;
+            assert!(owner < 3);
+            assert!(if seen[owner] == 0 { matches!(message.signal, Signal::BeginShutdown) }
+                else { matches!(message.signal, Signal::Exit) });
+            seen[owner] += 1;
+        }
+        let barrier = ingress.try_recv().unwrap();
+        assert_eq!(barrier.owner, SYSTEM_SIGNAL_OWNER);
+        assert!(matches!(barrier.signal, Signal::BeginShutdown));
+        assert_eq!(seen, [2, 2, 2]);
+        drop(system);
+        assert!(matches!(ingress.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn direct_signal_overflow_does_not_block_other_instances_or_emergency() {
+        let (system, mut ingress) = direct_signal_fixture(1);
+        let first = system.with_owner(0);
+        first.try_send(Signal::BeginShutdown).unwrap();
+        assert!(matches!(first.try_send(Signal::Exit), Err(crossbeam_channel::TrySendError::Full(_))));
+        system.with_owner(1).try_send(Signal::Exit).unwrap();
+        first.try_send_emergency(Signal::Exit).unwrap();
+        assert_eq!(ingress.try_recv().unwrap().owner, 0);
+        assert_eq!(ingress.try_recv().unwrap().owner, 1);
+        let emergency = ingress.try_recv().unwrap();
+        assert_eq!(emergency.owner, 0);
+        assert!(matches!(emergency.signal, Signal::Exit));
+        assert!(matches!(ingress.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
     }
 
     #[test]
