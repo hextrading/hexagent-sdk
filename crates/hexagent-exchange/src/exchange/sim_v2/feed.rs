@@ -592,6 +592,7 @@ mod tests {
 
     fn bid(coid: &str, price: f64) -> OrderRequest {
         OrderRequest {
+            prepared_token: None,
             client_order_id: coid.into(),
             exchange: Exchange::Polymarket,
             symbol: "up".into(),

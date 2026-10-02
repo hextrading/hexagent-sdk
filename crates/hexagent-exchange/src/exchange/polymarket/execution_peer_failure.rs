@@ -47,6 +47,8 @@ pub struct PeerFailureReceiver {
 }
 
 impl PeerFailureReceiver {
+    pub fn has_pending(&self) -> bool { !self.rx.is_empty() || !self.overflow_rx.is_empty() }
+
     /// Bounded work even while producers are publishing. Caller owns all
     /// ordering/deduplication and generation-retirement state.
     pub fn drain(&self) -> (Option<PeerFailure>, bool) {

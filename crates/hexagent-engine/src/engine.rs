@@ -11208,15 +11208,9 @@ impl Engine {
                                     if !feed.has_active_subscription() {
                                         last_data_at = std::time::Instant::now();
                                     }
-                                    // `next_event()` is non-blocking — when empty we'd
-                                    // otherwise busy-spin. Under SCHED_FIFO that's fatal:
-                                    // `execution` / hex worker threads share core 3 at
-                                    // the same priority and get zero CPU until our time
-                                    // slice (kernel.sched_rr_timeslice_ms, ~100 ms by
-                                    // default) expires. A short sleep yields the CPU and
-                                    // costs nothing — 100 µs latency is orders of
-                                    // magnitude under any WS event cadence.
-                                    std::thread::sleep(std::time::Duration::from_micros(100));
+                                    // Always sleep: yielding alone can starve lower FIFO roles.
+                                    // Per-feed tuning keeps CLOB/Chainlink polling unchanged.
+                                    std::thread::sleep(Duration::from_micros(cfg.idle_poll_us));
                                     continue;
                                 }
                                 Err(e) => {
@@ -12741,6 +12735,8 @@ impl Engine {
                         );
                     }
                     use hexagent_runtime::http1_pool::Role;
+                    let preparation_schedule = std::rc::Rc::new(std::cell::RefCell::new(
+                        crate::preparation_schedule::Schedule::default()));
                     let manifest =
                         hexagent_runtime::http1_pool::account_execution_slot_manifest();
                     for (account_id, role, slot) in manifest {
@@ -12772,9 +12768,16 @@ impl Engine {
                             slot,
                         ));
                         poly_connection_metrics.push(Arc::clone(&lane_metrics));
+                        let binding = (role == Role::Fast).then(||
+                            crate::os_tune::reserve_execution_binding("poly-exec", crate::os_tune::ExecutionThreadRole::PolymarketFast));
+                        let (preparation, preparation_completion) = if let Some(binding) = binding {
+                            let (route, completion) = crate::preparation_schedule::Schedule::register(&preparation_schedule, binding.core);
+                            (Some(route), Some(completion))
+                        } else { (None, None) };
                         let lane = PolyConnectionLane {
                             tx,
                             metrics: Arc::clone(&lane_metrics),
+                            preparation,
                         };
                         let routes = poly_connection_routes
                             .entry(account_id.clone())
@@ -12817,7 +12820,9 @@ impl Engine {
                                         Role::Cancel => crate::os_tune::ExecutionThreadRole::PolymarketCancel,
                                         Role::Reconcile | Role::Query | Role::GapReplay => unreachable!(),
                                     };
-                                    crate::os_tune::pin_execution_role(&thread_name, execution_role);
+                                    if let Some(binding) = binding {
+                                        crate::os_tune::pin_execution_binding(&thread_name, binding);
+                                    } else { crate::os_tune::pin_execution_role(&thread_name, execution_role); }
                                 }
                                 run_poly_connection_owner(
                                     router,
@@ -12826,6 +12831,7 @@ impl Engine {
                                     rx,
                                     lane_metrics,
                                     health_publisher,
+                                    preparation_completion,
                                 );
                             })
                             .unwrap();
@@ -13228,7 +13234,6 @@ impl Engine {
                 let mut maintenance_timer = hexagent_runtime::owner_timer::OwnerTimer::new(
                     Duration::from_millis(1), std::time::Instant::now(),
                 );
-                let mut maintenance_pending = true;
                 let mut signal_diagnostic_timer = hexagent_runtime::owner_timer::OwnerTimer::new(
                     Duration::from_secs(30), std::time::Instant::now());
                 loop {
@@ -13243,15 +13248,16 @@ impl Engine {
                             }
                         }
                     }
-                    if maintenance_pending || maintenance_due {
-                        if let Some(routes_by_account) = poly_connection_routes.as_mut() {
-                            for routes in routes_by_account.values_mut() {
+                    if let Some(routes_by_account) = poly_connection_routes.as_mut() {
+                        for routes in routes_by_account.values_mut() {
+                            // Cheap mailbox probes; only changed accounts run maintenance.
+                            // Deadline still handles expiry/retries without an incoming signal.
+                            if maintenance_due || routes.has_health_updates() {
                                 routes.refresh_health(now_ns());
                                 flush_poly_safety_cancel_outbox(routes);
                                 flush_poly_cancel_outbox(routes);
                             }
                         }
-                        maintenance_pending = false;
                     }
                     // The executor has a direct shutdown subscription. A
                     // dead strategy/router therefore cannot strand it on a
@@ -13293,7 +13299,6 @@ impl Engine {
                                                 request.reject_not_sent("probe account route unavailable");
                                             }
                                             dispatched = true;
-                                            maintenance_pending = true;
                                         }
                                         Err(crossbeam_channel::TryRecvError::Disconnected) => probe_http_rx = None,
                                         Err(crossbeam_channel::TryRecvError::Empty) => {},
@@ -13307,7 +13312,6 @@ impl Engine {
                         }
                     };
                     let Some(routed) = routed else { continue };
-                    maintenance_pending = true;
                     let embedded_instance_id = extract_instance_id(&routed.signal);
                     let numeric_instance_id = (routed.owner != SYSTEM_SIGNAL_OWNER)
                         .then(|| owner_instance_ids.get(routed.owner as usize))
@@ -15001,6 +15005,7 @@ impl PolyConnectionLaneMetrics {
 struct PolyConnectionLane {
     tx: Sender<PolyConnectionCommand>,
     metrics: Arc<PolyConnectionLaneMetrics>,
+    preparation: Option<crate::preparation_schedule::Route>,
 }
 
 impl PolyConnectionLane {
@@ -15013,6 +15018,7 @@ impl PolyConnectionLane {
         Self {
             tx,
             metrics: Arc::new(PolyConnectionLaneMetrics::new("test", role, slot)),
+            preparation: None,
         }
     }
 
@@ -15032,8 +15038,10 @@ impl PolyConnectionLane {
         self.metrics.enqueued_ns.store(now_ns(), Ordering::Release);
         self.metrics.cancel_reply_pending.store(
             matches!(command, PolyConnectionCommand::Cancel { .. }), Ordering::Release);
+        let prepares = matches!(&command, PolyConnectionCommand::Place { .. });
         match self.tx.try_send(command) {
             Ok(()) => {
+                if prepares { if let Some(route) = &self.preparation { route.issued(); } }
                 self.metrics.queue_depth.store(1, Ordering::Release);
                 self.metrics
                     .queue_high_water
@@ -15088,6 +15096,9 @@ impl Drop for PolyConnectionOccupancyGuard {
 const PEER_FAILURE_HINT_NS: u64 = 10_000_000_000;
 
 struct PolyAccountConnectionRoutes {
+    /// Dispatcher-local dirty bit: publishes changed admission on the next
+    /// loop without scanning/refreshing unrelated accounts after every signal.
+    maintenance_pending: bool,
     /// Dispatcher -> one account-scoped SCHED_OTHER audit owner. FIFO across
     /// retain/release, independent of HTTP admission and cancel backpressure.
     /// Full/disconnected is returned as typed control retry feedback. Private
@@ -15149,6 +15160,7 @@ struct PolyAccountConnectionRoutes {
 impl Default for PolyAccountConnectionRoutes {
     fn default() -> Self {
         Self {
+            maintenance_pending: false,
             event_audit: None,
             event_audit_high_water: 0,
             event_audit_rejected: 0,
@@ -15190,7 +15202,14 @@ impl Default for PolyAccountConnectionRoutes {
 }
 
 impl PolyAccountConnectionRoutes {
+    fn has_health_updates(&self) -> bool {
+        self.maintenance_pending || self.health_lanes.iter().any(|(_, _, rx)| !rx.is_empty())
+            || self.reset_rx.as_ref().is_some_and(|rx| !rx.is_empty())
+            || self.peer_failure_receivers.iter().any(|(rx, _)| rx.has_pending())
+    }
+
     fn refresh_health(&mut self, _now: u64) {
+        self.maintenance_pending = false;
         let Some(health) = self.health.as_mut() else { return; };
         for (role, slot, receiver) in &self.health_lanes {
             match receiver.try_recv() {
@@ -15476,7 +15495,7 @@ fn try_send_poly_owner(
     routes.refresh_health(now);
     let now = now_ns();
     let PolyAccountConnectionRoutes { fast, cancel, reconcile, fast_rr, cancel_rr,
-        reconcile_rr, health, cancel_lane_keys, .. } = routes;
+        reconcile_rr, health, cancel_lane_keys, maintenance_pending, .. } = routes;
     let (lanes, rr) = match role {
         hexagent_runtime::http1_pool::Role::Fast => (&*fast, fast_rr),
         hexagent_runtime::http1_pool::Role::Cancel => (&*cancel, cancel_rr),
@@ -15486,7 +15505,20 @@ fn try_send_poly_owner(
     if lanes.is_empty() {
         return Err(command);
     }
-    let start = *rr % lanes.len();
+    let mut start = *rr % lanes.len();
+    if role == hexagent_runtime::http1_pool::Role::Fast {
+        if let Some(route) = lanes.first().and_then(|lane| lane.preparation.as_ref()) { route.refresh(); }
+        // Rank only healthy idle candidates. Equal CPU load retains RR fairness.
+        let mut best = u64::MAX;
+        for offset in 0..lanes.len() {
+            let index = (*rr + offset) % lanes.len();
+            let lane = &lanes[index];
+            if lane.metrics.occupied.load(Ordering::Acquire)
+                || health.as_mut().is_some_and(|health| !health.lane_place_allowed(lane.metrics.slot, now)) { continue; }
+            let score = lane.preparation.as_ref().map_or(0, |route| route.pending_on_core());
+            if score < best { best = score; start = index; }
+        }
+    }
     for offset in 0..lanes.len() {
         let index = (start + offset) % lanes.len();
         if matches!(&command, PolyConnectionCommand::ProbeHttp { request, .. }
@@ -15523,6 +15555,7 @@ fn try_send_poly_owner(
         }
         match lanes[index].try_send(command) {
             Ok(()) => {
+                *maintenance_pending = true;
                 *rr = index.wrapping_add(1);
                 if role == hexagent_runtime::http1_pool::Role::Cancel {
                     cancel_lane_keys[index] = cancel_key;
@@ -15747,6 +15780,7 @@ fn run_poly_connection_owner(
     rx: Receiver<PolyConnectionCommand>,
     lane_metrics: Arc<PolyConnectionLaneMetrics>,
     mut health_publisher: Option<SnapshotPublisher<LaneObservation>>,
+    mut preparation_completion: Option<crate::preparation_schedule::Completion>,
 ) {
     use hexagent_runtime::http1_pool::Role;
     crate::latency::prepare_polymarket_order_stages();
@@ -15775,6 +15809,9 @@ fn run_poly_connection_owner(
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
+        let mut preparation_guard = if matches!(&command, PolyConnectionCommand::Place { .. }) {
+            preparation_completion.as_mut().map(|completion| completion.guard())
+        } else { None };
         let received_at = crate::latency::Instant::now();
         if let PolyConnectionCommand::Place { enqueued_at, .. } = &command {
             // Stop at dequeue, before connection metadata/admission work.
@@ -15856,6 +15893,8 @@ fn run_poly_connection_owner(
                         continue;
                     }
                 };
+                // Release CPU-work hint before any wait for the exchange reply.
+                if let Some(guard) = preparation_guard.as_mut() { guard.finish(); }
                 match pending {
                     Ok(pending) => finish_poly_typed_completion(
                         &mut router,
@@ -19159,6 +19198,7 @@ mod market_router_tests {
 
     fn order_req(coid: &str, instance_id: &str) -> OrderRequest {
         OrderRequest {
+            prepared_token: None,
             order_slot: Default::default(),
             client_order_id: coid.into(),
             exchange: Exchange::Polymarket,
@@ -20081,6 +20121,45 @@ mod market_router_tests {
             PolyConnectionCommand::Cancel { client_order_id, .. } if client_order_id == "second"
         ));
         assert!(routes.cancel_outbox.is_empty());
+    }
+
+    #[test]
+    fn cpu_aware_fast_selection_spreads_accounts_and_preserves_busy_exclusion() {
+        use hexagent_runtime::http1_pool::Role;
+        let schedule = std::rc::Rc::new(std::cell::RefCell::new(crate::preparation_schedule::Schedule::default()));
+        let mut accounts = Vec::new(); let mut receivers = Vec::new(); let mut completions = Vec::new();
+        for account in 0..3 {
+            let mut routes = PolyAccountConnectionRoutes::default();
+            for (slot, core) in [5, 14].into_iter().enumerate() {
+                let (tx, rx) = bounded(1);
+                let mut lane = PolyConnectionLane::for_test(tx, Role::Fast, slot);
+                let (route, completion) = crate::preparation_schedule::Schedule::register(&schedule, core);
+                lane.preparation = Some(route); routes.fast.push(lane);
+                receivers.push((account, slot, rx)); completions.push(completion);
+            }
+            accounts.push(routes);
+        }
+        let (tx, _rx) = bounded(8);
+        let update_tx = ExecutorUpdateSender { owner: 0, tx: tx.into() };
+        let command = || PolyConnectionCommand::Place { expected_generation: None, instance_id: "instance-0".into(),
+            order: order_req("coid", "instance-0"), stale_ms: 100, update_tx: update_tx.clone(), enqueued_at: Instant::now() };
+        for routes in &mut accounts { assert!(try_send_poly_owner(routes, Role::Fast, command()).is_ok()); }
+        assert_eq!(receivers.iter().filter(|(_, slot, rx)| *slot == 0 && !rx.is_empty()).count(), 2);
+        assert_eq!(receivers.iter().filter(|(_, slot, rx)| *slot == 1 && !rx.is_empty()).count(), 1);
+        // Completing preparation frees CPU load, while the old HTTP still owns slot 0.
+        completions[0].guard().finish();
+        assert!(accounts[0].fast[0].metrics.occupied.load(Ordering::Acquire));
+        assert!(try_send_poly_owner(&mut accounts[0], Role::Fast, command()).is_ok());
+        assert!(!receivers[1].2.is_empty());
+        assert!(try_send_poly_owner(&mut accounts[0], Role::Fast, command()).is_err());
+    }
+
+    #[test]
+    fn maintenance_detects_reset_without_waiting_for_timer() {
+        let (tx, rx) = bounded(1);
+        let mut routes = PolyAccountConnectionRoutes { reset_rx: Some(rx), ..Default::default() };
+        assert!(!routes.has_health_updates()); tx.send(()).unwrap(); assert!(routes.has_health_updates());
+        routes.reset_rx.as_ref().unwrap().recv().unwrap(); assert!(!routes.has_health_updates());
     }
 
     #[test]

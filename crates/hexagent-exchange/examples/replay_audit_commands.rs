@@ -239,6 +239,7 @@ fn signal(command: &Command, ordinal: usize) -> Result<Signal> {
         bail!("diagnostic slot generation exhausted")
     }
     Ok(Signal::NewOrder(OrderRequest {
+        prepared_token: None,
         order_slot: OrderSlot::with_generation(index, generation),
         client_order_id: command.coid.clone(),
         exchange: Exchange::Polymarket,

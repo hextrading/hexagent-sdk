@@ -188,6 +188,7 @@ pub fn inject_spot_feed_symbols(cfg: &StrategyConfig, full: &mut Config) {
     let has_binance = full.exchanges.iter().any(|e| e.name == "binance");
     if !has_binance {
         full.exchanges.push(crate::config::ExchangeConfig {
+            idle_poll_us: 100,
             name: "binance".to_string(),
             enabled: true,
             symbols: vec![sym.binance_symbol.clone()],

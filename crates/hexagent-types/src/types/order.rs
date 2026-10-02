@@ -248,9 +248,36 @@ impl Default for OrderSlot {
     }
 }
 
+/// Registration-time validated uint256 token. Original decimal bytes fence the
+/// cache against symbol changes; callers cannot construct an inconsistent word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedToken { decimal: [u8; 78], len: u8, word: [u8; 32] }
+impl PreparedToken {
+    pub fn parse(token: &str) -> Option<Self> {
+        if token.is_empty() || token.len() > 78 { return None; }
+        let mut word = [0u8; 32];
+        for digit in token.bytes() {
+            if !digit.is_ascii_digit() { return None; }
+            let mut carry = (digit - b'0') as u16;
+            for byte in word.iter_mut().rev() {
+                let n = *byte as u16 * 10 + carry; *byte = n as u8; carry = n >> 8;
+            }
+            if carry != 0 { return None; }
+        }
+        if word == [0; 32] { return None; }
+        let mut decimal = [0; 78]; decimal[..token.len()].copy_from_slice(token.as_bytes());
+        Some(Self { decimal, len: token.len() as u8, word })
+    }
+    pub fn matches(&self, token: &str) -> bool { &self.decimal[..self.len as usize] == token.as_bytes() }
+    pub fn word(&self) -> [u8; 32] { self.word }
+}
+
 /// Request to place a new order
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
+    /// Immutable registration-time cache; replay/legacy requests may omit it.
+    #[serde(skip)]
+    pub prepared_token: Option<PreparedToken>,
     /// Fixed owner-local routing identity, echoed by execution and lifecycle.
     #[serde(default)]
     pub order_slot: OrderSlot,
@@ -424,6 +451,7 @@ impl OrderRequest {
         quantity: f64,
     ) -> Self {
         Self {
+            prepared_token: None,
             order_slot: OrderSlot::UNASSIGNED,
             client_order_id: uuid::Uuid::new_v4().to_string(),
             exchange,
@@ -447,6 +475,7 @@ impl OrderRequest {
 
     pub fn new_market(exchange: Exchange, symbol: String, side: Side, quantity: f64) -> Self {
         Self {
+            prepared_token: None,
             order_slot: OrderSlot::UNASSIGNED,
             client_order_id: uuid::Uuid::new_v4().to_string(),
             exchange,
@@ -531,4 +560,17 @@ mod tests {
             OrderSlot::UNASSIGNED
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_token_cache_is_not_restored_from_untrusted_replay_fields() {
+    let mut order = OrderRequest::new_limit(Exchange::Polymarket, "42".into(), Side::Buy, 0.5, 10.0);
+    order.prepared_token = PreparedToken::parse("42");
+    let text = serde_json::to_string(&order).unwrap();
+    assert!(!text.contains("prepared_token"));
+    let restored: OrderRequest = serde_json::from_str(&text).unwrap();
+    assert!(restored.prepared_token.is_none());
+    assert!(PreparedToken::parse("042").unwrap().matches("042"));
+    assert!(!PreparedToken::parse("042").unwrap().matches("42"));
 }

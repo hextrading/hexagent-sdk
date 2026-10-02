@@ -1265,21 +1265,30 @@ pub fn pin_execution(thread_name: &str) {
 /// Pin an execution thread by its declared runtime role. New long-lived
 /// execution owners must use this entry point so a renamed observability label
 /// cannot silently move them onto the dispatcher core or change FIFO priority.
-pub fn pin_execution_role(thread_name: &str, role: ExecutionThreadRole) {
+/// Startup-reserved placement. The scheduler and worker use the exact same
+/// assignment; thread spawn order cannot change the dispatcher's CPU model.
+#[derive(Clone, Copy, Debug)]
+pub struct ExecutionBinding { pub core: usize, priority: u8 }
+
+pub fn reserve_execution_binding(thread_name: &str, role: ExecutionThreadRole) -> ExecutionBinding {
     let p = plan();
     let core = p.route_execution_role(role, thread_name);
-    pin_current(core, thread_name);
     let priority = match role {
-        ExecutionThreadRole::Feed if thread_name == "feed-polymarket" => {
-            p.fifo_polymarket_feed
-        }
-        ExecutionThreadRole::VenueCompletion | ExecutionThreadRole::PolymarketCompletion => {
-            p.fifo_completion
-        }
+        ExecutionThreadRole::Feed if thread_name == "feed-polymarket" => p.fifo_polymarket_feed,
+        ExecutionThreadRole::VenueCompletion | ExecutionThreadRole::PolymarketCompletion => p.fifo_completion,
         ExecutionThreadRole::PolymarketCancel => p.fifo_cancel,
         _ => p.fifo_execution,
     };
-    set_fifo(priority, thread_name);
+    ExecutionBinding { core, priority }
+}
+
+pub fn pin_execution_binding(thread_name: &str, binding: ExecutionBinding) {
+    pin_current(binding.core, thread_name);
+    set_fifo(binding.priority, thread_name);
+}
+
+pub fn pin_execution_role(thread_name: &str, role: ExecutionThreadRole) {
+    pin_execution_binding(thread_name, reserve_execution_binding(thread_name, role));
 }
 
 /// Pin a non-critical I/O-bound background thread to the background

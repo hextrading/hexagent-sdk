@@ -993,6 +993,7 @@ impl OrderManager {
                     );
                     self.reindex_order(&client_order_id);
                     emit(Signal::NewOrder(OrderRequest {
+                        prepared_token: None,
                         order_slot: Default::default(),
                         client_order_id,
                         exchange: self.exchange,

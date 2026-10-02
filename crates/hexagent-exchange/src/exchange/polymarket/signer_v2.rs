@@ -93,7 +93,7 @@ fn deposit_wallet_version_hash() -> [u8; 32] {
 }
 
 /// `bytes32(0)` as the 0x-prefixed hex the wire format expects.
-const METADATA_ZERO_HEX: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+pub(crate) const METADATA_ZERO_HEX: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 // ════════════════════════════════════════════════════════════════
 // v2 Order + SignedOrder
@@ -155,6 +155,14 @@ pub struct OrderSignerV2 {
     /// Shared with the account route's v1 signer. The order hot path performs
     /// one relaxed fetch-add and never enters a global registry.
     salt_sequence: Arc<AccountSaltSequence>,
+}
+
+/// Numeric live signing result. Compatibility OrderV2 remains unchanged.
+#[derive(Debug)]
+pub struct NumericSignedOrderV2 {
+    pub salt: u64, pub timestamp: u64, pub maker_amount: u128, pub taker_amount: u128,
+    pub maker: String, pub signer: String, pub builder: String, pub signature_type: u8,
+    pub signature: String, pub order_hash: String,
 }
 
 impl OrderSignerV2 {
@@ -257,6 +265,45 @@ impl OrderSignerV2 {
         } else {
             self.build_signed_order(token_id, price, size, side)
         }
+    }
+
+    /// Live path: use an immutable registration-time token and keep amounts,
+    /// salt, timestamp numeric through hashing and wire serialization.
+    pub fn build_signed_order_numeric(
+        &self, token_id: &str, prepared: Option<&crate::types::PreparedToken>,
+        price: f64, size: f64, side: crate::types::Side,
+    ) -> Result<NumericSignedOrderV2> {
+        super::signer::validate_price_size(price, size)?;
+        let token_word = if let Some(token) = prepared {
+            if !token.matches(token_id) { return Err(anyhow!("prepared token does not match order symbol")); }
+            token.word()
+        } else {
+            super::signer::validate_u256_decimal("token_id", token_id, false)?;
+            u256_from_decimal(token_id)
+        };
+        let (maker_amount, taker_amount) = super::signer::compute_amounts_numeric(price, size, side);
+        let salt = self.salt_sequence.next_u64();
+        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64).unwrap_or(0);
+        let poly1271 = matches!(self.signature_type, SignatureType::Poly1271);
+        let signer_address = if poly1271 {
+            self.funder.as_deref().ok_or_else(|| anyhow!("poly_1271 requires a deposit-wallet address"))?
+        } else { &self.signer_address };
+        let signer_word = if poly1271 { self.maker_word } else { self.signer_word };
+        let contents = hash_words(&[
+            order_v2_type_hash(), u256_bytes(salt as u128), self.maker_word, signer_word,
+            token_word, u256_bytes(maker_amount), u256_bytes(taker_amount),
+            u256_bytes(if side == crate::types::Side::Buy { 0 } else { 1 }),
+            u256_bytes(self.signature_type as u128), u256_bytes(timestamp as u128), [0; 32], self.builder_code,
+        ]);
+        let digest = eip712_digest(&self.domain_sep, &contents);
+        let signature = if poly1271 { self.sign_order_poly1271(contents, self.maker_word)? } else { self.sign_digest(&digest)? };
+        Ok(NumericSignedOrderV2 {
+            salt, timestamp, maker_amount, taker_amount, signature,
+            maker: self.maker_address.clone(), signer: signer_address.to_string(),
+            builder: self.builder_hex.clone(), signature_type: self.signature_type as u8,
+            order_hash: prefixed_hex(&digest),
+        })
     }
 
     pub fn sign_order(&self, order: &OrderV2) -> Result<String> {
@@ -578,6 +625,43 @@ fn parse_bytes32(s: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_live_signer_matches_compatibility_digest_signature_and_amounts() {
+        let key = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let token = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+        let prepared = crate::types::PreparedToken::parse(token).unwrap();
+        for kind in [SignatureType::Eoa, SignatureType::PolyProxy, SignatureType::PolyGnosisSafe, SignatureType::Poly1271] {
+            for neg_risk in [false, true] {
+                let signer = OrderSignerV2::new(key, neg_risk, kind, "").unwrap()
+                    .with_funder("0x1234567890123456789012345678901234567890");
+                for side in [crate::types::Side::Buy, crate::types::Side::Sell] {
+                    for (price, size) in [(0.37, 20.0), (0.01, 0.0001), (0.99, 1234.56789)] {
+                        let signed = signer.build_signed_order_numeric(token, Some(&prepared), price, size, side).unwrap();
+                        let (maker, taker) = compute_amounts(price, size, side);
+                        assert_eq!(signed.maker_amount.to_string(), maker); assert_eq!(signed.taker_amount.to_string(), taker);
+                        let order = OrderV2 { salt: signed.salt.to_string(), maker: signed.maker, signer: signed.signer,
+                            token_id: token.to_string(), maker_amount: maker, taker_amount: taker,
+                            side: if side == crate::types::Side::Buy { 0 } else { 1 }, signature_type: signed.signature_type,
+                            timestamp: signed.timestamp.to_string(), metadata: METADATA_ZERO_HEX.to_string(),
+                            builder: signed.builder, taker: "0x0000000000000000000000000000000000000000".into(), expiration: "0".into() };
+                        assert_eq!(signed.order_hash, signer.order_hash_hex(&order));
+                        let signature = if matches!(kind, SignatureType::Poly1271) {
+                            signer.sign_order_poly1271(order_v2_struct_hash(&order), address_to_bytes32(&order.signer)).unwrap()
+                        } else { signer.sign_order(&order).unwrap() };
+                        assert_eq!(signed.signature, signature);
+                    }
+                }
+                assert!(signer.build_signed_order_numeric("42", Some(&prepared), 0.5, 20.0, crate::types::Side::Buy).is_err());
+                for (price, size) in [(f64::NAN, 1.0), (0.5, f64::INFINITY), (0.0, 1.0), (0.5, 0.00000001)] {
+                    assert!(signer.build_signed_order_numeric(token, Some(&prepared), price, size, crate::types::Side::Buy).is_err());
+                }
+            }
+        }
+        assert!(crate::types::PreparedToken::parse("115792089237316195423570985008687907853269984665640564039457584007913129639936").is_none());
+        assert!(crate::types::PreparedToken::parse("0").is_none());
+        assert!(crate::types::PreparedToken::parse("1a").is_none());
+    }
 
     // Independent decimal long division used by the previous implementation.
     fn reference_decimal(s: &str) -> [u8; 32] {
