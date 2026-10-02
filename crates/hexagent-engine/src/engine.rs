@@ -2087,6 +2087,8 @@ fn stamp_quote_trigger(signals: &mut [Signal], trigger: &OrderBookSnapshot, log_
         }
     };
     for signal in signals {
+        signal.set_cancel_trigger(CancelTrigger { source: QuoteTriggerSource::OrderBook(trigger.exchange),
+            exchange_ns: trigger.exchange_timestamp_ns, local_ns: trigger.local_timestamp_ns });
         match signal {
             Signal::NewOrder(order) => stamp(order),
             Signal::BatchNewOrders { orders, .. }
@@ -2116,6 +2118,8 @@ fn stamp_execution_requote(signals: &mut [Signal], processing_ns: u64) {
         order.quote_trigger_source = QuoteTriggerSource::ExecutionCapacityResume;
     };
     for signal in signals {
+        signal.set_cancel_trigger(CancelTrigger { source: QuoteTriggerSource::ExecutionCapacityResume,
+            exchange_ns: 0, local_ns: processing_ns });
         match signal {
             Signal::NewOrder(order) => stamp(order),
             Signal::BatchNewOrders { orders, .. }
@@ -12798,6 +12802,10 @@ impl Engine {
                             Some(publisher)
                         } else { None };
                         let router = LiveRouter::new_with_poly_map(&config, &poly_states);
+                        let prewarm_url: Arc<str> = poly_states.values()
+                            .find(|shared| shared.account_state.account_id() == account_id)
+                            .map(|shared| Arc::from(format!("{}/", shared.clob_base_url.trim_end_matches('/'))))
+                            .expect("physical execution owner requires its account endpoint");
                         let thread_name = match role {
                             Role::Fast => format!("poly-exec-{account_id}-{slot}"),
                             Role::Cancel if safety_cancel_slot => {
@@ -12832,6 +12840,7 @@ impl Engine {
                                     lane_metrics,
                                     health_publisher,
                                     preparation_completion,
+                                    prewarm_url,
                                 );
                             })
                             .unwrap();
@@ -13992,6 +14001,7 @@ fn execute_venue_signal_with<T: ExchangeTrade>(
                 );
                 for update in rejected_venue_signal(
                     &Signal::CancelOrder {
+                        cancel_trigger: Default::default(),
                         exchange,
                         client_order_id,
                         instance_id: String::new(),
@@ -14081,6 +14091,7 @@ fn execute_venue_signal_with<T: ExchangeTrade>(
             let _ = drain_fixed(&mut fixed, emit);
         }
         Signal::BatchCancelOrders {
+            cancel_trigger,
             exchange,
             market_id,
             client_order_ids,
@@ -14102,6 +14113,7 @@ fn execute_venue_signal_with<T: ExchangeTrade>(
                 if fixed.is_empty() {
                     for update in rejected_venue_signal(
                         &Signal::BatchCancelOrders {
+                            cancel_trigger,
                             exchange,
                             market_id,
                             client_order_ids,
@@ -14119,6 +14131,7 @@ fn execute_venue_signal_with<T: ExchangeTrade>(
             let _ = drain_fixed(&mut fixed, emit);
         }
         Signal::BatchUpdateOrders {
+            cancel_trigger,
             exchange,
             market_id,
             cancel_client_order_ids,
@@ -14145,6 +14158,7 @@ fn execute_venue_signal_with<T: ExchangeTrade>(
                 if fixed.is_empty() {
                     for update in rejected_venue_signal(
                         &Signal::BatchUpdateOrders {
+                            cancel_trigger,
                             exchange,
                             market_id,
                             cancel_client_order_ids,
@@ -14163,6 +14177,7 @@ fn execute_venue_signal_with<T: ExchangeTrade>(
             let _ = drain_fixed(&mut fixed, emit);
         }
         Signal::ReplaceOrder {
+            cancel_trigger,
             exchange,
             market_id,
             cancel_client_order_ids,
@@ -14189,6 +14204,7 @@ fn execute_venue_signal_with<T: ExchangeTrade>(
                 if fixed.is_empty() {
                     for update in rejected_venue_signal(
                         &Signal::ReplaceOrder {
+                            cancel_trigger,
                             exchange,
                             market_id,
                             cancel_client_order_ids,
@@ -14798,6 +14814,7 @@ enum PolyConnectionCommand {
         enqueued_at: std::time::Instant,
     },
     Cancel {
+        cancel_trigger: CancelTrigger,
         instance_id: String,
         exchange: Exchange,
         client_order_id: String,
@@ -15781,12 +15798,21 @@ fn run_poly_connection_owner(
     lane_metrics: Arc<PolyConnectionLaneMetrics>,
     mut health_publisher: Option<SnapshotPublisher<LaneObservation>>,
     mut preparation_completion: Option<crate::preparation_schedule::Completion>,
+    prewarm_url: Arc<str>,
 ) {
     use hexagent_runtime::http1_pool::Role;
     crate::latency::prepare_polymarket_order_stages();
     crate::latency::prepare_thread_stages(&["polymarket.order.owner_preflight"]);
     let mut observation_sequence = 0u64;
     loop {
+        // The socket driver publishes retirement even while no business is in
+        // flight. Repair on the existing runtime before the next quote needs
+        // TLS; generation fencing and quarantine remain the admission authority.
+        if matches!(role, Role::Fast | Role::Cancel) && permit.instrumented_transport_closed()
+            && !permit.health_snapshot().quarantined
+        {
+            permit.current_pooled_client().note_instrumented_transport_failure(prewarm_url.to_string());
+        }
         if let Some(publisher) = health_publisher.as_mut() {
             let business = permit.business_outcome();
             let (failures, slow) = permit.business_outcome_totals();
@@ -15912,6 +15938,7 @@ fn run_poly_connection_owner(
                 }
             }
             PolyConnectionCommand::Cancel {
+                cancel_trigger,
                 instance_id,
                 exchange,
                 client_order_id,
@@ -15928,7 +15955,7 @@ fn run_poly_connection_owner(
                 let pending = match router.poly_route_mut(&instance_id) {
                     Ok(route) => {
                         route.set_gen_ns_hint(timestamp_ns);
-                        route.cancel_fire(&client_order_id, client)
+                        route.cancel_fire_with_trigger(&client_order_id, client, cancel_trigger)
                     }
                     Err(error) => {
                         error!("[Executor] Polymarket cancel owner route error: {error}");
@@ -16424,12 +16451,14 @@ fn dispatch_poly_signal_to_connection_owner(
             }
         }
         Signal::CancelOrder {
+            cancel_trigger,
             exchange,
             client_order_id,
             timestamp_ns,
             ..
         } if exchange == Exchange::Polymarket => {
             let command = PolyConnectionCommand::Cancel {
+                cancel_trigger,
                 instance_id,
                 exchange,
                 client_order_id,
@@ -16470,6 +16499,7 @@ fn dispatch_poly_signal_to_connection_owner(
             }
         }
         Signal::BatchCancelOrders {
+            cancel_trigger,
             exchange,
             client_order_ids,
             timestamp_ns,
@@ -16477,6 +16507,7 @@ fn dispatch_poly_signal_to_connection_owner(
         } if exchange == Exchange::Polymarket => {
             for client_order_id in client_order_ids {
                 let cancel = PolyConnectionCommand::Cancel {
+                    cancel_trigger,
                     instance_id: instance_id.clone(),
                     exchange,
                     client_order_id,
@@ -16500,6 +16531,7 @@ fn dispatch_poly_signal_to_connection_owner(
             }
         }
         Signal::BatchUpdateOrders {
+            cancel_trigger,
             exchange,
             cancel_client_order_ids,
             place_orders,
@@ -16507,6 +16539,7 @@ fn dispatch_poly_signal_to_connection_owner(
             ..
         }
         | Signal::ReplaceOrder {
+            cancel_trigger,
             exchange,
             cancel_client_order_ids,
             place_orders,
@@ -16536,6 +16569,7 @@ fn dispatch_poly_signal_to_connection_owner(
             }
             for client_order_id in cancel_client_order_ids {
                 let cancel = PolyConnectionCommand::Cancel {
+                    cancel_trigger,
                     instance_id: instance_id.clone(),
                     exchange,
                     client_order_id,
@@ -19241,6 +19275,7 @@ mod market_router_tests {
         );
 
         let cancel = Signal::CancelOrder {
+            cancel_trigger: Default::default(),
             exchange: Exchange::Hexmarket,
             client_order_id: "hex-coid-1".into(),
             instance_id: "instance-0".into(),
@@ -19254,6 +19289,7 @@ mod market_router_tests {
         let mut cancel_ids = OrderIdBatch::new();
         cancel_ids.push("hex-coid-1".into());
         let replace = Signal::BatchUpdateOrders {
+            cancel_trigger: Default::default(),
             exchange: Exchange::Hexmarket,
             market_id: "legacy-market-alias".into(),
             cancel_client_order_ids: cancel_ids,
@@ -19386,6 +19422,7 @@ mod market_router_tests {
     #[test]
     fn venue_cancel_failure_is_typed_and_never_silently_dropped() {
         let signal = Signal::CancelOrder {
+            cancel_trigger: Default::default(),
             exchange: Exchange::Hyperliquid,
             client_order_id: "cancel-me".into(),
             instance_id: "instance-0".into(),
@@ -19452,6 +19489,23 @@ mod market_router_tests {
                 QuoteTriggerSource::OrderBook(Exchange::Binance),
             );
         }
+    }
+
+    #[test]
+    fn cancel_only_callback_retains_its_own_trigger_without_a_place() {
+        let mut signals = [Signal::CancelOrder {
+            cancel_trigger: Default::default(), exchange: Exchange::Polymarket,
+            client_order_id: "cancel-existing".into(), instance_id: "btc".into(), timestamp_ns: 30,
+        }];
+        let trigger = OrderBookSnapshot { exchange: Exchange::Coinbase, symbol: "BTC-USD".into(),
+            bids: vec![], asks: vec![], exchange_timestamp_ns: 11, local_timestamp_ns: 22 };
+        stamp_quote_trigger(&mut signals, &trigger, false);
+        let Signal::CancelOrder { cancel_trigger, timestamp_ns, .. } = &signals[0] else { panic!() };
+        assert_eq!(*cancel_trigger, CancelTrigger { source: QuoteTriggerSource::OrderBook(Exchange::Coinbase), exchange_ns: 11, local_ns: 22 });
+        assert_eq!(*timestamp_ns, 30);
+        stamp_execution_requote(&mut signals, 44);
+        let Signal::CancelOrder { cancel_trigger, .. } = &signals[0] else { panic!() };
+        assert_eq!(*cancel_trigger, CancelTrigger { source: QuoteTriggerSource::ExecutionCapacityResume, exchange_ns: 0, local_ns: 44 });
     }
 
     fn direct_signal_fixture(capacity: usize) -> (SignalSender, LiveSignalIngress) {
@@ -19996,6 +20050,7 @@ mod market_router_tests {
         dispatch_poly_signal_to_connection_owner(
             Signal::NewOrder(order_req("new", "owner")), 0, sender.clone(), &mut routes);
         dispatch_poly_signal_to_connection_owner(Signal::CancelOrder {
+            cancel_trigger: Default::default(),
             exchange: Exchange::Polymarket, client_order_id: "resting".into(),
             instance_id: "owner".into(), timestamp_ns: now_ns(),
         }, 0, sender, &mut routes);
@@ -20039,6 +20094,7 @@ mod market_router_tests {
         };
         dispatch_poly_signal_to_connection_owner(
             Signal::ReplaceOrder {
+                cancel_trigger: Default::default(),
                 exchange: Exchange::Polymarket,
                 market_id: "market".into(),
                 cancel_client_order_ids: vec!["old-coid".into()].into_iter().collect(),
@@ -20086,6 +20142,7 @@ mod market_router_tests {
             ..Default::default()
         };
         let command = |coid: &str| PolyConnectionCommand::Cancel {
+            cancel_trigger: Default::default(),
             instance_id: "zhu-03".into(),
             exchange: Exchange::Polymarket,
             client_order_id: coid.into(),
@@ -20291,6 +20348,7 @@ mod market_router_tests {
             .cooldown_until_ns
             .store(now_ns().saturating_add(5_000_000_000), Ordering::Release);
         let command = |coid: &str| PolyConnectionCommand::Cancel {
+            cancel_trigger: Default::default(),
             instance_id: "zhu-03".into(),
             exchange: Exchange::Polymarket,
             client_order_id: coid.into(),
@@ -20651,6 +20709,7 @@ mod market_router_tests {
         let mut queue_peak = 0usize;
         for index in 0..EVENTS {
             let command = PolyConnectionCommand::Cancel {
+                cancel_trigger: Default::default(),
                 instance_id: "profile".into(),
                 exchange: Exchange::Polymarket,
                 client_order_id: index.to_string(),
@@ -20722,6 +20781,7 @@ mod market_router_tests {
         };
         dispatch_poly_signal_to_connection_owner(
             Signal::ReplaceOrder {
+                cancel_trigger: Default::default(),
                 exchange: Exchange::Polymarket,
                 market_id: "market".into(),
                 cancel_client_order_ids: vec!["old-a".into(), "old-b".into()].into_iter().collect(),

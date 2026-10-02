@@ -4243,6 +4243,7 @@ mod tests {
 
     fn reprice_signal(cancel_coid: &str, place_coid: &str) -> Signal {
         Signal::BatchUpdateOrders {
+            cancel_trigger: Default::default(),
             exchange: Exchange::Polymarket,
             market_id: String::new(),
             cancel_client_order_ids: [cancel_coid.to_string()].into_iter().collect(),
@@ -5017,6 +5018,7 @@ mod tests {
 
     fn cancel_signal(coid: &str, timestamp_ns: u64) -> Signal {
         Signal::CancelOrder {
+            cancel_trigger: Default::default(),
             exchange: Exchange::Polymarket,
             client_order_id: coid.into(),
             instance_id: String::new(),
@@ -5892,6 +5894,7 @@ mod tests {
 
     fn owned_cancel_signal(coid: &str, timestamp_ns: u64) -> Signal {
         Signal::CancelOrder {
+            cancel_trigger: Default::default(),
             exchange: Exchange::Polymarket,
             client_order_id: coid.into(),
             instance_id: "one".into(),
@@ -6730,12 +6733,14 @@ mod tests {
         let exchange = Exchange::Binance;
         let signals = [
             Signal::CancelOrder {
+                cancel_trigger: Default::default(),
                 exchange,
                 client_order_id: "venue".into(),
                 instance_id: "one".into(),
                 timestamp_ns: 10,
             },
             Signal::BatchCancelOrders {
+                cancel_trigger: Default::default(),
                 exchange,
                 market_id: String::new(),
                 client_order_ids: ["venue".into()].into_iter().collect(),
@@ -6743,6 +6748,7 @@ mod tests {
                 timestamp_ns: 10,
             },
             Signal::BatchUpdateOrders {
+                cancel_trigger: Default::default(),
                 exchange,
                 market_id: String::new(),
                 cancel_client_order_ids: ["venue".into()].into_iter().collect(),
@@ -6751,6 +6757,7 @@ mod tests {
                 timestamp_ns: 10,
             },
             Signal::ReplaceOrder {
+                cancel_trigger: Default::default(),
                 exchange,
                 market_id: String::new(),
                 cancel_client_order_ids: ["venue".into()].into_iter().collect(),

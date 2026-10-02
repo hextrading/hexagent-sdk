@@ -165,6 +165,27 @@ fn is_retryable_relayer_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<RetryableRelayerError>().is_some()
 }
 
+/// A POST may have taken effect. Preserve this marker even when a subsequent
+/// identical retry returns a definite 4xx; that 4xx cannot undo the first POST.
+#[derive(Debug)]
+struct AmbiguousWalletSubmit(String);
+impl std::fmt::Display for AmbiguousWalletSubmit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+impl std::error::Error for AmbiguousWalletSubmit {}
+pub(crate) fn wallet_submit_is_ambiguous(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<AmbiguousWalletSubmit>().is_some()
+}
+fn ambiguous_wallet_error(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(AmbiguousWalletSubmit(error.to_string()))
+}
+fn wallet_submission_conflict(text: &str) -> bool {
+    text.contains("wallet busy") || text.contains("nonce already")
+        || text.contains("nonce has already") || text.contains("nonce too low")
+        || text.contains("invalid nonce")
+        || (text.contains("batch nonce") && text.contains("does not match on-chain nonce"))
+}
+
 struct Call {
     target: String,
     data: String, // 0x-hex calldata; value is always 0
@@ -534,6 +555,20 @@ fn find_wallet_action_by_signer_nonce(
     Ok(best)
 }
 
+fn action_matches_wallet_batch(action: &serde_json::Value, dw: &str, calls: &[Call]) -> bool {
+    let Some(params) = action.get("depositWalletParams") else { return false; };
+    if !params.get("depositWallet").and_then(serde_json::Value::as_str)
+        .is_some_and(|wallet| wallet.eq_ignore_ascii_case(dw)) { return false; }
+    let Some(observed) = params.get("calls").and_then(serde_json::Value::as_array) else { return false; };
+    observed.len() == calls.len() && observed.iter().zip(calls).all(|(actual, expected)| {
+        actual.get("target").and_then(serde_json::Value::as_str)
+            .is_some_and(|v| v.eq_ignore_ascii_case(&expected.target))
+        && actual.get("data").and_then(serde_json::Value::as_str)
+            .is_some_and(|v| v.eq_ignore_ascii_case(&expected.data))
+        && actual.get("value").is_none_or(|v| v.as_u64() == Some(0) || v.as_str() == Some("0"))
+    })
+}
+
 fn action_matches_dw_split(
     action: &serde_json::Value,
     signer: &str,
@@ -786,6 +821,33 @@ pub(crate) fn recover_dw_split_job_id(
     recover_dw_split_onchain_hash(deposit_wallet, condition_id, amount_wei, operation_id)
 }
 
+/// Recover the exact pre-POST nonce before the legacy operation fingerprint.
+/// The journal survives response loss, process restart and delayed indexing.
+pub(crate) fn recover_journaled_dw_split(
+    builder_auth: &PolyAuth, signer: &str, deposit_wallet: &str,
+    condition_id: &str, amount_wei: u128, operation_id: &str,
+    submission: &hexagent_account::account::shared_account::MaintenanceWalletSubmission,
+) -> Result<Option<String>> {
+    if !submission.signer.eq_ignore_ascii_case(signer)
+        || !submission.deposit_wallet.eq_ignore_ascii_case(deposit_wallet)
+    { return Err(anyhow!("WALLET journal owner/wallet mismatch for {operation_id}")); }
+    let nonce = submission.nonce.parse::<u128>()?;
+    if let Some(action) = find_wallet_action_by_signer_nonce(builder_auth, signer, nonce)? {
+        if action.get("depositWalletParams").is_some() {
+            let expected = [Call { target: CTF_COLLATERAL_ADAPTER.to_string(),
+                data: split_position_calldata(PUSD_TOKEN, condition_id, amount_wei) }];
+            if !action_matches_wallet_batch(&action, deposit_wallet, &expected)
+            { return Err(anyhow!("WALLET journal nonce matched a different split for {operation_id}")); }
+            return Ok(action.get("transactionID").and_then(serde_json::Value::as_str).map(str::to_string));
+        }
+        // Flattened nonce-only responses do not prove the economic operation.
+        // Require the exact PositionSplit event below before allocating shares.
+    }
+    // No fresh nonce or POST here. The existing unique on-chain event proof
+    // fails closed if multiple identical splits fall inside the intent window.
+    recover_dw_split_onchain_hash(deposit_wallet, condition_id, amount_wei, operation_id)
+}
+
 /// Execute an ambiguous WALLET submission safely.
 ///
 /// A transport error, transient HTTP response, or malformed 2xx body does not
@@ -809,20 +871,20 @@ where
     Lookup: FnMut() -> Result<Option<serde_json::Value>>,
     Sleep: FnMut(std::time::Duration),
 {
+    let mut prior_ambiguous = false;
     for submit_attempt in 1..=WALLET_POST_ATTEMPTS {
         let submit_error = match submit() {
             Ok(json) => return Ok(json),
             Err(error) => error,
         };
         let error_text = submit_error.to_string().to_ascii_lowercase();
-        let submission_conflict = error_text.contains("wallet busy")
-            || error_text.contains("nonce already")
-            || error_text.contains("nonce has already")
-            || error_text.contains("nonce too low")
-            || error_text.contains("invalid nonce");
-        if !is_retryable_relayer_error(&submit_error) && !submission_conflict {
+        let submission_conflict = wallet_submission_conflict(&error_text);
+        let ambiguous = is_retryable_relayer_error(&submit_error) || submission_conflict;
+        if !ambiguous && !prior_ambiguous {
             return Err(submit_error);
         }
+        let stop_after_lookup = !ambiguous || submission_conflict;
+        prior_ambiguous = true;
 
         log::warn!(
             "[Relayer] WALLET submit outcome uncertain signer={} nonce={} \
@@ -886,8 +948,8 @@ where
 
         // A busy/nonce conflict is positive evidence that another action may
         // own this nonce. If it still cannot be identified, do not POST again.
-        if submission_conflict || submit_attempt == WALLET_POST_ATTEMPTS {
-            return Err(submit_error);
+        if stop_after_lookup || submit_attempt == WALLET_POST_ATTEMPTS {
+            return Err(ambiguous_wallet_error(submit_error));
         }
 
         log::warn!(
@@ -1030,7 +1092,7 @@ fn wallet_busy_error(
 }
 
 /// Sign + submit a relayer `type:"WALLET"` batch. Returns the tx id.
-fn submit_wallet_batch_with_hook<F>(
+fn submit_wallet_batch_with_hook<F, G>(
     key: &SigningKey,
     eoa: &str,
     dw: &str,
@@ -1038,10 +1100,12 @@ fn submit_wallet_batch_with_hook<F>(
     calls: &[Call],
     gate_maintenance_until_started: bool,
     dry_run: bool,
+    mut on_prepared: G,
     mut on_submitted: F,
 ) -> Result<String>
 where
     F: FnMut(&str) -> Result<()>,
+    G: FnMut(hexagent_account::account::shared_account::MaintenanceWalletSubmission) -> Result<()>,
 {
     // The owner grants one lossless lease per signer. Different accounts stay
     // concurrent; network I/O no longer runs while holding a mutex.
@@ -1068,22 +1132,24 @@ where
     // even after the create tx polls STATE_CONFIRMED (observed 2026-07-14:
     // the first batch for a fresh deposit wallet 400'd "wallet … is not
     // registered"). That rejection is transient — retry it on a fixed 5s
-    // backoff for up to ~90s. Every rejected attempt fetches a fresh relayer
-    // WALLET nonce and rebuilds deadline, digest, and batch signature.
-    // Any ambiguous error is reconciled by exact signer+nonce before retrying
-    // the byte-identical batch. A fresh nonce is used only for the definite
-    // "wallet not registered" rejection, where the relayer did not accept the
-    // action.
+    // backoff for up to ~90s. Keep the same signed nonce/body through registry
+    // retries as well: the pre-POST durable intent identifies one attempt even
+    // if a later retry loses its response. Only HTTP auth headers are refreshed.
     const REGISTRY_RETRIES: u32 = 18;
+    let nonce = relayer_wallet_nonce(builder_auth, eoa)?;
+    let deadline = now_secs()? + BATCH_DEADLINE_SECS;
+    let body_str = build_wallet_batch_body(key, eoa, dw, calls, nonce, deadline)?;
+    if dry_run {
+        println!("   (dry-run) nonce={} deadline={} batch={}", nonce, deadline, body_str);
+        return Ok(String::new());
+    }
+    on_prepared(hexagent_account::account::shared_account::MaintenanceWalletSubmission {
+        signer: eoa.to_ascii_lowercase(), deposit_wallet: dw.to_ascii_lowercase(),
+        nonce: nonce.to_string(), body_hash: hex::encode(keccak256(body_str.as_bytes())),
+        deadline_secs: deadline,
+    })?;
     let mut attempt = 0u32;
     let (json, submitted_nonce) = loop {
-        let nonce = relayer_wallet_nonce(builder_auth, eoa)?;
-        let deadline = now_secs()? + BATCH_DEADLINE_SECS;
-        let body_str = build_wallet_batch_body(key, eoa, dw, calls, nonce, deadline)?;
-        if dry_run {
-            println!("   (dry-run) nonce={} deadline={} batch={}", nonce, deadline, body_str);
-            return Ok(String::new());
-        }
         let submit_result = submit_with_ambiguous_recovery(
             eoa,
             nonce,
@@ -1106,12 +1172,15 @@ where
                 }
                 Ok(json)
             },
-            || find_wallet_action_by_signer_nonce(builder_auth, eoa, nonce),
+            || {
+                Ok(find_wallet_action_by_signer_nonce(builder_auth, eoa, nonce)?
+                    .filter(|action| action_matches_wallet_batch(action, dw, calls)))
+            },
             std::thread::sleep,
         );
         match submit_result {
             Ok(json) => break (json, nonce),
-            Err(e) if attempt < REGISTRY_RETRIES && e.to_string().contains("is not registered") => {
+            Err(e) if !wallet_submit_is_ambiguous(&e) && attempt < REGISTRY_RETRIES && e.to_string().contains("is not registered") => {
                 attempt += 1;
                 println!(
                     "   relayer wallet registry not ready yet — retry {}/{} in 5s …",
@@ -1119,7 +1188,7 @@ where
                 );
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }
-            Err(e) if e.to_string().contains("wallet busy") => {
+            Err(e) if !wallet_submit_is_ambiguous(&e) && e.to_string().contains("wallet busy") => {
                 return Err(wallet_busy_error(builder_auth, eoa, nonce, e));
             }
             Err(e) => return Err(e),
@@ -1161,7 +1230,7 @@ fn submit_wallet_batch(
     calls: &[Call], gate_maintenance_until_started: bool, dry_run: bool,
 ) -> Result<String> {
     submit_wallet_batch_with_hook(
-        key, eoa, dw, builder_auth, calls, gate_maintenance_until_started, dry_run, |_| Ok(()),
+        key, eoa, dw, builder_auth, calls, gate_maintenance_until_started, dry_run, |_| Ok(()), |_| Ok(()),
     )
 }
 
@@ -1260,17 +1329,19 @@ fn redeem_calldata(collateral: &str, condition_id: &str) -> String {
 /// Split `amount_wei` pUSD → Up+Down shares FROM the deposit wallet, via a
 /// `splitPosition` on the CTF in a relayer WALLET batch. Blocks until the
 /// tx confirms; returns the tx id (Err on submit/confirm failure).
-pub(crate) fn dw_split<F>(
+pub(crate) fn dw_split<F, G>(
     key: &SigningKey,
     eoa: &str,
     dw: &str,
     builder_auth: &PolyAuth,
     condition_id: &str,
     amount_wei: u128,
+    on_prepared: G,
     on_submitted: F,
 ) -> Result<String>
 where
     F: FnMut(&str) -> Result<()>,
+    G: FnMut(hexagent_account::account::shared_account::MaintenanceWalletSubmission) -> Result<()>,
 {
     // Split VIA the CtfCollateralAdapter (not the CTF directly): the adapter
     // pulls pUSD, unwraps to USDC.e, and mints USDC.e-space outcome tokens — the
@@ -1289,6 +1360,7 @@ where
         &calls,
         /*gate_maintenance_until_started=*/ true,
         /*dry_run=*/ false,
+        on_prepared,
         on_submitted,
     )
 }
@@ -2420,6 +2492,55 @@ mod derive_tests {
     }
 
     #[test]
+    fn nonce_mismatch_after_response_loss_preserves_pending_until_late_index() {
+        for late_index in [false, true] {
+            let mut posts = 0;
+            let mut lookups = 0;
+            let result = submit_with_ambiguous_recovery("signer", 10832, || {
+                posts += 1;
+                if posts == 1 { Err(retryable_relayer_error("response lost")) }
+                else { Err(anyhow!("batch nonce 10832 does not match on-chain nonce 10833")) }
+            }, || {
+                lookups += 1;
+                Ok((late_index && lookups == 4).then(|| serde_json::json!({
+                    "transactionID": "original-action", "state": "STATE_CONFIRMED"
+                })))
+            }, |_| {});
+            assert_eq!(posts, 2);
+            if late_index { assert_eq!(result.unwrap()["transactionID"], "original-action"); }
+            else { assert!(wallet_submit_is_ambiguous(&result.unwrap_err())); }
+        }
+    }
+
+    #[test]
+    fn definite_retry_rejection_cannot_erase_prior_ambiguous_post() {
+        let mut posts = 0;
+        let mut lookups = 0;
+        let error = submit_with_ambiguous_recovery("signer", 9, || {
+            posts += 1;
+            if posts == 1 { Err(retryable_relayer_error("timeout")) }
+            else { Err(anyhow!("bad signature 400")) }
+        }, || { lookups += 1; Ok(None) }, |_| {}).unwrap_err();
+        assert_eq!(posts, 2);
+        assert_eq!(lookups, 6);
+        assert!(wallet_submit_is_ambiguous(&error));
+    }
+
+    #[test]
+    fn exhausted_ambiguous_post_and_first_nonce_conflict_stay_pending() {
+        for message in ["timeout", "batch nonce 8 does not match on-chain nonce 9"] {
+            let mut posts = 0;
+            let result = submit_with_ambiguous_recovery("signer", 8, || {
+                posts += 1;
+                if message == "timeout" { Err(retryable_relayer_error(message)) }
+                else { Err(anyhow!(message)) }
+            }, || Ok(None), |_| {});
+            assert!(wallet_submit_is_ambiguous(&result.unwrap_err()));
+            assert_eq!(posts, if message == "timeout" { WALLET_POST_ATTEMPTS } else { 1 });
+        }
+    }
+
+    #[test]
     fn definite_wallet_submit_rejection_is_not_retried_or_reconciled() {
         let mut lookup_calls = 0;
         let result = submit_with_ambiguous_recovery(
@@ -2447,6 +2568,23 @@ mod derive_tests {
             wallet_action_recovery_rank(&serde_json::json!({"state": "STATE_EXECUTED"}))
                 > wallet_action_recovery_rank(&serde_json::json!({"state": "STATE_INVALID"}))
         );
+    }
+
+    #[test]
+    fn nonce_lookup_requires_exact_wallet_and_call_payload() {
+        let calls = [Call { target: "0xABCD".into(), data: "0x1234".into() }];
+        let valid = serde_json::json!({"depositWalletParams": {"depositWallet":"0xBEEF", "calls":[{"target":"0xabcd","data":"0x1234","value":"0"}]}});
+        assert!(action_matches_wallet_batch(&valid, "0xbeef", &calls));
+        assert!(!action_matches_wallet_batch(&valid, "0xother", &calls));
+        assert!(!action_matches_wallet_batch(&serde_json::json!({"nonce":"10832","transactionID":"unrelated"}), "0xbeef", &calls));
+        for field in ["target", "data", "value"] {
+            let mut wrong = valid.clone();
+            wrong["depositWalletParams"]["calls"][0][field] = "0x9999".into();
+            assert!(!action_matches_wallet_batch(&wrong, "0xbeef", &calls));
+        }
+        let mut extra = valid.clone();
+        extra["depositWalletParams"]["calls"].as_array_mut().unwrap().push(valid["depositWalletParams"]["calls"][0].clone());
+        assert!(!action_matches_wallet_batch(&extra, "0xbeef", &calls));
     }
 
     #[test]

@@ -2230,6 +2230,7 @@ enum LifecycleEvidence {
 
 #[derive(Debug)]
 struct AttemptAuditJob {
+    cancel_trigger: CancelTrigger,
     attempt: crate::http1_pool::AttemptTraceSnapshot,
     kind: &'static str,
     /// Execution-route owner, also present for cancels that have no placement
@@ -2239,8 +2240,8 @@ struct AttemptAuditJob {
     /// Immutable placement inputs copied only after the HTTP reply reaches the
     /// completion worker.  Keeping these on the bounded audit lane makes a
     /// live order attempt reproducible without formatting or allocating on the
-    /// strategy quote thread.  Cancels join back to their place by `coid` and
-    /// therefore carry `None` here.
+    /// strategy quote thread. Cancels carry `None` here; their causal clocks
+    /// come from `cancel_trigger`, never from the old order's placement.
     order: Option<AttemptOrderReplica>,
     client_order_id: String,
     exchange_order_id: Option<String>,
@@ -2351,9 +2352,9 @@ impl OrderAttemptRecorder {
                 "post_only": order.map(|order| order.post_only),
                 "reduce_only": order.map(|order| order.reduce_only),
                 "fee_rate_bps": order.map(|order| order.fee_rate_bps),
-                "trigger_source": order.map(|order| order.trigger_source.to_string()),
-                "trigger_exchange_ns": order.map(|order| order.trigger_exchange_ns),
-                "trigger_local_ns": order.map(|order| order.trigger_local_ns),
+                "trigger_source": order.map(|order| order.trigger_source).or_else(|| (job.cancel_trigger.local_ns != 0).then_some(job.cancel_trigger.source)).map(|source| source.to_string()),
+                "trigger_exchange_ns": order.map(|order| order.trigger_exchange_ns).or_else(|| (job.cancel_trigger.exchange_ns != 0).then_some(job.cancel_trigger.exchange_ns)),
+                "trigger_local_ns": order.map(|order| order.trigger_local_ns).or_else(|| (job.cancel_trigger.local_ns != 0).then_some(job.cancel_trigger.local_ns)),
                 "coid": job.client_order_id,
                 "oid": job.exchange_order_id,
                 "status": format!("{:?}", job.status),
@@ -5115,6 +5116,7 @@ impl SharedState {
         attempt: &crate::http1_pool::AttemptTraceHandle,
         kind: &'static str,
         order: Option<&OrderRequest>,
+        cancel_trigger: CancelTrigger,
         route_instance_id: &str,
         client_order_id: &str,
         exchange_order_id: Option<&str>,
@@ -5140,6 +5142,7 @@ impl SharedState {
             elapsed_ns,
         );
         let job = AttemptAuditJob {
+            cancel_trigger,
             attempt,
             kind,
             route_instance_id: route_instance_id.to_string(),
@@ -6831,6 +6834,7 @@ pub struct PendingSubmit {
 /// Produced by [`PolymarketTrade::cancel_fire`], consumed by
 /// [`PolymarketTrade::complete_cancel`].
 pub struct PendingCancel {
+    cancel_trigger: CancelTrigger,
     ctx: CancelCtx,
     rx: Option<HttpReplyReceiver>,
     timing: Option<Arc<HttpCompletionTiming>>,
@@ -11640,6 +11644,7 @@ impl PolymarketTrade {
             &attempt,
             "place",
             Some(order),
+            CancelTrigger::default(),
             &self.instance_id,
             &order.client_order_id,
             Some(&local_oid),
@@ -11656,6 +11661,15 @@ impl PolymarketTrade {
         &mut self,
         client_order_id: &str,
         client: crate::http1_pool::PooledClient,
+    ) -> PendingCancel {
+        self.cancel_fire_with_trigger(client_order_id, client, CancelTrigger::default())
+    }
+
+    pub fn cancel_fire_with_trigger(
+        &mut self,
+        client_order_id: &str,
+        client: crate::http1_pool::PooledClient,
+        cancel_trigger: CancelTrigger,
     ) -> PendingCancel {
         let signal_ns = self.gen_ns_hint;
         let prep_ns = now_ns();
@@ -11698,6 +11712,10 @@ impl PolymarketTrade {
             attempt.mark_dispatched(dispatched_ns);
         }
         if dispatched_ns > 0 {
+            if cancel_trigger.local_ns > 0 {
+                crate::latency::record_ns("polymarket.cancel.trigger_to_dispatch",
+                    dispatched_ns.saturating_sub(cancel_trigger.local_ns));
+            }
             crate::latency::record_ns(
                 "polymarket.cancel.attempt_signal_to_prep",
                 prep_ns.saturating_sub(signal_ns),
@@ -11708,6 +11726,7 @@ impl PolymarketTrade {
             );
         }
         PendingCancel {
+            cancel_trigger,
             ctx,
             rx,
             timing,
@@ -11724,6 +11743,7 @@ impl PolymarketTrade {
         pending: PendingCancel,
     ) -> OrderUpdate {
         let PendingCancel {
+            cancel_trigger,
             ctx,
             rx,
             timing,
@@ -11765,6 +11785,7 @@ impl PolymarketTrade {
                 attempt,
                 "cancel",
                 None,
+                cancel_trigger,
                 &self.instance_id,
                 client_order_id,
                 update.exchange_order_id.as_deref(),

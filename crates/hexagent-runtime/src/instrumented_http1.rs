@@ -35,6 +35,7 @@ struct ConnectTrace {
     io: IoTrace,
     attempts: AtomicU64,
     generation: AtomicU64,
+    closed_generation: AtomicU64,
     reuse_generation_reported: AtomicU64,
     dns_ns: AtomicU64,
     dns_tcp_ns: AtomicU64,
@@ -562,6 +563,13 @@ impl InstrumentedHttp1Client {
         }
     }
 
+    /// Published by the driver on stream retirement. Unknown/unconnected is
+    /// distinct from a formerly warm generation that has closed.
+    pub fn transport_closed(&self) -> bool {
+        let generation = self.trace.generation.load(Ordering::Acquire);
+        generation != 0 && self.trace.closed_generation.load(Ordering::Acquire) >= generation
+    }
+
     pub fn connection_snapshot(&self) -> Http1ConnectionSnapshot {
         Http1ConnectionSnapshot {
             connect_generation: self.trace.generation.load(Ordering::Acquire),
@@ -874,6 +882,26 @@ mod tests {
         stream
     }
 
+    #[test]
+    fn retiring_socket_watermark_does_not_invalidate_new_generation() {
+        let client = InstrumentedHttp1Client::new(Duration::from_secs(1)).unwrap();
+        assert!(!client.transport_closed());
+        client.trace.generation.store(2, Ordering::Release);
+        let socket = |generation| TimedIo {
+            inner: (), trace: Arc::clone(&client.trace), generation, flush_pending: false,
+            #[cfg(target_os = "linux")]
+            socket_fd: -1,
+        };
+        drop(socket(1));
+        assert!(!client.transport_closed());
+        drop(socket(2));
+        assert!(client.transport_closed());
+        client.trace.generation.store(3, Ordering::Release);
+        assert!(!client.transport_closed());
+        drop(socket(1));
+        assert!(!client.transport_closed());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn generation_distinguishes_reuse_from_transparent_reconnect() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -912,6 +940,10 @@ mod tests {
         assert!(reused.timings.first_reuse_for_generation);
         assert_eq!(reused.timings.connect_generation_before, 1);
         assert_eq!(reused.timings.connect_generation_after, 1);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client.transport_closed() { tokio::task::yield_now().await; }
+        }).await.expect("Connection: close must retire idle generation without another request");
 
         let reconnected = request().await.unwrap();
         assert!(reconnected.timings.transparent_reconnect());

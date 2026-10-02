@@ -24,6 +24,7 @@ fn fixture(
 
 fn command(iid: &str, coid: &str, sender: &ExecutorUpdateSender) -> PolyConnectionCommand {
     PolyConnectionCommand::Cancel {
+        cancel_trigger: Default::default(),
         instance_id: iid.into(),
         exchange: Exchange::Polymarket,
         client_order_id: coid.into(),
@@ -167,5 +168,28 @@ fn repeated_cancel_admission_latency_profile() {
         s.sort_unstable();
         let n = s.len();
         eprintln!("repeat_cancel version={version} n={n} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_high_water={} overflow=0 boundary=dispatcher_admission excludes=command_construction_http_response_scheduling", s[n/2], s[n*99/100], s[n*999/1000], s[n-1], peak[version]);
+    }
+}
+
+#[test]
+fn cancel_cause_survives_fifo_coalescing_and_owner_routing() {
+    let (mut routes, receivers, sender) = fixture(1);
+    let origin = CancelTrigger { source: QuoteTriggerSource::OrderBook(Exchange::Binance), exchange_ns: 100, local_ns: 101 };
+    let mut first = command("a", "active", &sender);
+    if let PolyConnectionCommand::Cancel { cancel_trigger, .. } = &mut first { *cancel_trigger = origin; }
+    assert!(send_poly_owner_lossless(&mut routes, Role::Cancel, first).is_ok());
+    let queued = |iid: &str, local_ns| {
+        let mut item = command(iid, "queued", &sender);
+        if let PolyConnectionCommand::Cancel { cancel_trigger, .. } = &mut item { *cancel_trigger = CancelTrigger { local_ns, ..origin }; }
+        item
+    };
+    assert!(send_poly_owner_lossless(&mut routes, Role::Cancel, queued("a", 200)).is_ok());
+    assert!(send_poly_owner_lossless(&mut routes, Role::Cancel, queued("a", 300)).is_ok());
+    assert!(send_poly_owner_lossless(&mut routes, Role::Cancel, queued("b", 400)).is_ok());
+    assert!(matches!(receivers[0].recv().unwrap(), PolyConnectionCommand::Cancel { cancel_trigger, .. } if cancel_trigger == origin));
+    for (iid, local_ns) in [("a", 200), ("b", 400)] {
+        routes.cancel[0].metrics.release_for_test();
+        flush_poly_cancel_outbox(&mut routes);
+        assert!(matches!(receivers[0].recv().unwrap(), PolyConnectionCommand::Cancel { instance_id, cancel_trigger, .. } if instance_id == iid && cancel_trigger.local_ns == local_ns));
     }
 }

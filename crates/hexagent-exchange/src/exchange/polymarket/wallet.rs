@@ -4385,14 +4385,17 @@ fn recover_pending_maintenance_operations(
             };
             let total: f64 = operation.allocations.values().copied().sum();
             let amount_wei = (total * 1_000_000.0).round().max(0.0) as u128;
-            let recovered = super::deposit_wallet::recover_dw_split_job_id(
-                &wallet.builder_auth,
-                &wallet.signer_address,
-                deposit_wallet,
-                &operation.condition_id,
-                amount_wei,
-                &operation.operation_id,
-            )
+            let recovered = if let Some(submission) = &operation.wallet_submission {
+                super::deposit_wallet::recover_journaled_dw_split(
+                    &wallet.builder_auth, &wallet.signer_address, deposit_wallet,
+                    &operation.condition_id, amount_wei, &operation.operation_id, submission,
+                )
+            } else {
+                super::deposit_wallet::recover_dw_split_job_id(
+                    &wallet.builder_auth, &wallet.signer_address, deposit_wallet,
+                    &operation.condition_id, amount_wei, &operation.operation_id,
+                )
+            }
             .map_err(|error| {
                 format!(
                     "query DW split job for operation {}: {error}",
@@ -4598,6 +4601,15 @@ fn run_split_one(
             &wallet.builder_auth,
             condition_id,
             amount_wei,
+            |submission| {
+                if let Some((account, operation_id)) = journal {
+                    account.prepare_maintenance_wallet_submission(operation_id, submission)
+                        .map_err(anyhow::Error::msg)?;
+                    account.flush_persistence(std::time::Duration::from_secs(2))
+                        .map_err(anyhow::Error::msg)?;
+                }
+                Ok(())
+            },
             |tx_id| {
                 accepted_tx_id = Some(tx_id.to_string());
                 let Some((account, operation_id)) = journal else {
@@ -4620,7 +4632,7 @@ fn run_split_one(
                 );
                 SplitOutcome::Confirmed
             }
-            Err(error) if accepted_tx_id.is_some() => {
+            Err(error) if accepted_tx_id.is_some() || super::deposit_wallet::wallet_submit_is_ambiguous(&error) => {
                 let tx_id = accepted_tx_id.unwrap_or_default();
                 if let Some((account, operation_id)) = journal {
                     account.mark_maintenance_operation_uncertain(
@@ -4630,7 +4642,7 @@ fn run_split_one(
                     let _ = account.flush_persistence(std::time::Duration::from_secs(2));
                 }
                 log::warn!(
-                    "[Maintenance] DW split accepted but not committed cid={} tx={}: {}",
+                    "[Maintenance] DW split outcome pending cid={} tx={}: {}",
                     cid_short,
                     tx_id,
                     error,
@@ -6429,6 +6441,7 @@ mod maintenance_status_tests {
             operation_id: "original".into(), kind: MaintenanceOperationKind::Split,
             condition_id: "event".into(), up_token_id: "UP".into(), down_token_id: "DOWN".into(),
             allocations: [("btc01".into(), 40.0)].into(), tx_id: Some("tx".into()),
+            wallet_submission: None,
             status: MaintenanceOperationStatus::Uncertain, created_at_ms: 1, updated_at_ms: 2, detail: None,
         };
         let tokens = vec!["UP".into(), "DOWN".into()];

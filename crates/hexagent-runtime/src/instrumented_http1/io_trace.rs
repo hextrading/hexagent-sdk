@@ -198,6 +198,14 @@ impl<T> TimedIo<T> {
     }
 }
 
+impl<T> Drop for TimedIo<T> {
+    fn drop(&mut self) {
+        // A retiring old socket must not invalidate a newer connection. This
+        // per-client monotone watermark crosses to readers as a compact value.
+        self.trace.closed_generation.fetch_max(self.generation, Ordering::Release);
+    }
+}
+
 impl<T: Connection> Connection for TimedIo<T> {
     fn connected(&self) -> Connected {
         self.inner.connected()

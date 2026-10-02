@@ -653,6 +653,11 @@ enum AccountOwnerOperation {
         allocations: HashMap<String, f64>,
         reply: crossbeam_channel::Sender<Result<(), ReservationError>>,
     },
+    PrepareMaintenanceWalletSubmission {
+        operation_id: String,
+        submission: MaintenanceWalletSubmission,
+        reply: crossbeam_channel::Sender<Result<(), String>>,
+    },
     MarkMaintenanceOperationSubmitted {
         operation_id: String,
         tx_id: String,
@@ -1005,6 +1010,9 @@ impl AccountOwnerCommand {
                     &allocations,
                     false,
                 ));
+            }
+            PrepareMaintenanceWalletSubmission { operation_id, submission, reply } => {
+                let _ = reply.send(account.prepare_maintenance_wallet_submission(&operation_id, submission));
             }
             MarkMaintenanceOperationSubmitted {
                 operation_id,
@@ -2982,6 +2990,17 @@ pub enum MaintenanceOperationStatus {
     Failed,
 }
 
+/// Cold maintenance owner journal, durably written before a WALLET POST.
+/// No signed body or authentication material is persisted here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceWalletSubmission {
+    pub signer: String,
+    pub deposit_wallet: String,
+    pub nonce: String,
+    pub body_hash: String,
+    pub deadline_secs: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MaintenanceOperation {
     pub operation_id: String,
@@ -2991,6 +3010,8 @@ pub struct MaintenanceOperation {
     pub down_token_id: String,
     pub allocations: BTreeMap<String, f64>,
     pub tx_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet_submission: Option<MaintenanceWalletSubmission>,
     pub status: MaintenanceOperationStatus,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -16250,6 +16271,7 @@ impl SharedAccount {
                     .map(|(instance, amount)| (instance.clone(), *amount))
                     .collect(),
                 tx_id: None,
+                wallet_submission: None,
                 status: MaintenanceOperationStatus::Reserved,
                 created_at_ms: now_ms,
                 updated_at_ms: now_ms,
@@ -16273,6 +16295,45 @@ impl SharedAccount {
                 return Err(error);
             }
         }
+        Ok(())
+    }
+
+    /// Called only by cold maintenance workers; the account owner is the sole
+    /// writer and the existing bounded command lane preserves ordering. The
+    /// caller must flush persistence before POST. Conflicting intent fails closed.
+    pub fn prepare_maintenance_wallet_submission(
+        &self,
+        operation_id: &str,
+        submission: MaintenanceWalletSubmission,
+    ) -> Result<(), String> {
+        if self.must_dispatch_to_account_owner() {
+            let operation_id = operation_id.to_string();
+            return self.request_account_owner(|reply| {
+                AccountOwnerCommand(AccountOwnerOperation::PrepareMaintenanceWalletSubmission {
+                    operation_id, submission, reply,
+                })
+            })?;
+        }
+        if submission.signer.is_empty() || submission.deposit_wallet.is_empty()
+            || submission.nonce.parse::<u128>().is_err() || submission.body_hash.len() != 64
+            || !submission.body_hash.bytes().all(|b| b.is_ascii_hexdigit())
+            || submission.deadline_secs == 0
+        {
+            return Err("invalid maintenance WALLET submission identity".into());
+        }
+        let mut state = self.lock_state();
+        let operation = state.maintenance_ops.get_mut(operation_id)
+            .ok_or_else(|| format!("unknown maintenance operation `{operation_id}`"))?;
+        if matches!(operation.status, MaintenanceOperationStatus::Confirmed | MaintenanceOperationStatus::Failed) {
+            return Err(format!("maintenance operation `{operation_id}` is terminal"));
+        }
+        if let Some(existing) = &operation.wallet_submission {
+            return if existing == &submission { Ok(()) }
+                else { Err(format!("maintenance operation `{operation_id}` WALLET intent conflict")) };
+        }
+        operation.wallet_submission = Some(submission);
+        operation.updated_at_ms = wall_clock_ms();
+        self.schedule_control_entry(&state, "maintenance_ops", operation_id, state.maintenance_ops.get(operation_id));
         Ok(())
     }
 
@@ -29640,6 +29701,52 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
         assert_eq!(instance.reservation_scope_version, 1);
         assert_eq!(repairs.len(), 1);
         assert!(validate_persisted_state("acct", &state).is_ok());
+    }
+
+    #[test]
+    fn prepared_wallet_intent_survives_restart_without_transaction_id() {
+        let _guard = persistence_test_guard();
+        let path = std::env::temp_dir().join(format!("hexagent-wallet-intent-{}-{}.json", std::process::id(), wall_clock_ms()));
+        let intent = MaintenanceWalletSubmission { signer: "signer".into(), deposit_wallet: "wallet".into(), nonce: "10832".into(), body_hash: "a".repeat(64), deadline_secs: 12345 };
+        {
+            let account = SharedAccount::new_persistent("maintenance", &path).unwrap();
+            account.register_instance("a", 1.0);
+            account.apply_physical_snapshot(100.0, HashMap::new()).unwrap();
+            account.reserve_maintenance_operation("intent", MaintenanceOperationKind::Split, "condition", "UP", "DOWN", &HashMap::from([("a".into(), 25.0)])).unwrap();
+            account.prepare_maintenance_wallet_submission("intent", intent.clone()).unwrap();
+            account.prepare_maintenance_wallet_submission("intent", intent.clone()).unwrap();
+            let mut conflict = intent.clone(); conflict.nonce = "10833".into();
+            assert!(account.prepare_maintenance_wallet_submission("intent", conflict).is_err());
+            account.mark_maintenance_operation_uncertain("intent", "POST outcome unknown");
+            account.flush_persistence(Duration::from_secs(2)).unwrap();
+        }
+        let restored = SharedAccount::new_persistent("maintenance", &path).unwrap();
+        let operation = restored.maintenance_operation("intent").unwrap();
+        assert_eq!(operation.wallet_submission, Some(intent));
+        assert_eq!(operation.tx_id, None);
+        assert!(restored.is_uncertain());
+        assert_eq!(restored.monitoring_snapshot().reserved_cash, 25.0);
+        assert!(restored.reserve_maintenance_operation("duplicate", MaintenanceOperationKind::Split, "condition", "UP", "DOWN", &HashMap::from([("a".into(), 25.0)])).is_err());
+        restored.mark_maintenance_operation_submitted("intent", "original-action").unwrap();
+        restored.confirm_maintenance_operation("intent").unwrap();
+        let after = restored.monitoring_snapshot();
+        restored.confirm_maintenance_operation("intent").unwrap();
+        assert_eq!(restored.monitoring_snapshot().physical_cash, after.physical_cash);
+        assert_eq!(after.reserved_cash, 0.0);
+        assert_eq!(restored.pending_maintenance_operations().len(), 0);
+        drop(restored);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.lock"));
+    }
+
+    #[test]
+    fn old_maintenance_journal_without_wallet_intent_remains_readable() {
+        let operation: MaintenanceOperation = serde_json::from_value(serde_json::json!({
+            "operation_id":"old", "kind":"Split", "condition_id":"cid", "up_token_id":"u",
+            "down_token_id":"d", "allocations":{"a":1.0}, "tx_id":null,
+            "status":"Uncertain", "created_at_ms":1, "updated_at_ms":2, "detail":null
+        })).unwrap();
+        assert_eq!(operation.wallet_submission, None);
     }
 
     #[test]
