@@ -9871,6 +9871,7 @@ impl Engine {
         let (hist_result_tx, hist_result_rx) = bounded::<HistoricalLoadResult>(8);
         crate::os_tune::pin_strategy_instance(&format!("strategy-{}", instance_id), instance_id);
         crate::strategy::prepare_strategy_span(instance_id);
+        crate::latency::prepare_scheduler_tail_queue();
         crate::latency::prepare_thread_stages(&[
             "strategy.market.queue",
             "strategy.market.receive_to_callback",
@@ -10440,7 +10441,30 @@ impl Engine {
                         for sig in callback_signal_batch.drain(..) {
                             if !emit(sig) { break 'worker; }
                         }
-                        crate::latency::record("strategy.market.callback", callback_started);
+                        let callback_ns = callback_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                        crate::latency::record_ns("strategy.market.callback", callback_ns);
+                        if callback_ns >= 250_000 {
+                            crate::latency::observe_scheduler_tail(crate::latency::SchedulerTail {
+                                probe: "strategy.market.callback",
+                                boundary: match event.as_ref() {
+                                    MarketEvent::OrderBook(_) => "orderbook_including_quote_and_signal_emit",
+                                    MarketEvent::Quote(_) => "bbo_quote",
+                                    MarketEvent::Trade(_) => "trade",
+                                    MarketEvent::Bar(_) => "bar",
+                                    MarketEvent::SpotPrice(_) => "spot",
+                                    MarketEvent::AssetCtx(_) => "asset_context",
+                                    MarketEvent::Instrument(_) => "instrument_including_history_request",
+                                    MarketEvent::Connected { .. } => "connected",
+                                    MarketEvent::Disconnected { .. } => "disconnected",
+                                    MarketEvent::MarketDataHealth(_) => "market_health",
+                                    MarketEvent::TickSizeChange(_) => "tick_size",
+                                    _ => "market_control",
+                                },
+                                observed_unix_ns: crate::types::now_ns(),
+                                lag_ns: callback_ns, span_wall_ns: callback_ns,
+                                span_cpu_ns: None, expirations: 1, error_code: None,
+                            });
+                        }
                     }
                     Err(_) => break,
                 },

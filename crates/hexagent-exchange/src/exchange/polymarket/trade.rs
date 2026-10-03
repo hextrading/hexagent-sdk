@@ -7060,6 +7060,7 @@ impl PolymarketTrade {
         shutdown_token: ShutdownToken,
         startup_query_repair: bool,
     ) -> Result<Self> {
+        super::market_info_v2::prewarm_market_info_owner()?;
         let salt_sequence = Arc::new(super::signer::AccountSaltSequence::new());
         let signer = OrderSigner::new_with_salt_sequence(
             private_key,
