@@ -427,6 +427,19 @@ impl SharedAccountOwnerState {
         self.account.archive_retired_history(wall_clock_ms())
     }
 
+    /// Startup/cold-owner only: prepare the reusable reader before the first
+    /// private event needs it. A failed preparation is retried by exact lookup.
+    pub fn prepare_history_archive_reader(&self) -> Result<(), String> {
+        let Some(archive) = self.account.history_archive.as_ref() else { return Ok(()); };
+        let mut reader = self.history_archive_reader.borrow_mut();
+        if reader.is_none() {
+            let started = crate::latency::Instant::now();
+            *reader = Some(archive.connection(false)?);
+            crate::latency::record("polymarket.account.history_archive.cold_open", started);
+        }
+        Ok(())
+    }
+
     pub fn hydrate_archived_private_event(&self, trade: bool, identity: &str) -> Result<usize, String> {
         // This capability is confined to the cold account owner. Reclaim at
         // each archive identity boundary, before borrowing the SQLite reader
@@ -434,13 +447,8 @@ impl SharedAccountOwnerState {
         self.account.route_retirement.reclaim_ready(
             &mut self.route_retirement_pending.borrow_mut(),
         );
-        let Some(archive) = self.account.history_archive.as_ref() else { return Ok(0); };
-        let mut reader = self.history_archive_reader.borrow_mut();
-        if reader.is_none() {
-            let started = crate::latency::Instant::now();
-            *reader = Some(archive.connection(false)?);
-            crate::latency::record("polymarket.account.history_archive.cold_open", started);
-        }
+        self.prepare_history_archive_reader()?;
+        let reader = self.history_archive_reader.borrow();
         self.account.hydrate_archived_private_event_with_connection(trade, identity, reader.as_ref())
     }
 

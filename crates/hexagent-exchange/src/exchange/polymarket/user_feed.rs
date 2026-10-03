@@ -2654,7 +2654,11 @@ fn route_private_batch(
     let mut cold_identities = Vec::with_capacity(capacity);
     let mut durable_skips = 0usize;
     for mut event in events {
-        event.timing.private_owner_dequeued_ns = crate::types::monotonic_now_ns();
+        // A cold archive/repair roundtrip retains the first ingress boundary.
+        // Overwriting it would mislabel cold work as private queue residence.
+        if event.timing.private_owner_dequeued_ns == 0 {
+            event.timing.private_owner_dequeued_ns = crate::types::monotonic_now_ns();
+        }
         let payload = event.payload();
         let route_started = crate::latency::Instant::now();
         let validate_started = crate::latency::Instant::now();
