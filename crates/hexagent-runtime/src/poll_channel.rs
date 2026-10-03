@@ -82,6 +82,11 @@ impl<T> Sender<T> {
         self.0.queue.is_empty()
     }
 
+    /// Owner shutdown status for async cold callers retaining reply envelopes.
+    pub fn is_disconnected(&self) -> bool {
+        !self.0.receiver_alive.load(Ordering::Acquire)
+    }
+
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         if !self.0.receiver_alive.load(Ordering::Acquire) {
             return Err(TrySendError::Disconnected(value));
@@ -180,6 +185,18 @@ impl<T> Drop for Receiver<T> {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[test]
+    fn sender_observes_owner_shutdown_with_queued_values() {
+        let (tx, rx) = bounded(2);
+        let other = tx.clone();
+        assert!(!tx.is_disconnected());
+        tx.try_send(7).unwrap();
+        drop(rx);
+        assert!(tx.is_disconnected());
+        assert!(other.is_disconnected());
+        assert_eq!(tx.try_send(9), Err(TrySendError::Disconnected(9)));
+    }
 
     #[test]
     fn timed_owner_receive_yields_for_preempted_publication_and_keeps_fifo() {

@@ -1,8 +1,8 @@
+use hexagent_runtime::poll_channel;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
 
 use anyhow::{anyhow, Result};
 use log::{info, warn};
@@ -381,16 +381,16 @@ enum SettlementOwnerCommand {
     Claim {
         condition_id: String,
         now: Instant,
-        reply: oneshot::Sender<SettlementLookupDecision>,
+        reply: poll_channel::Sender<SettlementLookupDecision>,
     },
     ReserveDelay {
         now: Instant,
-        reply: oneshot::Sender<Duration>,
+        reply: poll_channel::Sender<Duration>,
     },
     RequestAllowed {
         condition_id: String,
         now: Instant,
-        reply: oneshot::Sender<bool>,
+        reply: poll_channel::Sender<bool>,
     },
     Complete {
         condition_id: String,
@@ -417,20 +417,24 @@ struct SettlementQueueCounters {
 }
 
 /// Cold settlement controls only. State is written exclusively by the existing
-/// background owner. The bounded FIFO and one-shot replies suspend callers;
-/// they must never park the shared spot/private WebSocket reactor OS thread.
+/// background owner. Both commands and single-use replies use bounded polling
+/// FIFOs, with no cross-thread notification or Parker mutex. Async callers
+/// yield on a 1ms timer; the background owner polls at 1ms while idle. They
+/// must never park the shared spot/private WebSocket reactor OS thread.
 /// Requests retain the existing 2s admission timeout and fail closed. Already
 /// admitted work's Complete/Defer messages wait asynchronously for capacity and
 /// are retained by the pending future until admitted. Same-sender FIFO preserves
-/// completion before a subsequent claim. Cancellation before admission leaves
-/// owner state unchanged; cancellation after Claim admission drops the reply
-/// receiver and retains the existing single-flight lease/retry recovery. No
+/// completion before a subsequent claim. Concurrent producers are ordered by
+/// successful reservation, not the time their waiting futures were created.
+/// Cancellation before admission leaves owner state unchanged; cancellation
+/// after Claim admission drops the reply receiver and retains the existing single-flight lease/retry recovery. No
 /// private trade or order lifecycle events use this cold cache-control lane.
 #[derive(Clone)]
 struct SettlementMailbox {
-    tx: mpsc::Sender<SettlementOwnerCommand>,
+    tx: poll_channel::Sender<SettlementOwnerCommand>,
     // Shared atomics are telemetry only, never account/risk authority.
     counters: Arc<SettlementQueueCounters>,
+    capacity: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -455,44 +459,63 @@ pub fn settlement_owner_metrics() -> SettlementOwnerMetrics {
 }
 
 impl SettlementMailbox {
-    fn channel(capacity: usize) -> (Self, mpsc::Receiver<SettlementOwnerCommand>) {
-        let (tx, rx) = mpsc::channel(capacity);
+    fn channel(capacity: usize) -> (Self, poll_channel::Receiver<SettlementOwnerCommand>) {
+        let (tx, rx) = poll_channel::bounded(capacity);
         (
             Self {
                 tx,
                 counters: Arc::new(SettlementQueueCounters::default()),
+                capacity,
             },
             rx,
         )
     }
 
-    async fn send(&self, command: SettlementOwnerCommand, terminal: bool) -> bool {
-        let depth = (self.tx.max_capacity() - self.tx.capacity() + 1).min(self.tx.max_capacity());
-        let admitted = match self.tx.try_send(command) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-            Err(mpsc::error::TrySendError::Full(command)) => {
-                self.counters.backpressure.fetch_add(1, Ordering::Relaxed);
-                if terminal {
-                    self.tx.send(command).await.is_ok()
-                } else {
-                    matches!(
-                        tokio::time::timeout(Duration::from_secs(2), self.tx.send(command)).await,
-                        Ok(Ok(()))
-                    )
+    async fn send(&self, mut command: SettlementOwnerCommand, terminal: bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut waited = false;
+        loop {
+            let depth = (self.tx.len() + 1).min(self.capacity);
+            match self.tx.try_send(command) {
+                Ok(()) => {
+                    self.counters.high_water.fetch_max(depth, Ordering::Relaxed);
+                    return true;
                 }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
+                Err(crossbeam_channel::TrySendError::Full(returned)) => command = returned,
             }
-        };
-        if admitted {
-            self.counters.high_water.fetch_max(depth, Ordering::Relaxed);
-        } else {
-            self.counters.overflow.fetch_add(1, Ordering::Relaxed);
+            if !waited {
+                self.counters.backpressure.fetch_add(1, Ordering::Relaxed);
+                waited = true;
+            }
+            if !terminal && Instant::now() >= deadline {
+                break;
+            }
+            // Yield the reactor; no blocking send, wake, or parking lock.
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        admitted
+        self.counters.overflow.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
+    async fn reply<T>(&self, result: poll_channel::Receiver<T>) -> Option<T> {
+        loop {
+            match result.try_recv() {
+                Ok(value) => return Some(value),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return None,
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+            }
+            // Receiver drop does not drain a polling queue still held by a
+            // sender. Detect owner shutdown even for an enqueued reply handle.
+            if self.tx.is_disconnected() {
+                return result.try_recv().ok();
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
 
     async fn claim(&self, condition_id: &str, now: Instant) -> SettlementLookupDecision {
-        let (reply, result) = oneshot::channel();
+        let (reply, result) = poll_channel::bounded(1);
         if !self
             .send(
                 SettlementOwnerCommand::Claim {
@@ -506,22 +529,24 @@ impl SettlementMailbox {
         {
             return SettlementLookupDecision::Deferred;
         }
-        result.await.unwrap_or(SettlementLookupDecision::Deferred)
+        self.reply(result)
+            .await
+            .unwrap_or(SettlementLookupDecision::Deferred)
     }
 
     async fn reserve_delay(&self, now: Instant) -> Duration {
-        let (reply, result) = oneshot::channel();
+        let (reply, result) = poll_channel::bounded(1);
         if !self
             .send(SettlementOwnerCommand::ReserveDelay { now, reply }, false)
             .await
         {
             return DEFAULT_SETTLEMENT_RETRY;
         }
-        result.await.unwrap_or(DEFAULT_SETTLEMENT_RETRY)
+        self.reply(result).await.unwrap_or(DEFAULT_SETTLEMENT_RETRY)
     }
 
     async fn request_allowed(&self, condition_id: &str, now: Instant) -> bool {
-        let (reply, result) = oneshot::channel();
+        let (reply, result) = poll_channel::bounded(1);
         self.send(
             SettlementOwnerCommand::RequestAllowed {
                 condition_id: condition_id.to_string(),
@@ -531,7 +556,7 @@ impl SettlementMailbox {
             false,
         )
         .await
-            && result.await.unwrap_or(false)
+            && self.reply(result).await.unwrap_or(false)
     }
 
     async fn complete(
@@ -572,12 +597,20 @@ impl SettlementMailbox {
 }
 
 fn run_settlement_owner(
-    mut rx: mpsc::Receiver<SettlementOwnerCommand>,
+    rx: poll_channel::Receiver<SettlementOwnerCommand>,
     metrics: Arc<SettlementQueueCounters>,
 ) {
     let mut state = SettlementLookupState::default();
     let mut next_metrics = Instant::now();
-    while let Some(command) = rx.blocking_recv() {
+    loop {
+        let command = match rx.try_recv() {
+            Ok(command) => command,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+        };
         match command {
             SettlementOwnerCommand::Claim {
                 condition_id,
@@ -595,17 +628,17 @@ fn run_settlement_owner(
                     metrics.overflow.fetch_add(1, Ordering::Relaxed);
                     SettlementLookupDecision::Deferred
                 };
-                let _ = reply.send(decision);
+                let _ = reply.try_send(decision);
             }
             SettlementOwnerCommand::ReserveDelay { now, reply } => {
-                let _ = reply.send(state.reserve_request_delay(now));
+                let _ = reply.try_send(state.reserve_request_delay(now));
             }
             SettlementOwnerCommand::RequestAllowed {
                 condition_id,
                 now,
                 reply,
             } => {
-                let _ = reply.send(state.request_allowed(&condition_id, now));
+                let _ = reply.try_send(state.request_allowed(&condition_id, now));
             }
             SettlementOwnerCommand::Complete {
                 condition_id,
@@ -633,7 +666,7 @@ fn run_settlement_owner(
         }
         if Instant::now() >= next_metrics {
             log::info!("[settlement_owner_queue] depth={} capacity={} high_water={} backpressure={} overflow={}",
-                rx.len(), rx.max_capacity(), metrics.high_water.load(Ordering::Relaxed),
+                rx.len(), SETTLEMENT_OWNER_CAPACITY, metrics.high_water.load(Ordering::Relaxed),
                 metrics.backpressure.load(Ordering::Relaxed), metrics.overflow.load(Ordering::Relaxed));
             next_metrics = Instant::now() + Duration::from_secs(30);
         }
@@ -1229,11 +1262,11 @@ mod tests {
 
     #[test]
     fn settlement_reply_wait_does_not_park_shared_reactor() {
-        let (owner, mut rx) = SettlementMailbox::channel(1);
+        let (owner, rx) = SettlementMailbox::channel(1);
         let progressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seen = progressed.clone();
         let worker = std::thread::spawn(move || {
-            let Some(SettlementOwnerCommand::Claim { reply, .. }) = rx.blocking_recv() else {
+            let Ok(SettlementOwnerCommand::Claim { reply, .. }) = rx.recv() else {
                 panic!("claim")
             };
             let until = Instant::now() + Duration::from_millis(500);
@@ -1241,7 +1274,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
             let before_reply = seen.load(Ordering::Acquire);
-            reply.send(SettlementLookupDecision::Fetch).ok();
+            reply.try_send(SettlementLookupDecision::Fetch).ok();
             before_reply
         });
         settlement_test_runtime().block_on(async {
@@ -1283,7 +1316,7 @@ mod tests {
 
     #[test]
     fn settlement_full_fifo_yields_and_retains_terminal_messages_in_order() {
-        let (owner, mut rx) = SettlementMailbox::channel(1);
+        let (owner, rx) = SettlementMailbox::channel(1);
         settlement_test_runtime().block_on(async {
             let now = Instant::now();
             assert!(owner.complete("first", None, now).await);
@@ -1292,11 +1325,12 @@ mod tests {
             let mut terminal = Box::pin(owner.defer("third", Duration::from_secs(5), false, now));
             pending(terminal.as_mut());
             assert!(matches!(rx.try_recv().unwrap(), SettlementOwnerCommand::Complete { condition_id, .. } if condition_id == "first"));
+            tokio::time::sleep(Duration::from_millis(3)).await;
             pending(claim.as_mut());
             pending(terminal.as_mut());
             let SettlementOwnerCommand::Claim { condition_id, reply, .. } = rx.try_recv().unwrap() else { panic!("claim must remain ahead of terminal control") };
             assert_eq!(condition_id, "second");
-            reply.send(SettlementLookupDecision::Fetch).ok();
+            reply.try_send(SettlementLookupDecision::Fetch).ok();
             assert!(matches!(claim.await, SettlementLookupDecision::Fetch));
             assert!(terminal.await);
             assert!(matches!(rx.try_recv().unwrap(), SettlementOwnerCommand::Defer { condition_id, .. } if condition_id == "third"));
@@ -1304,6 +1338,20 @@ mod tests {
             assert_eq!(owner.counters.high_water.load(Ordering::Relaxed), 1);
             assert_eq!(owner.counters.backpressure.load(Ordering::Relaxed), 2);
             assert_eq!(owner.counters.overflow.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn settlement_owner_shutdown_after_enqueue_releases_reply_wait() {
+        let (owner, rx) = SettlementMailbox::channel(1);
+        settlement_test_runtime().block_on(async {
+            let mut claim = Box::pin(owner.claim("queued", Instant::now()));
+            pending(claim.as_mut());
+            assert_eq!(rx.len(), 1);
+            // The sender still owns the queued command/reply handle. Closing
+            // the owner must fail closed even though that envelope survives.
+            drop(rx);
+            assert!(matches!(tokio::time::timeout(Duration::from_millis(100), claim).await.unwrap(), SettlementLookupDecision::Deferred));
         });
     }
 
@@ -1327,7 +1375,7 @@ mod tests {
 
     #[test]
     fn settlement_admission_timeout_keeps_full_queue_intact() {
-        let (owner, mut rx) = SettlementMailbox::channel(1);
+        let (owner, rx) = SettlementMailbox::channel(1);
         settlement_test_runtime().block_on(async {
             let now = Instant::now();
             assert!(owner.complete("first", None, now).await);
@@ -1343,7 +1391,7 @@ mod tests {
         let (owner, worker) = test_settlement_owner();
         settlement_test_runtime().block_on(async {
             let now = Instant::now();
-            let (reply, result) = oneshot::channel();
+            let (reply, result) = poll_channel::bounded(1);
             drop(result);
             assert!(
                 owner
@@ -1379,17 +1427,19 @@ mod tests {
         let old_worker = std::thread::spawn(move || {
             while let Ok(reply) = old_rx.recv() {
                 std::thread::sleep(Duration::from_micros(200));
-                reply.send(()).unwrap();
+                reply.try_send(()).unwrap();
             }
         });
-        let (owner, mut rx) = SettlementMailbox::channel(1);
+        let (owner, rx) = SettlementMailbox::channel(1);
         let worker = std::thread::spawn(move || {
-            while let Some(command) = rx.blocking_recv() {
+            while let Ok(command) =
+                rx.recv_timeout_with_poll(Duration::from_secs(60), Duration::from_millis(1))
+            {
                 let SettlementOwnerCommand::Claim { reply, .. } = command else {
                     panic!("claim")
                 };
                 std::thread::sleep(Duration::from_micros(200));
-                reply.send(SettlementLookupDecision::Fetch).ok();
+                reply.try_send(SettlementLookupDecision::Fetch).ok();
             }
         });
         let mut before = Vec::with_capacity(N);
