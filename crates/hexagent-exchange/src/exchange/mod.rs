@@ -1,3 +1,4 @@
+pub(crate) mod ws_tls;
 pub mod aster;
 pub mod binance;
 pub mod bitget;

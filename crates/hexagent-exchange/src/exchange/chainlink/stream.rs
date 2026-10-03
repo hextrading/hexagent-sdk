@@ -30,6 +30,7 @@ const DEFAULT_WS_URL: &str = "wss://ws.dataengine.chain.link";
 const WS_PATH: &str = "/api/v1/ws";
 
 pub struct ChainlinkStreamMarket {
+    tls: Option<crate::exchange::ws_tls::WsTlsConfig>,
     /// Feed IDs (hex strings, e.g. "0x00037da0...")
     feed_ids: Vec<String>,
     /// Symbol labels for each feed ID (e.g. "btc/usd"), same order as feed_ids
@@ -44,6 +45,7 @@ pub struct ChainlinkStreamMarket {
 impl ChainlinkStreamMarket {
     pub fn new(api_key: &str, user_secret: &str, ws_url: &str) -> Self {
         Self {
+            tls: None,
             feed_ids: Vec::new(),
             symbols: Vec::new(),
             api_key: api_key.to_string(),
@@ -93,6 +95,7 @@ async fn chainlink_stream_ws_task(
     user_secret: String,
     event_tx: crate::exchange::PublicMarketPublisher,
     shutdown: Arc<AtomicBool>,
+    tls: crate::exchange::ws_tls::WsTlsConfig,
 ) {
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
 
@@ -163,7 +166,9 @@ async fn chainlink_stream_ws_task(
 
         let (stream, response) = match tokio::time::timeout(
             WS_CONNECT_TIMEOUT,
-            tokio_tungstenite::connect_async(request),
+            tokio_tungstenite::connect_async_tls_with_config(
+                request, None, false, Some(tls.connector()),
+            ),
         )
         .await
         {
@@ -276,6 +281,12 @@ impl ExchangeMarket for ChainlinkStreamMarket {
             ));
         }
 
+        // Prepare native trust before the feed future reaches the reactor.
+        // Each adapter owns an immutable configuration reused across reconnects.
+        if self.tls.is_none() {
+            self.tls = Some(crate::exchange::ws_tls::WsTlsConfig::load_native()?);
+        }
+        let tls = self.tls.as_ref().expect("TLS prepared").clone();
         let (event_tx, event_rx) = crate::exchange::public_market_channel();
         self.event_rx = Some(event_rx);
         // Per-task shutdown Arc — see binance/market.rs commentary.
@@ -290,6 +301,7 @@ impl ExchangeMarket for ChainlinkStreamMarket {
             self.user_secret.clone(),
             event_tx,
             shutdown,
+            tls,
         ));
         Ok(())
     }

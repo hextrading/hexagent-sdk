@@ -208,9 +208,9 @@ pub fn init() -> Result<()> {
         .spawn(move || {
             // Pin this thread to the async-RT core and raise to SCHED_FIFO.
             // Must happen BEFORE building the tokio runtime so the runtime's
-            // internal timer thread / blocking pool inherit reasonable
-            // defaults (they stay SCHED_OTHER; this thread drives the
-            // current_thread scheduler which hosts all hot-path futures).
+            // blocking pool inherits this FIFO policy unless explicitly demoted.
+            // on_thread_start below places those cold workers on background
+            // cores; the manually created current-thread reactor stays pinned.
             crate::os_tune::pin_async_rt("hexbot-async-rt");
             crate::latency::prepare_polymarket_private_stages();
             // A supervised CLOB epoch may fall back to this runtime. Prepare
@@ -219,7 +219,8 @@ pub fn init() -> Result<()> {
             crate::reactor_probe::prepare();
             let rt = match Builder::new_current_thread()
                 .enable_all()
-                .thread_name("hexbot-async-rt")
+                .thread_name("hexbot-rt-bg")
+                .on_thread_start(|| crate::os_tune::pin_background("hexbot-rt-bg"))
                 .build()
             {
                 Ok(rt) => rt,
@@ -251,7 +252,8 @@ pub fn init() -> Result<()> {
             crate::latency::prepare_polymarket_order_stages();
             let rt = match Builder::new_current_thread()
                 .enable_all()
-                .thread_name("hexbot-async-ord")
+                .thread_name("hexbot-ord-bg")
+                .on_thread_start(|| crate::os_tune::pin_background("hexbot-ord-bg"))
                 .build()
             {
                 Ok(rt) => rt,
@@ -281,7 +283,8 @@ pub fn init() -> Result<()> {
             crate::latency::prepare_polymarket_clob_stages();
             let rt = match Builder::new_current_thread()
                 .enable_all()
-                .thread_name("hexbot-async-clob")
+                .thread_name("hexbot-clob-bg")
+                .on_thread_start(|| crate::os_tune::pin_background("hexbot-clob-bg"))
                 .build()
             {
                 Ok(rt) => rt,
@@ -576,6 +579,24 @@ mod tests {
         assert_eq!(general.as_deref(), Some("hexbot-async-rt"));
         assert_eq!(clob.as_deref(), Some("hexbot-async-clob"));
         assert_eq!(order.as_deref(), Some("hexbot-async-ord"));
+    }
+
+    /// Current-thread reactors are manually pinned. Tokio's auxiliary blocking
+    /// threads (including DNS) must have a separate name and background role.
+    #[test]
+    fn blocking_workers_do_not_inherit_reactor_identity() {
+        init().unwrap();
+        for (handle, expected) in [
+            (handle(), "hexbot-rt-bg"),
+            (order_handle(), "hexbot-ord-bg"),
+            (clob_handle(), "hexbot-clob-bg"),
+        ] {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            handle.spawn_blocking(move || {
+                tx.send(std::thread::current().name().unwrap().to_string()).unwrap();
+            });
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), expected);
+        }
     }
 
     /// `init_http_timeout` must clamp values above the FAST client

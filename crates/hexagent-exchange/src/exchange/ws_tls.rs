@@ -1,4 +1,4 @@
-//! Feed-owned TLS configuration, prepared before the CLOB runtime receives work.
+//! Feed-owned TLS configuration, prepared before the WebSocket runtime receives work.
 //! tokio-tungstenite's default connector loads native certificates synchronously
 //! on every connect. Rotation and standby reconnects share the active reader's
 //! runtime, so even asynchronous handshakes must not take that default path.
@@ -8,13 +8,13 @@ use std::sync::Arc;
 use tokio_tungstenite::Connector;
 
 #[derive(Clone)]
-pub(super) struct ClobTlsConfig(Arc<ClientConfig>);
+pub(crate) struct WsTlsConfig(Arc<ClientConfig>);
 
-impl ClobTlsConfig {
-    pub(super) fn load_native() -> Result<Self> {
+impl WsTlsConfig {
+    pub(crate) fn load_native() -> Result<Self> {
         let loaded = rustls_native_certs::load_native_certs();
         if !loaded.errors.is_empty() {
-            log::warn!("CLOB native root CA loading errors: {:?}", loaded.errors);
+            log::warn!("WebSocket native root CA loading errors: {:?}", loaded.errors);
         }
         let mut roots = RootCertStore::empty();
         roots.add_parsable_certificates(loaded.certs);
@@ -23,7 +23,7 @@ impl ClobTlsConfig {
 
     fn from_roots(roots: RootCertStore) -> Result<Self> {
         if roots.is_empty() {
-            bail!("CLOB TLS initialization failed: no usable native root CA certificates");
+            bail!("WebSocket TLS initialization failed: no usable native root CA certificates");
         }
         let mut config = ClientConfig::builder()
             .with_root_certificates(roots)
@@ -34,7 +34,7 @@ impl ClobTlsConfig {
         Ok(Self(Arc::new(config)))
     }
 
-    pub(super) fn connector(&self) -> Connector {
+    pub(crate) fn connector(&self) -> Connector {
         Connector::Rustls(self.0.clone())
     }
 }
@@ -45,26 +45,26 @@ mod tests {
 
     #[test]
     fn missing_or_unparseable_native_roots_fail_closed() {
-        assert!(ClobTlsConfig::from_roots(RootCertStore::empty()).is_err());
+        assert!(WsTlsConfig::from_roots(RootCertStore::empty()).is_err());
         let mut roots = RootCertStore::empty();
         roots.add_parsable_certificates([vec![0_u8; 32].into()]);
-        assert!(ClobTlsConfig::from_roots(roots).is_err());
+        assert!(WsTlsConfig::from_roots(roots).is_err());
     }
 
     #[test]
     #[ignore = "manual native trust-store preparation benchmark; performs cold-path filesystem I/O"]
     fn native_roots_and_reconnect_connector_benchmark() {
         use std::{hint::black_box, time::Instant};
-        let prepared = ClobTlsConfig::load_native().unwrap();
+        let prepared = WsTlsConfig::load_native().unwrap();
         let mut baseline = Vec::with_capacity(256);
         let mut reused = Vec::with_capacity(256);
         for _ in 0..256 {
             let start = Instant::now();
-            black_box(ClobTlsConfig::load_native().unwrap());
+            black_box(WsTlsConfig::load_native().unwrap());
             baseline.push(start.elapsed().as_nanos());
             let start = Instant::now();
             let Connector::Rustls(config) = black_box(prepared.connector()) else {
-                panic!("CLOB must retain TLS certificate verification");
+                panic!("WebSocket must retain TLS certificate verification");
             };
             reused.push(start.elapsed().as_nanos());
             assert!(Arc::ptr_eq(&config, &prepared.0));
