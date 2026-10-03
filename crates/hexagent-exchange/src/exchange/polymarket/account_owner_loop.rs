@@ -207,6 +207,21 @@ pub(super) fn run(
             }
             break;
         }
+        if unified {
+            // Dedicated FIFO private owners must not register Select watchers:
+            // unwatch takes the producer's SyncWaker mutex and can park this
+            // high-priority owner behind a preempted producer. Keep the same
+            // bounded FIFO lanes, priorities and recovery checks; poll them on
+            // the next turn after a short OS yield. Idle only: no sleep while
+            // this turn made progress or retained work can advance. This also
+            // avoids per-idle-turn Select allocation/registration. The legacy
+            // cold owner below retains its event-driven wait.
+            queue_timing.begin_wait();
+            std::thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
+            queue_timing.end_wait();
+            let _ = shutdown_rx.try_recv();
+            continue;
+        }
         let wait_for_work = |recovery_rx: Option<
             &crossbeam_channel::Receiver<super::super::live_position::RecoveryDeliveryCommand>,
         >| {
