@@ -52,6 +52,7 @@ const RTDS_TOPIC_STALL_THRESHOLD: Duration = Duration::from_secs(90);
 const TOPIC_STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(30);
 
 pub struct ChainlinkMarket {
+    tls: Option<crate::exchange::ws_tls::WsTlsConfig>,
     symbols: Vec<String>,
     event_rx: Option<crate::exchange::PublicMarketReceiver>,
     ws_shutdown: Arc<AtomicBool>,
@@ -61,6 +62,7 @@ pub struct ChainlinkMarket {
 impl ChainlinkMarket {
     pub fn new() -> Self {
         Self {
+            tls: None,
             symbols: Vec::new(),
             event_rx: None,
             ws_shutdown: Arc::new(AtomicBool::new(false)),
@@ -73,6 +75,7 @@ async fn chainlink_ws_task(
     symbols: Vec<String>,
     event_tx: crate::exchange::PublicMarketPublisher,
     shutdown: Arc<AtomicBool>,
+    tls: crate::exchange::ws_tls::WsTlsConfig,
 ) {
     // base 0.1s, cap 6.4s → 0.1→0.2→0.4→0.8→1.6→3.2→6.4s (±50% jitter) on
     // consecutive failures. See the stability-gated reset below.
@@ -86,7 +89,9 @@ async fn chainlink_ws_task(
         info!("[Chainlink] Connecting to {}", RTDS_URL);
         let stream = match tokio::time::timeout(
             WS_CONNECT_TIMEOUT,
-            tokio_tungstenite::connect_async(RTDS_URL),
+            tokio_tungstenite::connect_async_tls_with_config(
+                RTDS_URL, None, false, Some(tls.connector()),
+            ),
         )
         .await
         {
@@ -360,13 +365,19 @@ fn json_f64(value: &serde_json::Value) -> Option<f64> {
 
 impl ExchangeMarket for ChainlinkMarket {
     fn connect(&mut self) -> Result<()> {
+        // Prepare native trust before the feed future reaches the reactor.
+        // Each adapter owns an immutable configuration reused across reconnects.
+        if self.tls.is_none() {
+            self.tls = Some(crate::exchange::ws_tls::WsTlsConfig::load_native()?);
+        }
+        let tls = self.tls.as_ref().expect("TLS prepared").clone();
         let (event_tx, event_rx) = crate::exchange::public_market_channel();
         self.event_rx = Some(event_rx);
         // Per-task shutdown Arc — see binance/market.rs.
         let shutdown = Arc::new(AtomicBool::new(false));
         self.ws_shutdown = shutdown.clone();
         let symbols = self.symbols.clone();
-        crate::async_rt::handle().spawn(chainlink_ws_task(symbols, event_tx, shutdown));
+        crate::async_rt::handle().spawn(chainlink_ws_task(symbols, event_tx, shutdown, tls));
         Ok(())
     }
 

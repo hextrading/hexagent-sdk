@@ -29,9 +29,7 @@ use crate::types::*;
 #[path = "live_bbo.rs"]
 mod live_bbo;
 
-#[path = "clob_tls.rs"]
-mod clob_tls;
-use clob_tls::ClobTlsConfig;
+use crate::exchange::ws_tls::WsTlsConfig as ClobTlsConfig;
 
 #[path = "clob_cooperative.rs"]
 mod clob_cooperative;
