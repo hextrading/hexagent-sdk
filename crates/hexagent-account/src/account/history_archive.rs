@@ -17,6 +17,7 @@ const ABSENCE_KEY_BYTES: usize = 128;
 #[derive(Debug)]
 struct VerifiedAbsence {
     sequence: AtomicU64,
+    kind: AtomicU8,
     generation: AtomicU64,
     fingerprint: AtomicU64,
     length: AtomicUsize,
@@ -26,6 +27,7 @@ impl VerifiedAbsence {
     fn new() -> Self {
         Self {
             sequence: AtomicU64::new(0),
+            kind: AtomicU8::new(0),
             generation: AtomicU64::new(0),
             fingerprint: AtomicU64::new(0),
             length: AtomicUsize::new(0),
@@ -33,8 +35,19 @@ impl VerifiedAbsence {
         }
     }
 }
-fn absence_fingerprint(key: &str) -> u64 {
-    key.bytes().fold(0xcbf29ce484222325u64, |h, b| {
+fn absence_key(kind: u8, key: &str) -> &str {
+    if kind == 2 {
+        let key = key.trim();
+        key.strip_prefix("0x").or_else(|| key.strip_prefix("0X")).unwrap_or(key)
+    } else {
+        base_trade_key(key)
+    }
+}
+fn absence_bytes(kind: u8, key: &str) -> impl Iterator<Item = u8> + '_ {
+    key.bytes().map(move |b| if kind == 2 { b.to_ascii_lowercase() } else { b })
+}
+fn absence_fingerprint(kind: u8, key: &str) -> u64 {
+    absence_bytes(kind, key).fold(0xcbf29ce484222325u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     })
 }
@@ -201,16 +214,21 @@ impl HistoryArchive {
     /// new economic row. Only exact cold-verified absence at this generation
     /// permits a Bloom false positive to proceed.
     pub(super) fn unverified_trade_hint(&self, trade_key: &str) -> bool {
-        let key = base_trade_key(trade_key);
-        if !self.may_contain(1, key) {
+        self.unverified_hint(1, trade_key)
+    }
+
+    fn unverified_hint(&self, kind: u8, identity: &str) -> bool {
+        let key = absence_key(kind, identity);
+        if !self.may_contain(kind, key) {
             return false;
         }
         let generation = self.generation.load(Ordering::SeqCst);
-        let fingerprint = absence_fingerprint(key);
+        let fingerprint = absence_fingerprint(kind, key);
         for slot in &self.absences {
             let sequence = slot.sequence.load(Ordering::SeqCst);
             if sequence == 0
                 || sequence % 2 != 0
+                || slot.kind.load(Ordering::SeqCst) != kind
                 || slot.generation.load(Ordering::SeqCst) != generation
                 || slot.fingerprint.load(Ordering::SeqCst) != fingerprint
                 || slot.length.load(Ordering::SeqCst) != key.len()
@@ -218,8 +236,7 @@ impl HistoryArchive {
             {
                 continue;
             }
-            let exact = key
-                .bytes()
+            let exact = absence_bytes(kind, key)
                 .zip(&slot.key)
                 .all(|(byte, stored)| stored.load(Ordering::SeqCst) == byte);
             if exact
@@ -235,18 +252,24 @@ impl HistoryArchive {
     // Called only after successful exact lookup by the sole cold writer. The
     // generation changes before newly archived proofs can leave hot memory.
     fn record_verified_absence(&self, key: &str) -> Result<(), String> {
+        self.record_verified_identity_absence(1, key)
+    }
+
+    fn record_verified_identity_absence(&self, kind: u8, identity: &str) -> Result<(), String> {
+        let key = absence_key(kind, identity);
         if key.len() > ABSENCE_KEY_BYTES {
             return Err("archive absence identity exceeds bounded certificate".into());
         }
         let index = self.absence_cursor.fetch_add(1, Ordering::Relaxed) % ABSENCE_SLOTS;
         let slot = &self.absences[index];
         slot.sequence.fetch_add(1, Ordering::SeqCst);
+        slot.kind.store(kind, Ordering::SeqCst);
         slot.generation
             .store(self.generation.load(Ordering::SeqCst), Ordering::SeqCst);
         slot.fingerprint
-            .store(absence_fingerprint(key), Ordering::SeqCst);
+            .store(absence_fingerprint(kind, key), Ordering::SeqCst);
         slot.length.store(key.len(), Ordering::SeqCst);
-        for (stored, byte) in slot.key.iter().zip(key.bytes()) {
+        for (stored, byte) in slot.key.iter().zip(absence_bytes(kind, key)) {
             stored.store(byte, Ordering::SeqCst);
         }
         slot.sequence.fetch_add(1, Ordering::SeqCst);
@@ -578,7 +601,7 @@ impl SharedAccount {
     pub fn archived_private_event_hint(&self, trade: bool, identity: &str) -> bool {
         self.history_archive
             .as_ref()
-            .is_some_and(|archive| archive.may_contain(if trade { 1 } else { 2 }, identity))
+            .is_some_and(|archive| archive.unverified_hint(if trade { 1 } else { 2 }, identity))
     }
 
     // Reserve the existing bounded cold-reclamation credits before any hot
@@ -741,7 +764,10 @@ impl SharedAccount {
         if rows.is_empty() {
             if trade {
                 archive.record_verified_absence(identity)?;
+            } else {
+                archive.record_verified_identity_absence(2, identity)?;
             }
+            crate::latency::record("polymarket.account.history_archive.cold_lookup", started);
             return Ok(0);
         }
         let _control = self.control_gate.write().unwrap();
@@ -886,6 +912,67 @@ mod tests {
         );
         state
     }
+    #[test]
+    fn order_absence_certificates_are_exact_bounded_generation_scoped_and_not_persistent() {
+        let fixture = Fixture::new();
+        let archive = HistoryArchive::open(&fixture.0, "account", 0).unwrap();
+        for byte in &archive.filter { byte.store(u8::MAX, Ordering::Release); }
+        let key = "AbCd0123";
+        assert!(archive.unverified_hint(2, key));
+        assert!(archive.load(2, key, 1).unwrap().is_empty());
+        archive.record_verified_identity_absence(2, key).unwrap();
+        assert!(!archive.unverified_hint(2, " 0xABCD0123 "));
+        assert!(!archive.unverified_hint(2, "0Xabcd0123"));
+        assert!(archive.unverified_hint(2, "abcd0124"));
+        assert!(archive.unverified_trade_hint("abcd0123"), "order proof cannot authorize a trade");
+        let other = Fixture::new();
+        let other_archive = HistoryArchive::open(&other.0, "other", 0).unwrap();
+        for byte in &other_archive.filter { byte.store(u8::MAX, Ordering::Release); }
+        assert!(other_archive.unverified_hint(2, key), "account isolation");
+        archive.absences[0].sequence.fetch_add(1, Ordering::SeqCst);
+        assert!(archive.unverified_hint(2, key), "overlapping replacement fails closed");
+        archive.absences[0].sequence.fetch_add(1, Ordering::SeqCst);
+        for n in 0..ABSENCE_SLOTS {
+            archive.record_verified_identity_absence(2, &format!("order-{n}")).unwrap();
+        }
+        assert!(archive.unverified_hint(2, key), "eviction requires exact lookup again");
+        archive.record_verified_identity_absence(2, key).unwrap();
+        archive.generation.fetch_add(1, Ordering::SeqCst);
+        assert!(archive.unverified_hint(2, key), "new archive generation invalidates proof");
+        archive.record_verified_identity_absence(2, key).unwrap();
+        let reopened = HistoryArchive::open(&fixture.0, "account", 0).unwrap();
+        for byte in &reopened.filter { byte.store(u8::MAX, Ordering::Release); }
+        assert!(reopened.unverified_hint(2, key), "restart/replay must reverify absence");
+    }
+
+    #[test]
+    #[ignore = "focused order false-positive lookup benchmark; run optimized explicitly"]
+    fn order_archive_absence_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        let fixture = Fixture::new();
+        let archive = HistoryArchive::open(&fixture.0, "account", 0).unwrap();
+        let key = "0xcbb1851aa79e77da900600e05cef9d0193c0dd89ff1155527a17d48c85ea24a3";
+        for byte in &archive.filter { byte.store(u8::MAX, Ordering::Release); }
+        let reader = archive.connection(false).unwrap();
+        assert!(archive.load_with_connection(&reader, 2, key, 1).unwrap().is_empty());
+        archive.record_verified_identity_absence(2, key).unwrap();
+        for cached in [false, true] {
+            let mut samples = Vec::with_capacity(10_000);
+            for i in 0..10_512 {
+                let started = Instant::now();
+                if cached {
+                    assert!(!black_box(archive.unverified_hint(2, black_box(key))));
+                } else if archive.may_contain(2, black_box(key)) {
+                    assert!(black_box(archive.load_with_connection(&reader, 2, key, 1).unwrap()).is_empty());
+                }
+                let elapsed = started.elapsed().as_nanos();
+                if i >= 512 { samples.push(elapsed); }
+            }
+            samples.sort_unstable();
+            println!("order_archive_absence cached={cached} n=10000 median_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0 boundary=membership_to_decision existing_reader=true cross_thread_wait_excluded=true", samples[4999], samples[9899], samples[9989], samples[9999]);
+        }
+    }
+
     #[test]
     fn bounded_exact_absence_cannot_authorize_a_different_or_newly_archived_trade() {
         let fixture = Fixture::new();

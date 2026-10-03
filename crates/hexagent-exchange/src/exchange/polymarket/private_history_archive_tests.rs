@@ -22,6 +22,8 @@ fn feedback() -> (
 fn archive_filter_false_positive_returns_to_owner_and_delivers_new_fill_once() {
     let (shared, mut owner, mut events) = super::execution_repair_tests::fixture();
     let mut event = events.pop().unwrap();
+    event.timing.private_owner_dequeued_ns = crate::types::monotonic_now_ns().max(1);
+    let first_dequeue = event.timing.private_owner_dequeued_ns;
     // Model an advisory filter false positive. The cold archive contains no
     // proof, so this normal new fill must return to the private owner route.
     event.needs_archive_lookup = true;
@@ -48,6 +50,8 @@ fn archive_filter_false_positive_returns_to_owner_and_delivers_new_fill_once() {
     assert_eq!(update.owner, 0);
     assert_eq!(update.update.trade_id.as_deref(), Some("repair-trade-2"));
     assert_eq!(update.update.filled_quantity, 2.0);
+    assert_eq!(update.timing.private_owner_dequeued_ns, first_dequeue,
+        "cold replay must retain the first private-owner ingress clock");
     assert!(done.blocking_recv().unwrap().is_ok());
     assert!(!owner.repair_inflight);
     event.needs_archive_lookup = false;

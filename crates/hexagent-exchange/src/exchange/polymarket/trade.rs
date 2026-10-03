@@ -4428,10 +4428,15 @@ impl SharedState {
                     "polymarket.account.wallet_calibration.wait_including_grace",
                     "polymarket.account.wallet_calibration.apply",
                     "polymarket.account.history_archive.cold_lookup",
+                    "polymarket.account.history_archive.cold_open",
                     "polymarket.account.history_archive.cold_commit",
                     "polymarket.account.route_reclaim.cold_drop",
                     "polymarket.account.route_reclaim.retirement_age",
                 ]);
+                if let Err(error) = account_owner.prepare_history_archive_reader() {
+                    // Exact event lookup retries and fails closed on error.
+                    log::warn!("[PolymarketTrade] history archive reader preparation failed account={}: {}", account_id, error);
+                }
                 let _ = cold_ready_tx.send(());
                 let wallet_grace_tick = crossbeam_channel::tick(Duration::from_millis(10));
                 let mut pending_gc = None;
@@ -4475,6 +4480,13 @@ impl SharedState {
                             Ok(()) => account_owner.execute_lifecycle_mirror(),
                             Err(_) => break,
                         },
+                        // A private event is waiting for this exact proof.
+                        // Preserve mirror-before-proof ordering, but do not
+                        // queue it behind unrelated control/wallet work.
+                        recv(archive_lookup_rx) -> command => match command {
+                            Ok(command) => command.prepare_archive(&_shared, &account_owner),
+                            Err(_) => break,
+                        },
                         recv(account_owner.receiver()) -> command => match command {
                             Ok(command) => account_owner.execute(command),
                             Err(_) => break,
@@ -4485,10 +4497,6 @@ impl SharedState {
                         // trade/order lifecycle work.
                         recv(account_owner.wallet_receiver()) -> wake => match wake {
                             Ok(()) => account_owner.execute_wallet_calibration(),
-                            Err(_) => break,
-                        },
-                        recv(archive_lookup_rx) -> command => match command {
-                            Ok(command) => command.prepare_archive(&_shared, &account_owner),
                             Err(_) => break,
                         },
                         recv(cold_gc_rx) -> wake => {
