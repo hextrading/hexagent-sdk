@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot};
 
 use anyhow::{anyhow, Result};
 use log::{info, warn};
@@ -380,16 +381,16 @@ enum SettlementOwnerCommand {
     Claim {
         condition_id: String,
         now: Instant,
-        reply: crossbeam_channel::Sender<SettlementLookupDecision>,
+        reply: oneshot::Sender<SettlementLookupDecision>,
     },
     ReserveDelay {
         now: Instant,
-        reply: crossbeam_channel::Sender<Duration>,
+        reply: oneshot::Sender<Duration>,
     },
     RequestAllowed {
         condition_id: String,
         now: Instant,
-        reply: crossbeam_channel::Sender<bool>,
+        reply: oneshot::Sender<bool>,
     },
     Complete {
         condition_id: String,
@@ -406,10 +407,31 @@ enum SettlementOwnerCommand {
 
 const SETTLEMENT_OWNER_CAPACITY: usize = 256;
 const SETTLEMENT_CACHE_CAPACITY: usize = 4_096;
-static SETTLEMENT_OWNER: OnceLock<crossbeam_channel::Sender<SettlementOwnerCommand>> =
-    OnceLock::new();
-static SETTLEMENT_QUEUE_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
-static SETTLEMENT_QUEUE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+static SETTLEMENT_OWNER: OnceLock<SettlementMailbox> = OnceLock::new();
+
+#[derive(Default)]
+struct SettlementQueueCounters {
+    high_water: AtomicUsize,
+    overflow: AtomicU64,
+    backpressure: AtomicU64,
+}
+
+/// Cold settlement controls only. State is written exclusively by the existing
+/// background owner. The bounded FIFO and one-shot replies suspend callers;
+/// they must never park the shared spot/private WebSocket reactor OS thread.
+/// Requests retain the existing 2s admission timeout and fail closed. Already
+/// admitted work's Complete/Defer messages wait asynchronously for capacity and
+/// are retained by the pending future until admitted. Same-sender FIFO preserves
+/// completion before a subsequent claim. Cancellation before admission leaves
+/// owner state unchanged; cancellation after Claim admission drops the reply
+/// receiver and retains the existing single-flight lease/retry recovery. No
+/// private trade or order lifecycle events use this cold cache-control lane.
+#[derive(Clone)]
+struct SettlementMailbox {
+    tx: mpsc::Sender<SettlementOwnerCommand>,
+    // Shared atomics are telemetry only, never account/risk authority.
+    counters: Arc<SettlementQueueCounters>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SettlementOwnerMetrics {
@@ -423,155 +445,216 @@ pub fn settlement_owner_metrics() -> SettlementOwnerMetrics {
     SettlementOwnerMetrics {
         queue_capacity: SETTLEMENT_OWNER_CAPACITY,
         cache_capacity: SETTLEMENT_CACHE_CAPACITY,
-        queue_high_water: SETTLEMENT_QUEUE_HIGH_WATER.load(Ordering::Relaxed),
-        queue_overflow: SETTLEMENT_QUEUE_OVERFLOW.load(Ordering::Relaxed),
+        queue_high_water: SETTLEMENT_OWNER
+            .get()
+            .map_or(0, |owner| owner.counters.high_water.load(Ordering::Relaxed)),
+        queue_overflow: SETTLEMENT_OWNER
+            .get()
+            .map_or(0, |owner| owner.counters.overflow.load(Ordering::Relaxed)),
     }
 }
 
-fn settlement_owner() -> crossbeam_channel::Sender<SettlementOwnerCommand> {
-    SETTLEMENT_OWNER.get_or_init(|| {
-        let (tx, rx) = crossbeam_channel::bounded(SETTLEMENT_OWNER_CAPACITY);
-        std::thread::Builder::new().name("poly-settlement-owner".to_string()).spawn(move || {
-            crate::os_tune::pin_background("poly-settlement-owner");
-            let mut state = SettlementLookupState::default();
-            while let Ok(command) = rx.recv() {
-                match command {
-                    SettlementOwnerCommand::Claim { condition_id, now, reply } => {
-                        state.entries.retain(|_, entry| match entry {
-                            SettlementLookupEntry::Ready { .. } => true,
-                            SettlementLookupEntry::InFlight { lease_until } => *lease_until > now,
-                            SettlementLookupEntry::RetryAt(retry_at) => *retry_at > now,
-                        });
-                        let decision = if state.make_room_for(&condition_id) {
-                            state.claim(&condition_id, now)
-                        } else {
-                            SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-                            SettlementLookupDecision::Deferred
-                        };
-                        let _ = reply.try_send(decision);
-                    }
-                    SettlementOwnerCommand::ReserveDelay { now, reply } => {
-                        let _ = reply.try_send(state.reserve_request_delay(now));
-                    }
-                    SettlementOwnerCommand::RequestAllowed { condition_id, now, reply } => {
-                        let _ = reply.try_send(state.request_allowed(&condition_id, now));
-                    }
-                    SettlementOwnerCommand::Complete { condition_id, resolution, now } => {
-                        if state.make_room_for(&condition_id) {
-                            state.complete(&condition_id, resolution, now);
-                        } else {
-                            SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    SettlementOwnerCommand::Defer {
-                        condition_id,
-                        retry_after,
-                        rate_limited,
-                        now,
-                    } => {
-                        if state.make_room_for(&condition_id) {
-                            state.defer_after_error(
-                                &condition_id,
-                                retry_after,
-                                rate_limited,
-                                now,
-                            );
-                        } else {
-                            SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+impl SettlementMailbox {
+    fn channel(capacity: usize) -> (Self, mpsc::Receiver<SettlementOwnerCommand>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                tx,
+                counters: Arc::new(SettlementQueueCounters::default()),
+            },
+            rx,
+        )
+    }
+
+    async fn send(&self, command: SettlementOwnerCommand, terminal: bool) -> bool {
+        let depth = (self.tx.max_capacity() - self.tx.capacity() + 1).min(self.tx.max_capacity());
+        let admitted = match self.tx.try_send(command) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+            Err(mpsc::error::TrySendError::Full(command)) => {
+                self.counters.backpressure.fetch_add(1, Ordering::Relaxed);
+                if terminal {
+                    self.tx.send(command).await.is_ok()
+                } else {
+                    matches!(
+                        tokio::time::timeout(Duration::from_secs(2), self.tx.send(command)).await,
+                        Ok(Ok(()))
+                    )
                 }
             }
-        }).expect("failed to spawn settlement owner");
-        tx
-    }).clone()
-}
-
-fn settlement_claim(condition_id: &str, now: Instant) -> SettlementLookupDecision {
-    let (tx, rx) = crossbeam_channel::bounded(1);
-    let owner = settlement_owner();
-    let admitted_depth = owner.len().saturating_add(1).min(SETTLEMENT_OWNER_CAPACITY);
-    if owner.send_timeout(SettlementOwnerCommand::Claim {
-        condition_id: condition_id.to_string(),
-        now,
-        reply: tx,
-    }, Duration::from_secs(2)).is_err() {
-        SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-        return SettlementLookupDecision::Deferred;
+        };
+        if admitted {
+            self.counters.high_water.fetch_max(depth, Ordering::Relaxed);
+        } else {
+            self.counters.overflow.fetch_add(1, Ordering::Relaxed);
+        }
+        admitted
     }
-    SETTLEMENT_QUEUE_HIGH_WATER.fetch_max(admitted_depth, Ordering::Relaxed);
-    rx.recv().unwrap_or(SettlementLookupDecision::Deferred)
-}
 
-fn settlement_reserve_delay(now: Instant) -> Duration {
-    let (tx, rx) = crossbeam_channel::bounded(1);
-    let owner = settlement_owner();
-    let admitted_depth = owner.len().saturating_add(1).min(SETTLEMENT_OWNER_CAPACITY);
-    if owner.send_timeout(
-        SettlementOwnerCommand::ReserveDelay { now, reply: tx },
-        Duration::from_secs(2),
-    ).is_err() {
-        SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-        return DEFAULT_SETTLEMENT_RETRY;
+    async fn claim(&self, condition_id: &str, now: Instant) -> SettlementLookupDecision {
+        let (reply, result) = oneshot::channel();
+        if !self
+            .send(
+                SettlementOwnerCommand::Claim {
+                    condition_id: condition_id.to_string(),
+                    now,
+                    reply,
+                },
+                false,
+            )
+            .await
+        {
+            return SettlementLookupDecision::Deferred;
+        }
+        result.await.unwrap_or(SettlementLookupDecision::Deferred)
     }
-    SETTLEMENT_QUEUE_HIGH_WATER.fetch_max(admitted_depth, Ordering::Relaxed);
-    rx.recv().unwrap_or(DEFAULT_SETTLEMENT_RETRY)
-}
 
-fn settlement_request_allowed(condition_id: &str, now: Instant) -> bool {
-    let (tx, rx) = crossbeam_channel::bounded(1);
-    let owner = settlement_owner();
-    let admitted_depth = owner.len().saturating_add(1).min(SETTLEMENT_OWNER_CAPACITY);
-    if owner.send_timeout(SettlementOwnerCommand::RequestAllowed {
-        condition_id: condition_id.to_string(),
-        now,
-        reply: tx,
-    }, Duration::from_secs(2)).is_err() {
-        SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-        return false;
+    async fn reserve_delay(&self, now: Instant) -> Duration {
+        let (reply, result) = oneshot::channel();
+        if !self
+            .send(SettlementOwnerCommand::ReserveDelay { now, reply }, false)
+            .await
+        {
+            return DEFAULT_SETTLEMENT_RETRY;
+        }
+        result.await.unwrap_or(DEFAULT_SETTLEMENT_RETRY)
     }
-    SETTLEMENT_QUEUE_HIGH_WATER.fetch_max(admitted_depth, Ordering::Relaxed);
-    rx.recv().unwrap_or(false)
+
+    async fn request_allowed(&self, condition_id: &str, now: Instant) -> bool {
+        let (reply, result) = oneshot::channel();
+        self.send(
+            SettlementOwnerCommand::RequestAllowed {
+                condition_id: condition_id.to_string(),
+                now,
+                reply,
+            },
+            false,
+        )
+        .await
+            && result.await.unwrap_or(false)
+    }
+
+    async fn complete(
+        &self,
+        condition_id: &str,
+        resolution: Option<HashMap<String, f64>>,
+        now: Instant,
+    ) -> bool {
+        self.send(
+            SettlementOwnerCommand::Complete {
+                condition_id: condition_id.to_string(),
+                resolution,
+                now,
+            },
+            true,
+        )
+        .await
+    }
+
+    async fn defer(
+        &self,
+        condition_id: &str,
+        retry_after: Duration,
+        rate_limited: bool,
+        now: Instant,
+    ) -> bool {
+        self.send(
+            SettlementOwnerCommand::Defer {
+                condition_id: condition_id.to_string(),
+                retry_after,
+                rate_limited,
+                now,
+            },
+            true,
+        )
+        .await
+    }
 }
 
-fn settlement_complete(
-    condition_id: &str,
-    resolution: Option<HashMap<String, f64>>,
-    now: Instant,
+fn run_settlement_owner(
+    mut rx: mpsc::Receiver<SettlementOwnerCommand>,
+    metrics: Arc<SettlementQueueCounters>,
 ) {
-    let owner = settlement_owner();
-    let admitted_depth = owner.len().saturating_add(1).min(SETTLEMENT_OWNER_CAPACITY);
-    if let Err(error) = owner.send_timeout(SettlementOwnerCommand::Complete {
-        condition_id: condition_id.to_string(),
-        resolution,
-        now,
-    }, Duration::from_secs(2)) {
-        SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-        warn!("[position] settlement owner saturated while completing {condition_id}: {error}");
-    } else {
-        SETTLEMENT_QUEUE_HIGH_WATER.fetch_max(admitted_depth, Ordering::Relaxed);
+    let mut state = SettlementLookupState::default();
+    let mut next_metrics = Instant::now();
+    while let Some(command) = rx.blocking_recv() {
+        match command {
+            SettlementOwnerCommand::Claim {
+                condition_id,
+                now,
+                reply,
+            } => {
+                state.entries.retain(|_, entry| match entry {
+                    SettlementLookupEntry::Ready { .. } => true,
+                    SettlementLookupEntry::InFlight { lease_until } => *lease_until > now,
+                    SettlementLookupEntry::RetryAt(retry_at) => *retry_at > now,
+                });
+                let decision = if state.make_room_for(&condition_id) {
+                    state.claim(&condition_id, now)
+                } else {
+                    metrics.overflow.fetch_add(1, Ordering::Relaxed);
+                    SettlementLookupDecision::Deferred
+                };
+                let _ = reply.send(decision);
+            }
+            SettlementOwnerCommand::ReserveDelay { now, reply } => {
+                let _ = reply.send(state.reserve_request_delay(now));
+            }
+            SettlementOwnerCommand::RequestAllowed {
+                condition_id,
+                now,
+                reply,
+            } => {
+                let _ = reply.send(state.request_allowed(&condition_id, now));
+            }
+            SettlementOwnerCommand::Complete {
+                condition_id,
+                resolution,
+                now,
+            } => {
+                if state.make_room_for(&condition_id) {
+                    state.complete(&condition_id, resolution, now);
+                } else {
+                    metrics.overflow.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            SettlementOwnerCommand::Defer {
+                condition_id,
+                retry_after,
+                rate_limited,
+                now,
+            } => {
+                if state.make_room_for(&condition_id) {
+                    state.defer_after_error(&condition_id, retry_after, rate_limited, now);
+                } else {
+                    metrics.overflow.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        if Instant::now() >= next_metrics {
+            log::info!("[settlement_owner_queue] depth={} capacity={} high_water={} backpressure={} overflow={}",
+                rx.len(), rx.max_capacity(), metrics.high_water.load(Ordering::Relaxed),
+                metrics.backpressure.load(Ordering::Relaxed), metrics.overflow.load(Ordering::Relaxed));
+            next_metrics = Instant::now() + Duration::from_secs(30);
+        }
     }
 }
 
-fn settlement_defer(
-    condition_id: &str,
-    retry_after: Duration,
-    rate_limited: bool,
-    now: Instant,
-) {
-    let owner = settlement_owner();
-    let admitted_depth = owner.len().saturating_add(1).min(SETTLEMENT_OWNER_CAPACITY);
-    if let Err(error) = owner.send_timeout(SettlementOwnerCommand::Defer {
-        condition_id: condition_id.to_string(),
-        retry_after,
-        rate_limited,
-        now,
-    }, Duration::from_secs(2)) {
-        SETTLEMENT_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-        warn!("[position] settlement owner saturated while deferring {condition_id}: {error}");
-    } else {
-        SETTLEMENT_QUEUE_HIGH_WATER.fetch_max(admitted_depth, Ordering::Relaxed);
-    }
+fn settlement_owner() -> SettlementMailbox {
+    SETTLEMENT_OWNER
+        .get_or_init(|| {
+            let (owner, rx) = SettlementMailbox::channel(SETTLEMENT_OWNER_CAPACITY);
+            let counters = owner.counters.clone();
+            std::thread::Builder::new()
+                .name("poly-settlement-owner".to_string())
+                .spawn(move || {
+                    crate::os_tune::pin_background("poly-settlement-owner");
+                    run_settlement_owner(rx, counters);
+                })
+                .expect("failed to spawn settlement owner");
+            owner
+        })
+        .clone()
 }
 
 fn settlement_request_limiter() -> &'static tokio::sync::Semaphore {
@@ -650,8 +733,9 @@ async fn fetch_authoritative_resolution(
 async fn fetch_authoritative_resolutions(condition_ids: HashSet<String>) -> HashMap<String, f64> {
     let client = crate::async_rt::http_client();
     let mut values = HashMap::new();
+    let owner = settlement_owner();
     for condition_id in condition_ids {
-        let decision = settlement_claim(&condition_id, Instant::now());
+        let decision = owner.claim(&condition_id, Instant::now()).await;
         match decision {
             SettlementLookupDecision::Cached(resolution) => {
                 values.extend(resolution);
@@ -662,19 +746,21 @@ async fn fetch_authoritative_resolutions(condition_ids: HashSet<String>) -> Hash
         }
 
         let Ok(_permit) = settlement_request_limiter().acquire().await else {
-            settlement_defer(
-                &condition_id,
-                DEFAULT_SETTLEMENT_RETRY,
-                false,
-                Instant::now(),
-            );
+            owner
+                .defer(
+                    &condition_id,
+                    DEFAULT_SETTLEMENT_RETRY,
+                    false,
+                    Instant::now(),
+                )
+                .await;
             continue;
         };
-        let delay = settlement_reserve_delay(Instant::now());
+        let delay = owner.reserve_delay(Instant::now()).await;
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let allowed = settlement_request_allowed(&condition_id, Instant::now());
+        let allowed = owner.request_allowed(&condition_id, Instant::now()).await;
         if !allowed {
             continue;
         }
@@ -685,15 +771,19 @@ async fn fetch_authoritative_resolutions(condition_ids: HashSet<String>) -> Hash
                 if let Some(resolution) = resolution.as_ref() {
                     values.extend(resolution.clone());
                 }
-                settlement_complete(&condition_id, resolution, Instant::now());
+                owner
+                    .complete(&condition_id, resolution, Instant::now())
+                    .await;
             }
             Err(error) => {
-                settlement_defer(
-                    &condition_id,
-                    error.retry_after,
-                    error.rate_limited,
-                    Instant::now(),
-                );
+                owner
+                    .defer(
+                        &condition_id,
+                        error.retry_after,
+                        error.rate_limited,
+                        Instant::now(),
+                    )
+                    .await;
                 log::warn!(
                     "[Polymarket] Authoritative settlement lookup unavailable; keeping provisional value and suppressing duplicate requests for {:?} global_cooldown={}: {}",
                     error.retry_after,
@@ -1118,54 +1208,223 @@ mod tests {
         assert!(state.request_allowed("condition-b", now + Duration::from_secs(30)));
     }
 
+    fn settlement_test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn test_settlement_owner() -> (SettlementMailbox, std::thread::JoinHandle<()>) {
+        let (owner, rx) = SettlementMailbox::channel(8);
+        let counters = owner.counters.clone();
+        let worker = std::thread::spawn(move || run_settlement_owner(rx, counters));
+        (owner, worker)
+    }
+
+    fn pending<F: std::future::Future>(future: std::pin::Pin<&mut F>) {
+        let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(future.poll(&mut cx).is_pending());
+    }
+
     #[test]
-    fn settlement_owner_reports_cached_roundtrip_tail_and_bounded_overflow() {
-        const EVENTS: usize = 4_096;
-        let condition_id = format!("condition-owner-latency-{}", std::process::id());
-        let now = Instant::now();
-        assert!(matches!(
-            settlement_claim(&condition_id, now),
-            SettlementLookupDecision::Fetch
-        ));
-        let expected = HashMap::from([("winner".to_string(), 1.0)]);
-        settlement_complete(&condition_id, Some(expected.clone()), now);
-        settlement_complete(&condition_id, Some(expected.clone()), now);
-
-        let mut samples = Vec::with_capacity(EVENTS);
-        for _ in 0..EVENTS {
-            let started = Instant::now();
-            assert!(matches!(
-                settlement_claim(&condition_id, Instant::now()),
-                SettlementLookupDecision::Cached(values) if values == expected
-            ));
-            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
-        }
-        samples.sort_unstable();
-        let percentile = |numerator: usize, denominator: usize| {
-            samples[(samples.len() - 1) * numerator / denominator]
-        };
-        let metrics = settlement_owner_metrics();
-        eprintln!(
-            "settlement owner: boundary=claim_send_to_cached_reply n={} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_high_water={} overflow={}",
-            samples.len(),
-            percentile(1, 2),
-            percentile(99, 100),
-            percentile(999, 1_000),
-            samples.last().copied().unwrap_or_default(),
-            metrics.queue_high_water,
-            metrics.queue_overflow,
+    fn settlement_reply_wait_does_not_park_shared_reactor() {
+        let (owner, mut rx) = SettlementMailbox::channel(1);
+        let progressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = progressed.clone();
+        let worker = std::thread::spawn(move || {
+            let Some(SettlementOwnerCommand::Claim { reply, .. }) = rx.blocking_recv() else {
+                panic!("claim")
+            };
+            let until = Instant::now() + Duration::from_millis(500);
+            while !seen.load(Ordering::Acquire) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let before_reply = seen.load(Ordering::Acquire);
+            reply.send(SettlementLookupDecision::Fetch).ok();
+            before_reply
+        });
+        settlement_test_runtime().block_on(async {
+            let (decision, ()) = tokio::join!(owner.claim("condition", Instant::now()), async {
+                tokio::task::yield_now().await;
+                progressed.store(true, Ordering::Release);
+            });
+            assert!(matches!(decision, SettlementLookupDecision::Fetch));
+        });
+        assert!(
+            worker.join().unwrap(),
+            "other reactor futures must run before the settlement reply"
         );
-        assert!(metrics.queue_high_water > 0);
-        assert_eq!(metrics.queue_overflow, 0);
+    }
 
-        let (full_tx, _full_rx) = crossbeam_channel::bounded::<u8>(SETTLEMENT_OWNER_CAPACITY);
-        for _ in 0..SETTLEMENT_OWNER_CAPACITY {
-            full_tx.try_send(1).unwrap();
+    #[test]
+    fn settlement_fifo_duplicate_completion_and_owner_isolation() {
+        let (first, first_worker) = test_settlement_owner();
+        let (second, second_worker) = test_settlement_owner();
+        settlement_test_runtime().block_on(async {
+            let now = Instant::now();
+            assert!(matches!(first.claim("same", now).await, SettlementLookupDecision::Fetch));
+            assert!(matches!(first.claim("same", now).await, SettlementLookupDecision::Deferred));
+            let resolution = HashMap::from([("winner".to_owned(), 1.0)]);
+            assert!(first.complete("same", Some(resolution.clone()), now).await);
+            assert!(first.complete("same", Some(resolution.clone()), now).await);
+            assert!(matches!(first.claim("same", now).await, SettlementLookupDecision::Cached(v) if v == resolution));
+            assert!(matches!(second.claim("same", now).await, SettlementLookupDecision::Fetch));
+            assert!(second.defer("same", Duration::from_secs(30), true, now).await);
+            assert!(!second.request_allowed("same", now).await);
+            assert!(matches!(first.claim("same", now).await, SettlementLookupDecision::Cached(v) if v == resolution));
+            assert_eq!(first.counters.overflow.load(Ordering::Relaxed), 0);
+        });
+        drop(first);
+        drop(second);
+        first_worker.join().unwrap();
+        second_worker.join().unwrap();
+    }
+
+    #[test]
+    fn settlement_full_fifo_yields_and_retains_terminal_messages_in_order() {
+        let (owner, mut rx) = SettlementMailbox::channel(1);
+        settlement_test_runtime().block_on(async {
+            let now = Instant::now();
+            assert!(owner.complete("first", None, now).await);
+            let mut claim = Box::pin(owner.claim("second", now));
+            pending(claim.as_mut());
+            let mut terminal = Box::pin(owner.defer("third", Duration::from_secs(5), false, now));
+            pending(terminal.as_mut());
+            assert!(matches!(rx.try_recv().unwrap(), SettlementOwnerCommand::Complete { condition_id, .. } if condition_id == "first"));
+            pending(claim.as_mut());
+            pending(terminal.as_mut());
+            let SettlementOwnerCommand::Claim { condition_id, reply, .. } = rx.try_recv().unwrap() else { panic!("claim must remain ahead of terminal control") };
+            assert_eq!(condition_id, "second");
+            reply.send(SettlementLookupDecision::Fetch).ok();
+            assert!(matches!(claim.await, SettlementLookupDecision::Fetch));
+            assert!(terminal.await);
+            assert!(matches!(rx.try_recv().unwrap(), SettlementOwnerCommand::Defer { condition_id, .. } if condition_id == "third"));
+            assert_eq!(rx.len(), 0);
+            assert_eq!(owner.counters.high_water.load(Ordering::Relaxed), 1);
+            assert_eq!(owner.counters.backpressure.load(Ordering::Relaxed), 2);
+            assert_eq!(owner.counters.overflow.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn settlement_disconnected_owner_fails_closed() {
+        let (owner, rx) = SettlementMailbox::channel(1);
+        drop(rx);
+        settlement_test_runtime().block_on(async {
+            let now = Instant::now();
+            assert!(matches!(
+                owner.claim("a", now).await,
+                SettlementLookupDecision::Deferred
+            ));
+            assert_eq!(owner.reserve_delay(now).await, DEFAULT_SETTLEMENT_RETRY);
+            assert!(!owner.request_allowed("a", now).await);
+            assert!(!owner.complete("a", None, now).await);
+            assert!(!owner.defer("a", Duration::from_secs(5), false, now).await);
+            assert_eq!(owner.counters.overflow.load(Ordering::Relaxed), 5);
+        });
+    }
+
+    #[test]
+    fn settlement_admission_timeout_keeps_full_queue_intact() {
+        let (owner, mut rx) = SettlementMailbox::channel(1);
+        settlement_test_runtime().block_on(async {
+            let now = Instant::now();
+            assert!(owner.complete("first", None, now).await);
+            assert!(matches!(owner.claim("timeout", now).await, SettlementLookupDecision::Deferred));
+            assert_eq!(owner.counters.overflow.load(Ordering::Relaxed), 1);
+            assert!(matches!(rx.try_recv().unwrap(), SettlementOwnerCommand::Complete { condition_id, .. } if condition_id == "first"));
+            assert_eq!(rx.len(), 0);
+        });
+    }
+
+    #[test]
+    fn settlement_abandoned_reply_retains_lease_and_replay_recovers_after_expiry() {
+        let (owner, worker) = test_settlement_owner();
+        settlement_test_runtime().block_on(async {
+            let now = Instant::now();
+            let (reply, result) = oneshot::channel();
+            drop(result);
+            assert!(
+                owner
+                    .send(
+                        SettlementOwnerCommand::Claim {
+                            condition_id: "abandoned".into(),
+                            now,
+                            reply
+                        },
+                        false
+                    )
+                    .await
+            );
+            assert!(matches!(
+                owner.claim("abandoned", now).await,
+                SettlementLookupDecision::Deferred
+            ));
+            let later = now + SETTLEMENT_IN_FLIGHT_LEASE + Duration::from_secs(1);
+            assert!(matches!(
+                owner.claim("abandoned", later).await,
+                SettlementLookupDecision::Fetch
+            ));
+        });
+        drop(owner);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "controlled release before/after poll and background roundtrip benchmark"]
+    fn settlement_reactor_poll_benchmark() {
+        const N: usize = 4096;
+        let (old_tx, old_rx) = crossbeam_channel::bounded::<crossbeam_channel::Sender<()>>(1);
+        let old_worker = std::thread::spawn(move || {
+            while let Ok(reply) = old_rx.recv() {
+                std::thread::sleep(Duration::from_micros(200));
+                reply.send(()).unwrap();
+            }
+        });
+        let (owner, mut rx) = SettlementMailbox::channel(1);
+        let worker = std::thread::spawn(move || {
+            while let Some(command) = rx.blocking_recv() {
+                let SettlementOwnerCommand::Claim { reply, .. } = command else {
+                    panic!("claim")
+                };
+                std::thread::sleep(Duration::from_micros(200));
+                reply.send(SettlementLookupDecision::Fetch).ok();
+            }
+        });
+        let mut before = Vec::with_capacity(N);
+        let mut after = Vec::with_capacity(N);
+        let mut delivery = Vec::with_capacity(N);
+        settlement_test_runtime().block_on(async {
+            for _ in 0..N {
+                let started = Instant::now();
+                let (reply, result) = crossbeam_channel::bounded(1);
+                old_tx.send(reply).unwrap();
+                result.recv().unwrap();
+                before.push(started.elapsed().as_nanos());
+                let start = Instant::now();
+                let mut request = Box::pin(owner.claim("bench", Instant::now()));
+                let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+                let ready = std::future::Future::poll(request.as_mut(), &mut cx);
+                after.push(start.elapsed().as_nanos());
+                if ready.is_pending() {
+                    request.await;
+                }
+                delivery.push(start.elapsed().as_nanos());
+            }
+        });
+        for (label, mut v) in [
+            ("before_blocking_poll", before),
+            ("after_first_poll_including_request_allocation", after),
+            ("after_background_reply", delivery),
+        ] {
+            v.sort_unstable();
+            eprintln!("settlement {label}: n={} median_ns={} p99_ns={} p999_ns={} max_ns={} capacity=1 high_water={} backpressure={} overflow={}", N, (v[N/2-1]+v[N/2])/2, v[(N*99).div_ceil(100)-1], v[(N*999).div_ceil(1000)-1], v[N-1], owner.counters.high_water.load(Ordering::Relaxed), owner.counters.backpressure.load(Ordering::Relaxed), owner.counters.overflow.load(Ordering::Relaxed));
         }
-        assert!(matches!(
-            full_tx.try_send(1),
-            Err(crossbeam_channel::TrySendError::Full(1))
-        ));
+        drop(old_tx);
+        drop(owner);
+        old_worker.join().unwrap();
+        worker.join().unwrap();
     }
 
     fn row(asset: &str, condition: &str, size: f64, value: f64, redeemable: bool) -> ApiPosition {
