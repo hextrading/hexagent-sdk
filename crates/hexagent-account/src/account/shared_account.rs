@@ -56,6 +56,9 @@ const ROUTE_SHARD_COUNT: usize = 64;
 #[path = "route_snapshot.rs"]
 mod route_snapshot;
 use route_snapshot::RouteSnapshot;
+#[path = "replay_metrics.rs"]
+mod replay_metrics;
+use replay_metrics::ReplayPageMetrics;
 const RECENT_VIRTUAL_TRADE_MUTATIONS: usize = 65_536;
 /// One request can be executing while one retry waits behind it. The GC
 /// coordinator never intentionally has more than one outstanding request per
@@ -6633,6 +6636,7 @@ fn write_persisted_account(path: &Path, snapshot: &PersistedAccount) -> Result<(
 #[derive(Debug)]
 pub struct SharedAccount {
     account_id: String,
+    replay_page_metrics: ReplayPageMetrics,
     history_archive: Option<HistoryArchive>,
     state: Arc<Mutex<SharedAccountState>>,
     account_owner_task_tx: crossbeam_channel::Sender<AccountOwnerCommand>,
@@ -7942,6 +7946,7 @@ impl SharedAccount {
             crossbeam_channel::bounded(WALLET_CALIBRATION_WAKE_CAPACITY);
         let account = Self {
             account_id: account_id.into(),
+            replay_page_metrics: ReplayPageMetrics::default(),
             history_archive: None,
             state: Arc::new(Mutex::new(SharedAccountState::default())),
             account_owner_task_tx,
@@ -8354,6 +8359,11 @@ impl SharedAccount {
         let initial_retired_order_audit_tombstones = state.retired_order_audit_tombstones.clone();
         let initial_binary_pairs = published_binary_pairs(&state);
         let initial_economic_snapshot = PublishedEconomicSnapshot::from_state(&state);
+        let replay_page_metrics = ReplayPageMetrics::new(
+            state.gap_replay_last_pages,
+            state.gap_replay_max_pages,
+            state.gap_replay_total_pages,
+        );
         let state = Arc::new(Mutex::new(state));
         if !startup_aggregate_repairs.is_empty() {
             log::warn!(
@@ -8376,6 +8386,7 @@ impl SharedAccount {
             crossbeam_channel::bounded(WALLET_CALIBRATION_WAKE_CAPACITY);
         let account = Self {
             account_id,
+            replay_page_metrics,
             history_archive: Some(history_archive),
             state,
             account_owner_task_tx,
@@ -8501,6 +8512,7 @@ impl SharedAccount {
         let wait_started = Instant::now();
         let control = self.control_gate.write().unwrap();
         let mut state = self.state.lock().unwrap();
+        self.refresh_replay_page_metrics(&mut state);
         state.unresolved_trade_match_times = self
             .unresolved_trade_match_times_fast
             .load()
@@ -8567,6 +8579,7 @@ impl SharedAccount {
         let wait_started = Instant::now();
         let control = self.control_gate.write().unwrap();
         let mut state = self.state.lock().unwrap();
+        self.refresh_replay_page_metrics(&mut state);
         let acquired_at = Instant::now();
         let wait_us = wait_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         self.account_lock_wait_last_us
@@ -13233,12 +13246,17 @@ impl SharedAccount {
         Ok(adjustment)
     }
 
+    /// Telemetry only: replay runs on the shared reactor and must not acquire
+    /// the aggregate control/state locks merely to report a page count.
     pub fn record_gap_replay_pages(&self, pages: usize) {
-        let mut state = self.lock_state();
-        let pages = pages as u64;
-        state.gap_replay_last_pages = pages;
-        state.gap_replay_max_pages = state.gap_replay_max_pages.max(pages);
-        state.gap_replay_total_pages = state.gap_replay_total_pages.saturating_add(pages);
+        self.replay_page_metrics.record(pages);
+    }
+
+    fn refresh_replay_page_metrics(&self, state: &mut SharedAccountState) {
+        let (last, maximum, total) = self.replay_page_metrics.snapshot();
+        state.gap_replay_last_pages = last;
+        state.gap_replay_max_pages = state.gap_replay_max_pages.max(maximum);
+        state.gap_replay_total_pages = state.gap_replay_total_pages.max(total);
     }
 
     pub fn record_maintenance_queue_wait(&self, wait: Duration) {
@@ -35747,3 +35765,7 @@ mod control_snapshot_reuse_tests;
 #[cfg(test)]
 #[path = "tail_snapshot_tests.rs"]
 mod tail_snapshot_tests;
+
+#[cfg(test)]
+#[path = "shared_account_replay_metrics_tests.rs"]
+mod replay_metrics_tests;
