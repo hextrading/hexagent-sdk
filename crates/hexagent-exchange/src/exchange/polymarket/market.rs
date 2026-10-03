@@ -4925,7 +4925,7 @@ async fn clob_ws_task(
                     Ok(tick) => (1, tick.lag_ns(), tick.expirations),
                     Err(error) => {
                         crate::latency::observe_scheduler_tail(crate::latency::SchedulerTail {
-                            probe: "timerfd_error", observed_unix_ns: now_ns(), lag_ns: 0,
+                            probe: "timerfd_error", boundary: "timer_read_error", observed_unix_ns: now_ns(), lag_ns: 0,
                             span_wall_ns: 0, span_cpu_ns: None, expirations: 0,
                             error_code: error.raw_os_error(),
                         });
@@ -4942,6 +4942,7 @@ async fn clob_ws_task(
             if lag_ns >= threshold {
                 crate::latency::observe_scheduler_tail(crate::latency::SchedulerTail {
                     probe: if index == 0 { "tokio_interval" } else { "timerfd" },
+                    boundary: "previous_actual_probe_to_current",
                     observed_unix_ns: now_ns(), lag_ns, span_wall_ns: span_ns,
                     span_cpu_ns: split.map(|(cpu, _)| cpu), expirations, error_code: None,
                 });
@@ -9634,6 +9635,7 @@ fn make_inline_rtds_event(r: InlineRtdsFields<'_>, local_now: u64) -> Option<Mar
 
 impl ExchangeMarket for PolymarketMarket {
     fn connect(&mut self) -> Result<()> {
+        super::market_info_v2::prewarm_market_info_owner()?;
         if self.clob_tls.is_none() {
             self.clob_tls = Some(ClobTlsConfig::load_native()?);
         }

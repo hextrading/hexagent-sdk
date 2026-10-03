@@ -216,6 +216,7 @@ pub fn init() -> Result<()> {
             // A supervised CLOB epoch may fall back to this runtime. Prepare
             // its observation lane before polling, including that recovery path.
             crate::latency::prepare_polymarket_clob_stages();
+            crate::reactor_probe::prepare();
             let rt = match Builder::new_current_thread()
                 .enable_all()
                 .thread_name("hexbot-async-rt")
@@ -231,7 +232,10 @@ pub fn init() -> Result<()> {
             let _ = handle_tx.send(handle);
             // Park the runtime on a future that never resolves — keeps
             // the runtime alive for the rest of the process.
-            rt.block_on(futures_util::future::pending::<()>());
+            rt.block_on(async {
+                tokio::spawn(crate::reactor_probe::run());
+                futures_util::future::pending::<()>().await;
+            });
         })
         .context("spawn async runtime thread")?;
 
@@ -510,7 +514,7 @@ where
 {
     let (tx, rx) = oneshot::channel::<T>();
     handle().spawn(async move {
-        let val = fut.await;
+        let val = crate::reactor_probe::observe_task(fut).await;
         let _ = tx.send(val);
     });
     // Block on the oneshot. If the runtime is down (shutdown), rx errors

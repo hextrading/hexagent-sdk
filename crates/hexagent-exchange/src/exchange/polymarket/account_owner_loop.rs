@@ -123,11 +123,13 @@ pub(super) fn run(
     let mut ingress: Option<Box<dyn PrivateIngress>> = None;
     let mut retirement: Option<RuntimeRetirement> = None;
     let mut turns = 0usize;
+    let mut queue_timing = hexagent_runtime::owner_queue_probe::OwnerQueueProbe::prepare();
     loop {
         let Some(shared) = weak.upgrade() else {
             break;
         };
         let started = crate::latency::Instant::now();
+        queue_timing.begin_turn();
         let mut worked = recovery.as_ref().is_some_and(|owner| owner.service_one());
         if let Ok(install) = install_rx.try_recv() {
             if ingress.is_some() {
@@ -158,7 +160,7 @@ pub(super) fn run(
         }
         if let Some(ingress) = ingress.as_mut() {
             let stage_started = crate::latency::Instant::now();
-            if ingress.step(&shared, &mut positions, &mut replay) {
+            if ingress.step(&shared, &mut positions, &mut replay, &queue_timing) {
                 crate::latency::record("polymarket.account.owner_ingress", stage_started);
                 worked = true;
             }
@@ -234,11 +236,13 @@ pub(super) fn run(
             };
             let _ = wait.ready_timeout(delay);
         };
+        queue_timing.begin_wait();
         if let Some(recovery) = recovery.as_ref() {
             recovery.with_receiver(|rx| wait_for_work(Some(rx)));
         } else {
             wait_for_work(None);
         }
+        queue_timing.end_wait();
         let _ = shutdown_rx.try_recv();
     }
 }

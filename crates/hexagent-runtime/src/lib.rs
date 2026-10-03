@@ -17,12 +17,14 @@ pub mod http1_pool;
 pub mod instrumented_http1;
 pub mod latency;
 pub mod latency_record;
+pub mod owner_queue_probe;
 pub mod latest_snapshot;
 pub mod memory;
 pub mod os_tune;
 pub mod owner_timer;
 pub mod poll_channel;
 pub mod precise_interval;
+mod reactor_probe;
 pub mod shutdown;
 pub mod try_queue;
 

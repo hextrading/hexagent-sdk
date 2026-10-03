@@ -88,7 +88,10 @@ struct MarketInfoKey {
 }
 
 enum MarketInfoFlight {
-    Fetching(Vec<crossbeam_channel::Sender<Option<MarketInfoV2>>>),
+    Fetching {
+        generation: u64,
+        waiters: Vec<crossbeam_channel::Sender<Option<MarketInfoV2>>>,
+    },
     Ready {
         fetched_at: Instant,
         value: MarketInfoV2,
@@ -99,10 +102,10 @@ enum MarketInfoOwnerCommand {
     Subscribe {
         key: MarketInfoKey,
         subscriber: crossbeam_channel::Sender<Option<MarketInfoV2>>,
-        leader: crossbeam_channel::Sender<bool>,
     },
     Finish {
         key: MarketInfoKey,
+        generation: u64,
         result: Option<MarketInfoV2>,
     },
 }
@@ -110,7 +113,7 @@ enum MarketInfoOwnerCommand {
 const MARKET_INFO_OWNER_CAPACITY: usize = 256;
 const MARKET_INFO_CACHE_CAPACITY: usize = 1_024;
 const MARKET_INFO_WAITER_CAPACITY: usize = 4_096;
-static MARKET_INFO_OWNER: OnceLock<crossbeam_channel::Sender<MarketInfoOwnerCommand>> =
+static MARKET_INFO_OWNER: OnceLock<hexagent_runtime::poll_channel::Sender<MarketInfoOwnerCommand>> =
     OnceLock::new();
 static MARKET_INFO_QUEUE_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
 static MARKET_INFO_QUEUE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
@@ -134,96 +137,164 @@ pub fn market_info_owner_metrics() -> MarketInfoOwnerMetrics {
     }
 }
 
-fn market_info_owner() -> crossbeam_channel::Sender<MarketInfoOwnerCommand> {
+/// Mutable cache belongs only to the existing background metadata owner.
+#[derive(Default)]
+struct MarketInfoOwnerState {
+    entries: HashMap<MarketInfoKey, MarketInfoFlight>,
+    waiter_count: usize,
+    next_generation: u64,
+}
+
+impl MarketInfoOwnerState {
+    /// Returns a generation only for a newly admitted flight. The owner, never
+    /// the strategy, starts that fetch. No acknowledgement round trip exists.
+    fn subscribe(
+        &mut self,
+        key: MarketInfoKey,
+        subscriber: crossbeam_channel::Sender<Option<MarketInfoV2>>,
+    ) -> Option<u64> {
+        self.entries.retain(|_, entry| match entry {
+            MarketInfoFlight::Fetching { .. } => true,
+            MarketInfoFlight::Ready { fetched_at, .. } => {
+                fetched_at.elapsed() < Duration::from_secs(2 * 60 * 60)
+            }
+        });
+        match self.entries.get_mut(&key) {
+            Some(MarketInfoFlight::Ready { value, .. }) => {
+                let _ = subscriber.try_send(Some(value.clone()));
+                return None;
+            }
+            Some(MarketInfoFlight::Fetching { waiters, .. })
+                if self.waiter_count < MARKET_INFO_WAITER_CAPACITY =>
+            {
+                waiters.push(subscriber);
+                self.waiter_count += 1;
+                return None;
+            }
+            _ => {}
+        }
+        if !self.entries.contains_key(&key) && self.entries.len() >= MARKET_INFO_CACHE_CAPACITY {
+            let oldest_ready = self
+                .entries
+                .iter()
+                .filter_map(|(key, entry)| match entry {
+                    MarketInfoFlight::Ready { fetched_at, .. } => Some((key.clone(), *fetched_at)),
+                    MarketInfoFlight::Fetching { .. } => None,
+                })
+                .min_by_key(|(_, at)| *at)
+                .map(|(key, _)| key);
+            if let Some(key) = oldest_ready {
+                self.entries.remove(&key);
+            }
+        }
+        if self.waiter_count >= MARKET_INFO_WAITER_CAPACITY
+            || self.entries.len() >= MARKET_INFO_CACHE_CAPACITY
+            || self.entries.contains_key(&key)
+        {
+            MARKET_INFO_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+            let _ = subscriber.try_send(None);
+            return None;
+        }
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("market-info generation exhausted");
+        let generation = self.next_generation;
+        self.entries.insert(
+            key,
+            MarketInfoFlight::Fetching {
+                generation,
+                waiters: vec![subscriber],
+            },
+        );
+        self.waiter_count += 1;
+        Some(generation)
+    }
+
+    fn finish(&mut self, key: MarketInfoKey, generation: u64, result: Option<MarketInfoV2>) {
+        // A late/duplicate result must not finish a newer retry for this key.
+        if !matches!(self.entries.get(&key), Some(MarketInfoFlight::Fetching { generation: active, .. }) if *active == generation)
+        {
+            return;
+        }
+        let Some(MarketInfoFlight::Fetching { waiters, .. }) = self.entries.remove(&key) else {
+            unreachable!()
+        };
+        self.waiter_count -= waiters.len();
+        if let Some(value) = result.as_ref() {
+            self.entries.insert(
+                key,
+                MarketInfoFlight::Ready {
+                    fetched_at: Instant::now(),
+                    value: value.clone(),
+                },
+            );
+        }
+        for waiter in waiters {
+            let _ = waiter.try_send(result.clone());
+        }
+    }
+}
+
+/// Startup only. Existing background affinity/topology role, bounded FIFO256.
+/// Callers on strategy threads only use the already installed sender.
+pub fn prewarm_market_info_owner() -> Result<()> {
+    hexagent_runtime::background_jobs::prewarm().map_err(|error| anyhow!(error))?;
     MARKET_INFO_OWNER.get_or_init(|| {
-        let (tx, rx) = crossbeam_channel::bounded(MARKET_INFO_OWNER_CAPACITY);
-        std::thread::Builder::new().name("poly-market-info-owner".to_string()).spawn(move || {
-            crate::os_tune::pin_background("poly-market-info-owner");
-            let mut entries = HashMap::<MarketInfoKey, MarketInfoFlight>::new();
-            let mut waiter_count = 0usize;
-            while let Ok(command) = rx.recv() {
-                entries.retain(|_, entry| match entry {
-                    MarketInfoFlight::Fetching(_) => true,
-                    MarketInfoFlight::Ready { fetched_at, .. } => {
-                        fetched_at.elapsed() < Duration::from_secs(2 * 60 * 60)
-                    }
-                });
-                match command {
-                    MarketInfoOwnerCommand::Subscribe { key, subscriber, leader } => {
-                        if !entries.contains_key(&key)
-                            && entries.len() >= MARKET_INFO_CACHE_CAPACITY
-                        {
-                            let oldest_ready = entries
-                                .iter()
-                                .filter_map(|(key, entry)| match entry {
-                                    MarketInfoFlight::Ready { fetched_at, .. } => {
-                                        Some((key.clone(), *fetched_at))
-                                    }
-                                    MarketInfoFlight::Fetching(_) => None,
+        let (tx, rx) = hexagent_runtime::poll_channel::bounded(MARKET_INFO_OWNER_CAPACITY);
+        let finish_tx = tx.clone();
+        std::thread::Builder::new()
+            .name("poly-market-info-owner".to_string())
+            .spawn(move || {
+                crate::os_tune::pin_background("poly-market-info-owner");
+                let mut state = MarketInfoOwnerState::default();
+                loop {
+                    let command = match rx
+                        .recv_timeout_with_poll(Duration::from_secs(1), Duration::from_millis(1))
+                    {
+                        Ok(command) => command,
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    };
+                    match command {
+                        MarketInfoOwnerCommand::Subscribe { key, subscriber } => {
+                            let key = market_info_key(
+                                key.api_url_prefix,
+                                key.condition_id,
+                                key.path_template,
+                            );
+                            if let Some(generation) = state.subscribe(key.clone(), subscriber) {
+                                let worker_key = key.clone();
+                                let completion = finish_tx.clone();
+                                if hexagent_runtime::background_jobs::try_submit(move || {
+                                    let result = fetch_market_info_with_retry(&worker_key);
+                                    // Cold producer: retain completion on full. The owner never
+                                    // waits for this worker, so capacity cannot strand a flight.
+                                    let _ = completion.send(MarketInfoOwnerCommand::Finish {
+                                        key: worker_key,
+                                        generation,
+                                        result,
+                                    });
                                 })
-                                .min_by_key(|(_, fetched_at)| *fetched_at)
-                                .map(|(key, _)| key);
-                            if let Some(oldest_ready) = oldest_ready {
-                                entries.remove(&oldest_ready);
+                                .is_err()
+                                {
+                                    MARKET_INFO_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+                                    state.finish(key, generation, None);
+                                }
                             }
                         }
-                        let has_entry_capacity = entries.len() < MARKET_INFO_CACHE_CAPACITY;
-                        match entries.get_mut(&key) {
-                            Some(MarketInfoFlight::Fetching(waiters))
-                                if waiter_count < MARKET_INFO_WAITER_CAPACITY =>
-                            {
-                                waiters.push(subscriber);
-                                waiter_count += 1;
-                                let _ = leader.try_send(false);
-                            }
-                            Some(MarketInfoFlight::Fetching(_)) => {
-                                MARKET_INFO_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-                                let _ = subscriber.try_send(None);
-                                let _ = leader.try_send(false);
-                            }
-                            Some(MarketInfoFlight::Ready { value, .. }) => {
-                                let _ = subscriber.try_send(Some(value.clone()));
-                                let _ = leader.try_send(false);
-                            }
-                            None if has_entry_capacity => {
-                                entries.insert(key, MarketInfoFlight::Fetching(vec![subscriber]));
-                                waiter_count += 1;
-                                let _ = leader.try_send(true);
-                            }
-                            None => {
-                                MARKET_INFO_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-                                let _ = subscriber.try_send(None);
-                                let _ = leader.try_send(false);
-                            }
-                        }
-                    }
-                    MarketInfoOwnerCommand::Finish { key, result } => {
-                        let (waiters, accept_result) = match entries.remove(&key) {
-                            Some(MarketInfoFlight::Fetching(waiters)) => (waiters, true),
-                            Some(ready @ MarketInfoFlight::Ready { .. }) => {
-                                entries.insert(key.clone(), ready);
-                                (Vec::new(), false)
-                            }
-                            None => (Vec::new(), false),
-                        };
-                        waiter_count = waiter_count.saturating_sub(waiters.len());
-                        if accept_result {
-                            if let Some(value) = result.as_ref() {
-                            entries.insert(key, MarketInfoFlight::Ready {
-                                fetched_at: Instant::now(),
-                                value: value.clone(),
-                            });
-                            }
-                        }
-                        for waiter in waiters {
-                            let _ = waiter.try_send(result.clone());
-                        }
+                        MarketInfoOwnerCommand::Finish {
+                            key,
+                            generation,
+                            result,
+                        } => state.finish(key, generation, result),
                     }
                 }
-            }
-        }).expect("failed to spawn market-info owner");
+            })
+            .expect("failed to spawn market-info owner");
         tx
-    }).clone()
+    });
+    Ok(())
 }
 
 fn market_info_key(
@@ -243,38 +314,35 @@ fn market_info_key(
 }
 
 fn subscribe_market_info(
-    key: &MarketInfoKey,
-) -> (crossbeam_channel::Receiver<Option<MarketInfoV2>>, bool) {
+    owner: Option<&hexagent_runtime::poll_channel::Sender<MarketInfoOwnerCommand>>,
+    key: MarketInfoKey,
+) -> crossbeam_channel::Receiver<Option<MarketInfoV2>> {
+    // One bounded response slot per market-control request (not per quote).
     let (tx, rx) = crossbeam_channel::bounded(1);
-    let (leader_tx, leader_rx) = crossbeam_channel::bounded(1);
-    let owner = market_info_owner();
-    let admitted_depth = owner.len().saturating_add(1).min(MARKET_INFO_OWNER_CAPACITY);
-    if owner.send_timeout(MarketInfoOwnerCommand::Subscribe {
-        key: key.clone(),
-        subscriber: tx.clone(),
-        leader: leader_tx,
-    }, Duration::from_secs(2)).is_err() {
+    let command = MarketInfoOwnerCommand::Subscribe {
+        key,
+        subscriber: tx,
+    };
+    let admitted_depth = owner.map_or(0, |owner| {
+        owner
+            .len()
+            .saturating_add(1)
+            .min(MARKET_INFO_OWNER_CAPACITY)
+    });
+    let rejected = match owner {
+        Some(owner) => owner
+            .try_send(command)
+            .err()
+            .map(|error| error.into_inner()),
+        None => Some(command),
+    };
+    if let Some(MarketInfoOwnerCommand::Subscribe { subscriber, .. }) = rejected {
         MARKET_INFO_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-        let _ = tx.try_send(None);
-        return (rx, false);
-    }
-    MARKET_INFO_QUEUE_HIGH_WATER.fetch_max(admitted_depth, Ordering::Relaxed);
-    let leader = leader_rx.recv().unwrap_or(false);
-    (rx, leader)
-}
-
-fn finish_market_info_fetch(key: &MarketInfoKey, result: Option<MarketInfoV2>) {
-    let owner = market_info_owner();
-    let admitted_depth = owner.len().saturating_add(1).min(MARKET_INFO_OWNER_CAPACITY);
-    if let Err(error) = owner.send_timeout(MarketInfoOwnerCommand::Finish {
-        key: key.clone(),
-        result,
-    }, Duration::from_secs(2)) {
-        MARKET_INFO_QUEUE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-        warn!("[market_info_v2] owner saturated while finishing fetch: {error}");
+        let _ = subscriber.try_send(None);
     } else {
         MARKET_INFO_QUEUE_HIGH_WATER.fetch_max(admitted_depth, Ordering::Relaxed);
     }
+    rx
 }
 
 /// Synchronously fetch market info via the v2 CLOB REST API.
@@ -299,8 +367,14 @@ pub fn fetch_clob_market_info(
 
     let raw = crate::async_rt::blocking_get_text(&url)
         .map_err(|e| anyhow!("market-info fetch {} failed: {}", url, e))?;
-    let json: Value = serde_json::from_str(&raw)
-        .map_err(|e| anyhow!("market-info parse {} failed: {} (body: {})", url, e, &raw[..raw.len().min(200)]))?;
+    let json: Value = serde_json::from_str(&raw).map_err(|e| {
+        anyhow!(
+            "market-info parse {} failed: {} (body: {})",
+            url,
+            e,
+            &raw[..raw.len().min(200)]
+        )
+    })?;
     parse_market_info_for_condition(&json, condition_id)
         .map_err(|e| anyhow!("{}: url={}  body={}", e, url, &raw[..raw.len().min(200)]))
 }
@@ -312,57 +386,47 @@ pub fn spawn_market_info_v2_fetch(
     condition_id: String,
     path_template: String,
 ) -> crossbeam_channel::Receiver<Option<MarketInfoV2>> {
-    let key = market_info_key(api_url_prefix, condition_id, path_template);
-    let (rx, is_leader) = subscribe_market_info(&key);
-    if !is_leader {
-        return rx;
-    }
-    let worker_key = key.clone();
-    let submit_result = hexagent_runtime::background_jobs::try_submit(move || {
-        const ATTEMPTS: u32 = 4;
-        let mut backoff = std::time::Duration::from_millis(200);
-        let mut result = None;
-        for attempt in 1..=ATTEMPTS {
-            match fetch_clob_market_info(
-                &worker_key.api_url_prefix,
-                &worker_key.condition_id,
-                &worker_key.path_template,
-            ) {
-                Ok(market_info) => {
-                    info!(
-                            "[market_info_v2] fetched cid={}... fee_rate={:.4} fee_exponent={:.2} bps={} taker_only={} attempt={}",
-                            &worker_key.condition_id[..worker_key.condition_id.len().min(16)],
-                            market_info.fee_rate,
-                            market_info.fee_exponent,
-                            market_info.fee_rate_bps,
-                            market_info.taker_only,
-                            attempt,
-                        );
-                    result = Some(market_info);
-                    break;
-                }
-                Err(error) => {
-                    warn!(
-                        "[market_info_v2] fetch attempt {}/{} failed cid={}...: {}",
-                        attempt,
-                        ATTEMPTS,
-                        &worker_key.condition_id[..worker_key.condition_id.len().min(16)],
-                        error,
-                    );
-                    if attempt < ATTEMPTS {
-                        std::thread::sleep(backoff);
-                        backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
-                    }
+    subscribe_market_info(
+        MARKET_INFO_OWNER.get(),
+        MarketInfoKey {
+            api_url_prefix,
+            condition_id,
+            path_template,
+        },
+    )
+}
+
+fn fetch_market_info_with_retry(worker_key: &MarketInfoKey) -> Option<MarketInfoV2> {
+    const ATTEMPTS: u32 = 4;
+    let mut backoff = std::time::Duration::from_millis(200);
+    for attempt in 1..=ATTEMPTS {
+        match fetch_clob_market_info(
+            &worker_key.api_url_prefix,
+            &worker_key.condition_id,
+            &worker_key.path_template,
+        ) {
+            Ok(market_info) => {
+                info!("[market_info_v2] fetched cid={}... fee_rate={:.4} fee_exponent={:.2} bps={} taker_only={} attempt={}",
+                    &worker_key.condition_id[..worker_key.condition_id.len().min(16)], market_info.fee_rate,
+                    market_info.fee_exponent, market_info.fee_rate_bps, market_info.taker_only, attempt);
+                return Some(market_info);
+            }
+            Err(error) => {
+                warn!(
+                    "[market_info_v2] fetch attempt {}/{} failed cid={}...: {}",
+                    attempt,
+                    ATTEMPTS,
+                    &worker_key.condition_id[..worker_key.condition_id.len().min(16)],
+                    error
+                );
+                if attempt < ATTEMPTS {
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
                 }
             }
         }
-        finish_market_info_fetch(&worker_key, result);
-    });
-    if let Err(error) = submit_result {
-        warn!("[market_info_v2] failed to enqueue fetch job: {}", error);
-        finish_market_info_fetch(&key, None);
     }
-    rx
+    None
 }
 
 /// Parse the v2 `getClobMarketInfo` response.
@@ -659,89 +723,263 @@ mod tests {
         assert!(parse_market_info_for_condition(&json, "0xdef").is_ok());
     }
 
-    #[test]
-    fn condition_singleflight_fans_out_and_caches_success() {
-        let key = market_info_key(
-            "https://example.invalid/".to_string(),
-            "0xSINGLEFLIGHT-TEST".to_string(),
-            String::new(),
-        );
-        let (first, first_is_leader) = subscribe_market_info(&key);
-        let (second, second_is_leader) = subscribe_market_info(&key);
-        assert!(first_is_leader);
-        assert!(!second_is_leader);
+    fn test_key(id: &str) -> MarketInfoKey {
+        market_info_key("https://example.invalid/".into(), id.into(), String::new())
+    }
 
-        let expected = MarketInfoV2 {
-            fee_rate: 0.01,
+    fn test_value(bps: u32) -> MarketInfoV2 {
+        MarketInfoV2 {
+            fee_rate: bps as f64 / 10_000.0,
             fee_exponent: 1.0,
-            fee_rate_bps: 100,
+            fee_rate_bps: bps,
             taker_only: true,
-            raw: serde_json::json!({"test": true}),
-        };
-        finish_market_info_fetch(&key, Some(expected.clone()));
-        assert_eq!(first.recv().unwrap().unwrap().fee_rate_bps, 100);
-        assert_eq!(second.recv().unwrap().unwrap().fee_rate_bps, 100);
-
-        let (cached, cached_is_leader) = subscribe_market_info(&key);
-        assert!(!cached_is_leader);
-        assert_eq!(cached.recv().unwrap().unwrap().fee_rate_bps, 100);
+            raw: Value::Null,
+        }
     }
 
     #[test]
-    fn market_info_owner_reports_cached_roundtrip_tail_and_bounded_overflow() {
-        const EVENTS: usize = 4_096;
-        let key = market_info_key(
-            "https://example.invalid/".to_string(),
-            format!("0xOWNER-LATENCY-{}", std::process::id()),
-            String::new(),
-        );
-        let (initial, leader) = subscribe_market_info(&key);
-        assert!(leader);
-        finish_market_info_fetch(
-            &key,
-            Some(MarketInfoV2 {
-                fee_rate: 0.01,
-                fee_exponent: 1.0,
-                fee_rate_bps: 100,
-                taker_only: true,
-                raw: serde_json::Value::Null,
-            }),
-        );
-        assert_eq!(initial.recv().unwrap().unwrap().fee_rate_bps, 100);
-
-        let mut samples = Vec::with_capacity(EVENTS);
-        for _ in 0..EVENTS {
-            let started = Instant::now();
-            let (cached, is_leader) = subscribe_market_info(&key);
-            assert!(!is_leader);
-            assert_eq!(cached.recv().unwrap().unwrap().fee_rate_bps, 100);
-            samples.push(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+    fn background_owner_fetches_once_and_delivers_to_all_subscribers() {
+        use std::io::{Read, Write};
+        crate::async_rt::init().unwrap();
+        prewarm_market_info_owner().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (arrived_tx, arrived) = crossbeam_channel::bounded(1);
+        let (release, release_rx) = crossbeam_channel::bounded(1);
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut socket, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "metadata fetch was not dispatched");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut bytes = [0; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut bytes).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&bytes[..read]);
+            }
+            assert!(String::from_utf8(request).unwrap().starts_with("GET /clob-markets/0xabc "));
+            arrived_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let body = r#"{"c":"0xabc","fd":{"r":0.01,"e":1.0,"to":true}}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            // Drop the listener: a second HTTP fetch cannot produce success.
+        });
+        let first = spawn_market_info_v2_fetch(url.clone(), "0xABC".into(), String::new());
+        arrived.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = spawn_market_info_v2_fetch(url.clone(), "0xabc".into(), String::new());
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+        release.send(()).unwrap();
+        for result in [first, second] {
+            assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap().unwrap().fee_rate_bps, 100);
         }
-        samples.sort_unstable();
-        let percentile = |numerator: usize, denominator: usize| {
-            samples[(samples.len() - 1) * numerator / denominator]
+        server.join().unwrap();
+        let cached = spawn_market_info_v2_fetch(url, "0xabc".into(), String::new());
+        assert_eq!(cached.recv_timeout(Duration::from_secs(5)).unwrap().unwrap().fee_rate_bps, 100);
+    }
+
+    #[test]
+    fn condition_singleflight_fans_out_and_caches_success() {
+        let mut state = MarketInfoOwnerState::default();
+        let key = test_key("0xABC");
+        let (tx1, first) = crossbeam_channel::bounded(1);
+        let (tx2, second) = crossbeam_channel::bounded(1);
+        let generation = state.subscribe(key.clone(), tx1).unwrap();
+        assert_eq!(state.subscribe(test_key("0xabc"), tx2), None);
+        state.finish(key.clone(), generation, Some(test_value(100)));
+        assert_eq!(first.try_recv().unwrap().unwrap().fee_rate_bps, 100);
+        assert_eq!(second.try_recv().unwrap().unwrap().fee_rate_bps, 100);
+        let (tx, cached) = crossbeam_channel::bounded(1);
+        assert_eq!(state.subscribe(key.clone(), tx), None);
+        assert_eq!(cached.try_recv().unwrap().unwrap().fee_rate_bps, 100);
+        assert_eq!(state.waiter_count, 0);
+        state.finish(key, generation, Some(test_value(200)));
+        assert!(
+            first.try_recv().is_err(),
+            "duplicate result cannot duplicate delivery"
+        );
+    }
+
+    #[test]
+    fn failed_fetch_retry_rejects_stale_completion_and_isolates_keys() {
+        let mut state = MarketInfoOwnerState::default();
+        let key = test_key("retry");
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let old = state.subscribe(key.clone(), tx).unwrap();
+        state.finish(key.clone(), old, None);
+        assert!(rx.try_recv().unwrap().is_none());
+        let (tx, retry) = crossbeam_channel::bounded(1);
+        let new = state.subscribe(key.clone(), tx).unwrap();
+        let (other_tx, other) = crossbeam_channel::bounded(1);
+        let other_gen = state.subscribe(test_key("other"), other_tx).unwrap();
+        state.finish(key.clone(), old, Some(test_value(900)));
+        assert!(retry.try_recv().is_err());
+        state.finish(key, new, Some(test_value(100)));
+        assert_eq!(retry.try_recv().unwrap().unwrap().fee_rate_bps, 100);
+        assert!(other.try_recv().is_err());
+        state.finish(test_key("other"), other_gen, Some(test_value(200)));
+        assert_eq!(other.try_recv().unwrap().unwrap().fee_rate_bps, 200);
+        assert_eq!(state.waiter_count, 0);
+    }
+
+    #[test]
+    fn stalled_owner_cannot_block_submit_and_full_or_missing_owner_returns_failure() {
+        let (tx, rx) = hexagent_runtime::poll_channel::bounded(1);
+        // Owner has not run at all: submission still completes synchronously.
+        let first = subscribe_market_info(Some(&tx), test_key("first"));
+        assert_eq!(rx.len(), 1);
+        assert!(first.try_recv().is_err());
+        let rejected = subscribe_market_info(Some(&tx), test_key("second"));
+        assert!(rejected.try_recv().unwrap().is_none());
+        let MarketInfoOwnerCommand::Subscribe { key, subscriber } = rx.try_recv().unwrap() else {
+            panic!()
         };
-        let metrics = market_info_owner_metrics();
-        eprintln!(
-            "market-info owner: boundary=subscribe_send_to_cached_reply n={} p50_ns={} p99_ns={} p999_ns={} max_ns={} queue_high_water={} overflow={}",
-            samples.len(),
-            percentile(1, 2),
-            percentile(99, 100),
-            percentile(999, 1_000),
-            samples.last().copied().unwrap_or_default(),
-            metrics.queue_high_water,
-            metrics.queue_overflow,
+        assert_eq!(
+            key.condition_id, "first",
+            "full queue preserves its admitted FIFO head"
         );
-        assert!(metrics.queue_high_water > 0);
-        assert_eq!(metrics.queue_overflow, 0);
+        let mut state = MarketInfoOwnerState::default();
+        let generation = state.subscribe(key.clone(), subscriber).unwrap();
+        state.finish(key, generation, Some(test_value(100)));
+        assert_eq!(first.try_recv().unwrap().unwrap().fee_rate_bps, 100);
+        assert!(subscribe_market_info(None, test_key("uninitialized"))
+            .try_recv()
+            .unwrap()
+            .is_none());
+        drop(rx);
+        assert!(subscribe_market_info(Some(&tx), test_key("disconnected"))
+            .try_recv()
+            .unwrap()
+            .is_none());
+    }
 
-        let (full_tx, _full_rx) = crossbeam_channel::bounded::<u8>(MARKET_INFO_OWNER_CAPACITY);
-        for _ in 0..MARKET_INFO_OWNER_CAPACITY {
-            full_tx.try_send(1).unwrap();
+    #[test]
+    fn waiter_and_cache_limits_fail_closed_without_orphaning_admitted_requests() {
+        let mut state = MarketInfoOwnerState::default();
+        let key = test_key("waiters");
+        let (tx, first) = crossbeam_channel::bounded(1);
+        let generation = state.subscribe(key.clone(), tx).unwrap();
+        for _ in 1..MARKET_INFO_WAITER_CAPACITY {
+            let (tx, _) = crossbeam_channel::bounded(1);
+            assert_eq!(state.subscribe(key.clone(), tx), None);
         }
-        assert!(matches!(
-            full_tx.try_send(1),
-            Err(crossbeam_channel::TrySendError::Full(1))
-        ));
+        let (tx, full) = crossbeam_channel::bounded(1);
+        assert_eq!(
+            state.subscribe(test_key("new-flight-at-waiter-limit"), tx),
+            None
+        );
+        assert!(full.try_recv().unwrap().is_none());
+        assert_eq!(state.waiter_count, MARKET_INFO_WAITER_CAPACITY);
+        state.finish(key, generation, Some(test_value(100)));
+        assert_eq!(state.waiter_count, 0);
+        assert_eq!(first.try_recv().unwrap().unwrap().fee_rate_bps, 100);
+        let mut state = MarketInfoOwnerState::default();
+        for i in 0..MARKET_INFO_CACHE_CAPACITY {
+            let (tx, _) = crossbeam_channel::bounded(1);
+            assert!(state
+                .subscribe(test_key(&format!("pending-{i}")), tx)
+                .is_some());
+        }
+        let (tx, full) = crossbeam_channel::bounded(1);
+        assert_eq!(state.subscribe(test_key("over-capacity"), tx), None);
+        assert!(full.try_recv().unwrap().is_none());
+        assert_eq!(state.entries.len(), MARKET_INFO_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn cached_metadata_expires_and_new_generation_can_fetch_again() {
+        let mut state = MarketInfoOwnerState::default();
+        state.entries.insert(
+            test_key("expired"),
+            MarketInfoFlight::Ready {
+                fetched_at: Instant::now() - Duration::from_secs(2 * 60 * 60 + 1),
+                value: test_value(100),
+            },
+        );
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        assert!(state.subscribe(test_key("expired"), tx).is_some());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    #[ignore = "focused benchmark; run release --ignored --nocapture"]
+    fn market_info_submit_tail_benchmark() {
+        const N: usize = 4096;
+        fn report(label: &str, mut samples: Vec<u64>, high_water: usize) {
+            samples.sort_unstable();
+            eprintln!("market-info {label}: n={} median_ns={} p99_ns={} p999_ns={} max_ns={} queue_high_water={} overflow=0 owner_delay_us=200",
+                samples.len(), samples[(samples.len()-1)/2], samples[(samples.len()-1)*99/100],
+                samples[(samples.len()-1)*999/1000], samples.last().unwrap(), high_water);
+        }
+        // Reproduce the old leader acknowledgement boundary. Fixed cold work
+        // exposes the dependency; this is not a claim about production RTT.
+        let (old_tx, old_rx) = crossbeam_channel::bounded::<crossbeam_channel::Sender<bool>>(1);
+        let old_owner = std::thread::spawn(move || {
+            while let Ok(reply) = old_rx.recv() {
+                std::thread::sleep(Duration::from_micros(200));
+                reply.send(false).unwrap();
+            }
+        });
+        let mut old = Vec::with_capacity(N);
+        for _ in 0..N {
+            let start = Instant::now();
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            old_tx.send_timeout(tx, Duration::from_secs(2)).unwrap();
+            rx.recv().unwrap();
+            old.push(start.elapsed().as_nanos() as u64);
+        }
+        drop(old_tx);
+        old_owner.join().unwrap();
+        let (tx, rx) = hexagent_runtime::poll_channel::bounded(1);
+        let owner = std::thread::spawn(move || {
+            let mut state = MarketInfoOwnerState::default();
+            for _ in 0..N {
+                let MarketInfoOwnerCommand::Subscribe { key, subscriber } =
+                    rx.recv_timeout(Duration::from_secs(1)).unwrap()
+                else {
+                    panic!()
+                };
+                std::thread::sleep(Duration::from_micros(200));
+                if let Some(generation) = state.subscribe(key.clone(), subscriber) {
+                    state.finish(key, generation, Some(test_value(100)));
+                }
+            }
+        });
+        let mut submit = Vec::with_capacity(N);
+        let mut end_to_end = Vec::with_capacity(N);
+        for _ in 0..N {
+            let key = test_key("bench");
+            let start = Instant::now();
+            let reply = subscribe_market_info(Some(&tx), key);
+            submit.push(start.elapsed().as_nanos() as u64);
+            assert_eq!(
+                reply
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap()
+                    .fee_rate_bps,
+                100
+            );
+            end_to_end.push(start.elapsed().as_nanos() as u64);
+        }
+        owner.join().unwrap();
+        report("before_strategy_submit_to_leader_ack", old, 1);
+        report(
+            "after_strategy_submit_including_response_slot_allocation",
+            submit,
+            1,
+        );
+        report("after_metadata_delivery", end_to_end, 1);
     }
 }

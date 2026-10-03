@@ -21,6 +21,7 @@ pub(crate) trait PrivateIngress: Send {
         shared: &SharedState,
         positions: &mut LivePositionManager,
         replay: &mut PrivateReplayOwner,
+        timing: &hexagent_runtime::owner_queue_probe::OwnerQueueProbe,
     ) -> bool;
     fn register<'a>(&'a self, wait: &mut crossbeam_channel::Select<'a>);
 }
@@ -201,6 +202,7 @@ impl<T: hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>> PrivateI
         shared: &SharedState,
         positions: &mut LivePositionManager,
         replay: &mut PrivateReplayOwner,
+        timing: &hexagent_runtime::owner_queue_probe::OwnerQueueProbe,
     ) -> bool {
         let mut progressed = false;
         if let Ok(reply) = self.repair_rx.try_recv() {
@@ -231,35 +233,42 @@ impl<T: hexagent_runtime::poll_channel::EventSender<RoutedOrderUpdate>> PrivateI
                 break;
             }
             if self.live.is_none() {
-                if let Ok(command) = self.live_rx.try_recv() {
-                    progressed = true;
-                    match command {
-                        PrivateApplyCommand::Live {
-                            events,
-                            recovery_generation,
-                            enqueued_at,
-                        } => {
-                            crate::latency::record(
-                                "polymarket.user.ws_enqueue_to_owner_dequeue",
+                match self.live_rx.try_recv() {
+                    Ok(command) => {
+                        progressed = true;
+                        match command {
+                            PrivateApplyCommand::Live {
+                                events,
+                                recovery_generation,
                                 enqueued_at,
-                            );
-                            self.live = Some(LiveFrame {
-                                events: events.into_iter(),
-                                generation: recovery_generation,
-                            });
-                        }
-                        PrivateApplyCommand::RecoveryFence {
-                            generation,
-                            completion,
-                        } => {
-                            self.fence = Some((generation, completion));
-                            break;
-                        }
-                        PrivateApplyCommand::Replay { completion, .. } => {
-                            let _ = completion
-                                .send(Err("replay command reached private live lane".into()));
+                            } => {
+                                let queue_ns = timing.observe_dequeue(enqueued_at);
+                                crate::latency::record_ns(
+                                    "polymarket.user.ws_enqueue_to_owner_dequeue",
+                                    queue_ns,
+                                );
+                                self.live = Some(LiveFrame {
+                                    events: events.into_iter(),
+                                    generation: recovery_generation,
+                                });
+                            }
+                            PrivateApplyCommand::RecoveryFence {
+                                generation,
+                                completion,
+                            } => {
+                                self.fence = Some((generation, completion));
+                                break;
+                            }
+                            PrivateApplyCommand::Replay { completion, .. } => {
+                                let _ = completion
+                                    .send(Err("replay command reached private live lane".into()));
+                            }
                         }
                     }
+                    // An empty FIFO ends this live burst. Repeating the same
+                    // empty pop 31 times delays replay/commit and the next
+                    // lifecycle turn without preserving any additional order.
+                    Err(_) => break,
                 }
             }
             if let Some(mut frame) = self.live.take() {

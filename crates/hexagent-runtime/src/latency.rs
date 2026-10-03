@@ -100,12 +100,13 @@ struct ThreadTelemetry {
     scheduler_tails: OnceLock<SchedulerTailQueue>,
 }
 
-/// Compact advisory evidence. The CLOB owner is the sole producer; the
+/// Compact advisory evidence. Each runtime owner is its lane's sole producer; the
 /// existing latency-dump worker is the consumer. Capacity64, FIFO, drop-new on
 /// overflow with a counter. Never shares capacity with private events.
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerTail {
     pub probe: &'static str,
+    pub boundary: &'static str,
     pub observed_unix_ns: u64,
     pub lag_ns: u64,
     pub span_wall_ns: u64,
@@ -208,9 +209,9 @@ impl ThreadTelemetry {
         if let Some(tails) = self.scheduler_tails.get() {
             for _ in 0..tails.queue.len().min(tails.queue.capacity()) {
                 let Some(tail) = tails.queue.try_pop() else { break; };
-                log::warn!("[scheduler_tail] owner={} probe={} observed_unix_ns={} lag_ns={} span_wall_ns={} span_cpu_ns={:?} span_off_cpu_ns={:?} expirations={} error_code={:?} boundary=previous_actual_probe_to_current includes_idle=true",
+                log::warn!("[scheduler_tail] owner={} probe={} observed_unix_ns={} lag_ns={} span_wall_ns={} span_cpu_ns={:?} span_off_cpu_ns={:?} expirations={} error_code={:?} boundary={}",
                     tails.owner, tail.probe, tail.observed_unix_ns, tail.lag_ns, tail.span_wall_ns,
-                    tail.span_cpu_ns, tail.span_cpu_ns.map(|cpu| tail.span_wall_ns.saturating_sub(cpu)), tail.expirations, tail.error_code);
+                    tail.span_cpu_ns, tail.span_cpu_ns.map(|cpu| tail.span_wall_ns.saturating_sub(cpu)), tail.expirations, tail.error_code, tail.boundary);
             }
         }
         let Some(queue) = self.observations.get() else {
@@ -382,6 +383,15 @@ pub fn prepare_scheduler_tail_queue() {
 pub fn observe_scheduler_tail(tail: SchedulerTail) -> bool {
     THREAD_RECORDER.with(|slot| slot.borrow().as_ref()
         .and_then(|r| r.telemetry.scheduler_tails.get()).is_some_and(|q| q.publish(tail)))
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_scheduler_tails() -> Vec<SchedulerTail> {
+    THREAD_RECORDER.with(|slot| {
+        let slot = slot.borrow();
+        let tails = slot.as_ref().unwrap().telemetry.scheduler_tails.get().unwrap();
+        std::iter::from_fn(|| tails.queue.try_pop()).collect()
+    })
 }
 
 /// Fixed queue stages: parser-to-adapter and adapter-to-router use message
@@ -922,7 +932,7 @@ mod tests {
     fn scheduler_evidence_is_bounded_fifo_and_owner_isolated() {
         let first = SchedulerTailQueue::new(2);
         let second = SchedulerTailQueue::new(2);
-        let sample = |id| SchedulerTail { probe: "test", observed_unix_ns: id,
+        let sample = |id| SchedulerTail { probe: "test", boundary: "test", observed_unix_ns: id,
             lag_ns: 100, span_wall_ns: 200, span_cpu_ns: Some(50), expirations: 1, error_code: None };
         assert!(first.publish(sample(1)));
         assert!(first.publish(sample(2)));
