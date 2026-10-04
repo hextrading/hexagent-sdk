@@ -1,0 +1,61 @@
+{
+  "utc": "2026-10-04T17:03:10.875455+00:00",
+  "main_affinity": [
+    0
+  ],
+  "nice": 19,
+  "cold_worker_core": 1,
+  "profile": "release fat LTO; sequential probes; no live order traffic; housekeeping CPUs only"
+}
+
+running 1 test
+warning: struct `OrderCrypto` is never constructed
+ --> /tmp/hexagent-fast-tail-src/crates/hexagent-exchange/src/exchange/polymarket/order_crypto.rs:7:19
+  |
+7 | pub(super) struct OrderCrypto {
+  |                   ^^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `ORDER` is never used
+  --> /tmp/hexagent-fast-tail-src/crates/hexagent-exchange/src/exchange/polymarket/order_crypto.rs:13:7
+   |
+13 | const ORDER: [u8; 32] = [
+   |       ^^^^^
+
+warning: associated items `new` and `sign` are never used
+  --> /tmp/hexagent-fast-tail-src/crates/hexagent-exchange/src/exchange/polymarket/order_crypto.rs:21:19
+   |
+20 | impl OrderCrypto {
+   | ---------------- associated items in this implementation
+21 |     pub(super) fn new(bytes: &[u8]) -> Result<Self> {
+   |                   ^^^
+...
+38 |     pub(super) fn sign(&self, digest: &[u8; 32]) -> Result<[u8; 65]> {
+   |                   ^^^^
+
+warning: `hexagent-crypto-probe` (lib) generated 3 warnings
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running unittests src/lib.rs (target/release/deps/hexagent_crypto_probe-38192f8afac273a9)
+test order_crypto::tests::benchmark_order_crypto ... k256 n=30000 median_ns=47575 p99_ns=52613 p999_ns=60383 max_ns=181384 queue_depth=0 overflow=0 boundary=prehashed_recoverable_signature
+startup_libsecp n=30000 median_ns=27871 p99_ns=31770 p999_ns=37105 max_ns=98205 queue_depth=0 overflow=0 boundary=prehashed_recoverable_signature
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 2.29s
+
+   Doc-tests hexagent_crypto_probe
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Finished `release` profile [optimized] target(s) in 0.09s
+
+running 1 test
+test instrumented_http1::tests::benchmark_cold_poll_interference ...      Running unittests src/lib.rs (/tmp/hexagent-fast-tail-target/release/deps/hexagent_runtime-191f7b313620cdbd)
+cold_offload=false n=2000 median_ns=1801032 p99_ns=1801772 p999_ns=1806688 max_ns=1829227 cold_inflight_high_water=6 reply_capacity=1 overflow=0 boundary=hot_task_enqueue_to_first_poll synthetic_cold_polls=6x300us
+cold_offload=true n=2000 median_ns=7190 p99_ns=73060 p999_ns=117111 max_ns=215650 cold_inflight_high_water=6 reply_capacity=1 overflow=0 boundary=hot_task_enqueue_to_first_poll synthetic_cold_polls=6x300us
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 118 filtered out; finished in 7.17s
+

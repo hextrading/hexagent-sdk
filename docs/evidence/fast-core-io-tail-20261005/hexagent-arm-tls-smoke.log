@@ -1,0 +1,6 @@
+   Compiling hexagent-runtime v0.1.0 (/tmp/hexagent-fast-tail-src/crates/hexagent-runtime)
+TLS GET turn=0 status=200 OK connect=true generation=1 dns_ns=349013 tcp_ns=1618838 tls_ns=3849482 total_ns=21208965
+TLS GET turn=1 status=200 OK connect=false generation=1 dns_ns=0 tcp_ns=0 tls_ns=0 total_ns=14266262
+IP hostname mismatch rejected before plaintext HTTP write; phase=Tls
+    Finished `release` profile [optimized] target(s) in 23.47s
+     Running `/tmp/hexagent-fast-tail-target/release/examples/cold_tls_probe`

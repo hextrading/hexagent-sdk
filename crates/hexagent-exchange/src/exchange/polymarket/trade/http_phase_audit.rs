@@ -106,6 +106,8 @@ impl HttpPhaseRecord {
             "peer": t.peer.map(|peer| peer.to_string()), "incomplete_phase": t.incomplete_phase.name(),
         });
         value["clock_domain_ns"] = crate::types::monotonic_clock_domain_ns().into();
+        value["connect_worker_queue_ns"] = serde_json::json!(
+            (!t.connect_attempted || t.connect_worker_queue_ns != 0).then_some(t.connect_worker_queue_ns));
         value["first_write_mono_ns"] = serde_json::json!((t.io.first_write_mono_ns != 0).then_some(t.io.first_write_mono_ns));
         value["first_read_mono_ns"] = serde_json::json!((t.io.first_read_mono_ns != 0).then_some(t.io.first_read_mono_ns));
         value

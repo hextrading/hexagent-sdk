@@ -1,0 +1,96 @@
+[
+  {
+    "coid": "btc01-1791121245681",
+    "source": "cancel_ack_leg_requote",
+    "runtime_queue_ns": 851756,
+    "first_poll_unix_ns": 1791129932262609922,
+    "connect_attempted": false,
+    "preceding_retire_and_repair_logs": [
+      "2026-10-04T16:05:32.250Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=2 elapsed_ms=932 admission_owner=account",
+      "2026-10-04T16:05:32.251Z  INFO hexagent_runtime::os_tune: [os_tune] Pinned 'hexbot-ord-bg' (tid=2438547) \u2192 core 4",
+      "2026-10-04T16:05:32.252Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=1 elapsed_ms=934 admission_owner=account",
+      "2026-10-04T16:05:32.252Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=3 elapsed_ms=934 admission_owner=account",
+      "2026-10-04T16:05:32.253Z  INFO hexagent_runtime::os_tune: [os_tune] Pinned 'hexbot-ord-bg' (tid=2438548) \u2192 core 4",
+      "2026-10-04T16:05:32.263Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=3 elapsed_ms=945 admission_owner=account",
+      "2026-10-04T16:05:32.266Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Fast trigger_slot=1 elapsed_ms=948 admission_owner=account",
+      "2026-10-04T16:05:32.266Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=1 elapsed_ms=948 admission_owner=account"
+    ]
+  },
+  {
+    "coid": "btc01-1791121243575",
+    "source": "strategy_callback",
+    "runtime_queue_ns": 799046,
+    "first_poll_unix_ns": 1791128138878006189,
+    "connect_attempted": false,
+    "preceding_retire_and_repair_logs": [
+      "2026-10-04T15:35:38.867Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=3 elapsed_ms=1150 admission_owner=account",
+      "2026-10-04T15:35:38.867Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=3 elapsed_ms=1150 admission_owner=account",
+      "2026-10-04T15:35:38.867Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=1 elapsed_ms=1150 admission_owner=account",
+      "2026-10-04T15:35:38.867Z  INFO hexagent_runtime::os_tune: [os_tune] Pinned 'hexbot-ord-bg' (tid=2436511) \u2192 core 4",
+      "2026-10-04T15:35:38.867Z  INFO hexagent_runtime::os_tune: [os_tune] Pinned 'hexbot-ord-bg' (tid=2436513) \u2192 core 4",
+      "2026-10-04T15:35:38.868Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=2 elapsed_ms=1151 admission_owner=account",
+      "2026-10-04T15:35:38.868Z  INFO hexagent_runtime::os_tune: [os_tune] Pinned 'hexbot-ord-bg' (tid=2436512) \u2192 core 4",
+      "2026-10-04T15:35:38.868Z  INFO hexagent_runtime::os_tune: [os_tune] Pinned 'hexbot-ord-bg' (tid=2436514) \u2192 core 4",
+      "2026-10-04T15:35:38.875Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Fast trigger_slot=1 elapsed_ms=1158 admission_owner=account",
+      "2026-10-04T15:35:38.875Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=1 elapsed_ms=1158 admission_owner=account",
+      "2026-10-04T15:35:38.876Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Fast trigger_slot=0 elapsed_ms=1160 admission_owner=account",
+      "2026-10-04T15:35:38.878Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=3 elapsed_ms=1162 admission_owner=account",
+      "2026-10-04T15:35:38.882Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Fast trigger_slot=0 elapsed_ms=1166 admission_owner=account"
+    ]
+  },
+  {
+    "coid": "btc03-1791121239921",
+    "source": "strategy_callback",
+    "runtime_queue_ns": 727174,
+    "first_poll_unix_ns": 1791125263378774461,
+    "connect_attempted": false,
+    "preceding_retire_and_repair_logs": [
+      "2026-10-04T14:47:43.363Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=1 elapsed_ms=841 admission_owner=account",
+      "2026-10-04T14:47:43.371Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=1 elapsed_ms=850 admission_owner=account",
+      "2026-10-04T14:47:43.379Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Fast trigger_slot=1 elapsed_ms=857 admission_owner=account",
+      "2026-10-04T14:47:43.383Z  INFO hexagent_runtime::http1_pool: [http1_pool] role=Cancel slot=1 replacement_generation=20 connect_generation=1 prewarm_attempts=1 prior_failures=1 avoided_peer=Some(172.64.153.51) peer=Some(104.18.34.205:443) ready=true"
+    ]
+  },
+  {
+    "coid": "btc02-1791121241021",
+    "source": "strategy_callback",
+    "runtime_queue_ns": 611121,
+    "first_poll_unix_ns": 1791126145521088237,
+    "connect_attempted": false,
+    "preceding_retire_and_repair_logs": [
+      "2026-10-04T15:02:25.503Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=2 elapsed_ms=981 admission_owner=account",
+      "2026-10-04T15:02:25.503Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=2 elapsed_ms=981 admission_owner=account",
+      "2026-10-04T15:02:25.504Z  INFO hexagent_runtime::os_tune: [os_tune] Pinned 'hexbot-ord-bg' (tid=2433007) \u2192 core 4",
+      "2026-10-04T15:02:25.505Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=1 elapsed_ms=983 admission_owner=account",
+      "2026-10-04T15:02:25.505Z  INFO hexagent_runtime::os_tune: [os_tune] Pinned 'hexbot-ord-bg' (tid=2433008) \u2192 core 4",
+      "2026-10-04T15:02:25.509Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=3 elapsed_ms=986 admission_owner=account",
+      "2026-10-04T15:02:25.509Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=1 elapsed_ms=987 admission_owner=account",
+      "2026-10-04T15:02:25.510Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=2 elapsed_ms=989 admission_owner=account",
+      "2026-10-04T15:02:25.521Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Fast trigger_slot=3 elapsed_ms=999 admission_owner=account"
+    ]
+  },
+  {
+    "coid": "btc01-1791121240658",
+    "source": "cancel_ack_leg_requote",
+    "runtime_queue_ns": 223768,
+    "first_poll_unix_ns": 1791126006618121569,
+    "connect_attempted": false,
+    "preceding_retire_and_repair_logs": [
+      "2026-10-04T15:00:06.606Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=2 elapsed_ms=584 admission_owner=account",
+      "2026-10-04T15:00:06.606Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=3 elapsed_ms=584 admission_owner=account",
+      "2026-10-04T15:00:06.606Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=2 elapsed_ms=584 admission_owner=account",
+      "2026-10-04T15:00:06.607Z  INFO hexagent_runtime::os_tune: [os_tune] Pinned 'hexbot-ord-bg' (tid=2432828) \u2192 core 4",
+      "2026-10-04T15:00:06.607Z  INFO hexagent_runtime::os_tune: [os_tune] Pinned 'hexbot-ord-bg' (tid=2432830) \u2192 core 4",
+      "2026-10-04T15:00:06.607Z  INFO hexagent_runtime::os_tune: [os_tune] Pinned 'hexbot-ord-bg' (tid=2432829) \u2192 core 4",
+      "2026-10-04T15:00:06.607Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Fast trigger_slot=1 elapsed_ms=585 admission_owner=account",
+      "2026-10-04T15:00:06.608Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=2 elapsed_ms=586 admission_owner=account",
+      "2026-10-04T15:00:06.608Z  INFO hexagent_runtime::os_tune: [os_tune] Pinned 'hexbot-ord-bg' (tid=2432831) \u2192 core 4",
+      "2026-10-04T15:00:06.609Z  INFO hexagent_runtime::os_tune: [os_tune] Pinned 'hexbot-ord-bg' (tid=2432832) \u2192 core 4",
+      "2026-10-04T15:00:06.610Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Fast trigger_slot=1 elapsed_ms=588 admission_owner=account",
+      "2026-10-04T15:00:06.610Z  INFO hexagent_runtime::os_tune: [os_tune] Pinned 'hexbot-ord-bg' (tid=2432833) \u2192 core 4",
+      "2026-10-04T15:00:06.618Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Fast trigger_slot=0 elapsed_ms=596 admission_owner=account",
+      "2026-10-04T15:00:06.620Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=3 elapsed_ms=598 admission_owner=account",
+      "2026-10-04T15:00:06.620Z  WARN hexagent_exchange::exchange::polymarket::network_incident: [connection_health_slow_success] action=retire_connection_generation trigger_role=Cancel trigger_slot=1 elapsed_ms=598 admission_owner=account"
+    ]
+  }
+]
