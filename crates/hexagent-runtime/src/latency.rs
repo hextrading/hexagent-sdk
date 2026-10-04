@@ -561,6 +561,7 @@ fn live_recorders() -> Vec<Arc<ThreadTelemetry>> {
 }
 
 fn snapshot_and_reset() -> Vec<(&'static str, StageSnapshot)> {
+    crate::cold_connect_submit::log_snapshot();
     let names = stages().names();
     let telemetry = live_recorders();
     let mut snapshots = names

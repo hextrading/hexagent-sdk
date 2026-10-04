@@ -1,0 +1,74 @@
+{
+  "runtime_macos": {
+    "passed": 113,
+    "ignored": 9,
+    "log_sha256": "e484be8947d21ea9dfd46482fb1f4530ee9fd581bfe045f69e68d8c8a5ecf5e6",
+    "command": "     Running unittests src/lib.rs (target/debug/deps/hexagent_runtime-6500d382e2ace255)"
+  },
+  "runtime_concurrent_startup": {
+    "passed": 4,
+    "ignored": 0,
+    "log_sha256": "e11963dea01a4657b74a9ac50d5bb128b89743d3aff09ac0087e9891fe20afc9",
+    "command": "     Running unittests src/lib.rs (target/debug/deps/hexagent_runtime-6500d382e2ace255)"
+  },
+  "exchange_macos": {
+    "passed": 1007,
+    "ignored": 54,
+    "log_sha256": "ca495de1393d89b0830f61ee2f072f152c0ff64d5935c52a04e09a18663933ad",
+    "command": "     Running unittests src/lib.rs (target/debug/deps/hexagent_exchange-9f658c9a53d8f6f7)"
+  },
+  "engine_macos": {
+    "passed": 176,
+    "ignored": 10,
+    "log_sha256": "89cc8e0540c8b9cc738bd3f9442de3f2e1af2f64f7dc149a9c5aee9c3761e8ba",
+    "command": "     Running unittests src/lib.rs (target/debug/deps/hexagent_engine-eecd40ff6e2d0dcb)"
+  },
+  "audit_macos_final": {
+    "passed": 39,
+    "ignored": 1,
+    "log_sha256": "63a29d2f4807bc53a6c165e32257e4d44c686a2832dccbe66bd2de772f513987",
+    "command": "     Running unittests src/lib.rs (target/debug/deps/hexagent_exchange-9f658c9a53d8f6f7)"
+  },
+  "workspace_all_targets_locked_check": {
+    "passed": true,
+    "log_sha256": "76d04cb5099bfe0c2d46ff5f1fc9ccb620195d5b789f2114c4103118299533ce"
+  },
+  "runtime_arm": {
+    "passed": 115,
+    "ignored": 9,
+    "sha256": "0034b60235e19b6a79f402011a4a4c8b58200ae48c18c80215fee44a59410bbd"
+  },
+  "latency_csv_test": {
+    "passed": 3,
+    "ignored": 0,
+    "sha256": "9caf30b112a83e1b6f79f0ccfb66f1cd415b500f78ee7ad29f29efcc7cf2359a",
+    "command": "cargo test -p hexagent-runtime --lib --locked latency_record::tests"
+  },
+  "worker-creation-arm.log": {
+    "sha256": "4ec1e07d17cbcb7e5f0ffb4af10fafe45ac9ee822b3951d6c813a08d1bf4cb7c",
+    "source_sha256": "67fe6989bda3de08022fe8326d19f641ea505b4a94edfef40b82370b633dbf66"
+  },
+  "tls-arm.log": {
+    "sha256": "f46f442bc242403ab1b0bc60a89fcbe23b4281fee6085ede11aee2734c9205e0"
+  },
+  "exchange_macos_final": {
+    "passed": 1008,
+    "ignored": 54,
+    "sha256": "eab5f4151229741c31d33f2ff217aa64f86b8c879ca17393f1ab0f2d7ccd054f"
+  },
+  "cold_reconcile_macos": {
+    "passed": 7,
+    "ignored": 0,
+    "sha256": "6f7566fd08add726e5fb036140212c3140d41a4b3b041591d82373b61d980666"
+  },
+  "audit_arm_final": {
+    "passed": 39,
+    "ignored": 1,
+    "sha256": "74d9aa1ca962b3ccca2d1a4bea64c907009057a0bc31dbe7add052f9669d4f24"
+  },
+  "cold_reconcile_arm": {
+    "passed": 7,
+    "ignored": 0,
+    "sha256": "2ef5f3a5c8ea391e455a57c2267eed33af4e1102c48e2cc85ef5dcd633c00924"
+  }
+}

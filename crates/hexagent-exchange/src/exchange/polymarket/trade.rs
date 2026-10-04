@@ -7,6 +7,8 @@ mod http_phase_audit;
 mod publication_observation;
 mod recovery_diagnostics;
 mod null_cancel_recovery;
+mod audit_writer;
+use audit_writer::RecordBatchWriter;
 pub use null_cancel_recovery::NullCancelRecovery;
 use http_phase_audit::{HttpPhaseAudit, HttpPhaseContext, HttpPhaseRecord};
 use recovery_diagnostics::{cancel_detail, RecoveryRound};
@@ -14,7 +16,6 @@ use recovery_diagnostics::{cancel_detail, RecoveryRound};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hasher;
-use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
@@ -2309,7 +2310,7 @@ enum AuditJob {
 struct OrderAttemptRecorder {
     directory: PathBuf,
     hour: i64,
-    writer: Option<BufWriter<std::fs::File>>,
+    writer: Option<RecordBatchWriter>,
 }
 
 impl OrderAttemptRecorder {
@@ -2323,15 +2324,18 @@ impl OrderAttemptRecorder {
         }
     }
 
-    fn ensure_writer(&mut self, hour: i64) -> std::io::Result<&mut BufWriter<std::fs::File>> {
+    fn ensure_writer(&mut self, hour: i64) -> std::io::Result<&mut RecordBatchWriter> {
         if self.writer.is_none() || self.hour != hour {
+            // A failed old-hour flush keeps that owner/batch installed; never
+            // silently discard it while opening the next artifact.
+            if let Some(writer) = self.writer.as_mut() { writer.flush()?; }
             std::fs::create_dir_all(&self.directory)?;
             let path = self.directory.join(format!("order-audit-{hour}.jsonl"));
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)?;
-            self.writer = Some(BufWriter::with_capacity(64 * 1024, file));
+            self.writer = Some(RecordBatchWriter::new(file));
             self.hour = hour;
         }
         Ok(self.writer.as_mut().expect("writer installed"))
@@ -2381,8 +2385,7 @@ impl OrderAttemptRecorder {
     fn write_record(&mut self, record: &serde_json::Value) -> std::io::Result<()> {
         let hour = chrono::Utc::now().timestamp().div_euclid(3600);
         let writer = self.ensure_writer(hour)?;
-        serde_json::to_writer(&mut *writer, record)?;
-        writer.write_all(b"\n")
+        writer.write_record(record)
     }
 }
 
@@ -5719,10 +5722,14 @@ impl SharedState {
         let execution = self.execution_snapshot();
         // Runtime ownership survives terminal open-order removal. The durable
         // fallback is restricted to this cold reconcile path, never cancel prep.
-        let ownership = self
-            .runtime_order_ownership
-            .get(order_id)
-            .or_else(|| self.account_state.order(client_order_id));
+        let ownership = match self.runtime_order_ownership.get(order_id) {
+            Some(order) => Some(order),
+            // Reporting projections may lag a completed lifecycle command.
+            // This fallback is cold-only: query the sole lifecycle writer,
+            // retaining the existing bounded admission and failure semantics.
+            None => self.account_state.recovery_order(client_order_id)
+                .map_err(|_| "lifecycle_owner_unavailable")?,
+        };
         validated_reconcile_order_identity(
             self.account_state.account_id(),
             client_order_id,
@@ -14611,6 +14618,20 @@ mod tests {
             let stored: crate::types::HotPathTrace = serde_json::from_value(value["hot_path"].clone()).unwrap();
             assert_eq!(stored, trace);
         }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn hourly_audit_rollover_flushes_complete_old_batch_before_new_hour() {
+        let directory = std::env::temp_dir().join(format!("hexagent-audit-rollover-{}-{}", std::process::id(), now_ns()));
+        let mut recorder = OrderAttemptRecorder { directory: directory.clone(), hour: -1, writer: None };
+        recorder.ensure_writer(100).unwrap().write_record(&serde_json::json!({"account": "a", "sequence": 1})).unwrap();
+        recorder.ensure_writer(101).unwrap().write_record(&serde_json::json!({"account": "a", "sequence": 2})).unwrap();
+        let old = std::fs::read_to_string(directory.join("order-audit-100.jsonl")).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&old).unwrap()["sequence"], 1);
+        drop(recorder);
+        let new = std::fs::read_to_string(directory.join("order-audit-101.jsonl")).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&new).unwrap()["sequence"], 2);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

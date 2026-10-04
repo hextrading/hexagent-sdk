@@ -34,24 +34,38 @@ type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 /// At most one connect per exclusive physical slot is submitted. The reply
 /// is capacity one; dropping the caller cancels the owned connect future,
 /// including a pending socket, rather than detaching an unlimited repair.
-async fn cold_connect<F>(future: F) -> Result<F::Output, tokio::sync::oneshot::error::RecvError>
+async fn cold_connect<F>(future: F) -> std::io::Result<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    cold_connect_via(future, crate::cold_connect_submit::try_submit).await
+}
+
+pub(crate) async fn cold_connect_via<F>(future: F,
+    submit: impl FnOnce(crate::cold_connect_submit::Job) -> std::io::Result<()>,
+) -> std::io::Result<F::Output>
+where F: Future + Send + 'static, F::Output: Send + 'static,
+{
     let runtime = tokio::runtime::Handle::current();
     let (mut tx, rx) = tokio::sync::oneshot::channel();
-    tokio::task::spawn_blocking(move || {
-        crate::latency::prepare_scheduler_tail_queue();
-        runtime.block_on(async move {
-            tokio::select! {
-                biased;
-                _ = tx.closed() => {}
-                result = observe_cold_connect(future) => { let _ = tx.send(result); }
-            }
+    submit(Box::new(move || {
+        if tx.is_closed() { return; }
+        // This call may create an OS worker synchronously. Its caller is the
+        // prestarted SCHED_OTHER submit owner, never the order I/O reactor.
+        let worker_runtime = runtime.clone();
+        runtime.spawn_blocking(move || {
+            crate::latency::prepare_scheduler_tail_queue();
+            worker_runtime.block_on(async move {
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => {}
+                    result = observe_cold_connect(future) => { let _ = tx.send(result); }
+                }
+            });
         });
-    });
-    rx.await
+    }))?;
+    rx.await.map_err(std::io::Error::other)
 }
 
 async fn observe_cold_connect<F: Future>(future: F) -> F::Output {
@@ -270,7 +284,7 @@ impl Service<Uri> for TimedTlsConnector {
             let deadline = tokio::time::Instant::now() + connect_timeout;
             let worker_trace = Arc::clone(&trace);
             let connect = inner.call(uri);
-            let result = cold_connect(async move {
+            let result = tokio::time::timeout_at(deadline, cold_connect(async move {
                 worker_trace.connect_worker_queue_ns.store(duration_ns(started.elapsed()), Ordering::Release);
                 // Hyper may keep a connect task after an HTTP timeout. Bound
                 // the entire cold connect, including worker pickup and TLS,
@@ -279,8 +293,8 @@ impl Service<Uri> for TimedTlsConnector {
                     .map_err(|error| -> <HttpsConnector<TimedTcpConnector> as Service<Uri>>::Error {
                         std::io::Error::new(std::io::ErrorKind::TimedOut, error).into()
                     })?
-            }).await
-                .map_err(std::io::Error::other)?;
+            })).await
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::TimedOut, error))??;
             trace
                 .tls_total_ns
                 .store(duration_ns(started.elapsed()), Ordering::Release);
@@ -785,6 +799,59 @@ mod tests {
         assert!(error.timings.connect_worker_queue_ns > 0);
         assert!(error.timings.total_ns < 1_000_000_000);
         tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+    }
+
+    #[test]
+    #[ignore = "release: cold blocking-worker creation interference; no exchange/network traffic"]
+    fn benchmark_cold_worker_creation_interference() {
+        use super::*;
+        const N: usize = 1_000;
+        const REPAIRS: usize = 6;
+        let cold_core = std::env::var("HEXPROBE_COLD_CORE").ok().map(|s| s.parse::<usize>().unwrap());
+        if let Some(core) = cold_core {
+            let mut cfg = hexagent_config::config::OsTuneConfig::default();
+            cfg.background_cores = vec![core];
+            crate::os_tune::init_from_config(&cfg);
+        }
+        crate::cold_connect_submit::prewarm().unwrap();
+        for offload_submit in [false, true] {
+            let mut values = Vec::with_capacity(N);
+            let mut created = 0;
+            for _ in 0..N {
+                // A new runtime per round forces the initial empty blocking
+                // pool, rather than concealing thread creation by prewarming it.
+                let starts = Arc::new(AtomicU64::new(0));
+                let worker_starts = starts.clone();
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all()
+                    .on_thread_start(move || {
+                        if let Some(core) = cold_core { assert!(core_affinity::set_for_current(core_affinity::CoreId { id: core })); }
+                        worker_starts.fetch_add(1, Ordering::Relaxed);
+                    }).build().unwrap();
+                rt.block_on(async {
+                    let mut repairs = Vec::with_capacity(REPAIRS);
+                    for _ in 0..REPAIRS {
+                        repairs.push(tokio::spawn(async move {
+                            let future = async { tokio::time::sleep(Duration::from_millis(10)).await; };
+                            if offload_submit { cold_connect(future).await.unwrap(); }
+                            else {
+                                let runtime = tokio::runtime::Handle::current();
+                                let worker_runtime = runtime.clone();
+                                runtime.spawn_blocking(move || worker_runtime.block_on(future)).await.unwrap();
+                            }
+                        }));
+                    }
+                    let enqueued = Instant::now();
+                    let hot = tokio::spawn(async move { duration_ns(enqueued.elapsed()) });
+                    values.push(hot.await.unwrap());
+                    for task in repairs { task.await.unwrap(); }
+                });
+                created += starts.load(Ordering::Relaxed);
+            }
+            values.sort_unstable();
+            println!("cold_submit_offload={offload_submit} n={N} median_ns={} p99_ns={} p999_ns={} max_ns={} created_workers={created} cold_inflight_bound={REPAIRS} submit_capacity=64 reply_capacity=1 boundary=hot_task_enqueue_to_first_poll fresh_blocking_pool_each_round=true",
+                (values[N/2-1]+values[N/2])/2, values[N*99/100-1], values[N*999/1000-1], values[N-1]);
+        }
+        println!("cold_submit_final_stats depth_sampled_high_water_admitted_dequeued_rejected_panics={:?}", crate::cold_connect_submit::benchmark_snapshot());
     }
 
     #[test]
