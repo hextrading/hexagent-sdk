@@ -1,0 +1,384 @@
+{
+  "boundary": "Exact receipt domain/session/sequence groups across strategy instances. Prep interval includes preflight/sign/body work. Wall interval overlap is association, not CPU-time proof; scheduler sampling is separate.",
+  "bindings": {
+    "('hex001', 0)": 5,
+    "('hex001', 1)": 14,
+    "('hex001', 2)": 5,
+    "('hex001', 3)": 14,
+    "('zhu02', 0)": 5,
+    "('zhu02', 1)": 14,
+    "('zhu02', 2)": 5,
+    "('zhu02', 3)": 14,
+    "('zhu03', 0)": 5,
+    "('zhu03', 1)": 14,
+    "('zhu03', 2)": 5,
+    "('zhu03', 3)": 14
+  },
+  "causal_market_bursts": 3262,
+  "by_burst": {
+    "1_orders_1_cores": {
+      "receive_to_submit": {
+        "n": 1567,
+        "median_ns": 182203,
+        "p99_ns": 225875,
+        "p999_ns": 256701,
+        "maximum_ns": 279622
+      },
+      "owner_queue": {
+        "n": 1567,
+        "median_ns": 5247,
+        "p99_ns": 6352,
+        "p999_ns": 7169,
+        "maximum_ns": 8113
+      }
+    },
+    "2_orders_1_cores": {
+      "receive_to_submit": {
+        "n": 2,
+        "median_ns": 243360.5,
+        "p99_ns": 285462,
+        "p999_ns": 285462,
+        "maximum_ns": 285462
+      },
+      "owner_queue": {
+        "n": 2,
+        "median_ns": 45108.5,
+        "p99_ns": 84024,
+        "p999_ns": 84024,
+        "maximum_ns": 84024
+      }
+    },
+    "2_orders_2_cores": {
+      "receive_to_submit": {
+        "n": 1212,
+        "median_ns": 184975.0,
+        "p99_ns": 233467,
+        "p999_ns": 251751,
+        "maximum_ns": 268034
+      },
+      "owner_queue": {
+        "n": 1212,
+        "median_ns": 5076.5,
+        "p99_ns": 6185,
+        "p999_ns": 6619,
+        "maximum_ns": 7826
+      }
+    },
+    "3_orders_2_cores": {
+      "receive_to_submit": {
+        "n": 3054,
+        "median_ns": 204827.5,
+        "p99_ns": 319621,
+        "p999_ns": 343497,
+        "maximum_ns": 365347
+      },
+      "owner_queue": {
+        "n": 3054,
+        "median_ns": 5253.0,
+        "p99_ns": 98917,
+        "p999_ns": 108364,
+        "maximum_ns": 121013
+      }
+    },
+    "4_orders_2_cores": {
+      "receive_to_submit": {
+        "n": 152,
+        "median_ns": 247981.0,
+        "p99_ns": 334284,
+        "p999_ns": 335194,
+        "maximum_ns": 335194
+      },
+      "owner_queue": {
+        "n": 152,
+        "median_ns": 34505.0,
+        "p99_ns": 104494,
+        "p999_ns": 107740,
+        "maximum_ns": 107740
+      }
+    },
+    "5_orders_2_cores": {
+      "receive_to_submit": {
+        "n": 45,
+        "median_ns": 266730,
+        "p99_ns": 385202,
+        "p999_ns": 385202,
+        "maximum_ns": 385202
+      },
+      "owner_queue": {
+        "n": 45,
+        "median_ns": 75073,
+        "p99_ns": 164045,
+        "p999_ns": 164045,
+        "maximum_ns": 164045
+      }
+    },
+    "6_orders_2_cores": {
+      "receive_to_submit": {
+        "n": 138,
+        "median_ns": 298527.5,
+        "p99_ns": 410164,
+        "p999_ns": 433867,
+        "maximum_ns": 433867
+      },
+      "owner_queue": {
+        "n": 138,
+        "median_ns": 83946.5,
+        "p99_ns": 188788,
+        "p999_ns": 211562,
+        "maximum_ns": 211562
+      }
+    }
+  },
+  "slowest_with_same_core_preparation": [
+    {
+      "coid": "btc02-1791121241357",
+      "iid": "btc02",
+      "slot": 3,
+      "core": 14,
+      "receive_to_submit_ns": 433867,
+      "owner_wait_ns": 211562,
+      "other_same_core_prep_overlap_ns": 101795,
+      "same_core_preparation_orders": [
+        {
+          "coid": "btc02-1791121241359",
+          "iid": "btc02",
+          "slot": 1,
+          "prep_mono_ns": 5367529999419,
+          "signed_mono_ns": 5367530053191
+        },
+        {
+          "coid": "btc03-1791121241361",
+          "iid": "btc03",
+          "slot": 1,
+          "prep_mono_ns": 5367529912668,
+          "signed_mono_ns": 5367529967569
+        }
+      ]
+    },
+    {
+      "coid": "btc01-1791121246078",
+      "iid": "btc01",
+      "slot": 2,
+      "core": 5,
+      "receive_to_submit_ns": 410164,
+      "owner_wait_ns": 173562,
+      "other_same_core_prep_overlap_ns": 99049,
+      "same_core_preparation_orders": [
+        {
+          "coid": "btc02-1791121246080",
+          "iid": "btc02",
+          "slot": 0,
+          "prep_mono_ns": 8967530771509,
+          "signed_mono_ns": 8967530825389
+        },
+        {
+          "coid": "btc02-1791121246082",
+          "iid": "btc02",
+          "slot": 2,
+          "prep_mono_ns": 8967530680792,
+          "signed_mono_ns": 8967530735413
+        }
+      ]
+    },
+    {
+      "coid": "btc03-1791121246077",
+      "iid": "btc03",
+      "slot": 3,
+      "core": 14,
+      "receive_to_submit_ns": 410028,
+      "owner_wait_ns": 174107,
+      "other_same_core_prep_overlap_ns": 102581,
+      "same_core_preparation_orders": [
+        {
+          "coid": "btc01-1791121246081",
+          "iid": "btc01",
+          "slot": 1,
+          "prep_mono_ns": 8967530686123,
+          "signed_mono_ns": 8967530741997
+        },
+        {
+          "coid": "btc03-1791121246079",
+          "iid": "btc03",
+          "slot": 1,
+          "prep_mono_ns": 8967530772860,
+          "signed_mono_ns": 8967530826997
+        }
+      ]
+    },
+    {
+      "coid": "btc02-1791121244300",
+      "iid": "btc02",
+      "slot": 0,
+      "core": 5,
+      "receive_to_submit_ns": 406626,
+      "owner_wait_ns": 178494,
+      "other_same_core_prep_overlap_ns": 103113,
+      "same_core_preparation_orders": [
+        {
+          "coid": "btc02-1791121244302",
+          "iid": "btc02",
+          "slot": 2,
+          "prep_mono_ns": 7467627638493,
+          "signed_mono_ns": 7467627692007
+        },
+        {
+          "coid": "btc03-1791121244299",
+          "iid": "btc03",
+          "slot": 0,
+          "prep_mono_ns": 7467627552627,
+          "signed_mono_ns": 7467627608646
+        }
+      ]
+    },
+    {
+      "coid": "btc03-1791121243062",
+      "iid": "btc03",
+      "slot": 2,
+      "core": 5,
+      "receive_to_submit_ns": 401330,
+      "owner_wait_ns": 161823,
+      "other_same_core_prep_overlap_ns": 100474,
+      "same_core_preparation_orders": [
+        {
+          "coid": "btc01-1791121243061",
+          "iid": "btc01",
+          "slot": 2,
+          "prep_mono_ns": 6567527607275,
+          "signed_mono_ns": 6567527664177
+        },
+        {
+          "coid": "btc01-1791121243060",
+          "iid": "btc01",
+          "slot": 0,
+          "prep_mono_ns": 6567527697861,
+          "signed_mono_ns": 6567527751430
+        }
+      ]
+    },
+    {
+      "coid": "btc02-1791121243063",
+      "iid": "btc02",
+      "slot": 1,
+      "core": 14,
+      "receive_to_submit_ns": 401273,
+      "owner_wait_ns": 158615,
+      "other_same_core_prep_overlap_ns": 101603,
+      "same_core_preparation_orders": [
+        {
+          "coid": "btc03-1791121243064",
+          "iid": "btc03",
+          "slot": 1,
+          "prep_mono_ns": 6567527613256,
+          "signed_mono_ns": 6567527667813
+        },
+        {
+          "coid": "btc02-1791121243065",
+          "iid": "btc02",
+          "slot": 3,
+          "prep_mono_ns": 6567527698086,
+          "signed_mono_ns": 6567527752387
+        }
+      ]
+    },
+    {
+      "coid": "btc03-1791121244298",
+      "iid": "btc03",
+      "slot": 1,
+      "core": 14,
+      "receive_to_submit_ns": 400221,
+      "owner_wait_ns": 170720,
+      "other_same_core_prep_overlap_ns": 98985,
+      "same_core_preparation_orders": [
+        {
+          "coid": "btc01-1791121244303",
+          "iid": "btc01",
+          "slot": 3,
+          "prep_mono_ns": 7467627546150,
+          "signed_mono_ns": 7467627601012
+        },
+        {
+          "coid": "btc01-1791121244301",
+          "iid": "btc01",
+          "slot": 1,
+          "prep_mono_ns": 7467627636135,
+          "signed_mono_ns": 7467627689779
+        }
+      ]
+    },
+    {
+      "coid": "btc02-1791121239432",
+      "iid": "btc02",
+      "slot": 3,
+      "core": 14,
+      "receive_to_submit_ns": 399395,
+      "owner_wait_ns": 166590,
+      "other_same_core_prep_overlap_ns": 101939,
+      "same_core_preparation_orders": [
+        {
+          "coid": "btc03-1791121239434",
+          "iid": "btc03",
+          "slot": 1,
+          "prep_mono_ns": 3867925324751,
+          "signed_mono_ns": 3867925380713
+        },
+        {
+          "coid": "btc01-1791121239436",
+          "iid": "btc01",
+          "slot": 1,
+          "prep_mono_ns": 3867925415244,
+          "signed_mono_ns": 3867925469722
+        }
+      ]
+    },
+    {
+      "coid": "btc01-1791121243494",
+      "iid": "btc01",
+      "slot": 0,
+      "core": 5,
+      "receive_to_submit_ns": 398271,
+      "owner_wait_ns": 174957,
+      "other_same_core_prep_overlap_ns": 99408,
+      "same_core_preparation_orders": [
+        {
+          "coid": "btc03-1791121243498",
+          "iid": "btc03",
+          "slot": 2,
+          "prep_mono_ns": 6868028530009,
+          "signed_mono_ns": 6868028584140
+        },
+        {
+          "coid": "btc02-1791121243495",
+          "iid": "btc02",
+          "slot": 0,
+          "prep_mono_ns": 6868028428873,
+          "signed_mono_ns": 6868028483586
+        }
+      ]
+    },
+    {
+      "coid": "btc03-1791121243497",
+      "iid": "btc03",
+      "slot": 3,
+      "core": 14,
+      "receive_to_submit_ns": 397493,
+      "owner_wait_ns": 172227,
+      "other_same_core_prep_overlap_ns": 101754,
+      "same_core_preparation_orders": [
+        {
+          "coid": "btc01-1791121243496",
+          "iid": "btc01",
+          "slot": 3,
+          "prep_mono_ns": 6868028434989,
+          "signed_mono_ns": 6868028489567
+        },
+        {
+          "coid": "btc02-1791121243493",
+          "iid": "btc02",
+          "slot": 1,
+          "prep_mono_ns": 6868028523195,
+          "signed_mono_ns": 6868028576962
+        }
+      ]
+    }
+  ]
+}

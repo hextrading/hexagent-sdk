@@ -1,0 +1,126 @@
+   Compiling hexagent-runtime v0.1.0 (/Users/Admin1/projects/hexagent-sdk-fast-core-io-tail/crates/hexagent-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.18s
+     Running unittests src/lib.rs (/Users/Admin1/projects/hexagent-sdk-market-dispatch-audit/target/debug/deps/hexagent_runtime-6500d382e2ace255)
+
+running 118 tests
+test async_rt::tests::blocking_workers_do_not_inherit_reactor_identity ... ok
+test async_rt::tests::http_timeout_load_falls_back_when_zero ... ok
+test async_rt::tests::init_http_timeout_clamps_above_ceiling ... ok
+test async_rt::tests::init_spawns_general_clob_and_order_runtimes ... ok
+test background_jobs::tests::executes_submitted_job ... ok
+test cold_rpc_jobs::tests::executes_submitted_rpc ... ok
+test http1_pool::repair_tests::instrumented_failed_probes_stay_quarantined_until_complete_warm_response ... ok
+test http1_pool::repair_tests::reqwest_failed_probes_stay_quarantined_until_complete_warm_response ... ok
+test http1_pool::tests::account_sizes_scale_with_instances ... ok
+test http1_pool::tests::admission_acquire_exhaust_release ... ok
+test http1_pool::tests::admission_attempt_trace_is_slot_owned_and_attempt_keyed ... ok
+test http1_pool::tests::admission_fast_and_cancel_are_physically_isolated ... ok
+test http1_pool::tests::admission_isolated_between_accounts ... ok
+test http1_pool::tests::admission_never_double_uses_a_slot ... ok
+test http1_pool::tests::business_outcome_is_attempt_fenced_and_account_local ... ok
+test http1_pool::tests::completion_peer_evidence_preserves_ipv4_ipv6_and_slot_isolation ... ok
+test http1_pool::tests::exempt_and_recovery_clients_cannot_publish_owner_business_recovery ... ok
+test http1_pool::tests::exempt_client_never_blocks ... ok
+test http1_pool::tests::gap_replay_rebuild_policy_requires_threshold_and_cooldown ... ok
+test http1_pool::tests::gap_replay_role_rotates_slots_and_tracks_generation ... ok
+test http1_pool::tests::global_default_sizes_are_fixed ... ok
+test http1_pool::tests::instance_cannot_belong_to_two_account_pool_groups ... ok
+test http1_pool::tests::instrumented_rebuild_replaces_generation_in_the_same_logical_slot ... ok
+test http1_pool::tests::instrumented_repair_is_single_owner_per_generation_without_cross_generation_cooldown ... ok
+test http1_pool::tests::keep_warm_enforces_exact_slot_pool_and_global_limits ... ok
+test http1_pool::tests::keep_warm_requires_thirty_seconds_without_any_slot_activity ... ok
+test http1_pool::tests::keep_warm_tick_spreads_one_sweep_across_all_slots ... ok
+test http1_pool::tests::no_response_evidence_survives_success_repair_and_duplicate_completion ... ok
+test http1_pool::tests::quarantined_slot_returns_only_after_replacement_install ... ok
+test http1_pool::tests::query_repair_preserves_cross_generation_cooldown ... ok
+test http1_pool::tests::replacement_readiness_is_not_business_recovery_and_hedges_keep_identity ... ok
+test http1_pool::tests::retained_acquire_wakes_on_permit_release_without_polling ... ok
+test http1_pool::tests::role_pool_keeps_per_logical_role_counters ... ok
+test http1_pool::tests::shared_account_instances_resolve_to_one_sized_pool_group ... ok
+test http1_pool::tests::spillover_probe_does_not_report_a_shed_business_request ... ok
+test http1_pool::tests::transported_response_resets_the_slot_failure_streak ... ok
+test instrumented_http1::tests::benchmark_cold_poll_interference ... ignored, release: synthetic cold poll interference; no exchange/network traffic
+test instrumented_http1::tests::benchmark_http_io_boundaries ... ignored, release: HTTP/1 loopback completion, instrumented versus bare Hyper reference
+test instrumented_http1::tests::cold_connect_runs_off_reactor_and_cancellation_drops_pending_work ... ok
+test instrumented_http1::tests::cold_connect_worker_failure_returns_error_and_allows_next_connect ... ok
+test instrumented_http1::tests::concurrent_callers_serialize_on_one_slot_connection ... ok
+test instrumented_http1::tests::fresh_client_time_success_does_not_hide_failed_peer_on_next_post ... ok
+test instrumented_http1::tests::generation_distinguishes_reuse_from_transparent_reconnect ... ok
+test instrumented_http1::tests::plaintext_boundaries_separate_server_wait_partial_headers_and_body ... ok
+test instrumented_http1::tests::queued_request_deadline_expires_without_sending_or_touching_active_trace ... ok
+test instrumented_http1::tests::refused_connection_is_not_sent_but_lost_response_stays_ambiguous ... ok
+test instrumented_http1::tests::repair_dns_excludes_failed_peer_only_when_an_alternative_exists ... ok
+test instrumented_http1::tests::retiring_socket_watermark_does_not_invalidate_new_generation ... ok
+test instrumented_http1::tests::stalled_tls_handshake_has_a_connect_deadline_and_never_sends_http ... ok
+test instrumented_http1::tests::timeout_after_headers_is_attributed_to_body ... ok
+test instrumented_http1::tests::timeout_retains_peer_generation_and_incomplete_ttfb_stage ... ok
+test latency::tests::benchmark_observation_publish ... ignored, release: compact observation producer cost and following dequeue
+test latency::tests::benchmark_observation_report_cadence ... ignored, release: 60-second logical workload, report-only versus 250ms draining
+test latency::tests::frequent_observation_drain_preserves_bursts_until_report ... ok
+test latency::tests::logarithmic_buckets_are_monotonic_and_cover_u64 ... ok
+test latency::tests::observation_fifo_is_bounded_ordered_and_thread_isolated ... ok
+test latency::tests::periodic_dump_is_woken_by_unified_shutdown ... ok
+test latency::tests::scheduler_evidence_is_bounded_fifo_and_owner_isolated ... ok
+test latency::tests::stage_capacity_exhaustion_drops_telemetry_without_panicking ... ok
+test latency::tests::thread_local_recording_produces_tail_percentiles ... ok
+test latency_record::tests::maybe_flush_is_noop_within_same_bucket ... ok
+test latency_record::tests::rotates_files_at_utc_midnight ... ok
+test latency_record::tests::writes_header_and_typed_rows_on_flush ... ok
+test latest_snapshot::tests::concurrent_replacement_never_tears_or_replays_a_snapshot ... ok
+test latest_snapshot::tests::latest_complete_snapshot_isolated_and_drained_before_disconnect ... ok
+test latest_snapshot::tests::preempted_writer_does_not_block_reader_or_expose_incomplete_value ... ok
+test memory::maintenance_tests::maintenance_is_optional_rate_limited_and_never_catches_up_in_a_burst ... ok
+test memory::tests::parses_status_and_smaps_rollup_units ... ok
+test os_tune::tests::polymarket_dispatch_and_completion_use_separate_pools ... ok
+test os_tune::tests::recorder_isolation_rejects_every_critical_or_background_collision ... ok
+test os_tune::tests::role_specific_execution_priorities_are_resolved ... ok
+test os_tune::tests::selective_stack_lock_range_is_page_aligned_and_bounded ... ok
+test os_tune::tests::strict_plan_accepts_five_dedicated_strategy_cores ... ok
+test os_tune::tests::strict_plan_allows_only_opted_in_background_execution_overlap ... ok
+test os_tune::tests::strict_plan_allows_only_opted_in_router_execution_overlap ... ok
+test os_tune::tests::strict_plan_allows_private_apply_on_dormant_strategy_cores_only ... ok
+test os_tune::tests::strict_plan_allows_private_apply_only_on_opted_in_completion_core ... ok
+test os_tune::tests::strict_plan_rejects_async_clob_overlap ... ok
+test os_tune::tests::strict_plan_rejects_missing_or_overlapping_strategy_core ... ok
+test os_tune::tests::strict_plan_requires_disjoint_private_cold_core ... ok
+test os_tune::tests::strict_plan_requires_private_route_core_disjoint_from_apply ... ok
+test os_tune::tests::two_fast_cores_keep_cancel_priority_and_cold_background_explicit ... ok
+test os_tune::tests::unified_three_account_plan_fits_16_cpus_without_sharing_critical_owners ... ok
+test owner_queue_probe::tests::fast_events_do_not_publish_and_owner_evidence_is_isolated ... ok
+test owner_queue_probe::tests::separates_idle_overlap_from_owner_work_without_attributing_unknown_cpu ... ok
+test owner_timer::tests::exact_deadline_and_delayed_turn_coalesce_without_catchup ... ok
+test owner_timer::tests::independent_owners_do_not_share_deadlines ... ok
+test owner_timer::tests::owner_timer_router_turn_benchmark ... ignored, manual timer/select benchmark; run release with --ignored --nocapture
+test poll_channel::tests::closing_consumer_returns_the_exact_retained_record ... ok
+test poll_channel::tests::cold_timeout_checks_ready_and_disconnected_before_deadline ... ok
+test poll_channel::tests::concurrent_producers_deliver_every_record_once_in_per_producer_order ... ok
+test poll_channel::tests::crossbeam_and_poll_lane_roundtrip_benchmark ... ignored, focused release microbenchmark; prints distributions, no timing assertion
+test poll_channel::tests::exact_capacity_order_and_disconnect_after_drain ... ok
+test poll_channel::tests::preempted_cold_ingress_benchmark ... ignored, manual preempted-ingress benchmark; release --ignored --nocapture
+test poll_channel::tests::retained_head_retries_without_duplication_and_lanes_are_isolated ... ok
+test poll_channel::tests::sender_observes_owner_shutdown_with_queued_values ... ok
+test poll_channel::tests::timed_owner_receive_yields_for_preempted_publication_and_keeps_fifo ... ok
+test poll_channel::tests::unfinished_publication_returns_immediately_without_overtaking ... ok
+test poll_channel::wake_lane_tests::concurrent_publication_and_sleep_deliver_exactly_once ... ok
+test poll_channel::wake_lane_tests::shared_dispatcher_wake_notifies_every_inbox_without_reordering ... ok
+test poll_channel::wake_lane_tests::woke_lane_retains_full_value_order_and_disconnect ... ok
+test reactor_probe::tests::general_poll_overhead ... ignored, focused release benchmark; reports synchronous general-task poll overhead
+test reactor_probe::tests::missing_or_backward_cpu_clock_remains_unknown ... ok
+test reactor_probe::tests::stalled_owner_emits_deadline_and_single_poll_evidence ... ok
+test reactor_probe::tests::task_polling_preserves_pending_wakes_output_and_cancellation ... ok
+test reply_slots::tests::dropped_receiver_and_late_completion_cannot_replay_into_reused_slot ... ok
+test reply_slots::tests::independent_owners_cannot_consume_each_others_replies ... ok
+test reply_slots::tests::lifecycle_is_lossless_and_no_reuse_while_any_generation_reader_remains ... ok
+test shutdown::tests::broadcasts_both_shutdown_phases_to_every_subscriber ... ok
+test shutdown::tests::late_subscriber_observes_finished_state ... ok
+test try_queue::tests::competing_consumers_and_producers_transfer_every_value_exactly_once ... ok
+test try_queue::tests::concurrent_producers_preserve_each_fifo_without_duplicates_or_loss ... ok
+test try_queue::tests::counters_wrap_without_confusing_empty_and_full_stamps ... ok
+test try_queue::tests::drop_releases_each_owned_value_once ... ok
+test try_queue::tests::fifo_exact_capacity_and_reuse_including_one_and_non_power_of_two ... ok
+test try_queue::tests::preempted_consumer_cannot_trap_producer_reusing_the_slot ... ok
+test try_queue::tests::preempted_publisher_cannot_trap_higher_priority_producer_or_consumer ... ok
+test wake::tests::publication_between_arm_and_wait_is_not_lost ... ok
+
+test result: ok. 110 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 2.84s
+

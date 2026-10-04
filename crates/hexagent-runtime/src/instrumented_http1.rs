@@ -26,6 +26,58 @@ use tower_service::Service;
 
 type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 
+/// Connection establishment is cold work, including synchronous certificate
+/// verification inside a TLS future poll. The existing order runtime's
+/// demoted blocking workers poll it with that same runtime handle: TCP socket
+/// registration remains on the order reactor, while crypto does not delay
+/// another slot's first request poll. No worker is added to the quote lane.
+/// At most one connect per exclusive physical slot is submitted. The reply
+/// is capacity one; dropping the caller cancels the owned connect future,
+/// including a pending socket, rather than detaching an unlimited repair.
+async fn cold_connect<F>(future: F) -> Result<F::Output, tokio::sync::oneshot::error::RecvError>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let runtime = tokio::runtime::Handle::current();
+    let (mut tx, rx) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        crate::latency::prepare_scheduler_tail_queue();
+        runtime.block_on(async move {
+            tokio::select! {
+                biased;
+                _ = tx.closed() => {}
+                result = observe_cold_connect(future) => { let _ = tx.send(result); }
+            }
+        });
+    });
+    rx.await
+}
+
+async fn observe_cold_connect<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        let started = Instant::now();
+        let cpu = crate::latency::thread_cpu_ns();
+        let result = future.as_mut().poll(cx);
+        let elapsed = duration_ns(started.elapsed());
+        if elapsed >= 100_000 {
+            let current_cpu = crate::latency::thread_cpu_ns();
+            crate::latency::observe_scheduler_tail(crate::latency::SchedulerTail {
+                probe: "order_cold_connect",
+                observed_unix_ns: hexagent_types::types::now_ns(),
+                lag_ns: elapsed,
+                span_wall_ns: elapsed,
+                span_cpu_ns: (cpu != 0 && current_cpu >= cpu).then(|| current_cpu - cpu),
+                expirations: 0,
+                error_code: None,
+                boundary: "single_connect_future_poll_on_background_worker",
+            });
+        }
+        result
+    }).await
+}
+
 mod io_trace;
 pub use io_trace::Http1IoTimings;
 use io_trace::{IoTrace, TimedIo};
@@ -40,6 +92,7 @@ struct ConnectTrace {
     dns_ns: AtomicU64,
     dns_tcp_ns: AtomicU64,
     tls_total_ns: AtomicU64,
+    connect_worker_queue_ns: AtomicU64,
     phase: AtomicU8,
     peer_family: AtomicU8,
     peer_port: AtomicU16,
@@ -189,6 +242,7 @@ impl Service<Uri> for TimedTcpConnector {
 struct TimedTlsConnector {
     inner: HttpsConnector<TimedTcpConnector>,
     trace: Arc<ConnectTrace>,
+    connect_timeout: Duration,
 }
 
 impl Service<Uri> for TimedTlsConnector {
@@ -204,14 +258,29 @@ impl Service<Uri> for TimedTlsConnector {
         self.trace.dns_ns.store(0, Ordering::Relaxed);
         self.trace.dns_tcp_ns.store(0, Ordering::Relaxed);
         self.trace.tls_total_ns.store(0, Ordering::Relaxed);
+        self.trace.connect_worker_queue_ns.store(0, Ordering::Relaxed);
         self.trace.peer_family.store(0, Ordering::Relaxed);
         self.trace.phase.store(PHASE_TLS, Ordering::Release);
         self.trace.attempts.fetch_add(1, Ordering::AcqRel);
         let mut inner = self.inner.clone();
         let trace = Arc::clone(&self.trace);
+        let connect_timeout = self.connect_timeout;
         Box::pin(async move {
             let started = Instant::now();
-            let result = inner.call(uri).await;
+            let deadline = tokio::time::Instant::now() + connect_timeout;
+            let worker_trace = Arc::clone(&trace);
+            let connect = inner.call(uri);
+            let result = cold_connect(async move {
+                worker_trace.connect_worker_queue_ns.store(duration_ns(started.elapsed()), Ordering::Release);
+                // Hyper may keep a connect task after an HTTP timeout. Bound
+                // the entire cold connect, including worker pickup and TLS,
+                // so a silent handshake cannot retain a worker indefinitely.
+                tokio::time::timeout_at(deadline, connect).await
+                    .map_err(|error| -> <HttpsConnector<TimedTcpConnector> as Service<Uri>>::Error {
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, error).into()
+                    })?
+            }).await
+                .map_err(std::io::Error::other)?;
             trace
                 .tls_total_ns
                 .store(duration_ns(started.elapsed()), Ordering::Release);
@@ -257,6 +326,8 @@ pub struct Http1PhaseTimings {
     pub dns_ns: u64,
     pub tcp_ns: u64,
     pub tls_ns: u64,
+    /// Cold worker pickup, excluded from TLS and TTFB; zero on socket reuse.
+    pub connect_worker_queue_ns: u64,
     /// Time from dispatch until response headers, excluding a connect made by
     /// this request. On a reused socket this is the raw header wait.
     pub ttfb_ns: u64,
@@ -402,6 +473,7 @@ impl InstrumentedHttp1Client {
         let connector = TimedTlsConnector {
             inner: https,
             trace: Arc::clone(&trace),
+            connect_timeout,
         };
         let mut builder = Client::builder(TokioExecutor::new());
         // Never let the generic client replay an order internally. A stale
@@ -611,17 +683,19 @@ impl InstrumentedHttp1Client {
         } else {
             false
         };
-        let (dns_ns, tcp_ns, tls_ns) = if connect_attempted {
+        let (dns_ns, tcp_ns, tls_ns, connect_worker_queue_ns) = if connect_attempted {
             let dns_ns = self.trace.dns_ns.load(Ordering::Acquire);
             let dns_tcp_ns = self.trace.dns_tcp_ns.load(Ordering::Acquire);
             let tls_total_ns = self.trace.tls_total_ns.load(Ordering::Acquire);
+            let worker_queue = self.trace.connect_worker_queue_ns.load(Ordering::Acquire);
             (
                 dns_ns,
                 dns_tcp_ns.saturating_sub(dns_ns),
-                tls_total_ns.saturating_sub(dns_tcp_ns),
+                tls_total_ns.saturating_sub(dns_tcp_ns).saturating_sub(worker_queue),
+                worker_queue,
             )
         } else {
-            (0, 0, 0)
+            (0, 0, 0, 0)
         };
         Http1PhaseTimings {
             io: self.trace.io.snapshot(if matches!(incomplete_phase, Http1IncompletePhase::None | Http1IncompletePhase::Body) { headers_ns } else { 0 }),
@@ -631,10 +705,12 @@ impl InstrumentedHttp1Client {
             dns_ns,
             tcp_ns,
             tls_ns,
+            connect_worker_queue_ns,
             ttfb_ns: headers_ns
                 .saturating_sub(dns_ns)
                 .saturating_sub(tcp_ns)
-                .saturating_sub(tls_ns),
+                .saturating_sub(tls_ns)
+                .saturating_sub(connect_worker_queue_ns),
             body_ns,
             total_ns,
             slot_wait_ns,
@@ -651,6 +727,106 @@ fn duration_ns(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "current_thread")]
+    async fn cold_connect_runs_off_reactor_and_cancellation_drops_pending_work() {
+        let reactor = std::thread::current().id();
+        let worker = super::cold_connect(async { std::thread::current().id() }).await.unwrap();
+        assert_ne!(reactor, worker);
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Release); }
+        }
+        let flag = DropFlag(dropped.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(super::cold_connect(async move {
+            let _flag = flag;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !dropped.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cold_connect_worker_failure_returns_error_and_allows_next_connect() {
+        assert!(super::cold_connect(async { panic!("controlled cold worker failure") }).await.is_err());
+        assert_eq!(super::cold_connect(async { 17 }).await.unwrap(), 17);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_tls_handshake_has_a_connect_deadline_and_never_sends_http() {
+        use super::*;
+        use tokio::io::AsyncReadExt;
+        // Startup cost is outside the deliberately short connection budget.
+        cold_connect(async {}).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut hello = [0; 4096];
+            assert!(stream.read(&mut hello).await.unwrap() > 0);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let client = InstrumentedHttp1Client::new(Duration::from_millis(50)).unwrap();
+        let error = client.request(reqwest::Method::GET, &format!("https://{addr}/time"),
+            reqwest::header::HeaderMap::new(), Bytes::new(), Duration::from_secs(1))
+            .await.unwrap_err();
+        assert_eq!(error.kind, InstrumentedHttp1ErrorKind::Connect);
+        assert_eq!(error.timings.incomplete_phase, Http1IncompletePhase::Tls);
+        assert_eq!(error.timings.connect_generation_after, 0);
+        assert_eq!(error.timings.io.written_bytes, 0);
+        assert!(error.timings.connect_worker_queue_ns > 0);
+        assert!(error.timings.total_ns < 1_000_000_000);
+        tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+    }
+
+    #[test]
+    #[ignore = "release: synthetic cold poll interference; no exchange/network traffic"]
+    fn benchmark_cold_poll_interference() {
+        use super::*;
+        const N: usize = 2_000;
+        const REPAIRS: usize = 6;
+        let cold_core = std::env::var("HEXPROBE_COLD_CORE").ok().map(|s| s.parse::<usize>().unwrap());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all()
+            .on_thread_start(move || {
+                if let Some(core) = cold_core { assert!(core_affinity::set_for_current(core_affinity::CoreId { id: core })); }
+            }).build().unwrap();
+        rt.block_on(async {
+            // Warm the existing blocking pool before the measured boundary.
+            let mut warm = Vec::new();
+            for _ in 0..REPAIRS { warm.push(tokio::spawn(cold_connect(async { tokio::time::sleep(Duration::from_millis(10)).await; }))); }
+            for task in warm { task.await.unwrap().unwrap(); }
+            for offload in [false, true] {
+                let mut values = Vec::with_capacity(N);
+                for _ in 0..N {
+                    let mut repairs = Vec::with_capacity(REPAIRS);
+                    for _ in 0..REPAIRS {
+                        repairs.push(tokio::spawn(async move {
+                            let poll = async {
+                                let start = Instant::now();
+                                while start.elapsed() < Duration::from_micros(300) { std::hint::spin_loop(); }
+                            };
+                            if offload { cold_connect(poll).await.unwrap(); } else { poll.await; }
+                        }));
+                    }
+                    let enqueued = Instant::now();
+                    let hot = tokio::spawn(async move { duration_ns(enqueued.elapsed()) });
+                    values.push(hot.await.unwrap());
+                    for task in repairs { task.await.unwrap(); }
+                }
+                values.sort_unstable();
+                println!("cold_offload={offload} n={N} median_ns={} p99_ns={} p999_ns={} max_ns={} cold_inflight_high_water={REPAIRS} reply_capacity=1 overflow=0 boundary=hot_task_enqueue_to_first_poll synthetic_cold_polls=6x300us",
+                    (values[N/2-1]+values[N/2])/2, values[N*99/100-1], values[N*999/1000-1], values[N-1]);
+            }
+        });
+    }
     use super::*;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -1035,7 +1211,12 @@ mod tests {
         assert_eq!(error.timings.incomplete_phase, Http1IncompletePhase::Ttfb);
         assert_eq!(error.timings.peer.map(|peer| peer.ip()), Some(addr.ip()));
         assert_eq!(error.timings.connect_generation_after, 1);
-        assert!(error.timings.ttfb_ns >= 15_000_000);
+        // The absolute 20ms budget includes cold connect/worker pickup.
+        // Check the observed phase and total deadline, without assuming
+        // connection establishment always consumed less than 5ms.
+        assert!(error.timings.total_ns >= 20_000_000);
+        assert!(error.timings.ttfb_ns > 0);
+        assert!(error.timings.ttfb_ns <= error.timings.total_ns);
         server.await.unwrap();
     }
 

@@ -24,7 +24,7 @@
 //! exchange should validate the EOA sig against the Safe's owners.
 
 use anyhow::{anyhow, Result};
-use k256::ecdsa::SigningKey;
+use super::order_crypto::OrderCrypto;
 use sha3::{Digest, Keccak256};
 
 use super::signer::{
@@ -135,7 +135,7 @@ pub struct SignedOrderV2 {
 // ════════════════════════════════════════════════════════════════
 
 pub struct OrderSignerV2 {
-    signing_key: SigningKey,
+    signing_key: OrderCrypto,
     pub signer_address: String,
     pub maker_address: String,
     exchange_address: String,
@@ -191,8 +191,7 @@ impl OrderSignerV2 {
         let hex_clean = private_key_hex.strip_prefix("0x").unwrap_or(private_key_hex);
         let key_bytes = hex::decode(hex_clean)
             .map_err(|e| anyhow!("Invalid private key hex: {}", e))?;
-        let signing_key = SigningKey::from_bytes(key_bytes.as_slice().into())
-            .map_err(|e| anyhow!("Invalid private key: {}", e))?;
+        let signing_key = OrderCrypto::new(&key_bytes)?;
 
         let (signer_address, maker_address) = derive_addresses(private_key_hex, sig_type)
             .ok_or_else(|| anyhow!("Failed to derive addresses from private key"))?;
@@ -315,12 +314,7 @@ impl OrderSignerV2 {
     /// order struct exactly once for both signature and orderID.
     fn sign_digest(&self, digest: &[u8; 32]) -> Result<String> {
         let _t = crate::latency::TimedStage::new("polymarket.signer_v2.sign");
-        let (sig, recid) = self.signing_key
-            .sign_prehash_recoverable(digest)
-            .map_err(|e| anyhow!("Signing failed: {}", e))?;
-        let mut sig_bytes = [0u8; 65];
-        sig_bytes[..64].copy_from_slice(&sig.to_bytes());
-        sig_bytes[64] = recid.to_byte() + 27;
+        let sig_bytes = self.signing_key.sign(digest)?;
         Ok(prefixed_hex(&sig_bytes))
     }
 
@@ -450,13 +444,7 @@ impl OrderSignerV2 {
         ]);
         let digest = eip712_digest(&app_domain_sep, &tds_hash);
 
-        let (sig, recid) = self
-            .signing_key
-            .sign_prehash_recoverable(&digest)
-            .map_err(|e| anyhow!("Signing failed: {}", e))?;
-        let mut inner = [0u8; 65];
-        inner[..64].copy_from_slice(&sig.to_bytes());
-        inner[64] = recid.to_byte() + 27;
+        let inner = self.signing_key.sign(&digest)?;
 
         let type_str = ORDER_TYPE_STRING.as_bytes();
         let type_len = u16::try_from(type_str.len()).expect("order type string fits u16");
