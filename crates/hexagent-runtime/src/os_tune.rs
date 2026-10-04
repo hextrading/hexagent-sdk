@@ -142,6 +142,7 @@ pub struct CorePlan {
     /// Response completion/accounting workers. Empty config inherits exec.
     pub poly_completion_cores: Vec<usize>,
     pub background_cores: Vec<usize>,
+    pub recorder_core: Option<usize>,
     pub fifo_async_rt: u8,
     pub fifo_strategy: u8,
     pub fifo_execution: u8,
@@ -179,6 +180,7 @@ impl CorePlan {
             poly_cancel_cores: Vec::new(),
             poly_completion_cores: Vec::new(),
             background_cores: vec![DEFAULT_BACKGROUND_CORE],
+            recorder_core: None,
             fifo_async_rt: DEFAULT_PRIO_ASYNC_RT,
             fifo_strategy: DEFAULT_PRIO_STRATEGY,
             fifo_execution: DEFAULT_PRIO_EXECUTION,
@@ -233,6 +235,7 @@ impl CorePlan {
             poly_cancel_cores,
             poly_completion_cores,
             background_cores: bg,
+            recorder_core: cfg.recorder_core,
             fifo_async_rt: cfg.fifo_async_rt.unwrap_or(DEFAULT_PRIO_ASYNC_RT),
             fifo_strategy: cfg.fifo_strategy.unwrap_or(DEFAULT_PRIO_STRATEGY),
             fifo_execution: cfg.fifo_execution.unwrap_or(DEFAULT_PRIO_EXECUTION),
@@ -595,6 +598,13 @@ impl CorePlan {
         latency_cores.extend(feed_cores);
         latency_cores.extend(poly_cores);
         latency_cores.extend(hex_cores);
+        if let Some(core) = self.recorder_core {
+            if latency_cores.contains(&core) || self.background_cores.contains(&core) {
+                return Err(format!(
+                    "recorder core {} overlaps another worker/background role", core
+                ));
+            }
+        }
         for &core in &self.background_cores {
             if latency_cores.contains(&core) {
                 if self.allow_private_cold_on_background_core
@@ -681,6 +691,7 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     );
     info!("[os_tune] dispatch sharing: cold_on_background={} cancel_on_execution={} fifo_cancel={}",
         plan.allow_private_cold_on_background_core, plan.allow_cancel_on_execution_core, plan.fifo_cancel);
+    info!("[os_tune] archive recorder_core={:?} policy=SCHED_OTHER fallback=background", plan.recorder_core);
     let _ = CORE_PLAN.set(plan);
 }
 
@@ -803,7 +814,7 @@ pub fn pin_current(core_id: usize, thread_name: &str) {
         || p.poly_completion_cores.iter().any(|&c| c == core_id)
     {
         "HEXBOT_NO_PIN_EXECUTION"
-    } else if p.background_cores.iter().any(|&c| c == core_id) {
+    } else if p.recorder_core == Some(core_id) || p.background_cores.iter().any(|&c| c == core_id) {
         "HEXBOT_NO_PIN_BACKGROUND"
     } else {
         ""
@@ -1304,6 +1315,14 @@ pub fn pin_background(thread_name: &str) {
     pin_current(core, thread_name);
 }
 
+/// Existing archive writer, isolated from CPU-heavy training when configured.
+/// Never inherits FIFO from its creator; strict affinity failures abort.
+pub fn pin_recorder(thread_name: &str) {
+    demote_current_to_other(thread_name);
+    let core = plan().recorder_core.unwrap_or_else(|| plan().route_background());
+    pin_current(core, thread_name);
+}
+
 fn demote_current_to_other(_thread_name: &str) {
     #[cfg(target_os = "linux")]
     {
@@ -1583,6 +1602,24 @@ mod tests {
         let plan = CorePlan::from_config(&cfg);
         assert_eq!(plan.async_clob, Some(16));
         assert_eq!(plan.validate_strategy_isolation(&five_instances()), Ok(()));
+    }
+
+    #[test]
+    fn recorder_isolation_rejects_every_critical_or_background_collision() {
+        let mut cfg = five_instance_config();
+        cfg.async_clob_core = Some(16);
+        cfg.background_cores = vec![0];
+        cfg.recorder_core = Some(1);
+        let plan = CorePlan::from_config(&cfg);
+        assert_eq!(plan.recorder_core, Some(1));
+        assert_eq!(plan.validate_strategy_isolation(&five_instances()), Ok(()));
+        for core in (0..=16).filter(|&core| core != 1) {
+            cfg.recorder_core = Some(core);
+            assert!(CorePlan::from_config(&cfg).validate_strategy_isolation(&five_instances())
+                .unwrap_err().contains("recorder core"), "core {core}");
+        }
+        cfg.recorder_core = None;
+        assert_eq!(CorePlan::from_config(&cfg).validate_strategy_isolation(&five_instances()), Ok(()));
     }
 
     #[test]

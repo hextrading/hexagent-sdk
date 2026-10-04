@@ -409,6 +409,15 @@ impl BookProtocolConsumer {
         rx: &Receiver<T>,
         timeout: std::time::Duration,
     ) -> std::result::Result<T, crossbeam_channel::RecvTimeoutError> {
+        // The caller already gave protocol evidence its bounded drain turn.
+        // A continuing evidence backlog must not starve ready archive events.
+        match rx.try_recv() {
+            Ok(event) => return Ok(event),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                return Err(crossbeam_channel::RecvTimeoutError::Disconnected);
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+        }
         // A single wakeup can represent more than one drain batch. Never
         // sleep with undrained evidence after consuming its coalesced wakeup.
         if !self.rx.is_empty() {
@@ -665,5 +674,26 @@ mod wake_tests {
             start.elapsed() < Duration::from_secs(1),
             "queued evidence must bypass the sleep even with no wake token"
         );
+    }
+
+    #[test]
+    fn pending_protocol_evidence_cannot_starve_ordered_market_or_disconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let lane = BookProtocolLane::new(83);
+        let consumer = lane.consumer(dir.path()).unwrap();
+        let route = BookProtocolRoute::new("token", "cid", None).unwrap();
+        let _session = lane.sink().session(&[route], 1);
+        assert!(!consumer.rx.is_empty());
+        let (tx, rx) = crossbeam_channel::bounded(3);
+        // The next two records represent a disconnect/reconnect transition;
+        // duplicates and their FIFO order must survive a protocol backlog.
+        for value in [1, 1, 2] { tx.send(value).unwrap(); }
+        drop(tx);
+        for value in [1, 1, 2] {
+            assert_eq!(consumer.recv_market(&rx, Duration::ZERO).unwrap(), value);
+            assert!(!consumer.rx.is_empty());
+        }
+        assert!(matches!(consumer.recv_market(&rx, Duration::ZERO),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)));
     }
 }

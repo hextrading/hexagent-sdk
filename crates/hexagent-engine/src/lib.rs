@@ -20,6 +20,7 @@ pub mod strategy {
 }
 
 pub mod engine;
+mod recorder_lane;
 mod execution_admission;
 mod execution_admission_lane;
 mod shutdown_completion;

@@ -3526,43 +3526,13 @@ fn is_routine_clob_resubscribe(reason: &str) -> bool {
 }
 
 fn forward_recorder_shared(
-    recorder_tx: Option<&Sender<Arc<MarketEvent>>>,
+    recorder_tx: Option<&mut crate::recorder_lane::RecorderSender>,
     event: Arc<MarketEvent>,
 ) {
-    if let Some(tx) = recorder_tx {
-        if matches!(event.as_ref(), MarketEvent::Exit) {
-            let _ = tx.send(event);
-            return;
-        }
-        let started = std::time::Instant::now();
-        match tx.try_send(event) {
-            Ok(()) => crate::latency::record_ns(
-                "market.recorder.enqueue",
-                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-            ),
-            Err(crossbeam_channel::TrySendError::Full(_)) => {
-                static DROPPED: AtomicU64 = AtomicU64::new(0);
-                static LAST_WARN_NS: AtomicU64 = AtomicU64::new(0);
-                let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
-                let now = now_ns();
-                let last = LAST_WARN_NS.load(Ordering::Relaxed);
-                if now.saturating_sub(last) >= 10_000_000_000
-                    && LAST_WARN_NS
-                        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    warn!(
-                        "[Recorder] live queue saturated; dropped_events_total={} action=preserve_strategy_latency",
-                        dropped
-                    );
-                }
-            }
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
-        }
-    }
+    if let Some(tx) = recorder_tx { tx.forward(event); }
 }
 
-fn forward_recorder_event(recorder_tx: Option<&Sender<Arc<MarketEvent>>>, event: &MarketEvent) {
+fn forward_recorder_event(recorder_tx: Option<&mut crate::recorder_lane::RecorderSender>, event: &MarketEvent) {
     forward_recorder_shared(recorder_tx, Arc::new(event.clone()));
 }
 
@@ -3973,7 +3943,7 @@ impl Engine {
     }
 
     /// Spawn a market data recorder thread. Returns (sender, join handle).
-    fn spawn_recorder_thread(&self) -> Result<(Sender<Arc<MarketEvent>>, thread::JoinHandle<()>)> {
+    fn spawn_recorder_thread(&self) -> Result<(crate::recorder_lane::RecorderSender, thread::JoinHandle<()>)> {
         // Live uses the same unfiltered recorder semantics as Record mode:
         // external spot/index and Polymarket events share one output root.
         self.spawn_recorder_thread_to(&self.config.recording.output_dir)
@@ -3982,7 +3952,7 @@ impl Engine {
     fn spawn_recorder_thread_to(
         &self,
         dir: &str,
-    ) -> Result<(Sender<Arc<MarketEvent>>, thread::JoinHandle<()>)> {
+    ) -> Result<(crate::recorder_lane::RecorderSender, thread::JoinHandle<()>)> {
         let output_dir = std::fs::canonicalize(dir)
             .unwrap_or_else(|_| {
                 let p = PathBuf::from(dir);
@@ -3996,15 +3966,18 @@ impl Engine {
             .as_ref()
             .map(|lane| lane.consumer(std::path::Path::new(&output_dir)))
             .transpose()?;
-        let (recorder_tx, recorder_rx) = bounded::<Arc<MarketEvent>>(CHANNEL_CAPACITY);
+        let (recorder_tx, recorder_rx, mut telemetry) = crate::recorder_lane::recorder_lane(CHANNEL_CAPACITY);
         let handle = thread::Builder::new()
             .name("recorder".into())
             .spawn(move || {
-                crate::os_tune::pin_background("recorder");
+                crate::os_tune::pin_recorder("recorder");
+                telemetry.set_output_dir(std::path::Path::new(&output_dir));
                 let mut recorder = match MarketRecorder::new(PathBuf::from(&output_dir)) {
                     Ok(r) => r,
                     Err(e) => {
                         error!("[Recorder] Failed to create: {}", e);
+                        telemetry.write_error();
+                        telemetry.report(recorder_rx.len(), true);
                         return;
                     }
                 };
@@ -4021,34 +3994,45 @@ impl Engine {
                     .unwrap_or(0);
                 let mut next_checkpoint_unix_secs =
                     ((now_secs / CHECKPOINT_INTERVAL_SECS) + 1) * CHECKPOINT_INTERVAL_SECS;
-                loop {
+                'archive: loop {
                     if let Some(protocol) = protocol.as_mut() {
                         if let Err(error) = protocol.drain(&mut recorder, 256) {
+                            telemetry.write_error();
                             error!("[Recorder] Protocol evidence incomplete: {}", error);
                         }
                     }
-                    let incoming = match protocol.as_ref() {
+                    let mut incoming = Some(match protocol.as_ref() {
                         Some(protocol) => {
                             protocol.recv_market(&recorder_rx, std::time::Duration::from_secs(5))
                         }
                         None => recorder_rx.recv_timeout(std::time::Duration::from_secs(5)),
-                    };
-                    match incoming {
-                        Ok(event) => {
-                            if matches!(event.as_ref(), MarketEvent::Exit) {
-                                break;
+                    });
+                    // Both archive lanes receive bounded turns. Evidence can
+                    // stay backlogged without starving the market FIFO.
+                    for _ in 0..crate::recorder_lane::ARCHIVE_BATCH {
+                        let message = incoming.take().unwrap_or_else(|| recorder_rx.try_recv()
+                            .map_err(|error| match error {
+                                crossbeam_channel::TryRecvError::Empty => crossbeam_channel::RecvTimeoutError::Timeout,
+                                crossbeam_channel::TryRecvError::Disconnected => crossbeam_channel::RecvTimeoutError::Disconnected,
+                            }));
+                        match message {
+                            Ok(message) => {
+                                let event = telemetry.received(message);
+                                if matches!(event.as_ref(), MarketEvent::Exit) { break 'archive; }
+                                if let Err(e) = recorder.write_event(event.as_ref()) {
+                                    telemetry.write_error();
+                                    error!("[Recorder] Write error: {}", e);
+                                }
                             }
-                            if let Err(e) = recorder.write_event(event.as_ref()) {
-                                error!("[Recorder] Write error: {}", e);
-                            }
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                            Err(_) => break 'archive,
                         }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                        Err(_) => break,
                     }
                     if last_flush.elapsed() >= flush_interval {
                         recorder.flush_buffers();
                         if let Some(protocol) = protocol.as_mut() {
                             if let Err(error) = protocol.checkpoint(&mut recorder) {
+                                telemetry.write_error();
                                 error!("[Recorder] Protocol flush incomplete: {}", error);
                             }
                         }
@@ -4067,16 +4051,20 @@ impl Engine {
                         next_checkpoint_unix_secs =
                             ((cur / CHECKPOINT_INTERVAL_SECS) + 1) * CHECKPOINT_INTERVAL_SECS;
                     }
+                    telemetry.report(recorder_rx.len(), false);
                 }
                 if let Some(protocol) = protocol.as_mut() {
                     if let Err(error) = protocol.finish(&mut recorder) {
+                        telemetry.write_error();
                         error!("[Recorder] Protocol shutdown incomplete: {}", error);
                     }
                 }
                 info!("[Recorder] Flushing {} events...", recorder.event_count());
                 if let Err(e) = recorder.flush() {
+                    telemetry.write_error();
                     error!("[Recorder] Flush error: {}", e);
                 }
+                telemetry.report(recorder_rx.len(), true);
                 info!(
                     "[Recorder] Finished: {} events written",
                     recorder.event_count()
@@ -4941,7 +4929,7 @@ impl Engine {
         let recorder_handle = thread::Builder::new()
             .name("recorder".into())
             .spawn(move || {
-                crate::os_tune::pin_background("recorder");
+                crate::os_tune::pin_recorder("recorder");
                 let mut recorder = match MarketRecorder::new(PathBuf::from(&output_dir)) {
                     Ok(r) => r,
                     Err(e) => { error!("[Recorder] Failed to create: {}", e); return; }
@@ -8245,7 +8233,7 @@ impl Engine {
         mut private_poll_rx: Option<hexagent_runtime::poll_channel::Receiver<RoutedOrderUpdate>>,
         mut executor_update_rx: Option<hexagent_runtime::poll_channel::Receiver<RoutedOrderUpdate>>,
         backtest: bool,
-        recorder_tx: Option<Sender<Arc<MarketEvent>>>,
+        mut recorder_tx: Option<crate::recorder_lane::RecorderSender>,
         rtt_probe_install: HashMap<
             String,
             (
@@ -8441,7 +8429,7 @@ impl Engine {
                 // belong to the live thread after warm-up ends.
                 let mut drained = 0u64;
                 while let Ok(event) = market_rx.try_recv() {
-                    forward_recorder_event(recorder_tx.as_ref(), &event);
+                    forward_recorder_event(recorder_tx.as_mut(), &event);
                     for strategy in &mut strategies {
                         match &event {
                             MarketEvent::OrderBook(ob) => strategy.on_orderbook(ob),
@@ -8648,7 +8636,7 @@ impl Engine {
                 // (mirrors the prediction warm-up drain above).
                 let mut drained = 0u64;
                 while let Ok(event) = market_rx.try_recv() {
-                    forward_recorder_event(recorder_tx.as_ref(), &event);
+                    forward_recorder_event(recorder_tx.as_mut(), &event);
                     for strategy in &mut strategies {
                         match &event {
                             MarketEvent::OrderBook(ob) => strategy.on_orderbook(ob),
@@ -8763,7 +8751,7 @@ impl Engine {
                                         s.on_exit();
                                     }
                                     forward_recorder_event(
-                                        recorder_tx.as_ref(), &MarketEvent::Exit,
+                                        recorder_tx.as_mut(), &MarketEvent::Exit,
                                     );
                                     if backtest || shutdown_done_rx.is_none() {
                                         for s in &mut strategies {
@@ -8821,7 +8809,7 @@ impl Engine {
                                 }
                                 Ok(event) => {
                                     // Record market data if recorder is active
-                                    forward_recorder_event(recorder_tx.as_ref(), &event);
+                                    forward_recorder_event(recorder_tx.as_mut(), &event);
                                     if backtest {
                                         if !matches!(&event, MarketEvent::Instrument(_) | MarketEvent::Connected { .. } | MarketEvent::Disconnected { .. }) {
                                             set_sim_clock(event.timestamp_ns());
@@ -8990,7 +8978,7 @@ impl Engine {
         update_rx: Receiver<RoutedOrderUpdate>,
         private_poll_rx: Option<hexagent_runtime::poll_channel::Receiver<RoutedOrderUpdate>>,
         executor_update_rx: Option<hexagent_runtime::poll_channel::Receiver<RoutedOrderUpdate>>,
-        recorder_tx: Option<Sender<Arc<MarketEvent>>>,
+        mut recorder_tx: Option<crate::recorder_lane::RecorderSender>,
         data_dirs: Vec<PathBuf>,
         shutdown_done_rx: Option<CompletionReceiver>,
         poly_states: &HashMap<String, Arc<crate::exchange::polymarket::trade::SharedState>>,
@@ -9399,7 +9387,7 @@ impl Engine {
                         Ok(MarketEvent::Exit) => {
                             if shutdown_in_progress { continue; }
                             forward_recorder_event(
-                                recorder_tx.as_ref(), &MarketEvent::Exit,
+                                recorder_tx.as_mut(), &MarketEvent::Exit,
                             );
                             let mut waiting: HashSet<usize> = (0..instance_ids.len())
                                 .filter(|idx| !worker_quarantined[*idx].load(Ordering::Acquire))
@@ -9469,7 +9457,7 @@ impl Engine {
                                 );
                             }
                             market_rx.mark_phase(5);
-                            forward_recorder_shared(recorder_tx.as_ref(), event);
+                            forward_recorder_shared(recorder_tx.as_mut(), event);
                             if market_overflow_drops.iter().any(|drops| *drops > 0)
                                 && market_overflow_log_at.elapsed()
                                     >= std::time::Duration::from_secs(1)
@@ -18347,11 +18335,11 @@ mod market_router_tests {
 
     #[test]
     fn live_recorder_forwards_polymarket_and_external_sources_once() {
-        let (tx, rx) = bounded::<Arc<MarketEvent>>(4);
-        forward_recorder_event(Some(&tx), &ob(Exchange::Polymarket, "up"));
+        let (mut tx, rx, _metrics) = crate::recorder_lane::recorder_lane(4);
+        forward_recorder_event(Some(&mut tx), &ob(Exchange::Polymarket, "up"));
         assert!(matches!(
             rx.try_recv(),
-            Ok(event) if matches!(event.as_ref(), MarketEvent::OrderBook(OrderBookSnapshot {
+            Ok(event) if matches!(event.event.as_ref(), MarketEvent::OrderBook(OrderBookSnapshot {
                 exchange: Exchange::Polymarket,
                 ..
             }))
@@ -18361,17 +18349,17 @@ mod market_router_tests {
             "Polymarket event must be enqueued once"
         );
 
-        forward_recorder_event(Some(&tx), &spot("btc/usd"));
+        forward_recorder_event(Some(&mut tx), &spot("btc/usd"));
         assert!(
-            matches!(rx.try_recv(), Ok(event) if matches!(event.as_ref(), MarketEvent::SpotPrice(_)))
+            matches!(rx.try_recv(), Ok(event) if matches!(event.event.as_ref(), MarketEvent::SpotPrice(_)))
         );
         assert!(
             rx.try_recv().is_err(),
             "external event must be enqueued once"
         );
 
-        forward_recorder_event(Some(&tx), &MarketEvent::Exit);
-        assert!(matches!(rx.try_recv(), Ok(event) if matches!(event.as_ref(), MarketEvent::Exit)));
+        forward_recorder_event(Some(&mut tx), &MarketEvent::Exit);
+        assert!(matches!(rx.try_recv(), Ok(event) if matches!(event.event.as_ref(), MarketEvent::Exit)));
         assert!(rx.try_recv().is_err(), "exit event must be enqueued once");
     }
 
