@@ -1,0 +1,43 @@
+{
+  "source_log_sha256": "57f05090eb1dc6641369b7e1bae5e9458dc22512d55510cd1e4e5f0742e4ea57",
+  "without_private_known_state": 5,
+  "unresolved_in_observed_window": 0,
+  "boundary": "Five place uncertain attempts have explicit inferred_two_null_cancelled policy and orphan closure evidence, with late-fill tracking retained. This is an existing recovery policy, not proof of exchange-private terminal confirmation. No policy was changed by these optimizations.",
+  "attempts": [
+    {
+      "coid": "btc03-1791144625969",
+      "operation": "place",
+      "status": "NewOrderTimeout",
+      "closure_evidence": "2026-10-04T20:35:33.012Z  INFO polymaker::strategy::polymaker::orphan_reconciler: [orphan_lifecycle] final=cleared origin=place_orphan resolution=inferred_two_null_cancelled status=Some(Cancelled) coid=btc03-1791144625969 symbol=98126492639278033373461212671747367586455031203216409275428503300766702684648 orderID=0x2099d051a0a612a3b0bbb8d8621731ad8796a6262b033a18bb2923ecec3d6016 orphan_age_ms=592.988 coid_tracked=false remaining_places=0 remaining_cancels=0 remaining_drains=0 lock_release=final instance_id=btc03",
+      "policy_evidence": "2026-10-04T20:35:33.012Z  WARN hexagent_exchange::exchange::polymarket::trade::null_cancel_recovery: [null_cancel_policy] coid=btc03-1791144625969 result=policy_complete status=Cancelled inferred=true late_fills_retained=true"
+    },
+    {
+      "coid": "btc02-1791144628009",
+      "operation": "place",
+      "status": "NewOrderTimeout",
+      "closure_evidence": "2026-10-04T20:56:17.999Z  INFO polymaker::strategy::polymaker::orphan_reconciler: [orphan_lifecycle] final=cleared origin=place_orphan resolution=inferred_two_null_cancelled status=Some(Cancelled) coid=btc02-1791144628009 symbol=45567025049150557375276214840097926126226473787961145696977024041048899172805 orderID=0x7b0542fb545757dfa4ef4104d08f2fcf26bbb698d4fd7b492e2b725a43d0e8e7 orphan_age_ms=2674.809 coid_tracked=false remaining_places=0 remaining_cancels=0 remaining_drains=0 lock_release=final instance_id=btc02",
+      "policy_evidence": "2026-10-04T20:56:17.999Z  WARN hexagent_exchange::exchange::polymarket::trade::null_cancel_recovery: [null_cancel_policy] coid=btc02-1791144628009 result=policy_complete status=Cancelled inferred=true late_fills_retained=true"
+    },
+    {
+      "coid": "btc02-1791144629513",
+      "operation": "place",
+      "status": "NewOrderTimeout",
+      "closure_evidence": "2026-10-04T21:11:09.356Z  INFO polymaker::strategy::polymaker::orphan_reconciler: [orphan_lifecycle] final=cleared origin=place_orphan resolution=inferred_two_null_cancelled status=Some(Cancelled) coid=btc02-1791144629513 symbol=73644127083484826828570744626674543778368461763213432239819952592858249892529 orderID=0xf6bf5e016520f4d7ed883476f17f9c9486aa1082f86bd70acdace171f46a06b4 orphan_age_ms=2101.693 coid_tracked=false remaining_places=0 remaining_cancels=0 remaining_drains=0 lock_release=final instance_id=btc02",
+      "policy_evidence": "2026-10-04T21:11:09.356Z  WARN hexagent_exchange::exchange::polymarket::trade::null_cancel_recovery: [null_cancel_policy] coid=btc02-1791144629513 result=policy_complete status=Cancelled inferred=true late_fills_retained=true"
+    },
+    {
+      "coid": "btc01-1791144629512",
+      "operation": "place",
+      "status": "NewOrderTimeout",
+      "closure_evidence": "2026-10-04T21:11:09.351Z  INFO polymaker::strategy::polymaker::orphan_reconciler: [orphan_lifecycle] final=cleared origin=place_orphan resolution=inferred_two_null_cancelled status=Some(Cancelled) coid=btc01-1791144629512 symbol=73644127083484826828570744626674543778368461763213432239819952592858249892529 orderID=0x8c1650b442a99f44fbfc8ece54f34927ad4441a4046568a30d6bf5f0473dfc26 orphan_age_ms=2096.964 coid_tracked=false remaining_places=0 remaining_cancels=0 remaining_drains=0 lock_release=final instance_id=btc01",
+      "policy_evidence": "2026-10-04T21:11:09.351Z  WARN hexagent_exchange::exchange::polymarket::trade::null_cancel_recovery: [null_cancel_policy] coid=btc01-1791144629512 result=policy_complete status=Cancelled inferred=true late_fills_retained=true"
+    },
+    {
+      "coid": "btc03-1791144629514",
+      "operation": "place",
+      "status": "NewOrderTimeout",
+      "closure_evidence": "2026-10-04T21:11:09.358Z  INFO polymaker::strategy::polymaker::orphan_reconciler: [orphan_lifecycle] final=cleared origin=place_orphan resolution=inferred_two_null_cancelled status=Some(Cancelled) coid=btc03-1791144629514 symbol=85061087377623622668179956853004275880574001468168226729002247009787161522920 orderID=0x3f0ece52c26144b177cbe54cf76c937752b63e630a6d7f199adc67973b7c4040 orphan_age_ms=2103.261 coid_tracked=false remaining_places=0 remaining_cancels=0 remaining_drains=0 lock_release=final instance_id=btc03",
+      "policy_evidence": "2026-10-04T21:11:09.357Z  WARN hexagent_exchange::exchange::polymarket::trade::null_cancel_recovery: [null_cancel_policy] coid=btc03-1791144629514 result=policy_complete status=Cancelled inferred=true late_fills_retained=true"
+    }
+  ]
+}
