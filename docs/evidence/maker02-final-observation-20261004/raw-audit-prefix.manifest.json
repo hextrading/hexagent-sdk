@@ -1,0 +1,24 @@
+{
+  "observed_utc": "2026-10-04T21:13:31.952211+00:00",
+  "sources": [
+    {
+      "path": "/home/rocky/projects/hexbot/data/record/order_audit/order-audit-497540.jsonl",
+      "prefix_bytes": 34819426,
+      "prefix_sha256": "dc31f49742924ee1d7dcaea5d6dfcc99dbd67701406245b9b9e8ea6972c185e8",
+      "complete_rows": 42079,
+      "trailing_incomplete_bytes": 0,
+      "malformed_lines": []
+    },
+    {
+      "path": "/home/rocky/projects/hexbot/data/record/order_audit/order-audit-497541.jsonl",
+      "prefix_bytes": 9768986,
+      "prefix_sha256": "33938cee4917a763c2c4372b0928c4b3cc975298bcfaefbc9ca877ecf0a6fee8",
+      "complete_rows": 11349,
+      "trailing_incomplete_bytes": 0,
+      "malformed_lines": []
+    }
+  ],
+  "malformed_lines": [],
+  "gzip_bytes": 4516217,
+  "gzip_sha256": "7777c80f123767fc137cf1bee543c88a370ca6f7800ae6508b430e48a9f8d144"
+}

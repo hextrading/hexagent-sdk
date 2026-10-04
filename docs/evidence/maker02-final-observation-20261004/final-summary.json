@@ -1,0 +1,4608 @@
+{
+  "window": {
+    "since": "2026-10-04T20:10:02.045Z",
+    "all_ready": "2026-10-04T20:11:46.297Z",
+    "until": "2026-10-04T21:11:46.297Z"
+  },
+  "versions": {
+    "new_main": "9b69c8f18efd22a9a4a6d06ae4db527329158805",
+    "sdk": "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+    "sdk_main": "0153c2150d24ce73a444ad9ec2668118aab0ddb9",
+    "pid": 2491935,
+    "start_ticks": 183828101,
+    "new_binary_sha256": "6bee06cf34ba94a0d59ed0e7a09519c8d8c06930a1610a9f08ecfe94fac049d6",
+    "configs": {
+      "config/live_polymaker.toml": "93a588c7efbc322b8869705c07e269dc5f176386a34f87fd0b31b4fd066898a9",
+      "config/live/poly_btc5m_01.toml": "d10304e5f512485bc73fdb08d9fe3e0547a4dcec2a2e460d73c46f75c74ccbd0",
+      "config/live/poly_btc5m_02.toml": "58e417fea9175d5c130326b7e141207c4a9f69617bd4c709ae706f3568488ea9",
+      "config/live/poly_btc5m_03.toml": "c1088bbf73978b53e295a9f77f7a056603c66b884b551677ce005305879c58fc"
+    }
+  },
+  "measurement": "same process monotonic domain; exact account/domain/attempt join",
+  "receipt_boundary": "WS message ready before JSON decode; excludes NIC/kernel/TLS/WS assembly",
+  "first_write_boundary": "application plaintext accepted by local transport; excludes TCP ACK",
+  "counts": {
+    "cancel.attempt_rows": 5429,
+    "cancel.causal_attempts": 5158,
+    "cancel.unknown_or_other_domain_receipt": 271,
+    "place.attempt_rows": 5653,
+    "place.causal_attempts": 4269,
+    "place.unknown_or_other_domain_receipt": 1384
+  },
+  "baseline_window": {
+    "since": "2026-10-04T14:42:00.000Z",
+    "until": "2026-10-04T16:35:00.000Z",
+    "note": "latest complete pre-fix window"
+  },
+  "baseline_latency_us": {
+    "cancel.executor_to_owner_publication": {
+      "n": 8319,
+      "median": 3.278,
+      "p99": 6.944,
+      "p999": 8.037,
+      "maximum": 9.533,
+      "minimum": 0.972
+    },
+    "cancel.first_read_to_completion": {
+      "n": 8319,
+      "median": 29.444,
+      "p99": 54.498,
+      "p999": 471.816,
+      "maximum": 52796.677,
+      "minimum": 16.155
+    },
+    "cancel.owner_preflight": {
+      "n": 8319,
+      "median": 2.76,
+      "p99": 9.721,
+      "p999": 13.192,
+      "maximum": 20.249,
+      "minimum": 1.827
+    },
+    "cancel.owner_queue": {
+      "n": 8319,
+      "median": 36.68,
+      "p99": 124.84,
+      "p999": 149.31,
+      "maximum": 168.351,
+      "minimum": 3.483
+    },
+    "cancel.parsed_to_strategy_dequeue": {
+      "n": 8319,
+      "median": 30.181,
+      "p99": 51.752,
+      "p999": 55.043,
+      "maximum": 74.514,
+      "minimum": 3.057
+    },
+    "cancel.prep_to_submit": {
+      "n": 8319,
+      "median": 18.555,
+      "p99": 30.676,
+      "p999": 60.987,
+      "maximum": 76.939,
+      "minimum": 5.441
+    },
+    "cancel.receive_to_completion": {
+      "n": 8319,
+      "median": 30220.003,
+      "p99": 917969.739,
+      "p999": 1665011.101,
+      "maximum": 1931732.11,
+      "minimum": 19622.282
+    },
+    "cancel.receive_to_first_read": {
+      "n": 8319,
+      "median": 30185.618,
+      "p99": 917932.334,
+      "p999": 1664968.776,
+      "maximum": 1931699.201,
+      "minimum": 19592.467
+    },
+    "cancel.receive_to_first_write": {
+      "n": 8319,
+      "median": 177.5,
+      "p99": 301.571,
+      "p999": 331.887,
+      "maximum": 350.522,
+      "minimum": 99.949
+    },
+    "cancel.receive_to_parsed": {
+      "n": 8319,
+      "median": 6.973,
+      "p99": 35.533,
+      "p999": 72.969,
+      "maximum": 77.035,
+      "minimum": 1.656
+    },
+    "cancel.receive_to_submit": {
+      "n": 8319,
+      "median": 163.702,
+      "p99": 284.212,
+      "p999": 310.534,
+      "maximum": 336.539,
+      "minimum": 84.89
+    },
+    "cancel.signal_to_executor": {
+      "n": 8319,
+      "median": 13.547,
+      "p99": 38.413,
+      "p999": 41.395,
+      "maximum": 42.919,
+      "minimum": 1.884
+    },
+    "cancel.strategy_dequeue_to_signal": {
+      "n": 8319,
+      "median": 47.039,
+      "p99": 79.252,
+      "p999": 92.47,
+      "maximum": 95.85,
+      "minimum": 14.978
+    },
+    "cancel.submit_return_to_first_write": {
+      "n": 8319,
+      "median": 14.905,
+      "p99": 40.541,
+      "p999": 55.197,
+      "maximum": 90.771,
+      "minimum": -2.825
+    },
+    "place.account_recorded_to_submit": {
+      "n": 6170,
+      "median": 21.043,
+      "p99": 49.83,
+      "p999": 68.492,
+      "maximum": 114.677,
+      "minimum": 15.285
+    },
+    "place.executor_to_owner_publication": {
+      "n": 6170,
+      "median": 1.472,
+      "p99": 2.226,
+      "p999": 3.474,
+      "maximum": 3.76,
+      "minimum": 0.99
+    },
+    "place.first_read_to_completion": {
+      "n": 6169,
+      "median": 31.366,
+      "p99": 53.759,
+      "p999": 32849.844,
+      "maximum": 51307.824,
+      "minimum": 19.84
+    },
+    "place.owner_preflight": {
+      "n": 6170,
+      "median": 2.518,
+      "p99": 3.644,
+      "p999": 4.045,
+      "maximum": 7.491,
+      "minimum": 1.615
+    },
+    "place.owner_queue": {
+      "n": 6170,
+      "median": 5.2175,
+      "p99": 107.74,
+      "p999": 173.633,
+      "maximum": 211.562,
+      "minimum": 3.491
+    },
+    "place.parsed_to_strategy_dequeue": {
+      "n": 6170,
+      "median": 30.394,
+      "p99": 52.039,
+      "p999": 56.942,
+      "maximum": 146.044,
+      "minimum": 5.201
+    },
+    "place.prep_to_signed": {
+      "n": 6170,
+      "median": 53.965,
+      "p99": 57.115,
+      "p999": 58.507,
+      "maximum": 60.082,
+      "minimum": 52.641
+    },
+    "place.prep_to_submit": {
+      "n": 6170,
+      "median": 77.798,
+      "p99": 107.094,
+      "p999": 125.702,
+      "maximum": 172.254,
+      "minimum": 71.732
+    },
+    "place.receive_to_completion": {
+      "n": 6170,
+      "median": 47370.604,
+      "p99": 857825.879,
+      "p999": 1607218.097,
+      "maximum": 2001954.082,
+      "minimum": 27523.004
+    },
+    "place.receive_to_first_read": {
+      "n": 6169,
+      "median": 47279.7,
+      "p99": 857607.694,
+      "p999": 1585155.535,
+      "maximum": 1933265.614,
+      "minimum": 27492.378
+    },
+    "place.receive_to_first_write": {
+      "n": 6170,
+      "median": 217.221,
+      "p99": 355.909,
+      "p999": 425.175,
+      "maximum": 451.73,
+      "minimum": 162.627
+    },
+    "place.receive_to_parsed": {
+      "n": 6170,
+      "median": 7.044,
+      "p99": 34.315,
+      "p999": 72.969,
+      "maximum": 77.035,
+      "minimum": 1.639
+    },
+    "place.receive_to_submit": {
+      "n": 6170,
+      "median": 192.538,
+      "p99": 338.655,
+      "p999": 400.221,
+      "maximum": 433.867,
+      "minimum": 144.032
+    },
+    "place.signal_to_executor": {
+      "n": 6170,
+      "median": 11.75,
+      "p99": 36.36,
+      "p999": 40.112,
+      "maximum": 42.332,
+      "minimum": 2.137
+    },
+    "place.signed_to_account_recorded": {
+      "n": 6170,
+      "median": 2.37,
+      "p99": 9.88,
+      "p999": 24.84,
+      "maximum": 33.37,
+      "minimum": 1.625
+    },
+    "place.strategy_dequeue_to_signal": {
+      "n": 6170,
+      "median": 47.676,
+      "p99": 78.377,
+      "p999": 83.894,
+      "maximum": 95.85,
+      "minimum": 27.915
+    },
+    "place.submit_return_to_first_write": {
+      "n": 6170,
+      "median": 18.8115,
+      "p99": 43.86,
+      "p999": 49.194,
+      "maximum": 85.153,
+      "minimum": 11.588
+    }
+  },
+  "final_latency_us": {
+    "cancel.executor_to_owner_publication": {
+      "n": 5158,
+      "median": 3.27,
+      "p99": 6.738,
+      "p999": 7.846,
+      "maximum": 8.801,
+      "minimum": 0.934
+    },
+    "cancel.first_read_to_completion": {
+      "n": 5149,
+      "median": 29.377,
+      "p99": 48.388,
+      "p999": 3729.777,
+      "maximum": 58428.237,
+      "minimum": 15.915
+    },
+    "cancel.owner_preflight": {
+      "n": 5158,
+      "median": 2.7075,
+      "p99": 9.635,
+      "p999": 12.011,
+      "maximum": 13.307,
+      "minimum": 1.873
+    },
+    "cancel.owner_queue": {
+      "n": 5158,
+      "median": 35.7935,
+      "p99": 118.704,
+      "p999": 138.981,
+      "maximum": 160.639,
+      "minimum": 3.102
+    },
+    "cancel.parsed_to_strategy_dequeue": {
+      "n": 5158,
+      "median": 30.3545,
+      "p99": 50.983,
+      "p999": 53.996,
+      "maximum": 57.101,
+      "minimum": 4.556
+    },
+    "cancel.prep_to_submit": {
+      "n": 5158,
+      "median": 15.8675,
+      "p99": 28.911,
+      "p999": 53.895,
+      "maximum": 66.507,
+      "minimum": 5.05
+    },
+    "cancel.receive_to_completion": {
+      "n": 5158,
+      "median": 34212.2645,
+      "p99": 906730.314,
+      "p999": 2001607.706,
+      "maximum": 2001888.602,
+      "minimum": 2355.027
+    },
+    "cancel.receive_to_first_read": {
+      "n": 5149,
+      "median": 34142.376,
+      "p99": 841947.571,
+      "p999": 1425178.652,
+      "maximum": 1717350.858,
+      "minimum": 19021.759
+    },
+    "cancel.receive_to_first_write": {
+      "n": 5158,
+      "median": 177.181,
+      "p99": 291.884,
+      "p999": 321.738,
+      "maximum": 360.918,
+      "minimum": 93.537
+    },
+    "cancel.receive_to_parsed": {
+      "n": 5158,
+      "median": 6.5235,
+      "p99": 29.885,
+      "p999": 68.604,
+      "maximum": 68.604,
+      "minimum": 1.644
+    },
+    "cancel.receive_to_submit": {
+      "n": 5158,
+      "median": 158.7205,
+      "p99": 269.336,
+      "p999": 295.327,
+      "maximum": 346.487,
+      "minimum": 78.396
+    },
+    "cancel.signal_to_executor": {
+      "n": 5158,
+      "median": 14.623,
+      "p99": 41.861,
+      "p999": 46.623,
+      "maximum": 49.949,
+      "minimum": 2.098
+    },
+    "cancel.strategy_dequeue_to_signal": {
+      "n": 5158,
+      "median": 43.118,
+      "p99": 73.712,
+      "p999": 79.489,
+      "maximum": 81.764,
+      "minimum": 15.535
+    },
+    "cancel.submit_return_to_first_write": {
+      "n": 5158,
+      "median": 16.8175,
+      "p99": 41.669,
+      "p999": 47.062,
+      "maximum": 53.673,
+      "minimum": 2.145
+    },
+    "place.account_recorded_to_submit": {
+      "n": 4269,
+      "median": 20.203,
+      "p99": 47.157,
+      "p999": 74.692,
+      "maximum": 85.568,
+      "minimum": 14.582
+    },
+    "place.executor_to_owner_publication": {
+      "n": 4269,
+      "median": 1.434,
+      "p99": 2.261,
+      "p999": 3.424,
+      "maximum": 4.162,
+      "minimum": 0.998
+    },
+    "place.first_read_to_completion": {
+      "n": 4264,
+      "median": 31.3855,
+      "p99": 48.658,
+      "p999": 3711.19,
+      "maximum": 54150.487,
+      "minimum": 22.776
+    },
+    "place.owner_preflight": {
+      "n": 4269,
+      "median": 2.338,
+      "p99": 3.398,
+      "p999": 5.286,
+      "maximum": 9.904,
+      "minimum": 1.638
+    },
+    "place.owner_queue": {
+      "n": 4269,
+      "median": 5.224,
+      "p99": 82.493,
+      "p999": 124.055,
+      "maximum": 143.193,
+      "minimum": 4.283
+    },
+    "place.parsed_to_strategy_dequeue": {
+      "n": 4269,
+      "median": 30.424,
+      "p99": 51.883,
+      "p999": 55.414,
+      "maximum": 88.879,
+      "minimum": 4.318
+    },
+    "place.prep_to_signed": {
+      "n": 4269,
+      "median": 32.054,
+      "p99": 35.496,
+      "p999": 37.168,
+      "maximum": 38.343,
+      "minimum": 31.381
+    },
+    "place.prep_to_submit": {
+      "n": 4269,
+      "median": 54.996,
+      "p99": 82.308,
+      "p999": 108.748,
+      "maximum": 120.337,
+      "minimum": 49.559
+    },
+    "place.receive_to_completion": {
+      "n": 4269,
+      "median": 52479.001,
+      "p99": 993892.806,
+      "p999": 1959803.899,
+      "maximum": 2001644.428,
+      "minimum": 2243.109
+    },
+    "place.receive_to_first_read": {
+      "n": 4264,
+      "median": 52369.806,
+      "p99": 925147.106,
+      "p999": 1620992.091,
+      "maximum": 1959759.501,
+      "minimum": 27175.452
+    },
+    "place.receive_to_first_write": {
+      "n": 4269,
+      "median": 189.876,
+      "p99": 296.958,
+      "p999": 354.738,
+      "maximum": 399.008,
+      "minimum": 137.843
+    },
+    "place.receive_to_parsed": {
+      "n": 4269,
+      "median": 6.697,
+      "p99": 25.313,
+      "p999": 58.811,
+      "maximum": 68.604,
+      "minimum": 1.743
+    },
+    "place.receive_to_submit": {
+      "n": 4269,
+      "median": 164.344,
+      "p99": 278.674,
+      "p999": 327.16,
+      "maximum": 372.042,
+      "minimum": 121.34
+    },
+    "place.signal_to_executor": {
+      "n": 4269,
+      "median": 12.575,
+      "p99": 38.276,
+      "p999": 44.953,
+      "maximum": 46.623,
+      "minimum": 2.098
+    },
+    "place.signed_to_account_recorded": {
+      "n": 4269,
+      "median": 2.382,
+      "p99": 6.408,
+      "p999": 19.915,
+      "maximum": 31.803,
+      "minimum": 1.594
+    },
+    "place.strategy_dequeue_to_signal": {
+      "n": 4269,
+      "median": 43.599,
+      "p99": 72.923,
+      "p999": 80.718,
+      "maximum": 83.952,
+      "minimum": 27.082
+    },
+    "place.submit_return_to_first_write": {
+      "n": 4269,
+      "median": 20.11,
+      "p99": 43.989,
+      "p999": 49.17,
+      "maximum": 77.048,
+      "minimum": 12.129
+    }
+  },
+  "dispatch_by_receipt_us": {
+    "cancel.market": {
+      "executor_to_submit": {
+        "n": 5158,
+        "median": 59.231,
+        "p99": 135.612,
+        "p999": 159.236,
+        "maximum": 189.353,
+        "minimum": 25.32
+      },
+      "owner_queue": {
+        "n": 5158,
+        "median": 35.7935,
+        "p99": 118.704,
+        "p999": 138.981,
+        "maximum": 160.639,
+        "minimum": 3.102
+      },
+      "runtime_queue": {
+        "n": 5158,
+        "median": 9.9905,
+        "p99": 32.124,
+        "p999": 37.762,
+        "maximum": 42.445,
+        "minimum": 1.034
+      },
+      "submit_return_to_first_write": {
+        "n": 5158,
+        "median": 16.8175,
+        "p99": 41.669,
+        "p999": 47.062,
+        "maximum": 53.673,
+        "minimum": 2.145
+      }
+    },
+    "cancel.no_market_receipt": {
+      "executor_to_submit": {
+        "n": 271,
+        "median": 33.902,
+        "p99": 51.803,
+        "p999": 72.022,
+        "maximum": 72.022,
+        "minimum": 23.972
+      },
+      "owner_queue": {
+        "n": 271,
+        "median": 8.336,
+        "p99": 20.288,
+        "p999": 24.381,
+        "maximum": 24.381,
+        "minimum": 3.901
+      },
+      "runtime_queue": {
+        "n": 271,
+        "median": 8.189,
+        "p99": 16.064,
+        "p999": 36.629,
+        "maximum": 36.629,
+        "minimum": 3.757
+      },
+      "submit_return_to_first_write": {
+        "n": 271,
+        "median": 14.413,
+        "p99": 20.881,
+        "p999": 41.237,
+        "maximum": 41.237,
+        "minimum": -6.415
+      }
+    },
+    "place.market": {
+      "executor_to_submit": {
+        "n": 4269,
+        "median": 65.188,
+        "p99": 151.994,
+        "p999": 190.466,
+        "maximum": 232.792,
+        "minimum": 58.095
+      },
+      "owner_queue": {
+        "n": 4269,
+        "median": 5.224,
+        "p99": 82.493,
+        "p999": 124.055,
+        "maximum": 143.193,
+        "minimum": 4.283
+      },
+      "runtime_queue": {
+        "n": 4269,
+        "median": 6.998,
+        "p99": 31.11,
+        "p999": 35.157,
+        "maximum": 64.261,
+        "minimum": 0.848
+      },
+      "submit_return_to_first_write": {
+        "n": 4269,
+        "median": 20.11,
+        "p99": 43.989,
+        "p999": 49.17,
+        "maximum": 77.048,
+        "minimum": 12.129
+      }
+    },
+    "place.no_market_receipt": {
+      "executor_to_submit": {
+        "n": 1384,
+        "median": 65.1845,
+        "p99": 85.983,
+        "p999": 99.532,
+        "maximum": 115.39,
+        "minimum": 60.257
+      },
+      "owner_queue": {
+        "n": 1384,
+        "median": 5.2805,
+        "p99": 6.333,
+        "p999": 8.103,
+        "maximum": 8.125,
+        "minimum": 4.462
+      },
+      "runtime_queue": {
+        "n": 1384,
+        "median": 6.5285,
+        "p99": 18.736,
+        "p999": 30.355,
+        "maximum": 33.464,
+        "minimum": 2.387
+      },
+      "submit_return_to_first_write": {
+        "n": 1384,
+        "median": 17.712,
+        "p99": 30.754,
+        "p999": 44.647,
+        "maximum": 46.288,
+        "minimum": 13.812
+      }
+    }
+  },
+  "bursts": {
+    "boundary": "Exact receipt domain/session/sequence groups across strategy instances. Prep interval includes preflight/sign/body work. Wall interval overlap is association, not CPU-time proof; scheduler sampling is separate.",
+    "bindings": {
+      "('hex001', 0)": 5,
+      "('hex001', 1)": 14,
+      "('hex001', 2)": 5,
+      "('hex001', 3)": 14,
+      "('zhu02', 0)": 5,
+      "('zhu02', 1)": 14,
+      "('zhu02', 2)": 5,
+      "('zhu02', 3)": 14,
+      "('zhu03', 0)": 5,
+      "('zhu03', 1)": 14,
+      "('zhu03', 2)": 5,
+      "('zhu03', 3)": 14
+    },
+    "causal_market_bursts": 2275,
+    "by_burst": {
+      "1_orders_1_cores": {
+        "receive_to_submit": {
+          "n": 1063,
+          "median_ns": 155073,
+          "p99_ns": 194151,
+          "p999_ns": 205748,
+          "maximum_ns": 205964
+        },
+        "owner_queue": {
+          "n": 1063,
+          "median_ns": 5273,
+          "p99_ns": 6152,
+          "p999_ns": 8973,
+          "maximum_ns": 9788
+        }
+      },
+      "2_orders_2_cores": {
+        "receive_to_submit": {
+          "n": 1022,
+          "median_ns": 159405.5,
+          "p99_ns": 201779,
+          "p999_ns": 212837,
+          "maximum_ns": 250840
+        },
+        "owner_queue": {
+          "n": 1022,
+          "median_ns": 5073.0,
+          "p99_ns": 5997,
+          "p999_ns": 7429,
+          "maximum_ns": 7729
+        }
+      },
+      "3_orders_2_cores": {
+        "receive_to_submit": {
+          "n": 1965,
+          "median_ns": 177334,
+          "p99_ns": 269388,
+          "p999_ns": 289941,
+          "maximum_ns": 299700
+        },
+        "owner_queue": {
+          "n": 1965,
+          "median_ns": 5284,
+          "p99_ns": 73272,
+          "p999_ns": 93779,
+          "maximum_ns": 109290
+        }
+      },
+      "4_orders_2_cores": {
+        "receive_to_submit": {
+          "n": 96,
+          "median_ns": 190554.5,
+          "p99_ns": 257261,
+          "p999_ns": 257261,
+          "maximum_ns": 257261
+        },
+        "owner_queue": {
+          "n": 96,
+          "median_ns": 21771.0,
+          "p99_ns": 67495,
+          "p999_ns": 67495,
+          "maximum_ns": 67495
+        }
+      },
+      "5_orders_2_cores": {
+        "receive_to_submit": {
+          "n": 45,
+          "median_ns": 219495,
+          "p99_ns": 312517,
+          "p999_ns": 312517,
+          "maximum_ns": 312517
+        },
+        "owner_queue": {
+          "n": 45,
+          "median_ns": 48943,
+          "p99_ns": 132735,
+          "p999_ns": 132735,
+          "maximum_ns": 132735
+        }
+      },
+      "6_orders_2_cores": {
+        "receive_to_submit": {
+          "n": 78,
+          "median_ns": 245665.0,
+          "p99_ns": 372042,
+          "p999_ns": 372042,
+          "maximum_ns": 372042
+        },
+        "owner_queue": {
+          "n": 78,
+          "median_ns": 60617.5,
+          "p99_ns": 143193,
+          "p999_ns": 143193,
+          "maximum_ns": 143193
+        }
+      }
+    },
+    "slowest_with_same_core_preparation": [
+      {
+        "coid": "btc02-1791144628255",
+        "iid": "btc02",
+        "slot": 2,
+        "core": 5,
+        "receive_to_submit_ns": 372042,
+        "owner_wait_ns": 112557,
+        "other_same_core_prep_overlap_ns": 57304,
+        "same_core_preparation_orders": [
+          {
+            "coid": "btc03-1791144628259",
+            "iid": "btc03",
+            "slot": 0,
+            "prep_mono_ns": 2977961735214,
+            "signed_mono_ns": 2977961768250
+          },
+          {
+            "coid": "btc01-1791144628257",
+            "iid": "btc01",
+            "slot": 2,
+            "prep_mono_ns": 2977961798427,
+            "signed_mono_ns": 2977961830089
+          }
+        ]
+      },
+      {
+        "coid": "btc03-1791144628256",
+        "iid": "btc03",
+        "slot": 1,
+        "core": 14,
+        "receive_to_submit_ns": 364526,
+        "owner_wait_ns": 114660,
+        "other_same_core_prep_overlap_ns": 55432,
+        "same_core_preparation_orders": [
+          {
+            "coid": "btc01-1791144628260",
+            "iid": "btc01",
+            "slot": 1,
+            "prep_mono_ns": 2977961729273,
+            "signed_mono_ns": 2977961762813
+          },
+          {
+            "coid": "btc02-1791144628258",
+            "iid": "btc02",
+            "slot": 1,
+            "prep_mono_ns": 2977961793610,
+            "signed_mono_ns": 2977961825655
+          }
+        ]
+      },
+      {
+        "coid": "btc02-1791144625932",
+        "iid": "btc02",
+        "slot": 1,
+        "core": 14,
+        "receive_to_submit_ns": 352056,
+        "owner_wait_ns": 142955,
+        "other_same_core_prep_overlap_ns": 57792,
+        "same_core_preparation_orders": [
+          {
+            "coid": "btc02-1791144625935",
+            "iid": "btc02",
+            "slot": 3,
+            "prep_mono_ns": 1477158382892,
+            "signed_mono_ns": 1477158415299
+          },
+          {
+            "coid": "btc03-1791144625934",
+            "iid": "btc03",
+            "slot": 3,
+            "prep_mono_ns": 1477158320787,
+            "signed_mono_ns": 1477158353507
+          }
+        ]
+      },
+      {
+        "coid": "btc02-1791144626169",
+        "iid": "btc02",
+        "slot": 3,
+        "core": 14,
+        "receive_to_submit_ns": 337993,
+        "owner_wait_ns": 115072,
+        "other_same_core_prep_overlap_ns": 54718,
+        "same_core_preparation_orders": [
+          {
+            "coid": "btc03-1791144626172",
+            "iid": "btc03",
+            "slot": 3,
+            "prep_mono_ns": 1777660369391,
+            "signed_mono_ns": 1777660402543
+          },
+          {
+            "coid": "btc01-1791144626168",
+            "iid": "btc01",
+            "slot": 1,
+            "prep_mono_ns": 1777660434629,
+            "signed_mono_ns": 1777660467160
+          }
+        ]
+      },
+      {
+        "coid": "btc02-1791144625481",
+        "iid": "btc02",
+        "slot": 1,
+        "core": 14,
+        "receive_to_submit_ns": 327160,
+        "owner_wait_ns": 143193,
+        "other_same_core_prep_overlap_ns": 57629,
+        "same_core_preparation_orders": [
+          {
+            "coid": "btc02-1791144625485",
+            "iid": "btc02",
+            "slot": 3,
+            "prep_mono_ns": 1177558385423,
+            "signed_mono_ns": 1177558417761
+          },
+          {
+            "coid": "btc03-1791144625484",
+            "iid": "btc03",
+            "slot": 3,
+            "prep_mono_ns": 1177558323106,
+            "signed_mono_ns": 1177558355897
+          }
+        ]
+      },
+      {
+        "coid": "btc03-1791144627820",
+        "iid": "btc03",
+        "slot": 1,
+        "core": 14,
+        "receive_to_submit_ns": 327027,
+        "owner_wait_ns": 121551,
+        "other_same_core_prep_overlap_ns": 56348,
+        "same_core_preparation_orders": [
+          {
+            "coid": "btc01-1791144627823",
+            "iid": "btc01",
+            "slot": 3,
+            "prep_mono_ns": 2677361633658,
+            "signed_mono_ns": 2677361666524
+          },
+          {
+            "coid": "btc02-1791144627818",
+            "iid": "btc02",
+            "slot": 1,
+            "prep_mono_ns": 2677361696616,
+            "signed_mono_ns": 2677361728272
+          }
+        ]
+      },
+      {
+        "coid": "btc01-1791144627821",
+        "iid": "btc01",
+        "slot": 0,
+        "core": 5,
+        "receive_to_submit_ns": 323496,
+        "owner_wait_ns": 124942,
+        "other_same_core_prep_overlap_ns": 56678,
+        "same_core_preparation_orders": [
+          {
+            "coid": "btc03-1791144627822",
+            "iid": "btc03",
+            "slot": 0,
+            "prep_mono_ns": 2677361695627,
+            "signed_mono_ns": 2677361728428
+          },
+          {
+            "coid": "btc02-1791144627819",
+            "iid": "btc02",
+            "slot": 0,
+            "prep_mono_ns": 2677361628973,
+            "signed_mono_ns": 2677361662455
+          }
+        ]
+      },
+      {
+        "coid": "btc01-1791144626167",
+        "iid": "btc01",
+        "slot": 2,
+        "core": 5,
+        "receive_to_submit_ns": 323031,
+        "owner_wait_ns": 112093,
+        "other_same_core_prep_overlap_ns": 57210,
+        "same_core_preparation_orders": [
+          {
+            "coid": "btc02-1791144626171",
+            "iid": "btc02",
+            "slot": 2,
+            "prep_mono_ns": 1777660375612,
+            "signed_mono_ns": 1777660408518
+          },
+          {
+            "coid": "btc03-1791144626170",
+            "iid": "btc03",
+            "slot": 0,
+            "prep_mono_ns": 1777660437334,
+            "signed_mono_ns": 1777660469562
+          }
+        ]
+      },
+      {
+        "coid": "btc02-1791144626544",
+        "iid": "btc02",
+        "slot": 2,
+        "core": 5,
+        "receive_to_submit_ns": 322704,
+        "owner_wait_ns": 115887,
+        "other_same_core_prep_overlap_ns": 56129,
+        "same_core_preparation_orders": [
+          {
+            "coid": "btc01-1791144626549",
+            "iid": "btc01",
+            "slot": 2,
+            "prep_mono_ns": 2077561730784,
+            "signed_mono_ns": 2077561762838
+          },
+          {
+            "coid": "btc03-1791144626546",
+            "iid": "btc03",
+            "slot": 2,
+            "prep_mono_ns": 2077561664509,
+            "signed_mono_ns": 2077561698013
+          }
+        ]
+      },
+      {
+        "coid": "btc02-1791144627128",
+        "iid": "btc02",
+        "slot": 1,
+        "core": 14,
+        "receive_to_submit_ns": 322332,
+        "owner_wait_ns": 113335,
+        "other_same_core_prep_overlap_ns": 57496,
+        "same_core_preparation_orders": [
+          {
+            "coid": "btc03-1791144627131",
+            "iid": "btc03",
+            "slot": 3,
+            "prep_mono_ns": 2377261598336,
+            "signed_mono_ns": 2377261630600
+          },
+          {
+            "coid": "btc02-1791144627130",
+            "iid": "btc02",
+            "slot": 3,
+            "prep_mono_ns": 2377261660326,
+            "signed_mono_ns": 2377261692792
+          }
+        ]
+      }
+    ]
+  },
+  "dispatch_tails": {
+    "cancel.market": {
+      "executor_to_owner_publication": {
+        "n": 5158,
+        "median_ns": 3270.0,
+        "p99_ns": 6738,
+        "p999_ns": 7846,
+        "maximum_ns": 8801,
+        "minimum_ns": 934
+      },
+      "owner_queue": {
+        "n": 5158,
+        "median_ns": 35793.5,
+        "p99_ns": 118704,
+        "p999_ns": 138981,
+        "maximum_ns": 160639,
+        "minimum_ns": 3102
+      },
+      "executor_to_submit": {
+        "n": 5158,
+        "median_ns": 59231.0,
+        "p99_ns": 135612,
+        "p999_ns": 159236,
+        "maximum_ns": 189353,
+        "minimum_ns": 25320
+      },
+      "submit_return_to_first_write_signed": {
+        "n": 5158,
+        "median_ns": 16817.5,
+        "p99_ns": 41669,
+        "p999_ns": 47062,
+        "maximum_ns": 53673,
+        "minimum_ns": 2145
+      },
+      "runtime_queue": {
+        "n": 5158,
+        "median_ns": 9990.5,
+        "p99_ns": 32124,
+        "p999_ns": 37762,
+        "maximum_ns": 42445,
+        "minimum_ns": 1034
+      }
+    },
+    "cancel.non_market_or_unknown_receipt": {
+      "executor_to_owner_publication": {
+        "n": 271,
+        "median_ns": 1374,
+        "p99_ns": 6012,
+        "p999_ns": 7205,
+        "maximum_ns": 7205,
+        "minimum_ns": 1164
+      },
+      "owner_queue": {
+        "n": 271,
+        "median_ns": 8336,
+        "p99_ns": 20288,
+        "p999_ns": 24381,
+        "maximum_ns": 24381,
+        "minimum_ns": 3901
+      },
+      "executor_to_submit": {
+        "n": 271,
+        "median_ns": 33902,
+        "p99_ns": 51803,
+        "p999_ns": 72022,
+        "maximum_ns": 72022,
+        "minimum_ns": 23972
+      },
+      "submit_return_to_first_write_signed": {
+        "n": 271,
+        "median_ns": 14413,
+        "p99_ns": 20881,
+        "p999_ns": 41237,
+        "maximum_ns": 41237,
+        "minimum_ns": -6415
+      },
+      "runtime_queue": {
+        "n": 271,
+        "median_ns": 8189,
+        "p99_ns": 16064,
+        "p999_ns": 36629,
+        "maximum_ns": 36629,
+        "minimum_ns": 3757
+      }
+    },
+    "place.market": {
+      "executor_to_owner_publication": {
+        "n": 4269,
+        "median_ns": 1434,
+        "p99_ns": 2261,
+        "p999_ns": 3424,
+        "maximum_ns": 4162,
+        "minimum_ns": 998
+      },
+      "owner_queue": {
+        "n": 4269,
+        "median_ns": 5224,
+        "p99_ns": 82493,
+        "p999_ns": 124055,
+        "maximum_ns": 143193,
+        "minimum_ns": 4283
+      },
+      "executor_to_submit": {
+        "n": 4269,
+        "median_ns": 65188,
+        "p99_ns": 151994,
+        "p999_ns": 190466,
+        "maximum_ns": 232792,
+        "minimum_ns": 58095
+      },
+      "submit_return_to_first_write_signed": {
+        "n": 4269,
+        "median_ns": 20110,
+        "p99_ns": 43989,
+        "p999_ns": 49170,
+        "maximum_ns": 77048,
+        "minimum_ns": 12129
+      },
+      "runtime_queue": {
+        "n": 4269,
+        "median_ns": 6998,
+        "p99_ns": 31110,
+        "p999_ns": 35157,
+        "maximum_ns": 64261,
+        "minimum_ns": 848
+      }
+    },
+    "place.non_market_or_unknown_receipt": {
+      "executor_to_owner_publication": {
+        "n": 1384,
+        "median_ns": 1433.0,
+        "p99_ns": 1960,
+        "p999_ns": 3403,
+        "maximum_ns": 4929,
+        "minimum_ns": 1087
+      },
+      "owner_queue": {
+        "n": 1384,
+        "median_ns": 5280.5,
+        "p99_ns": 6333,
+        "p999_ns": 8103,
+        "maximum_ns": 8125,
+        "minimum_ns": 4462
+      },
+      "executor_to_submit": {
+        "n": 1384,
+        "median_ns": 65184.5,
+        "p99_ns": 85983,
+        "p999_ns": 99532,
+        "maximum_ns": 115390,
+        "minimum_ns": 60257
+      },
+      "submit_return_to_first_write_signed": {
+        "n": 1384,
+        "median_ns": 17712.0,
+        "p99_ns": 30754,
+        "p999_ns": 44647,
+        "maximum_ns": 46288,
+        "minimum_ns": 13812
+      },
+      "runtime_queue": {
+        "n": 1384,
+        "median_ns": 6528.5,
+        "p99_ns": 18736,
+        "p999_ns": 30355,
+        "maximum_ns": 33464,
+        "minimum_ns": 2387
+      }
+    }
+  },
+  "orders": {
+    "place_rows": 5771,
+    "unique_place_coids": 5771,
+    "positive_fill_events": 278,
+    "zero_fill_replay_events": 556,
+    "errors": []
+  },
+  "recovery": {
+    "count": 14,
+    "without_private_known_state": 5,
+    "without_private_terminal": 5,
+    "uncertain_cancel_count": 35,
+    "uncertain_cancels_without_private_terminal": 10,
+    "uncertain_cancels_without_order_resolution_evidence": 0
+  },
+  "cold_connect": {
+    "boundary": "Only >=100us cold future polls are logged; these quantiles are thresholded tails, not all handshakes. CPU time excludes off-CPU preemption. These polls have no order identity and are not causally joined to nearby orders.",
+    "cold_poll_tails": {
+      "span_wall_ns": {
+        "n": 1113,
+        "median_ns": 442383,
+        "p99_ns": 33785197,
+        "p999_ns": 34463582,
+        "maximum_ns": 34525434
+      },
+      "span_cpu_ns": {
+        "n": 1113,
+        "median_ns": 77579,
+        "p99_ns": 1444662,
+        "p999_ns": 1614260,
+        "maximum_ns": 1624442
+      },
+      "span_off_cpu_ns": {
+        "n": 1113,
+        "median_ns": 243628,
+        "p99_ns": 32424913,
+        "p999_ns": 33099002,
+        "maximum_ns": 33171523
+      }
+    },
+    "worst_cpu_polls": [
+      {
+        "observed_unix_ns": 1791147727862424945,
+        "span_wall_ns": 16572967,
+        "span_cpu_ns": 1624442,
+        "span_off_cpu_ns": 14948525,
+        "owner": "hexbot-ord-bg",
+        "boundary": "single_connect_future_poll_on_background_worker"
+      },
+      {
+        "observed_unix_ns": 1791148130009275497,
+        "span_wall_ns": 9580471,
+        "span_cpu_ns": 1614260,
+        "span_off_cpu_ns": 7966211,
+        "owner": "hexbot-ord-bg",
+        "boundary": "single_connect_future_poll_on_background_worker"
+      },
+      {
+        "observed_unix_ns": 1791147023582147204,
+        "span_wall_ns": 13871202,
+        "span_cpu_ns": 1606304,
+        "span_off_cpu_ns": 12264898,
+        "owner": "hexbot-ord-bg",
+        "boundary": "single_connect_future_poll_on_background_worker"
+      },
+      {
+        "observed_unix_ns": 1791146171563326457,
+        "span_wall_ns": 5434861,
+        "span_cpu_ns": 1535823,
+        "span_off_cpu_ns": 3899038,
+        "owner": "hexbot-ord-bg",
+        "boundary": "single_connect_future_poll_on_background_worker"
+      },
+      {
+        "observed_unix_ns": 1791147727863847673,
+        "span_wall_ns": 14536167,
+        "span_cpu_ns": 1530350,
+        "span_off_cpu_ns": 13005817,
+        "owner": "hexbot-ord-bg",
+        "boundary": "single_connect_future_poll_on_background_worker"
+      },
+      {
+        "observed_unix_ns": 1791147791126143957,
+        "span_wall_ns": 12991790,
+        "span_cpu_ns": 1517048,
+        "span_off_cpu_ns": 11474742,
+        "owner": "hexbot-ord-bg",
+        "boundary": "single_connect_future_poll_on_background_worker"
+      },
+      {
+        "observed_unix_ns": 1791146708116664429,
+        "span_wall_ns": 5104552,
+        "span_cpu_ns": 1513399,
+        "span_off_cpu_ns": 3591153,
+        "owner": "hexbot-ord-bg",
+        "boundary": "single_connect_future_poll_on_background_worker"
+      },
+      {
+        "observed_unix_ns": 1791147680228859457,
+        "span_wall_ns": 6862860,
+        "span_cpu_ns": 1511161,
+        "span_off_cpu_ns": 5351699,
+        "owner": "hexbot-ord-bg",
+        "boundary": "single_connect_future_poll_on_background_worker"
+      },
+      {
+        "observed_unix_ns": 1791146708024575957,
+        "span_wall_ns": 6112335,
+        "span_cpu_ns": 1497035,
+        "span_off_cpu_ns": 4615300,
+        "owner": "hexbot-ord-bg",
+        "boundary": "single_connect_future_poll_on_background_worker"
+      },
+      {
+        "observed_unix_ns": 1791145934662679191,
+        "span_wall_ns": 4592231,
+        "span_cpu_ns": 1493337,
+        "span_off_cpu_ns": 3098894,
+        "owner": "hexbot-ord-bg",
+        "boundary": "single_connect_future_poll_on_background_worker"
+      }
+    ],
+    "wrong_owner_polls": [],
+    "diagnostic_queue_sample_count": 28,
+    "diagnostic_queue_maxima": {
+      "depth": 0,
+      "high_water": 5,
+      "dropped": 0
+    },
+    "business_http_legs": 11174,
+    "business_connect_attempted": 3,
+    "all_http_cold_connect_by_kind": {
+      "polymarket.http.get": 25,
+      "cancel": 3
+    },
+    "all_http_cold_worker_queue": {
+      "n": 28,
+      "median_ns": 118175.5,
+      "p99_ns": 618154,
+      "p999_ns": 618154,
+      "maximum_ns": 618154
+    },
+    "warm_primary_started_during_observed_cold_poll": {
+      "runtime_queue": {
+        "n": 27,
+        "median_ns": 7759,
+        "p99_ns": 22017,
+        "p999_ns": 22017,
+        "maximum_ns": 22017
+      },
+      "boundary": "HTTP helper start lies inside a thresholded background cold-poll wall interval, by same-host wall timestamps. Temporal association, not a causal join or exact queue-interval overlap."
+    },
+    "connect_worker_queue": {
+      "n": 3,
+      "median_ns": 119031,
+      "p99_ns": 122533,
+      "p999_ns": 122533,
+      "maximum_ns": 122533
+    },
+    "reused_leg_nonzero_connect_worker_queue": []
+  },
+  "queue_maxima_since_boot": {
+    "event_audit_depth": 0,
+    "event_audit_sampled_high_water": 5,
+    "event_audit_rejected": 0,
+    "cancel_outbox_depth": 0,
+    "cancel_outbox_overflow": 0,
+    "lifecycle_dropped": 0,
+    "cold_submit_depth": 0,
+    "cold_submit_sampled_high_water": 24,
+    "cold_submit_admitted": 491,
+    "cold_submit_dequeued": 491,
+    "cold_submit_rejected": 0,
+    "cold_submit_panics": 0
+  },
+  "runtime_final": {
+    "observed_utc": "2026-10-04T21:11:49.143378+00:00",
+    "minutes_remaining": 0.0,
+    "pid": 2491935,
+    "start_ticks": 183828101,
+    "process_missing": false,
+    "identity_changed": false,
+    "threads": 141,
+    "rss_mib": 2611.1,
+    "disk_available_gib": 22.33,
+    "levels_since_boot": {
+      "INFO": 35332,
+      "WARN": 2125
+    },
+    "first_ready": {
+      "btc03": "2026-10-04T20:10:46.295Z",
+      "btc01": "2026-10-04T20:11:13.997Z",
+      "btc02": "2026-10-04T20:11:13.999Z"
+    },
+    "crash_count": 0,
+    "crash_markers": [],
+    "owner_counts": {
+      "fast": 12,
+      "cancel": 12,
+      "private": 3,
+      "strategy": 3
+    },
+    "core_cpu_pct": {
+      "4": 18.9,
+      "3": 0.53,
+      "2": 0.08,
+      "8": 3.76,
+      "13": 24.16,
+      "12": 23.87,
+      "10": 23.84,
+      "1": 1.55,
+      "15": 2.1,
+      "5": 0.02,
+      "14": 0.02,
+      "6": 18.56,
+      "11": 18.9,
+      "9": 18.77,
+      "7": 11.67
+    },
+    "critical_alerts": [],
+    "topology_errors": [],
+    "observation_end": "2026-10-04T21:11:46.297Z",
+    "health": {
+      "btc03": {
+        "ledger_ready": true,
+        "fault_code": "none",
+        "quote_age_ms": 83,
+        "quote_blockers": [],
+        "critical_control_pending": 0,
+        "terminal_trade_drains": 0
+      },
+      "btc01": {
+        "ledger_ready": true,
+        "fault_code": "none",
+        "quote_age_ms": 85,
+        "quote_blockers": [],
+        "critical_control_pending": 0,
+        "terminal_trade_drains": 0
+      },
+      "btc02": {
+        "ledger_ready": true,
+        "fault_code": "none",
+        "quote_age_ms": 83,
+        "quote_blockers": [],
+        "critical_control_pending": 0,
+        "terminal_trade_drains": 0
+      }
+    },
+    "queue_maxima": {
+      "event_audit_depth": 0,
+      "event_audit_sampled_high_water": 5,
+      "event_audit_rejected": 0,
+      "cancel_outbox_depth": 0,
+      "cancel_outbox_overflow": 0,
+      "lifecycle_dropped": 0,
+      "cold_submit_depth": 0,
+      "cold_submit_sampled_high_water": 24,
+      "cold_submit_admitted": 491,
+      "cold_submit_dequeued": 491,
+      "cold_submit_rejected": 0,
+      "cold_submit_panics": 0
+    },
+    "new_log_bytes": 293498,
+    "rotated": false
+  },
+  "raw_prefix": {
+    "observed_utc": "2026-10-04T21:13:31.952211+00:00",
+    "sources": [
+      {
+        "path": "/home/rocky/projects/hexbot/data/record/order_audit/order-audit-497540.jsonl",
+        "prefix_bytes": 34819426,
+        "prefix_sha256": "dc31f49742924ee1d7dcaea5d6dfcc99dbd67701406245b9b9e8ea6972c185e8",
+        "complete_rows": 42079,
+        "trailing_incomplete_bytes": 0,
+        "malformed_lines": []
+      },
+      {
+        "path": "/home/rocky/projects/hexbot/data/record/order_audit/order-audit-497541.jsonl",
+        "prefix_bytes": 9768986,
+        "prefix_sha256": "33938cee4917a763c2c4372b0928c4b3cc975298bcfaefbc9ca877ecf0a6fee8",
+        "complete_rows": 11349,
+        "trailing_incomplete_bytes": 0,
+        "malformed_lines": []
+      }
+    ],
+    "malformed_lines": [],
+    "gzip_bytes": 4516217,
+    "gzip_sha256": "7777c80f123767fc137cf1bee543c88a370ca6f7800ae6508b430e48a9f8d144"
+  },
+  "selected_audit_manifest": {
+    "start_ns_inclusive": 1791144602045000000,
+    "end_ns_exclusive": 1791148306297000000,
+    "time_field_precedence": [
+      "completed_ns",
+      "stage_ns",
+      "timestamp_ns"
+    ],
+    "sources": [
+      {
+        "path": "/home/rocky/projects/hexbot/data/record/order_audit/order-audit-497540.jsonl",
+        "prefix_bytes": 34819426,
+        "prefix_sha256": "dc31f49742924ee1d7dcaea5d6dfcc99dbd67701406245b9b9e8ea6972c185e8",
+        "complete_rows": 42079,
+        "selected_rows": 35930,
+        "newest_event_ns_in_prefix": 1791147599849721545
+      },
+      {
+        "path": "/home/rocky/projects/hexbot/data/record/order_audit/order-audit-497541.jsonl",
+        "prefix_bytes": 9298990,
+        "prefix_sha256": "cb0176983d3456130758caae319dd3ab7c039bd0f821706c6bc17f7031fd4fc8",
+        "complete_rows": 10683,
+        "selected_rows": 10521,
+        "newest_event_ns_in_prefix": 1791148323056735299
+      }
+    ]
+  },
+  "final_attestation": {
+    "observed_utc": "2026-10-04T21:13:34.410634+00:00",
+    "main": "9b69c8f18efd22a9a4a6d06ae4db527329158805",
+    "branch": "main",
+    "tracked_status": "",
+    "pid": 2491935,
+    "start_ticks": 183828101,
+    "running_pids": [
+      2491935
+    ],
+    "binary_sha256": "6bee06cf34ba94a0d59ed0e7a09519c8d8c06930a1610a9f08ecfe94fac049d6",
+    "configs": {
+      "config/live_polymaker.toml": "93a588c7efbc322b8869705c07e269dc5f176386a34f87fd0b31b4fd066898a9",
+      "config/live/poly_btc5m_01.toml": "d10304e5f512485bc73fdb08d9fe3e0547a4dcec2a2e460d73c46f75c74ccbd0",
+      "config/live/poly_btc5m_02.toml": "58e417fea9175d5c130326b7e141207c4a9f69617bd4c709ae706f3568488ea9",
+      "config/live/poly_btc5m_03.toml": "c1088bbf73978b53e295a9f77f7a056603c66b884b551677ce005305879c58fc"
+    },
+    "sdk_cargo_revisions": [
+      "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+      "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+      "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+      "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+      "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+      "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+      "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2"
+    ],
+    "sdk_lock_revisions": [
+      "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+      "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+      "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+      "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+      "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+      "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+      "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2"
+    ],
+    "thread_count": 138
+  },
+  "file_hashes": {
+    "order-audit.jsonl.gz": "b80fab5b9bd9b0585ee7d099ab494d4fbc70603f7224ce4f782b52ff85d41d74",
+    "quoter.jsonl.gz": "4246c47ce5d9de579766fbe8a43da74c4ec954ae3cfa9f0c9e2363de9c515987",
+    "latency.csv.gz": "3797a5b3672ae7ec884411b582cf2d3618b00e80d59b29fd7fdb7be98f5be4fb",
+    "live-window.log.gz": "41e8006b36d2bb8b83c1b547ba815f39f1b470eb0b0a7738244bc22aa9319510",
+    "runtime.jsonl": "acd917983411e90f016b0da72dc3fd650c37dd7a5ecc32dd0696a1e5c4456f5c",
+    "checkpoints.jsonl": "45147637929a4dcdc7beb43c40bf98d68e1509217677928f5f8c757847c63df7"
+  },
+  "limits": [
+    "Different live windows are not controlled A/B.",
+    "Complete attempts whose origin and completion are both within the steady window; in-flight boundary attempts are censored.",
+    "Callbacks without a market receipt have no fabricated market origin.",
+    "Minute histogram summaries are not pooled event percentiles.",
+    "Cold poll diagnostics are thresholded at 100us and have no exact order identity.",
+    "Local plaintext transport write is not TCP or exchange acknowledgement."
+  ],
+  "recovery_resolution_review": {
+    "source_log_sha256": "57f05090eb1dc6641369b7e1bae5e9458dc22512d55510cd1e4e5f0742e4ea57",
+    "without_private_known_state": 5,
+    "unresolved_in_observed_window": 0,
+    "boundary": "Five place uncertain attempts have explicit inferred_two_null_cancelled policy and orphan closure evidence, with late-fill tracking retained. This is an existing recovery policy, not proof of exchange-private terminal confirmation. No policy was changed by these optimizations.",
+    "attempts": [
+      {
+        "coid": "btc03-1791144625969",
+        "operation": "place",
+        "status": "NewOrderTimeout",
+        "closure_evidence": "2026-10-04T20:35:33.012Z  INFO polymaker::strategy::polymaker::orphan_reconciler: [orphan_lifecycle] final=cleared origin=place_orphan resolution=inferred_two_null_cancelled status=Some(Cancelled) coid=btc03-1791144625969 symbol=98126492639278033373461212671747367586455031203216409275428503300766702684648 orderID=0x2099d051a0a612a3b0bbb8d8621731ad8796a6262b033a18bb2923ecec3d6016 orphan_age_ms=592.988 coid_tracked=false remaining_places=0 remaining_cancels=0 remaining_drains=0 lock_release=final instance_id=btc03",
+        "policy_evidence": "2026-10-04T20:35:33.012Z  WARN hexagent_exchange::exchange::polymarket::trade::null_cancel_recovery: [null_cancel_policy] coid=btc03-1791144625969 result=policy_complete status=Cancelled inferred=true late_fills_retained=true"
+      },
+      {
+        "coid": "btc02-1791144628009",
+        "operation": "place",
+        "status": "NewOrderTimeout",
+        "closure_evidence": "2026-10-04T20:56:17.999Z  INFO polymaker::strategy::polymaker::orphan_reconciler: [orphan_lifecycle] final=cleared origin=place_orphan resolution=inferred_two_null_cancelled status=Some(Cancelled) coid=btc02-1791144628009 symbol=45567025049150557375276214840097926126226473787961145696977024041048899172805 orderID=0x7b0542fb545757dfa4ef4104d08f2fcf26bbb698d4fd7b492e2b725a43d0e8e7 orphan_age_ms=2674.809 coid_tracked=false remaining_places=0 remaining_cancels=0 remaining_drains=0 lock_release=final instance_id=btc02",
+        "policy_evidence": "2026-10-04T20:56:17.999Z  WARN hexagent_exchange::exchange::polymarket::trade::null_cancel_recovery: [null_cancel_policy] coid=btc02-1791144628009 result=policy_complete status=Cancelled inferred=true late_fills_retained=true"
+      },
+      {
+        "coid": "btc02-1791144629513",
+        "operation": "place",
+        "status": "NewOrderTimeout",
+        "closure_evidence": "2026-10-04T21:11:09.356Z  INFO polymaker::strategy::polymaker::orphan_reconciler: [orphan_lifecycle] final=cleared origin=place_orphan resolution=inferred_two_null_cancelled status=Some(Cancelled) coid=btc02-1791144629513 symbol=73644127083484826828570744626674543778368461763213432239819952592858249892529 orderID=0xf6bf5e016520f4d7ed883476f17f9c9486aa1082f86bd70acdace171f46a06b4 orphan_age_ms=2101.693 coid_tracked=false remaining_places=0 remaining_cancels=0 remaining_drains=0 lock_release=final instance_id=btc02",
+        "policy_evidence": "2026-10-04T21:11:09.356Z  WARN hexagent_exchange::exchange::polymarket::trade::null_cancel_recovery: [null_cancel_policy] coid=btc02-1791144629513 result=policy_complete status=Cancelled inferred=true late_fills_retained=true"
+      },
+      {
+        "coid": "btc01-1791144629512",
+        "operation": "place",
+        "status": "NewOrderTimeout",
+        "closure_evidence": "2026-10-04T21:11:09.351Z  INFO polymaker::strategy::polymaker::orphan_reconciler: [orphan_lifecycle] final=cleared origin=place_orphan resolution=inferred_two_null_cancelled status=Some(Cancelled) coid=btc01-1791144629512 symbol=73644127083484826828570744626674543778368461763213432239819952592858249892529 orderID=0x8c1650b442a99f44fbfc8ece54f34927ad4441a4046568a30d6bf5f0473dfc26 orphan_age_ms=2096.964 coid_tracked=false remaining_places=0 remaining_cancels=0 remaining_drains=0 lock_release=final instance_id=btc01",
+        "policy_evidence": "2026-10-04T21:11:09.351Z  WARN hexagent_exchange::exchange::polymarket::trade::null_cancel_recovery: [null_cancel_policy] coid=btc01-1791144629512 result=policy_complete status=Cancelled inferred=true late_fills_retained=true"
+      },
+      {
+        "coid": "btc03-1791144629514",
+        "operation": "place",
+        "status": "NewOrderTimeout",
+        "closure_evidence": "2026-10-04T21:11:09.358Z  INFO polymaker::strategy::polymaker::orphan_reconciler: [orphan_lifecycle] final=cleared origin=place_orphan resolution=inferred_two_null_cancelled status=Some(Cancelled) coid=btc03-1791144629514 symbol=85061087377623622668179956853004275880574001468168226729002247009787161522920 orderID=0x3f0ece52c26144b177cbe54cf76c937752b63e630a6d7f199adc67973b7c4040 orphan_age_ms=2103.261 coid_tracked=false remaining_places=0 remaining_cancels=0 remaining_drains=0 lock_release=final instance_id=btc03",
+        "policy_evidence": "2026-10-04T21:11:09.357Z  WARN hexagent_exchange::exchange::polymarket::trade::null_cancel_recovery: [null_cancel_policy] coid=btc03-1791144629514 result=policy_complete status=Cancelled inferred=true late_fills_retained=true"
+      }
+    ]
+  },
+  "minute_histogram_summaries": {
+    "polymarket.account.lifecycle_apply": {
+      "windows": 59,
+      "events": 10892,
+      "median_of_window_medians": 14.3,
+      "median_of_window_p99": 22.5,
+      "median_of_window_p999": 25.9,
+      "largest_window_p99": 36.6,
+      "largest_window_p999": 151.6,
+      "maximum": 151.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.gap_replay.http_body": {
+      "windows": 59,
+      "events": 1065,
+      "median_of_window_medians": 36.9,
+      "median_of_window_p99": 1050.0,
+      "median_of_window_p999": 1050.0,
+      "largest_window_p99": 439260.0,
+      "largest_window_p999": 439260.0,
+      "maximum": 439260.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.gap_replay.json_decode": {
+      "windows": 59,
+      "events": 1065,
+      "median_of_window_medians": 15.4,
+      "median_of_window_p99": 32.0,
+      "median_of_window_p999": 32.0,
+      "largest_window_p99": 117.6,
+      "largest_window_p999": 117.6,
+      "maximum": 117.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.account_apply": {
+      "windows": 59,
+      "events": 11648,
+      "median_of_window_medians": 14.3,
+      "median_of_window_p99": 46.8,
+      "median_of_window_p999": 49.2,
+      "largest_window_p99": 103.4,
+      "largest_window_p999": 181.5,
+      "maximum": 181.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.account_order_log": {
+      "windows": 59,
+      "events": 10820,
+      "median_of_window_medians": 3.1,
+      "median_of_window_p99": 6.1,
+      "median_of_window_p999": 6.8,
+      "largest_window_p99": 29.8,
+      "largest_window_p999": 104.1,
+      "maximum": 104.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.account_resolve_anomaly": {
+      "windows": 59,
+      "events": 11648,
+      "median_of_window_medians": 1.0,
+      "median_of_window_p99": 1.7,
+      "median_of_window_p999": 1.8,
+      "largest_window_p99": 2.7,
+      "largest_window_p999": 5.4,
+      "maximum": 5.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.dispatch": {
+      "windows": 59,
+      "events": 11648,
+      "median_of_window_medians": 4.6,
+      "median_of_window_p99": 5.1,
+      "median_of_window_p999": 5.2,
+      "largest_window_p99": 8.4,
+      "largest_window_p999": 11.4,
+      "maximum": 11.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.event_parse": {
+      "windows": 59,
+      "events": 11708,
+      "median_of_window_medians": 5.6,
+      "median_of_window_p99": 19.8,
+      "median_of_window_p999": 23.6,
+      "largest_window_p99": 57.3,
+      "largest_window_p999": 71.1,
+      "maximum": 71.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.fast_route_to_account_owner": {
+      "windows": 59,
+      "events": 11672,
+      "median_of_window_medians": 0.352,
+      "median_of_window_p99": 53.2,
+      "median_of_window_p999": 64.2,
+      "largest_window_p99": 126.9,
+      "largest_window_p999": 137.0,
+      "maximum": 137.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.frame_total": {
+      "windows": 59,
+      "events": 11708,
+      "median_of_window_medians": 5.6,
+      "median_of_window_p99": 19.8,
+      "median_of_window_p999": 23.3,
+      "largest_window_p99": 57.3,
+      "largest_window_p999": 71.0,
+      "maximum": 71.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.json_parse": {
+      "windows": 59,
+      "events": 11708,
+      "median_of_window_medians": 3.8,
+      "median_of_window_p99": 16.4,
+      "median_of_window_p999": 20.0,
+      "largest_window_p99": 57.3,
+      "largest_window_p999": 69.4,
+      "maximum": 69.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.json_parse_cpu": {
+      "windows": 59,
+      "events": 11708,
+      "median_of_window_medians": 3.6,
+      "median_of_window_p99": 16.4,
+      "median_of_window_p999": 19.8,
+      "largest_window_p99": 57.3,
+      "largest_window_p999": 69.4,
+      "maximum": 69.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.json_parse_off_cpu": {
+      "windows": 59,
+      "events": 11708,
+      "median_of_window_medians": 0.096,
+      "median_of_window_p99": 0.253,
+      "median_of_window_p999": 0.279,
+      "largest_window_p99": 0.362,
+      "largest_window_p999": 5.2,
+      "maximum": 5.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.apply_enqueue": {
+      "windows": 59,
+      "events": 11708,
+      "median_of_window_medians": 0.224,
+      "median_of_window_p99": 0.724,
+      "median_of_window_p999": 0.784,
+      "largest_window_p99": 0.998,
+      "largest_window_p999": 4.8,
+      "maximum": 4.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.health_apply": {
+      "windows": 59,
+      "events": 11648,
+      "median_of_window_medians": 0.07200000000000001,
+      "median_of_window_p99": 0.20800000000000002,
+      "median_of_window_p999": 0.28300000000000003,
+      "largest_window_p99": 0.394,
+      "largest_window_p999": 0.417,
+      "maximum": 0.417,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.trade_replay_anchor_apply": {
+      "windows": 25,
+      "events": 827,
+      "median_of_window_medians": 14.3,
+      "median_of_window_p99": 15.5,
+      "median_of_window_p999": 15.5,
+      "largest_window_p99": 25.5,
+      "largest_window_p999": 25.7,
+      "maximum": 25.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.validate_route": {
+      "windows": 59,
+      "events": 13488,
+      "median_of_window_medians": 4.6,
+      "median_of_window_p99": 12.3,
+      "median_of_window_p999": 19.0,
+      "largest_window_p99": 38.5,
+      "largest_window_p999": 43.2,
+      "maximum": 43.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.validate_route_dispatch": {
+      "windows": 59,
+      "events": 13488,
+      "median_of_window_medians": 10.2,
+      "median_of_window_p99": 20.5,
+      "median_of_window_p999": 24.2,
+      "largest_window_p99": 43.6,
+      "largest_window_p999": 52.3,
+      "maximum": 52.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.validate_trade_fields": {
+      "windows": 27,
+      "events": 851,
+      "median_of_window_medians": 7.2,
+      "median_of_window_p99": 18.4,
+      "median_of_window_p999": 18.6,
+      "largest_window_p99": 24.8,
+      "largest_window_p999": 24.8,
+      "maximum": 24.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_runtime_deadline_lag": {
+      "windows": 59,
+      "events": 355506,
+      "median_of_window_medians": 20.5,
+      "median_of_window_p99": 28.7,
+      "median_of_window_p999": 49.2,
+      "largest_window_p99": 30.7,
+      "largest_window_p999": 73.7,
+      "maximum": 395.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_source_age_at_publish": {
+      "windows": 59,
+      "events": 1402195,
+      "median_of_window_medians": 5.6,
+      "median_of_window_p99": 13.3,
+      "median_of_window_p999": 28.7,
+      "largest_window_p99": 14.3,
+      "largest_window_p999": 30.7,
+      "maximum": 218420.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_wire_receive_to_publish": {
+      "windows": 59,
+      "events": 1402171,
+      "median_of_window_medians": 5.6,
+      "median_of_window_p99": 13.3,
+      "median_of_window_p999": 28.7,
+      "largest_window_p99": 14.3,
+      "largest_window_p999": 30.7,
+      "maximum": 51.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_live_bbo_apply": {
+      "windows": 59,
+      "events": 1453829,
+      "median_of_window_medians": 0.64,
+      "median_of_window_p99": 2.3,
+      "median_of_window_p999": 3.6,
+      "largest_window_p99": 2.3,
+      "largest_window_p999": 4.6,
+      "maximum": 34.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_price_change_source_to_receive": {
+      "windows": 59,
+      "events": 1377383,
+      "median_of_window_medians": 6820.0,
+      "median_of_window_p99": 167770.0,
+      "median_of_window_p999": 251660.0,
+      "largest_window_p99": 503320.0,
+      "largest_window_p999": 939520.0,
+      "maximum": 996030.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_best_bid_ask_source_to_receive": {
+      "windows": 59,
+      "events": 42974,
+      "median_of_window_medians": 6820.0,
+      "median_of_window_p99": 150990.0,
+      "median_of_window_p999": 224920.0,
+      "largest_window_p99": 939520.0,
+      "largest_window_p999": 941220.0,
+      "maximum": 941220.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_parse": {
+      "windows": 59,
+      "events": 1474746,
+      "median_of_window_medians": 7.7,
+      "median_of_window_p99": 16.4,
+      "median_of_window_p999": 30.7,
+      "largest_window_p99": 18.4,
+      "largest_window_p999": 32.8,
+      "maximum": 53.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_event_construction": {
+      "windows": 59,
+      "events": 1474758,
+      "median_of_window_medians": 1.2,
+      "median_of_window_p99": 3.1,
+      "median_of_window_p999": 4.6,
+      "largest_window_p99": 3.3,
+      "largest_window_p999": 6.7,
+      "maximum": 35.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_parse_apply": {
+      "windows": 59,
+      "events": 1474746,
+      "median_of_window_medians": 3.6,
+      "median_of_window_p99": 11.3,
+      "median_of_window_p999": 16.4,
+      "largest_window_p99": 12.3,
+      "largest_window_p999": 26.6,
+      "maximum": 48.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_parse_apply_cpu": {
+      "windows": 59,
+      "events": 1474746,
+      "median_of_window_medians": 4.1,
+      "median_of_window_p99": 12.3,
+      "median_of_window_p999": 24.6,
+      "largest_window_p99": 13.3,
+      "largest_window_p999": 28.7,
+      "maximum": 48.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_parse_apply_preempted": {
+      "windows": 59,
+      "events": 1474746,
+      "median_of_window_medians": 0.001,
+      "median_of_window_p99": 0.001,
+      "median_of_window_p999": 0.001,
+      "largest_window_p99": 0.001,
+      "largest_window_p999": 0.001,
+      "maximum": 0.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_runtime_scheduler_lag": {
+      "windows": 59,
+      "events": 355506,
+      "median_of_window_medians": 1050.0,
+      "median_of_window_p99": 1180.0,
+      "median_of_window_p999": 1180.0,
+      "largest_window_p99": 1180.0,
+      "largest_window_p999": 1180.0,
+      "maximum": 1840.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_simd_json": {
+      "windows": 59,
+      "events": 1474758,
+      "median_of_window_medians": 2.3,
+      "median_of_window_p99": 8.2,
+      "median_of_window_p999": 11.3,
+      "largest_window_p99": 9.2,
+      "largest_window_p999": 24.6,
+      "maximum": 46.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "runtime.general.deadline_lag": {
+      "windows": 59,
+      "events": 355506,
+      "median_of_window_medians": 5.1,
+      "median_of_window_p99": 6.1,
+      "median_of_window_p999": 7.7,
+      "largest_window_p99": 6.7,
+      "largest_window_p999": 14.3,
+      "maximum": 739.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.cancel.trigger_to_dispatch": {
+      "windows": 59,
+      "events": 5331,
+      "median_of_window_medians": 163.8,
+      "median_of_window_p99": 254.1,
+      "median_of_window_p999": 258.1,
+      "largest_window_p99": 340.1,
+      "largest_window_p999": 340.1,
+      "maximum": 340.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.cancel.response_classify": {
+      "windows": 59,
+      "events": 5331,
+      "median_of_window_medians": 1.3,
+      "median_of_window_p99": 6.2,
+      "median_of_window_p999": 6.4,
+      "largest_window_p99": 41.0,
+      "largest_window_p999": 52.8,
+      "maximum": 52.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.cancel.response_handler": {
+      "windows": 59,
+      "events": 5331,
+      "median_of_window_medians": 4.1,
+      "median_of_window_p99": 11.3,
+      "median_of_window_p999": 11.9,
+      "largest_window_p99": 70.0,
+      "largest_window_p999": 70.0,
+      "maximum": 70.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.response_handler": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 12.3,
+      "median_of_window_p99": 15.3,
+      "median_of_window_p999": 15.7,
+      "largest_window_p99": 58.4,
+      "largest_window_p999": 58.4,
+      "maximum": 58.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.response_parse": {
+      "windows": 58,
+      "events": 5531,
+      "median_of_window_medians": 0.384,
+      "median_of_window_p99": 0.64,
+      "median_of_window_p999": 0.9355,
+      "largest_window_p99": 14.3,
+      "largest_window_p999": 21.0,
+      "maximum": 21.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.body": {
+      "windows": 59,
+      "events": 13846,
+      "median_of_window_medians": 0.768,
+      "median_of_window_p99": 1.5,
+      "median_of_window_p999": 18.2,
+      "largest_window_p99": 4720.0,
+      "largest_window_p999": 58400.0,
+      "maximum": 58400.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.reuse": {
+      "windows": 59,
+      "events": 13818,
+      "median_of_window_medians": 0.001,
+      "median_of_window_p99": 0.001,
+      "median_of_window_p999": 0.001,
+      "largest_window_p99": 0.001,
+      "largest_window_p999": 0.001,
+      "maximum": 0.001,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.slot_serialization_wait": {
+      "windows": 59,
+      "events": 13846,
+      "median_of_window_medians": 0.28800000000000003,
+      "median_of_window_p99": 0.48,
+      "median_of_window_p999": 0.544,
+      "largest_window_p99": 0.616,
+      "largest_window_p999": 414200.0,
+      "maximum": 414200.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.total_segmented": {
+      "windows": 59,
+      "events": 13846,
+      "median_of_window_medians": 37750.0,
+      "median_of_window_p99": 436210.0,
+      "median_of_window_p999": 552830.0,
+      "largest_window_p99": 2000000.0,
+      "largest_window_p999": 2000000.0,
+      "maximum": 2000000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.ttfb": {
+      "windows": 59,
+      "events": 13846,
+      "median_of_window_medians": 37750.0,
+      "median_of_window_p99": 436210.0,
+      "median_of_window_p999": 552830.0,
+      "largest_window_p99": 2000000.0,
+      "largest_window_p999": 2000000.0,
+      "maximum": 2000000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "runtime.allocator.background_maintenance": {
+      "windows": 59,
+      "events": 3256,
+      "median_of_window_medians": 28.7,
+      "median_of_window_p99": 779.6,
+      "median_of_window_p999": 779.6,
+      "largest_window_p99": 3440.0,
+      "largest_window_p999": 3440.0,
+      "maximum": 3440.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.wallet_calibration.wait_including_grace": {
+      "windows": 59,
+      "events": 342,
+      "median_of_window_medians": 54530.0,
+      "median_of_window_p99": 58860.0,
+      "median_of_window_p999": 58860.0,
+      "largest_window_p99": 167200.0,
+      "largest_window_p999": 167200.0,
+      "maximum": 167200.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.wallet_calibration.apply": {
+      "windows": 59,
+      "events": 342,
+      "median_of_window_medians": 98.3,
+      "median_of_window_p99": 11980.0,
+      "median_of_window_p999": 11980.0,
+      "largest_window_p99": 72950.0,
+      "largest_window_p999": 72950.0,
+      "maximum": 72950.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.owner_turn": {
+      "windows": 59,
+      "events": 58695,
+      "median_of_window_medians": 16.4,
+      "median_of_window_p99": 81.9,
+      "median_of_window_p999": 139.0,
+      "largest_window_p99": 507.5,
+      "largest_window_p999": 772.2,
+      "maximum": 809.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.ws_enqueue_to_owner_dequeue": {
+      "windows": 59,
+      "events": 11675,
+      "median_of_window_medians": 8.2,
+      "median_of_window_p99": 20.7,
+      "median_of_window_p999": 27.8,
+      "largest_window_p99": 49.6,
+      "largest_window_p999": 60.9,
+      "maximum": 60.9,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.pending_apply_depth": {
+      "windows": 59,
+      "events": 11672,
+      "median_of_window_medians": 0.001,
+      "median_of_window_p99": 0.002,
+      "median_of_window_p999": 0.003,
+      "largest_window_p99": 0.003,
+      "largest_window_p999": 0.004,
+      "maximum": 0.004,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.register.access": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 2.3,
+      "median_of_window_p99": 3.0,
+      "median_of_window_p999": 3.0,
+      "largest_window_p99": 6.4,
+      "largest_window_p999": 6.4,
+      "maximum": 6.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.register.reservation": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 1.9,
+      "median_of_window_p99": 5.1,
+      "median_of_window_p999": 5.35,
+      "largest_window_p99": 25.3,
+      "largest_window_p999": 25.3,
+      "maximum": 25.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.register.routes": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 22.5,
+      "median_of_window_p99": 30.5,
+      "median_of_window_p999": 31.15,
+      "largest_window_p99": 45.4,
+      "largest_window_p999": 157.9,
+      "maximum": 157.9,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.register.persist_enqueue": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 5.1,
+      "median_of_window_p99": 12.7,
+      "median_of_window_p999": 13.8,
+      "largest_window_p99": 22.6,
+      "largest_window_p999": 35.7,
+      "maximum": 35.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.register.cpu": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 32.8,
+      "median_of_window_p99": 45.1,
+      "median_of_window_p999": 45.8,
+      "largest_window_p99": 60.0,
+      "largest_window_p999": 163.1,
+      "maximum": 163.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.register.off_cpu": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 0.48,
+      "median_of_window_p99": 0.8075000000000001,
+      "median_of_window_p999": 0.8125,
+      "largest_window_p99": 0.9,
+      "largest_window_p999": 0.9500000000000001,
+      "maximum": 0.9500000000000001,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.publish.load": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 0.64,
+      "median_of_window_p99": 0.982,
+      "median_of_window_p999": 1.0,
+      "largest_window_p99": 1.3,
+      "largest_window_p999": 5.2,
+      "maximum": 5.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.publish.identity_index": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 0.448,
+      "median_of_window_p99": 1.3,
+      "median_of_window_p999": 1.3,
+      "largest_window_p99": 4.5,
+      "largest_window_p999": 5.1,
+      "maximum": 5.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.publish.coid_snapshot": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 2.6,
+      "median_of_window_p99": 5.1,
+      "median_of_window_p999": 5.35,
+      "largest_window_p99": 9.8,
+      "largest_window_p999": 13.2,
+      "maximum": 13.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.publish.reverse_index": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 0.013000000000000001,
+      "median_of_window_p99": 0.02,
+      "median_of_window_p999": 0.037000000000000005,
+      "largest_window_p99": 0.176,
+      "largest_window_p999": 0.176,
+      "maximum": 0.176,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.publish.oid_snapshot": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 2.6,
+      "median_of_window_p99": 5.3,
+      "median_of_window_p999": 5.8,
+      "largest_window_p99": 10.3,
+      "largest_window_p999": 19.0,
+      "maximum": 19.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.publish.token_index": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 0.013000000000000001,
+      "median_of_window_p99": 0.051000000000000004,
+      "median_of_window_p999": 0.11649999999999999,
+      "largest_window_p99": 5.6,
+      "largest_window_p999": 5.6,
+      "maximum": 5.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.publish.token_snapshot": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 2.6,
+      "median_of_window_p99": 4.2,
+      "median_of_window_p999": 4.35,
+      "largest_window_p99": 6.4,
+      "largest_window_p999": 66.0,
+      "maximum": 66.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.publish.swap": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 6.1,
+      "median_of_window_p99": 15.25,
+      "median_of_window_p999": 15.6,
+      "largest_window_p99": 22.3,
+      "largest_window_p999": 22.3,
+      "maximum": 22.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.publish.release": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 3.3,
+      "median_of_window_p99": 3.9,
+      "median_of_window_p999": 4.0,
+      "largest_window_p99": 5.0,
+      "largest_window_p999": 7.6,
+      "maximum": 7.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.publish.cpu": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 20.5,
+      "median_of_window_p99": 27.75,
+      "median_of_window_p999": 28.2,
+      "largest_window_p99": 34.5,
+      "largest_window_p999": 85.9,
+      "maximum": 85.9,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.publish.off_cpu": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 0.64,
+      "median_of_window_p99": 0.96,
+      "median_of_window_p999": 0.994,
+      "largest_window_p99": 1.1,
+      "largest_window_p999": 1.2,
+      "maximum": 1.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.owner_command": {
+      "windows": 59,
+      "events": 3816,
+      "median_of_window_medians": 15.4,
+      "median_of_window_p99": 31.5,
+      "median_of_window_p999": 38.6,
+      "largest_window_p99": 770.1,
+      "largest_window_p999": 807.5,
+      "maximum": 807.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.owner_execution": {
+      "windows": 59,
+      "events": 40129,
+      "median_of_window_medians": 12.3,
+      "median_of_window_p99": 65.5,
+      "median_of_window_p999": 73.4,
+      "largest_window_p99": 79.6,
+      "largest_window_p999": 152.5,
+      "maximum": 182.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.owner_register_order": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 53.2,
+      "median_of_window_p99": 73.05,
+      "median_of_window_p999": 73.1,
+      "largest_window_p99": 89.1,
+      "largest_window_p999": 182.7,
+      "maximum": 182.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.owner_register_ledger": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 32.8,
+      "median_of_window_p99": 47.1,
+      "median_of_window_p999": 47.85,
+      "largest_window_p99": 60.8,
+      "largest_window_p999": 163.9,
+      "maximum": 163.9,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.owner_register_publish": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 20.5,
+      "median_of_window_p99": 29.2,
+      "median_of_window_p999": 29.5,
+      "largest_window_p99": 35.7,
+      "largest_window_p999": 86.9,
+      "maximum": 86.9,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.owner_ingress": {
+      "windows": 59,
+      "events": 25380,
+      "median_of_window_medians": 10.2,
+      "median_of_window_p99": 65.5,
+      "median_of_window_p999": 68.2,
+      "largest_window_p99": 178.0,
+      "largest_window_p999": 196.1,
+      "maximum": 196.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.owner_maintenance": {
+      "windows": 25,
+      "events": 827,
+      "median_of_window_medians": 0.28800000000000003,
+      "median_of_window_p99": 11.4,
+      "median_of_window_p999": 11.4,
+      "largest_window_p99": 14.0,
+      "largest_window_p999": 15.3,
+      "maximum": 15.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.recovery.reconcile_recovered_orders": {
+      "windows": 58,
+      "events": 1632,
+      "median_of_window_medians": 25170.0,
+      "median_of_window_p99": 234915.0,
+      "median_of_window_p999": 234915.0,
+      "largest_window_p99": 403690.0,
+      "largest_window_p999": 403690.0,
+      "maximum": 403690.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "execution.probe_ingress_wait": {
+      "windows": 19,
+      "events": 251,
+      "median_of_window_medians": 53.2,
+      "median_of_window_p99": 99.5,
+      "median_of_window_p999": 99.5,
+      "largest_window_p99": 123.6,
+      "largest_window_p999": 123.6,
+      "maximum": 123.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.owner_preflight": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 1.8,
+      "median_of_window_p99": 2.5,
+      "median_of_window_p999": 2.5,
+      "largest_window_p99": 5.5,
+      "largest_window_p999": 9.4,
+      "maximum": 9.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.gap_replay.page_total": {
+      "windows": 59,
+      "events": 1065,
+      "median_of_window_medians": 27260.0,
+      "median_of_window_p99": 72710.0,
+      "median_of_window_p999": 72710.0,
+      "largest_window_p99": 765490.0,
+      "largest_window_p999": 765490.0,
+      "maximum": 765490.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.durable_lifecycle_skip": {
+      "windows": 59,
+      "events": 1789,
+      "median_of_window_medians": 0.001,
+      "median_of_window_p99": 0.001,
+      "median_of_window_p999": 0.001,
+      "largest_window_p99": 0.001,
+      "largest_window_p999": 0.001,
+      "maximum": 0.001,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.gap_replay.owner_turn_roundtrip": {
+      "windows": 59,
+      "events": 1073,
+      "median_of_window_medians": 36.9,
+      "median_of_window_p99": 66.1,
+      "median_of_window_p999": 66.1,
+      "largest_window_p99": 218.6,
+      "largest_window_p999": 218.6,
+      "maximum": 218.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.gap_replay.apply_page": {
+      "windows": 59,
+      "events": 1065,
+      "median_of_window_medians": 41.0,
+      "median_of_window_p99": 76.1,
+      "median_of_window_p999": 76.1,
+      "largest_window_p99": 251.9,
+      "largest_window_p999": 251.9,
+      "maximum": 251.9,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "market.receive_to_router": {
+      "windows": 59,
+      "events": 1627626,
+      "median_of_window_medians": 20.5,
+      "median_of_window_p99": 106.5,
+      "median_of_window_p999": 122.9,
+      "largest_window_p99": 106.5,
+      "largest_window_p999": 122.9,
+      "maximum": 150.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "market.router.dispatch": {
+      "windows": 59,
+      "events": 1627822,
+      "median_of_window_medians": 1.0,
+      "median_of_window_p99": 3.1,
+      "median_of_window_p999": 4.6,
+      "largest_window_p99": 3.3,
+      "largest_window_p999": 5.6,
+      "maximum": 19.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "market.adapter_queue.binance": {
+      "windows": 59,
+      "events": 116834,
+      "median_of_window_medians": 15.4,
+      "median_of_window_p99": 28.7,
+      "median_of_window_p999": 30.7,
+      "largest_window_p99": 32.8,
+      "largest_window_p999": 40.2,
+      "maximum": 40.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "market.adapter_queue.coinbase": {
+      "windows": 59,
+      "events": 71476,
+      "median_of_window_medians": 14.3,
+      "median_of_window_p99": 28.7,
+      "median_of_window_p999": 30.7,
+      "largest_window_p99": 30.7,
+      "largest_window_p999": 35.9,
+      "maximum": 36.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "market.adapter_queue.chainlink": {
+      "windows": 59,
+      "events": 21150,
+      "median_of_window_medians": 53.2,
+      "median_of_window_p99": 104.4,
+      "median_of_window_p999": 104.4,
+      "largest_window_p99": 106.5,
+      "largest_window_p999": 107.7,
+      "maximum": 107.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "market.adapter_queue.other": {
+      "windows": 59,
+      "events": 59,
+      "median_of_window_medians": 14.7,
+      "median_of_window_p99": 14.7,
+      "median_of_window_p999": 14.7,
+      "largest_window_p99": 28.5,
+      "largest_window_p999": 28.5,
+      "maximum": 28.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "market.root_queue.binance": {
+      "windows": 59,
+      "events": 116834,
+      "median_of_window_medians": 9.2,
+      "median_of_window_p99": 20.5,
+      "median_of_window_p999": 22.2,
+      "largest_window_p99": 22.5,
+      "largest_window_p999": 30.6,
+      "maximum": 30.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "market.root_queue.coinbase": {
+      "windows": 59,
+      "events": 71476,
+      "median_of_window_medians": 7.2,
+      "median_of_window_p99": 15.4,
+      "median_of_window_p999": 18.4,
+      "largest_window_p99": 20.5,
+      "largest_window_p999": 23.4,
+      "maximum": 32.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "market.root_queue.chainlink": {
+      "windows": 59,
+      "events": 21150,
+      "median_of_window_medians": 7.2,
+      "median_of_window_p99": 14.3,
+      "median_of_window_p999": 16.4,
+      "largest_window_p99": 16.4,
+      "largest_window_p999": 31.6,
+      "maximum": 31.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "market.root_queue.polymarket": {
+      "windows": 59,
+      "events": 1418190,
+      "median_of_window_medians": 7.2,
+      "median_of_window_p99": 15.4,
+      "median_of_window_p999": 20.5,
+      "largest_window_p99": 16.4,
+      "largest_window_p999": 24.6,
+      "maximum": 35.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "market.root_queue.other": {
+      "windows": 59,
+      "events": 172,
+      "median_of_window_medians": 7.5,
+      "median_of_window_p99": 10.3,
+      "median_of_window_p999": 10.3,
+      "largest_window_p99": 18.8,
+      "largest_window_p999": 18.8,
+      "maximum": 18.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "market.recorder.queue_wait": {
+      "windows": 59,
+      "events": 1627838,
+      "median_of_window_medians": 4.1,
+      "median_of_window_p99": 524.3,
+      "median_of_window_p999": 1700.0,
+      "largest_window_p99": 8390.0,
+      "largest_window_p999": 13630.0,
+      "maximum": 14380.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "strategy.market.queue": {
+      "windows": 59,
+      "events": 3984707,
+      "median_of_window_medians": 6.7,
+      "median_of_window_p99": 14.3,
+      "median_of_window_p999": 15.4,
+      "largest_window_p99": 14.3,
+      "largest_window_p999": 15.4,
+      "maximum": 250.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "strategy.market.receive_to_callback": {
+      "windows": 59,
+      "events": 3984162,
+      "median_of_window_medians": 26.6,
+      "median_of_window_p99": 106.5,
+      "median_of_window_p999": 131.1,
+      "largest_window_p99": 114.7,
+      "largest_window_p999": 131.1,
+      "maximum": 267.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "strategy.market.callback": {
+      "windows": 59,
+      "events": 3984707,
+      "median_of_window_medians": 1.5,
+      "median_of_window_p99": 26.6,
+      "median_of_window_p999": 49.2,
+      "largest_window_p99": 30.7,
+      "largest_window_p999": 57.3,
+      "maximum": 147.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "strategy.private_update.queue": {
+      "windows": 59,
+      "events": 12021,
+      "median_of_window_medians": 6.7,
+      "median_of_window_p99": 12.3,
+      "median_of_window_p999": 55.6,
+      "largest_window_p99": 147.5,
+      "largest_window_p999": 169.7,
+      "maximum": 169.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "strategy.private_update.callback": {
+      "windows": 59,
+      "events": 12021,
+      "median_of_window_medians": 57.3,
+      "median_of_window_p99": 88.6,
+      "median_of_window_p999": 88.9,
+      "largest_window_p99": 163.8,
+      "largest_window_p999": 244.4,
+      "maximum": 244.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "strategy.watchdog.callback": {
+      "windows": 59,
+      "events": 106650,
+      "median_of_window_medians": 2.3,
+      "median_of_window_p99": 8.2,
+      "median_of_window_p999": 15.0,
+      "largest_window_p99": 10.2,
+      "largest_window_p999": 491.5,
+      "maximum": 519.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "strategy.execution_capacity.publish_to_apply": {
+      "windows": 59,
+      "events": 112710,
+      "median_of_window_medians": 7.2,
+      "median_of_window_p99": 49.2,
+      "median_of_window_p999": 73.7,
+      "largest_window_p99": 61.4,
+      "largest_window_p999": 90.1,
+      "maximum": 162.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.bbo_receive_to_apply": {
+      "windows": 59,
+      "events": 3350079,
+      "median_of_window_medians": 26.6,
+      "median_of_window_p99": 106.5,
+      "median_of_window_p999": 131.1,
+      "largest_window_p99": 114.7,
+      "largest_window_p999": 137.9,
+      "maximum": 268.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.bbo_publish_to_apply": {
+      "windows": 59,
+      "events": 3350145,
+      "median_of_window_medians": 20.5,
+      "median_of_window_p99": 106.5,
+      "median_of_window_p999": 122.9,
+      "largest_window_p99": 114.7,
+      "largest_window_p999": 130.6,
+      "maximum": 260.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.snapshot_owner_roundtrip": {
+      "windows": 59,
+      "events": 342,
+      "median_of_window_medians": 58720.0,
+      "median_of_window_p99": 76810.0,
+      "median_of_window_p999": 76810.0,
+      "largest_window_p99": 170640.0,
+      "largest_window_p999": 170640.0,
+      "maximum": 170640.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.quote": {
+      "windows": 59,
+      "events": 107360,
+      "median_of_window_medians": 14.3,
+      "median_of_window_p99": 28.7,
+      "median_of_window_p999": 35.9,
+      "largest_window_p99": 32.8,
+      "largest_window_p999": 65.5,
+      "maximum": 65.9,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.order_update.route_lookup": {
+      "windows": 59,
+      "events": 23616,
+      "median_of_window_medians": 0.028,
+      "median_of_window_p99": 0.176,
+      "median_of_window_p999": 0.254,
+      "largest_window_p99": 0.315,
+      "largest_window_p999": 2.7,
+      "maximum": 2.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.order_update.trade_apply": {
+      "windows": 25,
+      "events": 827,
+      "median_of_window_medians": 15.4,
+      "median_of_window_p99": 24.6,
+      "median_of_window_p999": 25.8,
+      "largest_window_p99": 44.2,
+      "largest_window_p999": 44.2,
+      "maximum": 44.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.order_update.om_apply": {
+      "windows": 59,
+      "events": 23616,
+      "median_of_window_medians": 1.3,
+      "median_of_window_p99": 2.6,
+      "median_of_window_p999": 16.6,
+      "largest_window_p99": 18.4,
+      "largest_window_p999": 21.0,
+      "maximum": 21.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.order_update.hard_cap": {
+      "windows": 25,
+      "events": 275,
+      "median_of_window_medians": 1.0,
+      "median_of_window_p99": 1.3,
+      "median_of_window_p999": 1.3,
+      "largest_window_p99": 5.3,
+      "largest_window_p999": 5.3,
+      "maximum": 5.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.order_state.ws_to_om_apply": {
+      "windows": 59,
+      "events": 10814,
+      "median_of_window_medians": 36.9,
+      "median_of_window_p99": 122.9,
+      "median_of_window_p999": 139.8,
+      "largest_window_p99": 209.0,
+      "largest_window_p999": 262.0,
+      "maximum": 262.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.order_state.ws_to_om_apply.accepted": {
+      "windows": 58,
+      "events": 5393,
+      "median_of_window_medians": 32.8,
+      "median_of_window_p99": 103.6,
+      "median_of_window_p999": 116.55,
+      "largest_window_p99": 209.0,
+      "largest_window_p999": 262.0,
+      "maximum": 262.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.order_state.ws_to_om_apply.cancelled": {
+      "windows": 59,
+      "events": 5306,
+      "median_of_window_medians": 36.9,
+      "median_of_window_p99": 98.3,
+      "median_of_window_p999": 106.7,
+      "largest_window_p99": 211.3,
+      "largest_window_p999": 220.0,
+      "maximum": 220.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.order_state.direct_handoff_to_om_apply": {
+      "windows": 59,
+      "events": 10814,
+      "median_of_window_medians": 14.3,
+      "median_of_window_p99": 98.3,
+      "median_of_window_p999": 106.2,
+      "largest_window_p99": 187.0,
+      "largest_window_p999": 233.2,
+      "maximum": 233.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.order_state.ws_to_callback_done": {
+      "windows": 59,
+      "events": 10821,
+      "median_of_window_medians": 81.9,
+      "median_of_window_p99": 213.0,
+      "median_of_window_p999": 240.2,
+      "largest_window_p99": 360.4,
+      "largest_window_p999": 382.7,
+      "maximum": 382.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.exchange_event_to_private_producer": {
+      "windows": 25,
+      "events": 827,
+      "median_of_window_medians": 6290.0,
+      "median_of_window_p99": 23140.0,
+      "median_of_window_p999": 23810.0,
+      "largest_window_p99": 1020000.0,
+      "largest_window_p999": 1020000.0,
+      "maximum": 1020000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.private_producer_to_strategy_account_apply": {
+      "windows": 25,
+      "events": 827,
+      "median_of_window_medians": 41.0,
+      "median_of_window_p99": 84.8,
+      "median_of_window_p999": 84.8,
+      "largest_window_p99": 167.7,
+      "largest_window_p999": 167.7,
+      "maximum": 167.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.exchange_event_to_strategy_account_apply": {
+      "windows": 25,
+      "events": 827,
+      "median_of_window_medians": 6290.0,
+      "median_of_window_p99": 23180.0,
+      "median_of_window_p999": 23940.0,
+      "largest_window_p99": 1020000.0,
+      "largest_window_p999": 1020000.0,
+      "maximum": 1020000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.private_ws_to_json_parse": {
+      "windows": 25,
+      "events": 813,
+      "median_of_window_medians": 7.7,
+      "median_of_window_p99": 18.2,
+      "median_of_window_p999": 18.2,
+      "largest_window_p99": 69.6,
+      "largest_window_p999": 69.6,
+      "maximum": 69.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.private_json_parse_to_owner_dequeue": {
+      "windows": 25,
+      "events": 813,
+      "median_of_window_medians": 10.2,
+      "median_of_window_p99": 16.3,
+      "median_of_window_p999": 16.3,
+      "largest_window_p99": 57.3,
+      "largest_window_p999": 59.4,
+      "maximum": 59.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.private_owner_dequeue_to_producer": {
+      "windows": 25,
+      "events": 827,
+      "median_of_window_medians": 18.4,
+      "median_of_window_p99": 28.7,
+      "median_of_window_p999": 29.4,
+      "largest_window_p99": 37.8,
+      "largest_window_p999": 37.8,
+      "maximum": 37.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.private_producer_to_root_router": {
+      "windows": 25,
+      "events": 827,
+      "median_of_window_medians": 1.4,
+      "median_of_window_p99": 2.0,
+      "median_of_window_p999": 2.0,
+      "largest_window_p99": 15.4,
+      "largest_window_p999": 16.1,
+      "maximum": 16.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.root_router_to_strategy_account_apply": {
+      "windows": 25,
+      "events": 827,
+      "median_of_window_medians": 36.9,
+      "median_of_window_p99": 83.2,
+      "median_of_window_p999": 83.2,
+      "largest_window_p99": 166.8,
+      "largest_window_p999": 166.8,
+      "maximum": 166.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.private_ws_to_strategy_account_apply": {
+      "windows": 25,
+      "events": 813,
+      "median_of_window_medians": 81.9,
+      "median_of_window_p99": 127.8,
+      "median_of_window_p999": 127.8,
+      "largest_window_p99": 214.5,
+      "largest_window_p999": 214.5,
+      "maximum": 214.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.account_control_drain": {
+      "windows": 59,
+      "events": 106650,
+      "median_of_window_medians": 0.04,
+      "median_of_window_p99": 0.192,
+      "median_of_window_p999": 2.2,
+      "largest_window_p99": 1.9,
+      "largest_window_p999": 6.1,
+      "maximum": 7.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.account_snapshot": {
+      "windows": 59,
+      "events": 8889,
+      "median_of_window_medians": 0.16,
+      "median_of_window_p99": 7.8,
+      "median_of_window_p999": 9.0,
+      "largest_window_p99": 14.3,
+      "largest_window_p999": 18.1,
+      "maximum": 18.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.event_scan": {
+      "windows": 59,
+      "events": 106650,
+      "median_of_window_medians": 0.5760000000000001,
+      "median_of_window_p99": 0.8320000000000001,
+      "median_of_window_p999": 1.2,
+      "largest_window_p99": 1.0,
+      "largest_window_p999": 3.8,
+      "maximum": 7.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.fee_blocker": {
+      "windows": 59,
+      "events": 8886,
+      "median_of_window_medians": 0.07200000000000001,
+      "median_of_window_p99": 0.32,
+      "median_of_window_p999": 0.362,
+      "largest_window_p99": 0.448,
+      "largest_window_p999": 2.6,
+      "maximum": 2.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.inventory_ready": {
+      "windows": 59,
+      "events": 106650,
+      "median_of_window_medians": 0.08,
+      "median_of_window_p99": 0.448,
+      "median_of_window_p999": 0.768,
+      "largest_window_p99": 0.64,
+      "largest_window_p999": 61.3,
+      "maximum": 61.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.maintenance_control": {
+      "windows": 59,
+      "events": 8886,
+      "median_of_window_medians": 0.5760000000000001,
+      "median_of_window_p99": 1.3,
+      "median_of_window_p999": 1.4,
+      "largest_window_p99": 57.3,
+      "largest_window_p999": 81.3,
+      "maximum": 81.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.maintenance_status_drain": {
+      "windows": 59,
+      "events": 106650,
+      "median_of_window_medians": 0.07200000000000001,
+      "median_of_window_p99": 0.384,
+      "median_of_window_p999": 0.64,
+      "largest_window_p99": 0.5760000000000001,
+      "largest_window_p999": 0.862,
+      "maximum": 5.9,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.market_info": {
+      "windows": 59,
+      "events": 8889,
+      "median_of_window_medians": 1.4,
+      "median_of_window_p99": 3.3,
+      "median_of_window_p999": 7.1,
+      "largest_window_p99": 24.6,
+      "largest_window_p999": 26.3,
+      "maximum": 26.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.platform_status": {
+      "windows": 59,
+      "events": 106650,
+      "median_of_window_medians": 0.024,
+      "median_of_window_p99": 5.1,
+      "median_of_window_p999": 6.7,
+      "largest_window_p99": 5.6,
+      "largest_window_p999": 8.2,
+      "maximum": 23.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.recovery_apply": {
+      "windows": 59,
+      "events": 8889,
+      "median_of_window_medians": 0.48,
+      "median_of_window_p99": 0.96,
+      "median_of_window_p999": 1.0,
+      "largest_window_p99": 1.2,
+      "largest_window_p999": 2.8,
+      "maximum": 2.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.recovery_schedule": {
+      "windows": 59,
+      "events": 8889,
+      "median_of_window_medians": 0.12,
+      "median_of_window_p99": 0.32,
+      "median_of_window_p999": 0.354,
+      "largest_window_p99": 0.401,
+      "largest_window_p999": 0.445,
+      "maximum": 0.445,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.settled_gc_owner_apply": {
+      "windows": 59,
+      "events": 106650,
+      "median_of_window_medians": 0.04,
+      "median_of_window_p99": 0.224,
+      "median_of_window_p999": 0.5760000000000001,
+      "largest_window_p99": 0.5760000000000001,
+      "largest_window_p999": 0.96,
+      "maximum": 1.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.settled_persist": {
+      "windows": 59,
+      "events": 8886,
+      "median_of_window_medians": 0.192,
+      "median_of_window_p99": 0.6990000000000001,
+      "median_of_window_p999": 0.727,
+      "largest_window_p99": 13.3,
+      "largest_window_p999": 15.5,
+      "maximum": 15.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.settlement_fetch": {
+      "windows": 59,
+      "events": 8889,
+      "median_of_window_medians": 0.5760000000000001,
+      "median_of_window_p99": 1.2,
+      "median_of_window_p999": 1.2,
+      "largest_window_p99": 491.5,
+      "largest_window_p999": 516.7,
+      "maximum": 516.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.strike_fetch": {
+      "windows": 59,
+      "events": 8886,
+      "median_of_window_medians": 0.64,
+      "median_of_window_p99": 1.2,
+      "median_of_window_p999": 1.4,
+      "largest_window_p99": 2.6,
+      "largest_window_p999": 14.3,
+      "maximum": 14.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.taker_readiness": {
+      "windows": 59,
+      "events": 8886,
+      "median_of_window_medians": 0.256,
+      "median_of_window_p99": 0.64,
+      "median_of_window_p999": 0.676,
+      "largest_window_p99": 0.96,
+      "largest_window_p999": 4.6,
+      "maximum": 4.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "strategy.market.pending_depth": {
+      "windows": 59,
+      "events": 3984708,
+      "median_of_window_medians": 0.001,
+      "median_of_window_p99": 0.009000000000000001,
+      "median_of_window_p999": 0.015,
+      "largest_window_p99": 0.016,
+      "largest_window_p999": 0.018000000000000002,
+      "maximum": 0.02,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_bridge_queue": {
+      "windows": 59,
+      "events": 1418275,
+      "median_of_window_medians": 4.6,
+      "median_of_window_p99": 90.1,
+      "median_of_window_p999": 105.2,
+      "largest_window_p99": 98.3,
+      "largest_window_p999": 106.5,
+      "maximum": 107.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_runtime_scheduler_over_1ms": {
+      "windows": 59,
+      "events": 355506,
+      "median_of_window_medians": 26.6,
+      "median_of_window_p99": 122.9,
+      "median_of_window_p999": 175.7,
+      "largest_window_p99": 147.5,
+      "largest_window_p999": 180.2,
+      "maximum": 839.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_send.subscribe": {
+      "windows": 17,
+      "events": 40,
+      "median_of_window_medians": 9.1,
+      "median_of_window_p99": 9.4,
+      "median_of_window_p999": 9.4,
+      "largest_window_p99": 10.4,
+      "largest_window_p999": 10.4,
+      "maximum": 10.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_forward": {
+      "windows": 59,
+      "events": 1474770,
+      "median_of_window_medians": 3.3,
+      "median_of_window_p99": 4.6,
+      "median_of_window_p999": 7.2,
+      "largest_window_p99": 5.1,
+      "largest_window_p999": 24.6,
+      "maximum": 44.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_data_frame_gap": {
+      "windows": 59,
+      "events": 1474742,
+      "median_of_window_medians": 24.6,
+      "median_of_window_p99": 29360.0,
+      "median_of_window_p999": 83890.0,
+      "largest_window_p99": 134220.0,
+      "largest_window_p999": 335540.0,
+      "maximum": 1730000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_scheduler_lag": {
+      "windows": 59,
+      "events": 355493,
+      "median_of_window_medians": 1840.0,
+      "median_of_window_p99": 1840.0,
+      "median_of_window_p999": 1850.0,
+      "largest_window_p99": 1840.0,
+      "largest_window_p999": 1970.0,
+      "maximum": 2540.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_loop_scheduler_lag": {
+      "windows": 59,
+      "events": 355493,
+      "median_of_window_medians": 1840.0,
+      "median_of_window_p99": 1840.0,
+      "median_of_window_p999": 1850.0,
+      "largest_window_p99": 1840.0,
+      "largest_window_p999": 1970.0,
+      "maximum": 2540.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_loop_scheduler_over_1ms": {
+      "windows": 59,
+      "events": 355493,
+      "median_of_window_medians": 720.9,
+      "median_of_window_p99": 847.2,
+      "median_of_window_p999": 847.4,
+      "largest_window_p99": 852.0,
+      "largest_window_p999": 852.0,
+      "maximum": 1540.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.watchdog.seed_waits": {
+      "windows": 59,
+      "events": 8889,
+      "median_of_window_medians": 0.14400000000000002,
+      "median_of_window_p99": 0.5760000000000001,
+      "median_of_window_p999": 0.601,
+      "largest_window_p99": 0.768,
+      "largest_window_p999": 0.864,
+      "maximum": 0.864,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_socket_unread_probe": {
+      "windows": 59,
+      "events": 35549,
+      "median_of_window_medians": 0.8320000000000001,
+      "median_of_window_p99": 1.4,
+      "median_of_window_p999": 1.9,
+      "largest_window_p99": 1.7,
+      "largest_window_p999": 20.6,
+      "maximum": 20.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_standby_socket_unread_probe": {
+      "windows": 59,
+      "events": 35451,
+      "median_of_window_medians": 0.5760000000000001,
+      "median_of_window_p99": 0.96,
+      "median_of_window_p999": 1.1,
+      "largest_window_p99": 1.0,
+      "largest_window_p999": 21.0,
+      "maximum": 21.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "strategy.trigger_to_quote_signal": {
+      "windows": 58,
+      "events": 4197,
+      "median_of_window_medians": 81.9,
+      "median_of_window_p99": 108.5,
+      "median_of_window_p999": 108.6,
+      "largest_window_p99": 125.5,
+      "largest_window_p999": 125.5,
+      "maximum": 125.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "strategy.quote_signal_to_executor": {
+      "windows": 58,
+      "events": 5557,
+      "median_of_window_medians": 22.5,
+      "median_of_window_p99": 123.4,
+      "median_of_window_p999": 124.75,
+      "largest_window_p99": 276.8,
+      "largest_window_p999": 276.8,
+      "maximum": 276.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.connection_owner_queue": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 6.1,
+      "median_of_window_p99": 72.35,
+      "median_of_window_p999": 74.8,
+      "largest_window_p99": 143.7,
+      "largest_window_p999": 143.7,
+      "maximum": 143.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.post_only.quote_age_at_dispatch": {
+      "windows": 58,
+      "events": 5293,
+      "median_of_window_medians": 28.7,
+      "median_of_window_p99": 131.75,
+      "median_of_window_p999": 134.1,
+      "largest_window_p99": 284.2,
+      "largest_window_p999": 284.2,
+      "maximum": 284.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.trigger_age_at_dispatch": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 114.7,
+      "median_of_window_p99": 236.55,
+      "median_of_window_p999": 241.3,
+      "largest_window_p99": 395.9,
+      "largest_window_p999": 395.9,
+      "maximum": 395.9,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.update.root_router_to_instance_worker": {
+      "windows": 59,
+      "events": 12021,
+      "median_of_window_medians": 6.1,
+      "median_of_window_p99": 12.2,
+      "median_of_window_p999": 55.2,
+      "largest_window_p99": 147.5,
+      "largest_window_p999": 169.3,
+      "maximum": 169.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.attempt_quote_to_prep": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 30.7,
+      "median_of_window_p99": 134.2,
+      "median_of_window_p999": 135.3,
+      "largest_window_p99": 285.8,
+      "largest_window_p999": 285.8,
+      "maximum": 285.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.attempt_prep_to_signed": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 32.8,
+      "median_of_window_p99": 35.2,
+      "median_of_window_p999": 35.2,
+      "largest_window_p99": 38.3,
+      "largest_window_p999": 38.3,
+      "maximum": 38.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.place.runtime_queue": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 7.2,
+      "median_of_window_p99": 30.7,
+      "median_of_window_p999": 30.9,
+      "largest_window_p99": 64.3,
+      "largest_window_p999": 64.3,
+      "maximum": 64.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.attempt_signed_to_reserve": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 2.6,
+      "median_of_window_p99": 5.4,
+      "median_of_window_p999": 6.75,
+      "largest_window_p99": 24.1,
+      "largest_window_p999": 31.8,
+      "maximum": 31.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.attempt_reserve_to_http_dispatch": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 22.5,
+      "median_of_window_p99": 45.1,
+      "median_of_window_p999": 49.15,
+      "largest_window_p99": 81.9,
+      "largest_window_p999": 85.6,
+      "maximum": 85.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.place.network": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 50330.0,
+      "median_of_window_p99": 438710.0,
+      "median_of_window_p999": 495465.0,
+      "largest_window_p99": 2000000.0,
+      "largest_window_p999": 2000000.0,
+      "maximum": 2000000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.place.reply_enqueue": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 3.8,
+      "median_of_window_p99": 4.9,
+      "median_of_window_p999": 4.9,
+      "largest_window_p99": 7.9,
+      "largest_window_p999": 8.1,
+      "maximum": 8.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.completion_wait_response": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 50330.0,
+      "median_of_window_p99": 438730.0,
+      "median_of_window_p999": 495470.0,
+      "largest_window_p99": 2000000.0,
+      "largest_window_p999": 2000000.0,
+      "maximum": 2000000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.place_order": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 50330.0,
+      "median_of_window_p99": 438740.0,
+      "median_of_window_p999": 495480.0,
+      "largest_window_p99": 2000000.0,
+      "largest_window_p999": 2000000.0,
+      "maximum": 2000000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.response_ready_to_handler": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 5.6,
+      "median_of_window_p99": 6.4,
+      "median_of_window_p999": 6.4,
+      "largest_window_p99": 9.2,
+      "largest_window_p999": 62.3,
+      "maximum": 62.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.reply_enqueued_to_handler": {
+      "windows": 58,
+      "events": 5551,
+      "median_of_window_medians": 1.4,
+      "median_of_window_p99": 2.1,
+      "median_of_window_p999": 2.1500000000000004,
+      "largest_window_p99": 5.1,
+      "largest_window_p999": 60.4,
+      "maximum": 60.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.response_account_apply": {
+      "windows": 58,
+      "events": 5531,
+      "median_of_window_medians": 0.4,
+      "median_of_window_p99": 0.665,
+      "median_of_window_p999": 0.6890000000000001,
+      "largest_window_p99": 24.0,
+      "largest_window_p999": 24.0,
+      "maximum": 24.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.lifecycle_queue": {
+      "windows": 59,
+      "events": 10892,
+      "median_of_window_medians": 13.3,
+      "median_of_window_p99": 27.4,
+      "median_of_window_p999": 29.1,
+      "largest_window_p99": 57.8,
+      "largest_window_p999": 75.6,
+      "maximum": 75.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.attempt_dispatch_to_lifecycle_done": {
+      "windows": 58,
+      "events": 5552,
+      "median_of_window_medians": 50330.0,
+      "median_of_window_p99": 438750.0,
+      "median_of_window_p999": 495485.0,
+      "largest_window_p99": 2000000.0,
+      "largest_window_p999": 2000000.0,
+      "maximum": 2000000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.lifecycle_apply.lock_wait": {
+      "windows": 59,
+      "events": 10892,
+      "median_of_window_medians": 0.048,
+      "median_of_window_p99": 0.088,
+      "median_of_window_p999": 0.137,
+      "largest_window_p99": 0.198,
+      "largest_window_p999": 0.343,
+      "maximum": 0.343,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.lifecycle_apply.lock_wait.status_update": {
+      "windows": 58,
+      "events": 5586,
+      "median_of_window_medians": 0.048,
+      "median_of_window_p99": 0.096,
+      "median_of_window_p999": 0.1355,
+      "largest_window_p99": 0.198,
+      "largest_window_p999": 0.198,
+      "maximum": 0.198,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.lifecycle_apply.mutation": {
+      "windows": 59,
+      "events": 10892,
+      "median_of_window_medians": 10.2,
+      "median_of_window_p99": 11.3,
+      "median_of_window_p999": 12.2,
+      "largest_window_p99": 16.2,
+      "largest_window_p999": 146.2,
+      "maximum": 146.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.lifecycle_apply.persist_enqueue": {
+      "windows": 59,
+      "events": 10892,
+      "median_of_window_medians": 4.1,
+      "median_of_window_p99": 11.0,
+      "median_of_window_p999": 14.5,
+      "largest_window_p99": 20.5,
+      "largest_window_p999": 29.6,
+      "maximum": 29.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.lifecycle_apply.unattributed": {
+      "windows": 59,
+      "events": 10892,
+      "median_of_window_medians": 0.64,
+      "median_of_window_p99": 5.1,
+      "median_of_window_p999": 5.7,
+      "largest_window_p99": 12.6,
+      "largest_window_p999": 14.9,
+      "maximum": 14.9,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.lifecycle_apply.place_ack": {
+      "windows": 58,
+      "events": 5531,
+      "median_of_window_medians": 15.4,
+      "median_of_window_p99": 23.299999999999997,
+      "median_of_window_p999": 25.700000000000003,
+      "largest_window_p99": 39.4,
+      "largest_window_p999": 151.6,
+      "maximum": 151.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.direct_private_queue_high_water": {
+      "windows": 59,
+      "events": 11648,
+      "median_of_window_medians": 0.001,
+      "median_of_window_p99": 0.001,
+      "median_of_window_p999": 0.002,
+      "largest_window_p99": 0.002,
+      "largest_window_p999": 0.003,
+      "maximum": 0.003,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.retired_order_audit_lookup": {
+      "windows": 59,
+      "events": 10821,
+      "median_of_window_medians": 0.16,
+      "median_of_window_p99": 0.28800000000000003,
+      "median_of_window_p999": 0.308,
+      "largest_window_p99": 0.7020000000000001,
+      "largest_window_p999": 4.5,
+      "maximum": 4.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.account_order_reconcile_route": {
+      "windows": 59,
+      "events": 10821,
+      "median_of_window_medians": 1.4,
+      "median_of_window_p99": 3.1,
+      "median_of_window_p999": 5.3,
+      "largest_window_p99": 13.2,
+      "largest_window_p999": 155.5,
+      "maximum": 155.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.account_order_lifecycle_commit.live": {
+      "windows": 58,
+      "events": 5426,
+      "median_of_window_medians": 0.96,
+      "median_of_window_p99": 1.9,
+      "median_of_window_p999": 2.5,
+      "largest_window_p99": 14.6,
+      "largest_window_p999": 20.3,
+      "maximum": 20.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.account_order_lifecycle_commit": {
+      "windows": 59,
+      "events": 10820,
+      "median_of_window_medians": 2.8,
+      "median_of_window_p99": 26.6,
+      "median_of_window_p999": 30.9,
+      "largest_window_p99": 39.4,
+      "largest_window_p999": 75.8,
+      "maximum": 75.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.account_apply.order": {
+      "windows": 59,
+      "events": 10821,
+      "median_of_window_medians": 13.3,
+      "median_of_window_p99": 36.9,
+      "median_of_window_p999": 42.2,
+      "largest_window_p99": 49.2,
+      "largest_window_p999": 181.4,
+      "maximum": 181.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.mark_live_queue": {
+      "windows": 58,
+      "events": 5428,
+      "median_of_window_medians": 10.2,
+      "median_of_window_p99": 14.3,
+      "median_of_window_p999": 17.6,
+      "largest_window_p99": 36.0,
+      "largest_window_p999": 110.8,
+      "maximum": 110.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "strategy.private_direct.callback": {
+      "windows": 59,
+      "events": 11648,
+      "median_of_window_medians": 57.3,
+      "median_of_window_p99": 187.2,
+      "median_of_window_p999": 187.3,
+      "largest_window_p99": 378.3,
+      "largest_window_p999": 378.3,
+      "maximum": 378.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.attempt_audit_queue": {
+      "windows": 59,
+      "events": 10883,
+      "median_of_window_medians": 147.5,
+      "median_of_window_p99": 491.5,
+      "median_of_window_p999": 560.1,
+      "largest_window_p99": 2620.0,
+      "largest_window_p999": 2790.0,
+      "maximum": 2790.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.cancel.connection_owner_queue": {
+      "windows": 59,
+      "events": 5331,
+      "median_of_window_medians": 36.9,
+      "median_of_window_p99": 120.0,
+      "median_of_window_p999": 120.1,
+      "largest_window_p99": 162.3,
+      "largest_window_p999": 162.3,
+      "maximum": 162.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.cancel.signal_to_prep": {
+      "windows": 59,
+      "events": 5331,
+      "median_of_window_medians": 65.5,
+      "median_of_window_p99": 163.8,
+      "median_of_window_p999": 165.8,
+      "largest_window_p99": 213.2,
+      "largest_window_p999": 213.2,
+      "maximum": 213.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.cancel.runtime_queue": {
+      "windows": 59,
+      "events": 5423,
+      "median_of_window_medians": 10.2,
+      "median_of_window_p99": 31.4,
+      "median_of_window_p999": 31.6,
+      "largest_window_p99": 42.0,
+      "largest_window_p999": 42.5,
+      "maximum": 42.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.cancel.attempt_signal_to_prep": {
+      "windows": 59,
+      "events": 5331,
+      "median_of_window_medians": 61.4,
+      "median_of_window_p99": 163.8,
+      "median_of_window_p999": 165.2,
+      "largest_window_p99": 212.8,
+      "largest_window_p999": 212.8,
+      "maximum": 212.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.cancel.attempt_prep_to_http_dispatch": {
+      "windows": 59,
+      "events": 5331,
+      "median_of_window_medians": 18.4,
+      "median_of_window_p99": 28.7,
+      "median_of_window_p999": 29.5,
+      "largest_window_p99": 63.0,
+      "largest_window_p999": 66.4,
+      "maximum": 66.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.cancel.network": {
+      "windows": 59,
+      "events": 5423,
+      "median_of_window_medians": 33550.0,
+      "median_of_window_p99": 461320.0,
+      "median_of_window_p999": 496160.0,
+      "largest_window_p99": 2000000.0,
+      "largest_window_p999": 2000000.0,
+      "maximum": 2000000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.cancel.reply_enqueue": {
+      "windows": 59,
+      "events": 5423,
+      "median_of_window_medians": 3.8,
+      "median_of_window_p99": 6.5,
+      "median_of_window_p999": 6.5,
+      "largest_window_p99": 8.1,
+      "largest_window_p999": 14.3,
+      "maximum": 14.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.cancel_order": {
+      "windows": 59,
+      "events": 5423,
+      "median_of_window_medians": 33550.0,
+      "median_of_window_p99": 461340.0,
+      "median_of_window_p999": 496190.0,
+      "largest_window_p99": 2000000.0,
+      "largest_window_p999": 2000000.0,
+      "maximum": 2000000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.cancel.completion_wait_response": {
+      "windows": 59,
+      "events": 5331,
+      "median_of_window_medians": 37750.0,
+      "median_of_window_p99": 461320.0,
+      "median_of_window_p999": 496170.0,
+      "largest_window_p99": 2000000.0,
+      "largest_window_p999": 2000000.0,
+      "maximum": 2000000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.cancel.response_ready_to_handler": {
+      "windows": 59,
+      "events": 5331,
+      "median_of_window_medians": 9.2,
+      "median_of_window_p99": 14.3,
+      "median_of_window_p999": 14.5,
+      "largest_window_p99": 213.0,
+      "largest_window_p999": 242.6,
+      "maximum": 242.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.cancel.reply_enqueued_to_handler": {
+      "windows": 59,
+      "events": 5331,
+      "median_of_window_medians": 4.6,
+      "median_of_window_p99": 9.9,
+      "median_of_window_p999": 10.2,
+      "largest_window_p99": 213.0,
+      "largest_window_p999": 240.6,
+      "maximum": 240.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.cancel.response_account_apply": {
+      "windows": 59,
+      "events": 5331,
+      "median_of_window_medians": 1.9,
+      "median_of_window_p99": 7.6,
+      "median_of_window_p999": 8.3,
+      "largest_window_p99": 61.8,
+      "largest_window_p999": 64.2,
+      "maximum": 64.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.cancel.attempt_dispatch_to_lifecycle_done": {
+      "windows": 59,
+      "events": 5331,
+      "median_of_window_medians": 37750.0,
+      "median_of_window_p99": 461330.0,
+      "median_of_window_p999": 496190.0,
+      "largest_window_p99": 2000000.0,
+      "largest_window_p999": 2000000.0,
+      "maximum": 2000000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.lifecycle_apply.lock_wait.cancelled": {
+      "windows": 59,
+      "events": 5290,
+      "median_of_window_medians": 0.048,
+      "median_of_window_p99": 0.062,
+      "median_of_window_p999": 0.063,
+      "largest_window_p99": 0.17400000000000002,
+      "largest_window_p999": 0.17400000000000002,
+      "maximum": 0.17400000000000002,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.lifecycle_apply.cancelled": {
+      "windows": 59,
+      "events": 5290,
+      "median_of_window_medians": 0.96,
+      "median_of_window_p99": 19.4,
+      "median_of_window_p999": 19.8,
+      "largest_window_p99": 35.5,
+      "largest_window_p999": 35.5,
+      "maximum": 35.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.terminal_audit_route": {
+      "windows": 59,
+      "events": 6297,
+      "median_of_window_medians": 0.192,
+      "median_of_window_p99": 0.448,
+      "median_of_window_p999": 0.48,
+      "largest_window_p99": 5.1,
+      "largest_window_p999": 7.2,
+      "maximum": 7.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.terminal_audit_lifecycle_wait": {
+      "windows": 59,
+      "events": 6297,
+      "median_of_window_medians": 0.018000000000000002,
+      "median_of_window_p99": 0.023,
+      "median_of_window_p999": 0.023,
+      "largest_window_p99": 0.171,
+      "largest_window_p999": 0.171,
+      "maximum": 0.171,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.terminal_audit_critical": {
+      "windows": 59,
+      "events": 6297,
+      "median_of_window_medians": 18.4,
+      "median_of_window_p99": 28.0,
+      "median_of_window_p999": 29.0,
+      "largest_window_p99": 41.0,
+      "largest_window_p999": 73.6,
+      "maximum": 73.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.terminal_audit_commit": {
+      "windows": 59,
+      "events": 6297,
+      "median_of_window_medians": 18.4,
+      "median_of_window_p99": 81.9,
+      "median_of_window_p999": 87.2,
+      "largest_window_p99": 147.5,
+      "largest_window_p999": 193.3,
+      "maximum": 193.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.terminal_runtime_teardown": {
+      "windows": 59,
+      "events": 6248,
+      "median_of_window_medians": 0.8320000000000001,
+      "median_of_window_p99": 3.3,
+      "median_of_window_p999": 35.8,
+      "largest_window_p99": 68.2,
+      "largest_window_p999": 68.2,
+      "maximum": 68.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.account_order_lifecycle_commit.terminal": {
+      "windows": 59,
+      "events": 5394,
+      "median_of_window_medians": 20.5,
+      "median_of_window_p99": 29.5,
+      "median_of_window_p999": 30.5,
+      "largest_window_p99": 41.0,
+      "largest_window_p999": 75.7,
+      "maximum": 75.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_send.heartbeat_text": {
+      "windows": 59,
+      "events": 711,
+      "median_of_window_medians": 10.2,
+      "median_of_window_p99": 11.4,
+      "median_of_window_p999": 11.4,
+      "largest_window_p99": 34.0,
+      "largest_window_p999": 34.0,
+      "maximum": 34.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_send.heartbeat_frame": {
+      "windows": 59,
+      "events": 711,
+      "median_of_window_medians": 2.6,
+      "median_of_window_p99": 2.8,
+      "median_of_window_p999": 2.8,
+      "largest_window_p99": 3.7,
+      "largest_window_p999": 3.7,
+      "maximum": 3.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_standby_send.heartbeat_text": {
+      "windows": 59,
+      "events": 710,
+      "median_of_window_medians": 4.1,
+      "median_of_window_p99": 4.6,
+      "median_of_window_p999": 4.6,
+      "largest_window_p99": 6.6,
+      "largest_window_p999": 6.6,
+      "maximum": 6.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_standby_send.heartbeat_frame": {
+      "windows": 59,
+      "events": 710,
+      "median_of_window_medians": 1.8,
+      "median_of_window_p99": 2.2,
+      "median_of_window_p999": 2.2,
+      "largest_window_p99": 3.2,
+      "largest_window_p999": 3.2,
+      "maximum": 3.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.reconcile.runtime_queue": {
+      "windows": 58,
+      "events": 1706,
+      "median_of_window_medians": 15.4,
+      "median_of_window_p99": 57.35,
+      "median_of_window_p999": 57.35,
+      "largest_window_p99": 201.6,
+      "largest_window_p999": 201.6,
+      "maximum": 201.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.reconcile.network": {
+      "windows": 58,
+      "events": 1706,
+      "median_of_window_medians": 23070.0,
+      "median_of_window_p99": 175180.0,
+      "median_of_window_p999": 175180.0,
+      "largest_window_p99": 277830.0,
+      "largest_window_p999": 277830.0,
+      "maximum": 277830.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.get": {
+      "windows": 58,
+      "events": 1806,
+      "median_of_window_medians": 23070.0,
+      "median_of_window_p99": 175215.0,
+      "median_of_window_p999": 175215.0,
+      "largest_window_p99": 277860.0,
+      "largest_window_p999": 277860.0,
+      "maximum": 277860.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.trade_lifecycle_high_water": {
+      "windows": 27,
+      "events": 851,
+      "median_of_window_medians": 1.4,
+      "median_of_window_p99": 1.9,
+      "median_of_window_p999": 1.9,
+      "largest_window_p99": 2.6,
+      "largest_window_p999": 6.1,
+      "maximum": 6.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.account_trade_transition": {
+      "windows": 25,
+      "events": 827,
+      "median_of_window_medians": 30.7,
+      "median_of_window_p99": 44.1,
+      "median_of_window_p999": 44.1,
+      "largest_window_p99": 70.2,
+      "largest_window_p999": 76.9,
+      "maximum": 76.9,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.account_live_position": {
+      "windows": 25,
+      "events": 827,
+      "median_of_window_medians": 0.96,
+      "median_of_window_p99": 1.9,
+      "median_of_window_p999": 1.9,
+      "largest_window_p99": 3.5,
+      "largest_window_p999": 3.5,
+      "maximum": 3.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.account_apply.trade": {
+      "windows": 25,
+      "events": 827,
+      "median_of_window_medians": 57.3,
+      "median_of_window_p99": 75.0,
+      "median_of_window_p999": 75.7,
+      "largest_window_p99": 103.2,
+      "largest_window_p999": 103.2,
+      "maximum": 103.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.filled_cleanup_queue": {
+      "windows": 25,
+      "events": 827,
+      "median_of_window_medians": 18.4,
+      "median_of_window_p99": 55.9,
+      "median_of_window_p999": 55.9,
+      "largest_window_p99": 124.4,
+      "largest_window_p999": 124.4,
+      "maximum": 124.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.order.quote_age_at_dispatch": {
+      "windows": 25,
+      "events": 259,
+      "median_of_window_medians": 24.6,
+      "median_of_window_p99": 100.9,
+      "median_of_window_p999": 100.9,
+      "largest_window_p99": 138.8,
+      "largest_window_p999": 138.8,
+      "maximum": 138.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.orphan.age": {
+      "windows": 19,
+      "events": 52,
+      "median_of_window_medians": 0.001,
+      "median_of_window_p99": 0.001,
+      "median_of_window_p999": 0.001,
+      "largest_window_p99": 163910.0,
+      "largest_window_p999": 163910.0,
+      "maximum": 163910.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.orphan.coordinator_queue": {
+      "windows": 19,
+      "events": 126,
+      "median_of_window_medians": 61.4,
+      "median_of_window_p99": 94.5,
+      "median_of_window_p999": 94.5,
+      "largest_window_p99": 102620.0,
+      "largest_window_p999": 102620.0,
+      "maximum": 102620.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.reconcile.reply_enqueue": {
+      "windows": 19,
+      "events": 128,
+      "median_of_window_medians": 4.6,
+      "median_of_window_p99": 6.0,
+      "median_of_window_p999": 6.0,
+      "largest_window_p99": 8.7,
+      "largest_window_p999": 8.7,
+      "maximum": 8.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_checkpoint_source_age_at_publish": {
+      "windows": 24,
+      "events": 24,
+      "median_of_window_medians": 994.45,
+      "median_of_window_p99": 994.45,
+      "median_of_window_p999": 994.45,
+      "largest_window_p99": 218420.0,
+      "largest_window_p999": 218420.0,
+      "maximum": 218420.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "market.checkpoint_source_age_at_router": {
+      "windows": 24,
+      "events": 24,
+      "median_of_window_medians": 1060.7,
+      "median_of_window_p99": 1060.7,
+      "median_of_window_p999": 1060.7,
+      "largest_window_p99": 218440.0,
+      "largest_window_p999": 218440.0,
+      "maximum": 218440.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.bbo_checkpoint_source_age_at_apply": {
+      "windows": 22,
+      "events": 66,
+      "median_of_window_medians": 1100.0,
+      "median_of_window_p99": 1100.0,
+      "median_of_window_p999": 1100.0,
+      "largest_window_p99": 218460.0,
+      "largest_window_p999": 218460.0,
+      "maximum": 218460.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.fee.owner_rebuild": {
+      "windows": 12,
+      "events": 36,
+      "median_of_window_medians": 4.5,
+      "median_of_window_p99": 6.3,
+      "median_of_window_p999": 6.3,
+      "largest_window_p99": 8.1,
+      "largest_window_p999": 8.1,
+      "maximum": 8.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.inventory_ready.event_seed": {
+      "windows": 12,
+      "events": 36,
+      "median_of_window_medians": 36.7,
+      "median_of_window_p99": 36.95,
+      "median_of_window_p999": 36.95,
+      "largest_window_p99": 42.7,
+      "largest_window_p999": 42.7,
+      "maximum": 42.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.inventory_ready.strategy_account_split": {
+      "windows": 12,
+      "events": 36,
+      "median_of_window_medians": 4.4,
+      "median_of_window_p99": 4.65,
+      "median_of_window_p999": 4.65,
+      "largest_window_p99": 5.2,
+      "largest_window_p999": 5.2,
+      "maximum": 5.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.startup.seed.owner_apply": {
+      "windows": 12,
+      "events": 72,
+      "median_of_window_medians": 0.224,
+      "median_of_window_p99": 34.25,
+      "median_of_window_p999": 34.25,
+      "largest_window_p99": 40.6,
+      "largest_window_p999": 40.6,
+      "maximum": 40.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.startup.seed.outcomes": {
+      "windows": 12,
+      "events": 36,
+      "median_of_window_medians": 1.4,
+      "median_of_window_p99": 1.6,
+      "median_of_window_p999": 1.6,
+      "largest_window_p99": 1.9,
+      "largest_window_p999": 1.9,
+      "maximum": 1.9,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "strategy.market.checkpoint_source_age_at_callback": {
+      "windows": 22,
+      "events": 66,
+      "median_of_window_medians": 1100.0,
+      "median_of_window_p99": 1100.0,
+      "median_of_window_p999": 1100.0,
+      "largest_window_p99": 218460.0,
+      "largest_window_p999": 218460.0,
+      "maximum": 218460.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.fee.background_prepare": {
+      "windows": 12,
+      "events": 36,
+      "median_of_window_medians": 786.4,
+      "median_of_window_p99": 1835.0,
+      "median_of_window_p999": 1835.0,
+      "largest_window_p99": 2000.0,
+      "largest_window_p999": 2000.0,
+      "maximum": 2000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.history_archive.cold_commit": {
+      "windows": 10,
+      "events": 28,
+      "median_of_window_medians": 12125.0,
+      "median_of_window_p99": 12575.0,
+      "median_of_window_p999": 12575.0,
+      "largest_window_p99": 27310.0,
+      "largest_window_p999": 27310.0,
+      "maximum": 27310.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.route_reclaim.cold_drop": {
+      "windows": 12,
+      "events": 681,
+      "median_of_window_medians": 29.7,
+      "median_of_window_p99": 258.85,
+      "median_of_window_p999": 258.85,
+      "largest_window_p99": 379.0,
+      "largest_window_p999": 379.0,
+      "maximum": 379.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.route_reclaim.retirement_age": {
+      "windows": 12,
+      "events": 681,
+      "median_of_window_medians": 6030.0,
+      "median_of_window_p99": 31000.0,
+      "median_of_window_p999": 31000.0,
+      "largest_window_p99": 55480.0,
+      "largest_window_p999": 55480.0,
+      "maximum": 55480.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.owner_retirement": {
+      "windows": 12,
+      "events": 331,
+      "median_of_window_medians": 204.8,
+      "median_of_window_p99": 252.4,
+      "median_of_window_p999": 252.4,
+      "largest_window_p99": 350.4,
+      "largest_window_p999": 350.4,
+      "maximum": 350.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.event_audit.owner_queue": {
+      "windows": 12,
+      "events": 72,
+      "median_of_window_medians": 720.9,
+      "median_of_window_p99": 39810.0,
+      "median_of_window_p999": 39810.0,
+      "largest_window_p99": 70240.0,
+      "largest_window_p999": 70240.0,
+      "maximum": 70240.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.event_audit.apply": {
+      "windows": 12,
+      "events": 72,
+      "median_of_window_medians": 18870.0,
+      "median_of_window_p99": 39480.0,
+      "median_of_window_p999": 39480.0,
+      "largest_window_p99": 69770.0,
+      "largest_window_p999": 69770.0,
+      "maximum": 69770.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.safety_cancel.connection_owner_queue": {
+      "windows": 12,
+      "events": 36,
+      "median_of_window_medians": 98.3,
+      "median_of_window_p99": 175.85,
+      "median_of_window_p999": 175.85,
+      "largest_window_p99": 201.9,
+      "largest_window_p999": 201.9,
+      "maximum": 201.9,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.settled_gc_owner_queue": {
+      "windows": 12,
+      "events": 679,
+      "median_of_window_medians": 4455.0,
+      "median_of_window_p99": 8575.0,
+      "median_of_window_p999": 8575.0,
+      "largest_window_p99": 9910.0,
+      "largest_window_p999": 9910.0,
+      "maximum": 9910.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.settled_gc_owner_route_wait": {
+      "windows": 12,
+      "events": 684,
+      "median_of_window_medians": 0.019000000000000003,
+      "median_of_window_p99": 0.0865,
+      "median_of_window_p999": 0.0865,
+      "largest_window_p99": 0.325,
+      "largest_window_p999": 0.325,
+      "maximum": 0.325,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.settled_gc_owner_control_wait": {
+      "windows": 12,
+      "events": 679,
+      "median_of_window_medians": 0.015,
+      "median_of_window_p99": 0.0815,
+      "median_of_window_p999": 0.0815,
+      "largest_window_p99": 0.29,
+      "largest_window_p999": 0.29,
+      "maximum": 0.29,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.settled_gc_owner_state_wait": {
+      "windows": 12,
+      "events": 679,
+      "median_of_window_medians": 0.014,
+      "median_of_window_p99": 0.0695,
+      "median_of_window_p999": 0.0695,
+      "largest_window_p99": 0.17200000000000001,
+      "largest_window_p999": 0.17200000000000001,
+      "maximum": 0.17200000000000001,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.settled_gc_owner_lifecycle_wait": {
+      "windows": 12,
+      "events": 679,
+      "median_of_window_medians": 0.014,
+      "median_of_window_p99": 0.1475,
+      "median_of_window_p999": 0.1475,
+      "largest_window_p99": 0.259,
+      "largest_window_p999": 0.259,
+      "maximum": 0.259,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.settled_gc_owner_select": {
+      "windows": 12,
+      "events": 679,
+      "median_of_window_medians": 5.6,
+      "median_of_window_p99": 23.35,
+      "median_of_window_p999": 23.35,
+      "largest_window_p99": 27.8,
+      "largest_window_p999": 27.8,
+      "maximum": 27.8,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.settled_gc_persist_capture": {
+      "windows": 12,
+      "events": 689,
+      "median_of_window_medians": 5.1,
+      "median_of_window_p99": 395.5,
+      "median_of_window_p999": 395.5,
+      "largest_window_p99": 472.4,
+      "largest_window_p999": 472.4,
+      "maximum": 472.4,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.settled_gc_owner_routes": {
+      "windows": 12,
+      "events": 679,
+      "median_of_window_medians": 122.9,
+      "median_of_window_p99": 203.2,
+      "median_of_window_p999": 203.2,
+      "largest_window_p99": 279.5,
+      "largest_window_p999": 279.5,
+      "maximum": 279.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.settled_gc_owner_critical": {
+      "windows": 12,
+      "events": 679,
+      "median_of_window_medians": 147.5,
+      "median_of_window_p99": 665.5,
+      "median_of_window_p999": 665.5,
+      "largest_window_p99": 799.7,
+      "largest_window_p999": 799.7,
+      "maximum": 799.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.settled_gc_owner_apply": {
+      "windows": 12,
+      "events": 684,
+      "median_of_window_medians": 180.2,
+      "median_of_window_p99": 716.75,
+      "median_of_window_p999": 716.75,
+      "largest_window_p99": 830.2,
+      "largest_window_p999": 830.2,
+      "maximum": 830.2,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.order_state.ws_to_om_apply.filled": {
+      "windows": 19,
+      "events": 88,
+      "median_of_window_medians": 49.2,
+      "median_of_window_p99": 139.8,
+      "median_of_window_p999": 139.8,
+      "largest_window_p99": 158.5,
+      "largest_window_p999": 158.5,
+      "maximum": 158.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.query.runtime_queue": {
+      "windows": 19,
+      "events": 100,
+      "median_of_window_medians": 9.2,
+      "median_of_window_p99": 18.1,
+      "median_of_window_p999": 18.1,
+      "largest_window_p99": 54.7,
+      "largest_window_p999": 54.7,
+      "maximum": 54.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.query.network": {
+      "windows": 19,
+      "events": 100,
+      "median_of_window_medians": 25170.0,
+      "median_of_window_p99": 35690.0,
+      "median_of_window_p999": 35690.0,
+      "largest_window_p99": 261019.99999999997,
+      "largest_window_p999": 261019.99999999997,
+      "maximum": 261019.99999999997,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.recovery.event_end_lookup": {
+      "windows": 15,
+      "events": 29,
+      "median_of_window_medians": 23070.0,
+      "median_of_window_p99": 25480.0,
+      "median_of_window_p999": 25480.0,
+      "largest_window_p99": 258890.0,
+      "largest_window_p999": 258890.0,
+      "maximum": 258890.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.lifecycle_apply.status_update": {
+      "windows": 16,
+      "events": 55,
+      "median_of_window_medians": 14.3,
+      "median_of_window_p99": 15.95,
+      "median_of_window_p999": 15.95,
+      "largest_window_p99": 20.7,
+      "largest_window_p999": 20.7,
+      "maximum": 20.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.connect": {
+      "windows": 12,
+      "events": 28,
+      "median_of_window_medians": 0.001,
+      "median_of_window_p99": 0.001,
+      "median_of_window_p999": 0.001,
+      "largest_window_p99": 0.001,
+      "largest_window_p999": 0.001,
+      "maximum": 0.001,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.dns": {
+      "windows": 12,
+      "events": 28,
+      "median_of_window_medians": 484.4,
+      "median_of_window_p99": 570.95,
+      "median_of_window_p999": 570.95,
+      "largest_window_p99": 1590.0,
+      "largest_window_p999": 1590.0,
+      "maximum": 1590.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.tcp": {
+      "windows": 12,
+      "events": 28,
+      "median_of_window_medians": 2580.0,
+      "median_of_window_p99": 2595.0,
+      "median_of_window_p999": 2595.0,
+      "largest_window_p99": 5240.0,
+      "largest_window_p999": 5240.0,
+      "maximum": 5240.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.tls": {
+      "windows": 12,
+      "events": 28,
+      "median_of_window_medians": 3410.0,
+      "median_of_window_p99": 3890.0,
+      "median_of_window_p999": 3890.0,
+      "largest_window_p99": 6700.0,
+      "largest_window_p999": 6700.0,
+      "maximum": 6700.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.transparent_reconnect": {
+      "windows": 12,
+      "events": 28,
+      "median_of_window_medians": 0.001,
+      "median_of_window_p99": 0.001,
+      "median_of_window_p999": 0.001,
+      "largest_window_p99": 0.001,
+      "largest_window_p999": 0.001,
+      "maximum": 0.001,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "strategy.execution_capacity.resume_to_quote": {
+      "windows": 6,
+      "events": 68,
+      "median_of_window_medians": 18.4,
+      "median_of_window_p99": 65.3,
+      "median_of_window_p999": 65.3,
+      "largest_window_p99": 165.6,
+      "largest_window_p999": 165.6,
+      "maximum": 165.6,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "strategy.execution_capacity.requote": {
+      "windows": 6,
+      "events": 68,
+      "median_of_window_medians": 28.7,
+      "median_of_window_p99": 51.099999999999994,
+      "median_of_window_p999": 51.099999999999994,
+      "largest_window_p99": 65.7,
+      "largest_window_p999": 65.7,
+      "maximum": 65.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.settled_gc_owner_control_busy": {
+      "windows": 2,
+      "events": 5,
+      "median_of_window_medians": 0.001,
+      "median_of_window_p99": 0.001,
+      "median_of_window_p999": 0.001,
+      "largest_window_p99": 0.001,
+      "largest_window_p999": 0.001,
+      "maximum": 0.001,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.lifecycle_apply.lock_wait.rejected": {
+      "windows": 6,
+      "events": 16,
+      "median_of_window_medians": 0.16,
+      "median_of_window_p99": 0.258,
+      "median_of_window_p999": 0.258,
+      "largest_window_p99": 0.343,
+      "largest_window_p999": 0.343,
+      "maximum": 0.343,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.account.lifecycle_apply.rejected": {
+      "windows": 6,
+      "events": 16,
+      "median_of_window_medians": 20.5,
+      "median_of_window_p99": 21.95,
+      "median_of_window_p999": 21.95,
+      "largest_window_p99": 24.5,
+      "largest_window_p999": 24.5,
+      "maximum": 24.5,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.orphan.lock_release_to_delayed_fill": {
+      "windows": 9,
+      "events": 18,
+      "median_of_window_medians": 0.001,
+      "median_of_window_p99": 0.001,
+      "median_of_window_p999": 0.001,
+      "largest_window_p99": 32930.0,
+      "largest_window_p999": 32930.0,
+      "maximum": 32930.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.unaudited_bridge.age": {
+      "windows": 3,
+      "events": 5,
+      "median_of_window_medians": 24.6,
+      "median_of_window_p99": 1130.0,
+      "median_of_window_p999": 1130.0,
+      "largest_window_p99": 32930.0,
+      "largest_window_p999": 32930.0,
+      "maximum": 32930.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.ws.clob_hot_failover": {
+      "windows": 3,
+      "events": 3,
+      "median_of_window_medians": 21.8,
+      "median_of_window_p99": 21.8,
+      "median_of_window_p999": 21.8,
+      "largest_window_p99": 24.3,
+      "largest_window_p999": 24.3,
+      "maximum": 24.3,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.owner_replay_skip": {
+      "windows": 5,
+      "events": 24,
+      "median_of_window_medians": 0.001,
+      "median_of_window_p99": 0.001,
+      "median_of_window_p999": 0.001,
+      "largest_window_p99": 0.001,
+      "largest_window_p999": 0.001,
+      "maximum": 0.001,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.user.cold_committed_skip": {
+      "windows": 11,
+      "events": 27,
+      "median_of_window_medians": 0.001,
+      "median_of_window_p99": 0.001,
+      "median_of_window_p999": 0.001,
+      "largest_window_p99": 0.001,
+      "largest_window_p999": 0.001,
+      "maximum": 0.001,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.strategy.order_state.ws_to_om_apply.partially_filled": {
+      "windows": 12,
+      "events": 27,
+      "median_of_window_medians": 128.35000000000002,
+      "median_of_window_p99": 139.3,
+      "median_of_window_p999": 139.3,
+      "largest_window_p99": 193.1,
+      "largest_window_p999": 193.1,
+      "maximum": 193.1,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.query.reply_enqueue": {
+      "windows": 10,
+      "events": 31,
+      "median_of_window_medians": 4.6,
+      "median_of_window_p99": 4.95,
+      "median_of_window_p999": 4.95,
+      "largest_window_p99": 6.7,
+      "largest_window_p999": 6.7,
+      "maximum": 6.7,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    },
+    "polymarket.http.incomplete.ttfb": {
+      "windows": 3,
+      "events": 23,
+      "median_of_window_medians": 2000000.0,
+      "median_of_window_p99": 2000000.0,
+      "median_of_window_p999": 2000000.0,
+      "largest_window_p99": 2000000.0,
+      "largest_window_p999": 2000000.0,
+      "maximum": 2000000.0,
+      "boundary": "Minute summaries, NOT pooled event quantiles."
+    }
+  }
+}

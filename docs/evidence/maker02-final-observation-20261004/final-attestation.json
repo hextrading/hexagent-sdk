@@ -1,0 +1,37 @@
+{
+  "observed_utc": "2026-10-04T21:13:34.410634+00:00",
+  "main": "9b69c8f18efd22a9a4a6d06ae4db527329158805",
+  "branch": "main",
+  "tracked_status": "",
+  "pid": 2491935,
+  "start_ticks": 183828101,
+  "running_pids": [
+    2491935
+  ],
+  "binary_sha256": "6bee06cf34ba94a0d59ed0e7a09519c8d8c06930a1610a9f08ecfe94fac049d6",
+  "configs": {
+    "config/live_polymaker.toml": "93a588c7efbc322b8869705c07e269dc5f176386a34f87fd0b31b4fd066898a9",
+    "config/live/poly_btc5m_01.toml": "d10304e5f512485bc73fdb08d9fe3e0547a4dcec2a2e460d73c46f75c74ccbd0",
+    "config/live/poly_btc5m_02.toml": "58e417fea9175d5c130326b7e141207c4a9f69617bd4c709ae706f3568488ea9",
+    "config/live/poly_btc5m_03.toml": "c1088bbf73978b53e295a9f77f7a056603c66b884b551677ce005305879c58fc"
+  },
+  "sdk_cargo_revisions": [
+    "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+    "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+    "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+    "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+    "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+    "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+    "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2"
+  ],
+  "sdk_lock_revisions": [
+    "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+    "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+    "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+    "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+    "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+    "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2",
+    "4ce2435faf0090f65d531a6eb39ba6a7c734e0e2"
+  ],
+  "thread_count": 138
+}
