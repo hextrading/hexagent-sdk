@@ -150,6 +150,11 @@ pub struct OsTuneConfig {
     /// single core 0 (legacy default).
     #[serde(default)]
     pub background_cores: Vec<usize>,
+    /// Optional dedicated SCHED_OTHER CPU for the live/paper archive writer.
+    /// In strict mode it must be disjoint from background and critical roles.
+    /// Unset preserves the legacy background pool placement.
+    #[serde(default)]
+    pub recorder_core: Option<usize>,
     pub fifo_async_rt: Option<u8>,
     pub fifo_strategy: Option<u8>,
     pub fifo_execution: Option<u8>,
@@ -196,6 +201,7 @@ impl Default for OsTuneConfig {
             poly_cancel_cores: Vec::new(),
             poly_completion_cores: Vec::new(),
             background_cores: Vec::new(),
+            recorder_core: None,
             fifo_async_rt: None,
             fifo_strategy: None,
             fifo_execution: None,
