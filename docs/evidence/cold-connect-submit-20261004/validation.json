@@ -31,7 +31,7 @@
   },
   "workspace_all_targets_locked_check": {
     "passed": true,
-    "log_sha256": "7b1fefb4419006f8d342f8d288f871c34b9df60ff12444fc7499230796511d47"
+    "log_sha256": "beaab2f728db5ff5d20545828dfc43215c9e5abf96e38241bbf485ffcac41882"
   },
   "runtime_arm": {
     "passed": 115,
@@ -41,10 +41,12 @@
   "latency_csv_test": {
     "passed": 3,
     "ignored": 0,
-    "sha256": "9caf30b112a83e1b6f79f0ccfb66f1cd415b500f78ee7ad29f29efcc7cf2359a"
+    "sha256": "9caf30b112a83e1b6f79f0ccfb66f1cd415b500f78ee7ad29f29efcc7cf2359a",
+    "command": "cargo test -p hexagent-runtime --lib --locked latency_record::tests"
   },
   "worker-creation-arm.log": {
-    "sha256": "67fe6989bda3de08022fe8326d19f641ea505b4a94edfef40b82370b633dbf66"
+    "sha256": "4ec1e07d17cbcb7e5f0ffb4af10fafe45ac9ee822b3951d6c813a08d1bf4cb7c",
+    "source_sha256": "67fe6989bda3de08022fe8326d19f641ea505b4a94edfef40b82370b633dbf66"
   },
   "tls-arm.log": {
     "sha256": "f46f442bc242403ab1b0bc60a89fcbe23b4281fee6085ede11aee2734c9205e0"

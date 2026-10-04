@@ -5722,10 +5722,14 @@ impl SharedState {
         let execution = self.execution_snapshot();
         // Runtime ownership survives terminal open-order removal. The durable
         // fallback is restricted to this cold reconcile path, never cancel prep.
-        let ownership = self
-            .runtime_order_ownership
-            .get(order_id)
-            .or_else(|| self.account_state.order(client_order_id));
+        let ownership = match self.runtime_order_ownership.get(order_id) {
+            Some(order) => Some(order),
+            // Reporting projections may lag a completed lifecycle command.
+            // This fallback is cold-only: query the sole lifecycle writer,
+            // retaining the existing bounded admission and failure semantics.
+            None => self.account_state.recovery_order(client_order_id)
+                .map_err(|_| "lifecycle_owner_unavailable")?,
+        };
         validated_reconcile_order_identity(
             self.account_state.account_id(),
             client_order_id,

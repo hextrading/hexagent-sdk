@@ -134,8 +134,8 @@ fn reconcile_cancel_preserves_sell_and_buy_identity_after_cleanup_and_duplicate_
                 updates[0].error.as_deref(),
                 Some(ORPHAN_RECONCILE_AUTHORITATIVE_TERMINAL)
             );
-            // A cold owner read is a FIFO barrier after audit/teardown jobs.
-            let terminal = shared.account_state.order(coid).unwrap();
+            shared.flush_execution_state_for_test();
+            let terminal = shared.account_state.recovery_order(coid).unwrap().unwrap();
             assert_eq!(terminal.reserved_cash, 0.0, "duplicate={duplicate}");
             assert_eq!(terminal.reserved_quantity, 0.0, "duplicate={duplicate}");
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -194,13 +194,33 @@ fn reconcile_retry_and_filled_pending_audit_keep_original_identity_and_reservati
             if status != OrderStatus::Filled {
                 assert_eq!(updates[0].error.as_deref(), Some("retry-after=1000"));
             }
-            let retained = shared.account_state.order(coid).unwrap();
+            shared.flush_execution_state_for_test();
+            let retained = shared.account_state.recovery_order(coid).unwrap().unwrap();
+            assert_eq!(retained.status, status);
             assert_eq!(retained.reserved_cash, order.reserved_cash);
             assert_eq!(retained.reserved_quantity, order.reserved_quantity);
         }
     }
     shutdown.request();
     shutdown.finish();
+    assert_eq!(shared.join_background_workers(), 3);
+}
+
+#[test]
+fn cold_reconcile_fallback_reads_owner_and_keeps_instance_and_generation_fences() {
+    let shutdown = ShutdownToken::new();
+    let trade = super::tests::shutdown_test_trade(shutdown.clone());
+    let shared = trade.shared_state();
+    let order = ownership(Side::Sell, "fallback-sell", "0x7733", "btc01");
+    install(&shared, &order);
+    shared.runtime_order_ownership.remove(&order.order_id);
+    let identity = shared.reconcile_order_identity(&order.client_order_id, &order.order_id).unwrap();
+    assert_eq!(identity.instance_id, order.instance_id);
+    assert_eq!(identity.order_slot, order.order_slot);
+    assert_eq!(identity.side, Side::Sell);
+    assert!(shared.reconcile_order_identity(&order.client_order_id, "0x7744").is_err());
+    assert!(shared.reconcile_order_identity("sibling", &order.order_id).is_err());
+    shutdown.request(); shutdown.finish();
     assert_eq!(shared.join_background_workers(), 3);
 }
 
