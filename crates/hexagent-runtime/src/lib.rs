@@ -13,6 +13,7 @@ pub use hexagent_config::config;
 pub mod async_rt;
 pub mod background_jobs;
 pub mod cold_rpc_jobs;
+pub mod cold_connect_submit;
 pub mod http1_pool;
 pub mod instrumented_http1;
 pub mod latency;

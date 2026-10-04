@@ -195,9 +195,14 @@ pub fn current_cancel_timeout() -> Duration {
 /// call multiple times; only the first call has effect. Must be invoked
 /// once during process startup (e.g. at the top of `main`).
 pub fn init() -> Result<()> {
+    // Startup callers can race (including embedding applications). Serialize
+    // construction before publishing handles; no runtime task uses this lock.
+    static STARTUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _startup = STARTUP.lock().map_err(|_| anyhow!("runtime startup lock poisoned"))?;
     if RUNTIME_HANDLE.get().is_some() {
         return Ok(());
     }
+    crate::cold_connect_submit::prewarm().map_err(|error| anyhow!(error))?;
     // Spawn the runtime on a dedicated thread. The thread owns the
     // `Runtime` value, which it keeps alive by parking on
     // `runtime.block_on(pending_future)` so the runtime never shuts down

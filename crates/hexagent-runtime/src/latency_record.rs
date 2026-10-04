@@ -407,22 +407,17 @@ mod tests {
 
     #[test]
     fn maybe_flush_is_noop_within_same_bucket() {
-        let dir = tmp_dir("bucket");
-        let recorder = LatencyRecorder::new(dir.to_str().unwrap(), "start");
-        recorder.record("m", RequestKind::Place, 1.0, RequestStatus::Ok);
+        // Inspect the publication lane directly. A fixed number of yields
+        // cannot guarantee that a background file writer has been scheduled.
+        let (tx, rx) = bounded(2);
+        let recorder = LatencyRecorder { tx, last_flush_bucket: AtomicU64::new(current_bucket() + 1), dropped: AtomicU64::new(0) };
         recorder.maybe_flush();
-        assert!(list_probe_files(&dir).is_empty());
+        assert!(matches!(rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
         recorder.last_flush_bucket.store(0, Ordering::Relaxed);
         recorder.maybe_flush();
-        // Flush messages preserve FIFO order behind the record.
-        for _ in 0..100 {
-            if !list_probe_files(&dir).is_empty() {
-                break;
-            }
-            std::thread::yield_now();
-        }
-        assert_eq!(list_probe_files(&dir).len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(rx.try_recv(), Ok(WriterMessage::Flush(None))));
+        recorder.maybe_flush();
+        assert!(matches!(rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
     }
 
     #[test]
