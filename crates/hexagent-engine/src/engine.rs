@@ -2112,6 +2112,23 @@ fn stamp_quote_trigger(signals: &mut [Signal], trigger: &OrderBookSnapshot, log_
     }
 }
 
+/// Stamp immediately after the execution ingress returns its owned signal,
+/// before routing identity lookup and command/admission construction.
+fn stamp_execution_receive(signal: &mut Signal, received: u64) {
+    match signal {
+        Signal::NewOrder(order) => order.hot_path.executor_received_mono_ns = received,
+        Signal::BatchNewOrders { orders, .. } => for order in orders { order.hot_path.executor_received_mono_ns = received; },
+        Signal::BatchUpdateOrders { place_orders, cancel_trigger, .. }
+        | Signal::ReplaceOrder { place_orders, cancel_trigger, .. } => {
+            for order in place_orders { order.hot_path.executor_received_mono_ns = received; }
+            cancel_trigger.hot_path.executor_received_mono_ns = received;
+        }
+        Signal::CancelOrder { cancel_trigger, .. }
+        | Signal::BatchCancelOrders { cancel_trigger, .. } => cancel_trigger.hot_path.executor_received_mono_ns = received,
+        _ => {}
+    }
+}
+
 /// Recovery calculates at current owner-processing time. The original
 /// publication delay has its own metric and is never a replayable order price.
 fn stamp_execution_requote(signals: &mut [Signal], processing_ns: u64) {
@@ -10285,6 +10302,9 @@ impl Engine {
                         let Some(queued) = resolve_market_event(queued, &latest_market) else {
                             continue;
                         };
+                        // Latest-value markers can resolve to a newer snapshot.
+                        // Stamp after taking that causal payload, before metrics.
+                        let strategy_dequeued_mono_ns = crate::types::monotonic_now_ns();
                         if matches!(queued.event.as_ref(), MarketEvent::Exit) {
                         heartbeat.store(elapsed_ns(&clock_origin), Ordering::Release);
                         if !shutdown_started {
@@ -10300,7 +10320,6 @@ impl Engine {
                             "strategy.market.queue",
                             market_queue_monotonic_ns().saturating_sub(queued.enqueued_ns),
                         );
-                        let strategy_dequeued_mono_ns = crate::types::monotonic_now_ns();
                         let event = queued.event;
                         if let Some(age) = market_receive_age_ns(&event, crate::types::now_ns()) {
                             crate::latency::observe_ns(market_source_age_stage(&event,
@@ -13368,7 +13387,8 @@ impl Engine {
                             }
                         }
                     };
-                    let Some(routed) = routed else { continue };
+                    let Some(mut routed) = routed else { continue };
+                    stamp_execution_receive(&mut routed.signal, crate::types::monotonic_now_ns());
                     let embedded_instance_id = extract_instance_id(&routed.signal);
                     let numeric_instance_id = (routed.owner != SYSTEM_SIGNAL_OWNER)
                         .then(|| owner_instance_ids.get(routed.owner as usize))
@@ -16501,27 +16521,14 @@ fn dispatch_probe_http(request: ProbeHttpRequest, routes: &mut PolyAccountConnec
 }
 
 fn dispatch_poly_signal_to_connection_owner(
-    mut signal: Signal,
+    signal: Signal,
     stale_ms: u64,
     update_tx: ExecutorUpdateSender,
     routes: &mut PolyAccountConnectionRoutes,
 ) -> bool {
     use hexagent_runtime::http1_pool::Role;
-    let received = hexagent_types::types::monotonic_now_ns();
     let instance_id = extract_instance_id(&signal);
     log_executor_receive(&signal);
-    match &mut signal {
-        Signal::NewOrder(order) => order.hot_path.executor_received_mono_ns = received,
-        Signal::BatchNewOrders { orders, .. } => for order in orders { order.hot_path.executor_received_mono_ns = received; },
-        Signal::BatchUpdateOrders { place_orders, cancel_trigger, .. }
-        | Signal::ReplaceOrder { place_orders, cancel_trigger, .. } => {
-            for order in place_orders { order.hot_path.executor_received_mono_ns = received; }
-            cancel_trigger.hot_path.executor_received_mono_ns = received;
-        }
-        Signal::CancelOrder { cancel_trigger, .. }
-        | Signal::BatchCancelOrders { cancel_trigger, .. } => cancel_trigger.hot_path.executor_received_mono_ns = received,
-        _ => {}
-    }
     match signal {
         Signal::NewOrder(order) if order.exchange == Exchange::Polymarket => {
             let command = PolyConnectionCommand::Place {
@@ -19562,6 +19569,8 @@ mod market_router_tests {
 
         stamp_quote_trigger(&mut signals, &trigger, false, crate::types::monotonic_now_ns());
 
+        let received = crate::types::monotonic_now_ns();
+        for signal in &mut signals { stamp_execution_receive(signal, received); }
         let orders: Vec<&OrderRequest> = signals
             .iter()
             .flat_map(|signal| match signal {
@@ -19572,6 +19581,7 @@ mod market_router_tests {
             .collect();
         assert_eq!(orders.len(), 2);
         for order in orders {
+            assert_eq!(order.hot_path.executor_received_mono_ns, received);
             assert_eq!(order.hot_path.receipt, trigger.receipt);
             assert_eq!(order.hot_path.clock_domain_ns, trigger.receipt.clock_domain_ns);
             assert!(order.hot_path.signal_mono_ns >= order.hot_path.strategy_dequeued_mono_ns);
