@@ -2,11 +2,13 @@ pub mod event;
 pub mod instrument;
 pub mod market;
 pub mod order;
+pub mod hot_path;
 
 pub use event::*;
 pub use instrument::*;
 pub use market::*;
 pub use order::*;
+pub use hot_path::*;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -41,14 +43,21 @@ pub fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
-/// Process-local monotonic timestamp for cross-thread latency traces. Values
-/// are meaningful only within one process generation and deliberately never
-/// participate in exchange/business timestamps or persistence.
+struct TraceClock { origin: Instant, epoch_unix_ns: u64 }
+fn trace_clock() -> &'static TraceClock {
+    static CLOCK: OnceLock<TraceClock> = OnceLock::new();
+    CLOCK.get_or_init(|| TraceClock { origin: Instant::now(), epoch_unix_ns: now_ns() })
+}
+
+/// Persisted monotonic values are comparable only inside this clock domain.
+/// It is initialized once before live workers, never a business clock.
+pub fn monotonic_clock_domain_ns() -> u64 { trace_clock().epoch_unix_ns }
+
+/// Process-local monotonic timestamp for cross-thread latency traces. Persist
+/// with monotonic_clock_domain_ns; never use it for freshness or exchange time.
 #[inline]
 pub fn monotonic_now_ns() -> u64 {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    (EPOCH
-        .get_or_init(Instant::now)
+    (trace_clock().origin
         .elapsed()
         .as_nanos()
         .min(u64::MAX as u128) as u64)

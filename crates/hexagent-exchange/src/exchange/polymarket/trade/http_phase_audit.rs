@@ -78,7 +78,7 @@ impl HttpPhaseAudit {
 impl HttpPhaseRecord {
     pub fn value(&self, account: &str) -> serde_json::Value {
         let t = self.timings;
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "kind": "http_phase", "account": account,
             "attempt_id": self.attempt_id, "root_attempt_id": self.context.root_attempt_id,
             "leg": self.context.leg, "request_kind": self.context.kind,
@@ -104,7 +104,11 @@ impl HttpPhaseRecord {
             "connect_attempted": t.connect_attempted,
             "generation_before": t.connect_generation_before, "generation_after": t.connect_generation_after,
             "peer": t.peer.map(|peer| peer.to_string()), "incomplete_phase": t.incomplete_phase.name(),
-        })
+        });
+        value["clock_domain_ns"] = crate::types::monotonic_clock_domain_ns().into();
+        value["first_write_mono_ns"] = serde_json::json!((t.io.first_write_mono_ns != 0).then_some(t.io.first_write_mono_ns));
+        value["first_read_mono_ns"] = serde_json::json!((t.io.first_read_mono_ns != 0).then_some(t.io.first_read_mono_ns));
+        value
     }
 }
 
@@ -149,6 +153,18 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn wire_boundaries_share_the_receipt_domain_and_absent_writes_are_null() {
+        let mut r = record(7, 7, 0);
+        assert!(r.value("account")["first_write_mono_ns"].is_null());
+        r.timings.io.first_write_mono_ns = crate::types::monotonic_now_ns();
+        r.timings.io.first_read_mono_ns = r.timings.io.first_write_mono_ns + 100;
+        let value = r.value("account");
+        assert_eq!(value["clock_domain_ns"], crate::types::monotonic_clock_domain_ns());
+        assert_eq!(value["first_write_mono_ns"], r.timings.io.first_write_mono_ns);
+        assert_eq!(value["first_read_mono_ns"], r.timings.io.first_read_mono_ns);
+    }
+
     #[test]
     fn bounded_phase_lane_preserves_root_hedge_order_and_counts_loss() {
         let (tx, rx) = crossbeam_channel::bounded(2);

@@ -161,6 +161,7 @@ async fn coinbase_ws_task(
             }
         };
         let (mut write, mut read) = stream.split();
+        let mut receipts = crate::types::ReceiptSequencer::new();
 
         let sub = serde_json::json!({
             "type": "subscribe",
@@ -219,6 +220,7 @@ async fn coinbase_ws_task(
                             break;
                         }
                     };
+                    let receipt = receipts.received();
                     match msg {
                         Message::Text(text) => {
                             // simd-json drop-in for SIMD parse speedup.
@@ -332,7 +334,7 @@ async fn coinbase_ws_task(
                                 if !book.bids.is_empty() && !book.asks.is_empty() { backoff.reset(); }
                                 let (bids, asks) = book.snapshot(MAX_DEPTH);
                                 if bids.is_empty() || asks.is_empty() { continue; }
-                                let event = MarketEvent::OrderBook(OrderBookSnapshot {
+                                let event = MarketEvent::OrderBook(OrderBookSnapshot { receipt: receipt.parsed(),
                                     exchange: Exchange::Coinbase,
                                     symbol: product_id.to_string(),
                                     bids,
@@ -372,7 +374,7 @@ async fn coinbase_ws_task(
                                     .unwrap_or_else(now_ns);
                                 let (bids, asks) = book.snapshot(MAX_DEPTH);
                                 if bids.is_empty() || asks.is_empty() { continue; }
-                                let event = MarketEvent::OrderBook(OrderBookSnapshot {
+                                let event = MarketEvent::OrderBook(OrderBookSnapshot { receipt: receipt.parsed(),
                                     exchange: Exchange::Coinbase,
                                     symbol: product_id.to_string(),
                                     bids,

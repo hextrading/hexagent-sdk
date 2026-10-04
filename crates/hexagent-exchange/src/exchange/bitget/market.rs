@@ -173,7 +173,7 @@ async fn bitget_ws_task(
                                     let ts_ms = item.get("ts")
                                         .and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| v.as_u64()))
                                         .unwrap_or(0);
-                                    let event = MarketEvent::OrderBook(OrderBookSnapshot {
+                                    let event = MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
                                         exchange: Exchange::Bitget,
                                         symbol: inst_id.clone(),
                                         bids,

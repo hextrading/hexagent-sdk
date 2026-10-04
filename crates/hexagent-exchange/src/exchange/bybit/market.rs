@@ -182,7 +182,7 @@ async fn bybit_ws_task(
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0);
 
-                            let event = MarketEvent::OrderBook(OrderBookSnapshot {
+                            let event = MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
                                 exchange: Exchange::Bybit,
                                 symbol,
                                 bids,

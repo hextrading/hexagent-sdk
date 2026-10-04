@@ -40,6 +40,9 @@ pub struct OsTuneConfig {
     /// whose isolated-core layout is part of the latency SLO.
     #[serde(default)]
     pub strict_core_isolation: bool,
+    /// Wake idle execution/connection owners after queue publication (Linux futex).
+    #[serde(default)]
+    pub execution_wakeup: bool,
     /// Allow ordinary-priority background threads to share only the
     /// `execution_core`. This is an explicit production escape hatch for
     /// hosts whose system/IRQ cores must be kept completely free of bot
@@ -103,6 +106,11 @@ pub struct OsTuneConfig {
     /// priority. Fast signing and completion remain on separate CPUs.
     #[serde(default)]
     pub allow_cancel_on_execution_core: bool,
+    /// Consolidate cancel/completion and cold work beside the strategy router,
+    /// freeing a dedicated dispatcher CPU. Requires event wakeups and router
+    /// priority above cancel/completion; Fast/signing never shares this CPU.
+    #[serde(default)]
+    pub allow_execution_aux_on_router_core: bool,
     /// Shared-account id -> dedicated private event application core.  These
     /// lifecycle owners apply authenticated order/trade updates to their
     /// account-local state. Keeping them off the ingress and housekeeping
@@ -178,6 +186,7 @@ impl Default for OsTuneConfig {
         Self {
             enable_pin: true,
             enable_fifo: true,
+            execution_wakeup: false,
             strict_core_isolation: false,
             allow_background_on_execution_core: false,
             allow_strategy_router_on_execution_core: false,
@@ -192,6 +201,7 @@ impl Default for OsTuneConfig {
             allow_shared_private_cold_core: false,
             allow_private_cold_on_background_core: false,
             allow_cancel_on_execution_core: false,
+            allow_execution_aux_on_router_core: false,
             private_apply_cores: HashMap::new(),
             private_cold_cores: HashMap::new(),
             execution_core: None,

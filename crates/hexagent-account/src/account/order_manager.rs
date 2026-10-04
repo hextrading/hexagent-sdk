@@ -994,7 +994,7 @@ impl OrderManager {
                         },
                     );
                     self.reindex_order(&client_order_id);
-                    emit(Signal::NewOrder(OrderRequest {
+                    emit(Signal::NewOrder(OrderRequest { hot_path: Default::default(),
                         prepared_token: None,
                         order_slot: Default::default(),
                         client_order_id,

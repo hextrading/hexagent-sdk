@@ -167,7 +167,7 @@ async fn hyperliquid_ws_task(
                                     if bids.is_empty() || asks.is_empty() { continue; }
                                     let ts = d.get("time").and_then(|v| v.as_u64())
                                         .map(|ms| ms * 1_000_000).unwrap_or_else(now_ns);
-                                    let event = MarketEvent::OrderBook(OrderBookSnapshot {
+                                    let event = MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
                                         exchange: Exchange::Hyperliquid,
                                         symbol: coin,
                                         bids,

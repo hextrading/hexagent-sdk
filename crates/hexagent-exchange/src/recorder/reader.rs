@@ -1981,7 +1981,7 @@ fn stream_parquet_event_batches_selected(
                         .map(parse_price_levels)
                         .unwrap_or_default();
 
-                    MarketEvent::OrderBook(OrderBookSnapshot {
+                    MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
                         exchange,
                         symbol: symbol.to_string(),
                         bids,
@@ -2470,7 +2470,7 @@ mod tests {
     }
 
     fn book(symbol: &str, timestamp_ns: u64) -> OrderBookSnapshot {
-        OrderBookSnapshot {
+        OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: symbol.to_string(),
             bids: vec![PriceLevel {
@@ -2837,7 +2837,7 @@ mod tests {
         let legacy = rmp_serde::to_vec(&(Exchange::Polymarket, "token", 0.4, 1.0, 0.6, 1.0, 100_u64, 200_u64)).unwrap();
         let mut quote: QuoteTick = rmp_serde::from_slice(&legacy).unwrap();
         assert_eq!(quote.delivery.origin, crate::types::QuoteOrigin::Unspecified);
-        quote.delivery = crate::types::QuoteDelivery { origin: crate::types::QuoteOrigin::SubscriptionCheckpoint, published_timestamp_ns: 400 };
+        quote.delivery = crate::types::QuoteDelivery { receipt: Default::default(), origin: crate::types::QuoteOrigin::SubscriptionCheckpoint, published_timestamp_ns: 400 };
         let restored: QuoteTick = rmp_serde::from_slice(&rmp_serde::to_vec(&quote).unwrap()).unwrap();
         assert_eq!(restored.delivery, quote.delivery);
         assert_eq!(restored.local_timestamp_ns, 200);

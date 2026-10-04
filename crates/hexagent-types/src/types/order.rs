@@ -293,9 +293,9 @@ pub struct OrderRequest {
     /// emission time and is used by executor staleness admission.
     #[serde(default)]
     pub quote_trigger_exchange_timestamp_ns: u64,
-    /// Local receive timestamp of the market-data event that triggered this
-    /// quote. This is the preferred origin for end-to-end latency because it
-    /// uses the same host clock as every downstream lifecycle stage.
+    /// Legacy adapter-local wall timestamp (may be stamped after parsing).
+    /// Preserve for existing freshness/admission semantics. Receive-to-dispatch
+    /// measurements use hot_path.receipt and the shared monotonic clock.
     #[serde(default)]
     pub quote_trigger_local_timestamp_ns: u64,
     /// Stable event/market identifier supplied by the strategy (for example a
@@ -328,6 +328,8 @@ pub struct OrderRequest {
     /// Used only for logging — no business logic depends on this.
     #[serde(default)]
     pub outcome_label: String,
+    #[serde(default)]
+    pub hot_path: super::hot_path::HotPathTrace,
 }
 
 /// Exact metadata from an authenticated, order-specific reconciliation GET.
@@ -470,6 +472,7 @@ impl OrderRequest {
             post_only: true,
             reduce_only: false,
             outcome_label: String::new(),
+            hot_path: Default::default(),
         }
     }
 
@@ -494,6 +497,7 @@ impl OrderRequest {
             post_only: false, // market orders are not post-only
             reduce_only: false,
             outcome_label: String::new(),
+            hot_path: Default::default(),
         }
     }
 }

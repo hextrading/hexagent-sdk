@@ -437,7 +437,7 @@ mod tests {
     use crate::types::{Exchange, PriceLevel, QuoteTick, Side};
 
     fn empty_book(symbol: &str) -> OrderBookSnapshot {
-        OrderBookSnapshot {
+        OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: symbol.to_string(),
             bids: vec![],

@@ -4311,7 +4311,7 @@ mod tests {
     }
 
     fn place_signal(coid: &str) -> Signal {
-        Signal::NewOrder(OrderRequest {
+        Signal::NewOrder(OrderRequest { hot_path: Default::default(),
             prepared_token: None,
             client_order_id: coid.to_string(),
             exchange: Exchange::Polymarket,
@@ -4342,7 +4342,7 @@ mod tests {
                 let mut sim = sim_with_fixed_rtt(100);
                 sim.set_taker_overhead_enabled(false);
                 sim.core.configure_admission(true, false, true);
-                sim.core.on_orderbook(&OrderBookSnapshot {
+                sim.core.on_orderbook(&OrderBookSnapshot { receipt: Default::default(),
                     exchange: Exchange::Polymarket,
                     symbol: "tok".into(),
                     bids: vec![PriceLevel {
@@ -4425,7 +4425,7 @@ mod tests {
         sim.set_book_continuity_replay(
             BookContinuityReplay::from_reader(std::io::Cursor::new(""), "owner").unwrap(),
         );
-        sim.core.on_orderbook(&OrderBookSnapshot {
+        sim.core.on_orderbook(&OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: "tok".into(),
             bids: vec![],
@@ -4512,7 +4512,7 @@ mod tests {
             sim.set_book_continuity_replay(
                 BookContinuityReplay::from_reader(std::io::Cursor::new(rows), "owner").unwrap(),
             );
-            let mut book = OrderBookSnapshot {
+            let mut book = OrderBookSnapshot { receipt: Default::default(),
                 exchange: Exchange::Polymarket,
                 symbol: "tok".into(),
                 bids: vec![PriceLevel {
@@ -4579,7 +4579,7 @@ mod tests {
         sim.causal_matching = true;
         sim.taker_race_horizon_ns = 950_000_000;
         sim.core.configure_race(0.0, 1.0);
-        sim.core.on_orderbook(&OrderBookSnapshot {
+        sim.core.on_orderbook(&OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: "tok".into(),
             bids: vec![],
@@ -4604,7 +4604,7 @@ mod tests {
 
         // Another taker consumes most of the touch before our L1 reach. The
         // causal cap must see that smaller quantity without future lookahead.
-        sim.core.on_orderbook(&OrderBookSnapshot {
+        sim.core.on_orderbook(&OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: "tok".into(),
             bids: vec![],
@@ -4639,7 +4639,7 @@ mod tests {
         let emit = 1_000_000_000;
         sim.submit(&signal, emit);
         for (offset, qty) in [(10_000_000, 0.0), (20_000_000, 10.0)] {
-            sim.core.on_orderbook(&OrderBookSnapshot {
+            sim.core.on_orderbook(&OrderBookSnapshot { receipt: Default::default(),
                 exchange: Exchange::Polymarket,
                 symbol: "tok".into(),
                 bids: vec![],
@@ -4740,7 +4740,7 @@ mod tests {
         sim.submit_with_latency_split(&signal, emit, 150_000_000, 150_000_000)
             .unwrap();
         sim.step();
-        sim.core.on_orderbook(&OrderBookSnapshot {
+        sim.core.on_orderbook(&OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: "tok".into(),
             bids: vec![],
@@ -4787,7 +4787,7 @@ mod tests {
         sim.submit_with_latency_split(&signal, emit, 50_000_000, 50_000_000)
             .unwrap();
         assert_eq!(sim.peek_server_when(), Some(emit + 50_000_000));
-        sim.core.on_orderbook(&OrderBookSnapshot {
+        sim.core.on_orderbook(&OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: "tok".into(),
             bids: vec![],
@@ -4877,7 +4877,7 @@ mod tests {
             sim.causal_matching = true;
             sim.taker_race_horizon_ns = 950_000_000;
             sim.core.configure_race(0.0, 1.0);
-            sim.core.on_orderbook(&OrderBookSnapshot {
+            sim.core.on_orderbook(&OrderBookSnapshot { receipt: Default::default(),
                 exchange: Exchange::Polymarket,
                 symbol: "tok".into(),
                 bids: vec![],
@@ -4992,7 +4992,7 @@ mod tests {
 
     fn seed_front_order(sim: &mut Simulator, coid: &str) {
         sim.core.configure_replay_self_depth(1.0);
-        sim.core.on_orderbook(&OrderBookSnapshot {
+        sim.core.on_orderbook(&OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: "tok".into(),
             bids: vec![PriceLevel {
@@ -5201,7 +5201,7 @@ mod tests {
         sim.set_taker_overhead_enabled(false);
         sim.latency
             .set_fill_push_mult(private_delay_ms as f64 / 50.0);
-        sim.core.on_orderbook(&OrderBookSnapshot {
+        sim.core.on_orderbook(&OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: "tok".into(),
             bids: vec![],
@@ -5251,7 +5251,7 @@ mod tests {
     #[test]
     fn partial_fak_http_is_matched_and_private_retains_actual_quantity() {
         let (mut sim, signal) = separated_taker_sim(200);
-        sim.core.on_orderbook(&OrderBookSnapshot {
+        sim.core.on_orderbook(&OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: "tok".into(),
             bids: vec![],
@@ -5864,7 +5864,7 @@ mod tests {
         sim.dynamic_fill_markout = true;
         sim.dynamic_markout_spot_vol = true;
         sim.dynamic_markout_lookback_ns = 5_000_000_000;
-        let book = |price: f64, ts: u64| OrderBookSnapshot {
+        let book = |price: f64, ts: u64| OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Binance,
             symbol: "BTCUSDT".into(),
             bids: vec![PriceLevel {
@@ -5913,7 +5913,7 @@ mod tests {
 
     fn owned_front_order(sim: &mut Simulator, coid: &str, iid: &str, token: &str) {
         sim.core.configure_replay_self_depth(1.0);
-        sim.core.on_orderbook(&OrderBookSnapshot {
+        sim.core.on_orderbook(&OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: token.into(),
             bids: vec![PriceLevel {

@@ -83,6 +83,13 @@ pub trait Strategy: Send {
     ) -> Result<(), SignalBatchOverflow> {
         extend_signal_batch(out, self.on_quote(ts_event))
     }
+    /// Explicit immutable cause for a market-driven quote. Callback/recovery
+    /// quotes retain on_quote_into and therefore cannot reuse an old receipt.
+    fn on_market_quote_into(
+        &mut self, ts_event: u64, _receipt: crate::types::MarketReceipt, out: &mut SignalBatch,
+    ) -> Result<(), SignalBatchOverflow> {
+        self.on_quote_into(ts_event, out)
+    }
     fn quote_interval_ms(&self) -> u64 {
         0
     }

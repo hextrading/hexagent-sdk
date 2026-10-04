@@ -1216,6 +1216,7 @@ dependencies = [
  "futures-util",
  "hdrhistogram",
  "hexagent-config",
+ "hexagent-types",
  "http-body-util",
  "hyper",
  "hyper-rustls",
@@ -1247,6 +1248,7 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "hex",
+ "rmp-serde",
  "serde",
  "serde_json",
  "uuid",

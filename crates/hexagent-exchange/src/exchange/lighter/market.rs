@@ -237,7 +237,7 @@ async fn lighter_ws_task(
                                     // last_updated_at is µs since epoch.
                                     let ts = data.get("last_updated_at").and_then(|v| v.as_u64())
                                         .map(|us| us * 1_000).unwrap_or_else(now_ns);
-                                    let event = MarketEvent::OrderBook(OrderBookSnapshot {
+                                    let event = MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
                                         exchange: Exchange::Lighter,
                                         symbol: symbol.clone(),
                                         bids,

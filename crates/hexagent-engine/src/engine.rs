@@ -2028,9 +2028,12 @@ fn claim_lifecycle_slow_log(
 /// Attach the exact OrderBook event that caused `Strategy::on_quote` to run.
 /// The strategy only receives the local timestamp, so this engine boundary is
 /// the last place where both exchange and local clocks are still available.
-fn stamp_quote_trigger(signals: &mut [Signal], trigger: &OrderBookSnapshot, log_lifecycle: bool) {
+fn stamp_quote_trigger(signals: &mut [Signal], trigger: &OrderBookSnapshot, log_lifecycle: bool, strategy_dequeued_mono_ns: u64) {
     let stage_ns = now_ns();
+    let hot_path = hexagent_types::types::HotPathTrace { receipt: trigger.receipt, clock_domain_ns: crate::types::monotonic_clock_domain_ns(), strategy_dequeued_mono_ns,
+        signal_mono_ns: hexagent_types::types::monotonic_now_ns(), ..Default::default() };
     let stamp = |order: &mut OrderRequest| {
+        order.hot_path = hot_path;
         order.quote_trigger_exchange_timestamp_ns = trigger.exchange_timestamp_ns;
         order.quote_trigger_local_timestamp_ns = trigger.local_timestamp_ns;
         order.quote_trigger_source = QuoteTriggerSource::OrderBook(trigger.exchange);
@@ -2087,7 +2090,7 @@ fn stamp_quote_trigger(signals: &mut [Signal], trigger: &OrderBookSnapshot, log_
         }
     };
     for signal in signals {
-        signal.set_cancel_trigger(CancelTrigger { source: QuoteTriggerSource::OrderBook(trigger.exchange),
+        signal.set_cancel_trigger(CancelTrigger { hot_path, source: QuoteTriggerSource::OrderBook(trigger.exchange),
             exchange_ns: trigger.exchange_timestamp_ns, local_ns: trigger.local_timestamp_ns });
         match signal {
             Signal::NewOrder(order) => stamp(order),
@@ -2118,7 +2121,7 @@ fn stamp_execution_requote(signals: &mut [Signal], processing_ns: u64) {
         order.quote_trigger_source = QuoteTriggerSource::ExecutionCapacityResume;
     };
     for signal in signals {
-        signal.set_cancel_trigger(CancelTrigger { source: QuoteTriggerSource::ExecutionCapacityResume,
+        signal.set_cancel_trigger(CancelTrigger { hot_path: Default::default(), source: QuoteTriggerSource::ExecutionCapacityResume,
             exchange_ns: 0, local_ns: processing_ns });
         match signal {
             Signal::NewOrder(order) => stamp(order),
@@ -3011,6 +3014,26 @@ impl From<Receiver<RoutedSignal>> for ExecutionSignalIngress {
     fn from(rx: Receiver<RoutedSignal>) -> Self { Self::Compatibility(rx) }
 }
 impl ExecutionSignalIngress {
+    fn idle_recv(&mut self) -> Result<RoutedSignal, crossbeam_channel::TryRecvError> {
+        if let Self::Live(ingress) = self {
+            if ingress.lanes[0].has_wake() {
+                // Arm before recheck; publication before futex WAIT returns EAGAIN.
+                // Recheck through the same arbitration so control barriers remain intact.
+                ingress.lanes[0].arm_wake();
+                match ingress.try_recv() {
+                    Ok(value) => { ingress.lanes[0].cancel_wake(); return Ok(value); }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        ingress.lanes[0].cancel_wake(); return Err(crossbeam_channel::TryRecvError::Disconnected);
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => {}
+                }
+                ingress.lanes[0].wait_for_wake(Duration::from_micros(100));
+                return ingress.try_recv();
+            }
+        }
+        thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
+        self.try_recv()
+    }
     fn try_recv(&mut self) -> Result<RoutedSignal, crossbeam_channel::TryRecvError> {
         match self { Self::Compatibility(rx) => rx.try_recv(), Self::Live(rx) => rx.try_recv() }
     }
@@ -4254,16 +4277,18 @@ impl Engine {
             }
         }
 
+        let _ = hexagent_types::types::monotonic_clock_domain_ns();
         let (market_tx, market_rx) = crate::exchange::market_event_channel(CHANNEL_CAPACITY);
         // Strategy↔executor control traffic must not stall quote processing or
         // HTTP completion threads. Venue-specific queues below enforce the
         // actual place/cancel/reconcile admission policy.
-        let (signal_tx_raw, signal_rx) = hexagent_runtime::poll_channel::bounded::<RoutedSignal>(CHANNEL_CAPACITY);
+        let execution_wake = self.config.os_tune.execution_wakeup.then(|| Arc::new(hexagent_runtime::wake::Wake::default()));
+        let (signal_tx_raw, signal_rx) = hexagent_runtime::poll_channel::bounded_with_wake::<RoutedSignal>(CHANNEL_CAPACITY, execution_wake.clone());
         let strategy_count = self.config.strategies.iter().filter(|s| s.enabled).count();
         let (owner_signal_txs, owner_signal_rxs): (Vec<_>, Vec<_>) = (0..strategy_count)
-            .map(|_| hexagent_runtime::poll_channel::bounded::<RoutedSignal>(INSTANCE_SIGNAL_LANE_CAPACITY))
+            .map(|_| hexagent_runtime::poll_channel::bounded_with_wake::<RoutedSignal>(INSTANCE_SIGNAL_LANE_CAPACITY, execution_wake.clone()))
             .unzip();
-        let (signal_control_tx, signal_control_rx) = hexagent_runtime::poll_channel::bounded::<RoutedSignal>(8);
+        let (signal_control_tx, signal_control_rx) = hexagent_runtime::poll_channel::bounded_with_wake::<RoutedSignal>(8, execution_wake);
         let signal_rx = ExecutionSignalIngress::Live(LiveSignalIngress::new(
             signal_rx, owner_signal_rxs, signal_control_rx));
         let signal_arbiter_handle: Option<thread::JoinHandle<()>> = None;
@@ -7130,7 +7155,7 @@ impl Engine {
                                     sim.submit(&emergency, strategy_now);
                                     continue;
                                 }
-                                stamp_quote_trigger(&mut quote_signal_batch, ob, false);
+                                stamp_quote_trigger(&mut quote_signal_batch, ob, false, 0);
                                 for sig in quote_signal_batch.drain(..) {
                                     ensure_recovery_signal_allowed(&owner_recovery, i, &sig)?;
                                     sim.submit(&sig, strategy_now);
@@ -8816,6 +8841,7 @@ impl Engine {
                                         }
                                     }
                                     for (i, strategy) in strategies.iter_mut().enumerate() {
+                                        let strategy_dequeued_mono_ns = crate::types::monotonic_now_ns();
                                         let signals = match &event {
                                             MarketEvent::OrderBook(ob) => { strategy.on_orderbook(ob); Vec::new() }
                                             MarketEvent::Trade(t) => { strategy.on_trade_tick(t); Vec::new() }
@@ -8888,7 +8914,7 @@ impl Engine {
                                                     last_quote_ns[i] = ts;
                                                     quote_signal_batch.clear();
                                                     if let Err(overflow) = strategy
-                                                        .on_quote_into(ts, &mut quote_signal_batch)
+                                                        .on_market_quote_into(ts, ob.receipt, &mut quote_signal_batch)
                                                     {
                                                         quote_signal_batch.clear();
                                                         let emergency = emergency_cancel_for_signal(
@@ -8901,7 +8927,7 @@ impl Engine {
                                                         }
                                                         continue;
                                                     }
-                                                    stamp_quote_trigger(&mut quote_signal_batch, ob, true);
+                                                    stamp_quote_trigger(&mut quote_signal_batch, ob, true, strategy_dequeued_mono_ns);
                                                     for sig in quote_signal_batch.drain(..) {
                                                         if signal_tx.send(sig).is_err() { return; }
                                                     }
@@ -10274,6 +10300,7 @@ impl Engine {
                             "strategy.market.queue",
                             market_queue_monotonic_ns().saturating_sub(queued.enqueued_ns),
                         );
+                        let strategy_dequeued_mono_ns = crate::types::monotonic_now_ns();
                         let event = queued.event;
                         if let Some(age) = market_receive_age_ns(&event, crate::types::now_ns()) {
                             crate::latency::observe_ns(market_source_age_stage(&event,
@@ -10408,7 +10435,7 @@ impl Engine {
                                     last_quote_ns = ts;
                                     quote_signal_batch.clear();
                                     if let Err(overflow) =
-                                        strategy.on_quote_into(ts, &mut quote_signal_batch)
+                                        strategy.on_market_quote_into(ts, ob.receipt, &mut quote_signal_batch)
                                     {
                                         quote_signal_batch.clear();
                                         handle_signal_batch_overflow(
@@ -10419,7 +10446,7 @@ impl Engine {
                                         );
                                         break 'worker;
                                     }
-                                    stamp_quote_trigger(&mut quote_signal_batch, ob, true);
+                                    stamp_quote_trigger(&mut quote_signal_batch, ob, true, strategy_dequeued_mono_ns);
                                     for sig in quote_signal_batch.drain(..) {
                                         if !emit(sig) { break 'worker; }
                                     }
@@ -12781,7 +12808,9 @@ impl Engine {
                         // producer after reservation but before message publish.
                         // Crossbeam array recv spins in that state; this lane
                         // sleeps instead, so the producer can finish publishing.
-                        let (tx, rx) = hexagent_runtime::poll_channel::bounded::<PolyConnectionCommand>(capacity);
+                        let wake = (config.os_tune.execution_wakeup && matches!(role, Role::Fast | Role::Cancel))
+                            .then(|| Arc::new(hexagent_runtime::wake::Wake::default()));
+                        let (tx, rx) = hexagent_runtime::poll_channel::bounded_with_wake::<PolyConnectionCommand>(capacity, wake);
                         let lane_metrics = Arc::new(PolyConnectionLaneMetrics::new(
                             &account_id,
                             role,
@@ -13330,9 +13359,12 @@ impl Engine {
                                     }
                                 }
                                 if !dispatched {
-                                    thread::sleep(hexagent_runtime::poll_channel::IDLE_POLL);
-                                }
-                                None
+                                    match signal_rx.idle_recv() {
+                                        Ok(routed) => Some(routed),
+                                        Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                                        Err(crossbeam_channel::TryRecvError::Empty) => None,
+                                    }
+                                } else { None }
                             }
                         }
                     };
@@ -14878,6 +14910,13 @@ struct CancelKey {
 }
 
 impl PolyConnectionCommand {
+    fn hot_path_mut(&mut self) -> Option<&mut hexagent_types::types::HotPathTrace> {
+        match self {
+            Self::Place { order, .. } => Some(&mut order.hot_path),
+            Self::Cancel { cancel_trigger, .. } => Some(&mut cancel_trigger.hot_path),
+            _ => None,
+        }
+    }
     fn cancel_key(&self) -> Option<CancelKey> {
         let Self::Cancel { instance_id, client_order_id, update_tx, .. } = self else { return None; };
         if instance_id.len() > 64 || client_order_id.len() > 128 { return None; }
@@ -15057,7 +15096,7 @@ impl PolyConnectionLane {
 
     fn try_send(
         &self,
-        command: PolyConnectionCommand,
+        mut command: PolyConnectionCommand,
     ) -> Result<(), crossbeam_channel::TrySendError<PolyConnectionCommand>> {
         if self
             .metrics
@@ -15072,10 +15111,11 @@ impl PolyConnectionLane {
         self.metrics.cancel_reply_pending.store(
             matches!(command, PolyConnectionCommand::Cancel { .. }), Ordering::Release);
         let prepares = matches!(&command, PolyConnectionCommand::Place { .. });
+        if let Some(trace) = command.hot_path_mut() { trace.owner_published_mono_ns = hexagent_types::types::monotonic_now_ns(); }
+        self.metrics.queue_depth.store(1, Ordering::Release);
         match self.tx.try_send(command) {
             Ok(()) => {
                 if prepares { if let Some(route) = &self.preparation { route.issued(); } }
-                self.metrics.queue_depth.store(1, Ordering::Release);
                 self.metrics
                     .queue_high_water
                     .fetch_max(1, Ordering::Relaxed);
@@ -15132,6 +15172,7 @@ struct PolyAccountConnectionRoutes {
     /// Dispatcher-local dirty bit: publishes changed admission on the next
     /// loop without scanning/refreshing unrelated accounts after every signal.
     maintenance_pending: bool,
+    next_health_refresh_mono_ns: u64,
     /// Dispatcher -> one account-scoped SCHED_OTHER audit owner. FIFO across
     /// retain/release, independent of HTTP admission and cancel backpressure.
     /// Full/disconnected is returned as typed control retry feedback. Private
@@ -15194,6 +15235,7 @@ impl Default for PolyAccountConnectionRoutes {
     fn default() -> Self {
         Self {
             maintenance_pending: false,
+            next_health_refresh_mono_ns: 0,
             event_audit: None,
             event_audit_high_water: 0,
             event_audit_rejected: 0,
@@ -15241,7 +15283,14 @@ impl PolyAccountConnectionRoutes {
             || self.peer_failure_receivers.iter().any(|(rx, _)| rx.has_pending())
     }
 
+    fn refresh_health_if_needed(&mut self, now: u64) {
+        if self.has_health_updates() || hexagent_types::types::monotonic_now_ns() >= self.next_health_refresh_mono_ns {
+            self.refresh_health(now);
+        }
+    }
+
     fn refresh_health(&mut self, _now: u64) {
+        self.next_health_refresh_mono_ns = hexagent_types::types::monotonic_now_ns().saturating_add(1_000_000);
         self.maintenance_pending = false;
         let Some(health) = self.health.as_mut() else { return; };
         for (role, slot, receiver) in &self.health_lanes {
@@ -15525,7 +15574,7 @@ fn try_send_poly_owner(
     routes.cancel_lane_keys.resize(routes.cancel.len(), None);
     let cancel_key = command.cancel_key();
     let now = now_ns();
-    routes.refresh_health(now);
+    routes.refresh_health_if_needed(now);
     let now = now_ns();
     let PolyAccountConnectionRoutes { fast, cancel, reconcile, fast_rr, cancel_rr,
         reconcile_rr, health, cancel_lane_keys, maintenance_pending, .. } = routes;
@@ -15857,11 +15906,12 @@ fn run_poly_connection_owner(
         // Twelve Cancel owners share a core with a lower-priority dispatcher.
         // A 10 us idle poll saturated that core in the Linux FIFO probe; 50 us
         // leaves publication time for the producer while bounding pickup delay.
-        let command = match rx.recv_timeout_with_poll(HEARTBEAT, idle_poll) {
+        let mut command = match rx.recv_timeout_with_poll(HEARTBEAT, idle_poll) {
             Ok(command) => command,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
+        if let Some(trace) = command.hot_path_mut() { trace.owner_dequeued_mono_ns = hexagent_types::types::monotonic_now_ns(); }
         let mut preparation_guard = if matches!(&command, PolyConnectionCommand::Place { .. }) {
             preparation_completion.as_mut().map(|completion| completion.guard())
         } else { None };
@@ -16451,14 +16501,27 @@ fn dispatch_probe_http(request: ProbeHttpRequest, routes: &mut PolyAccountConnec
 }
 
 fn dispatch_poly_signal_to_connection_owner(
-    signal: Signal,
+    mut signal: Signal,
     stale_ms: u64,
     update_tx: ExecutorUpdateSender,
     routes: &mut PolyAccountConnectionRoutes,
 ) -> bool {
     use hexagent_runtime::http1_pool::Role;
+    let received = hexagent_types::types::monotonic_now_ns();
     let instance_id = extract_instance_id(&signal);
     log_executor_receive(&signal);
+    match &mut signal {
+        Signal::NewOrder(order) => order.hot_path.executor_received_mono_ns = received,
+        Signal::BatchNewOrders { orders, .. } => for order in orders { order.hot_path.executor_received_mono_ns = received; },
+        Signal::BatchUpdateOrders { place_orders, cancel_trigger, .. }
+        | Signal::ReplaceOrder { place_orders, cancel_trigger, .. } => {
+            for order in place_orders { order.hot_path.executor_received_mono_ns = received; }
+            cancel_trigger.hot_path.executor_received_mono_ns = received;
+        }
+        Signal::CancelOrder { cancel_trigger, .. }
+        | Signal::BatchCancelOrders { cancel_trigger, .. } => cancel_trigger.hot_path.executor_received_mono_ns = received,
+        _ => {}
+    }
     match signal {
         Signal::NewOrder(order) if order.exchange == Exchange::Polymarket => {
             let command = PolyConnectionCommand::Place {
@@ -18024,7 +18087,7 @@ mod market_router_tests {
     }
 
     fn ob(exchange: Exchange, symbol: &str) -> MarketEvent {
-        MarketEvent::OrderBook(OrderBookSnapshot {
+        MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
             exchange,
             symbol: symbol.into(),
             bids: vec![],
@@ -18051,7 +18114,7 @@ mod market_router_tests {
         let mut event = quote(Exchange::Polymarket, "token-a");
         assert_eq!(market_source_age_stage(&event, "wire", "checkpoint"), "wire");
         if let MarketEvent::Quote(q) = &mut event {
-            q.delivery = QuoteDelivery { origin: QuoteOrigin::SubscriptionCheckpoint, published_timestamp_ns: 1_000_000 };
+            q.delivery = QuoteDelivery { receipt: Default::default(), origin: QuoteOrigin::SubscriptionCheckpoint, published_timestamp_ns: 1_000_000 };
         }
         assert_eq!(market_source_age_stage(&event, "wire", "checkpoint"), "checkpoint");
         assert_eq!(market_receive_age_ns(&event, 1_000_001), Some(1_000_000));
@@ -18423,7 +18486,7 @@ mod market_router_tests {
         for origin in [QuoteOrigin::Wire, QuoteOrigin::SubscriptionCheckpoint] {
             let mut event = quote(Exchange::Polymarket, "token");
             if let MarketEvent::Quote(q) = &mut event {
-                q.delivery = QuoteDelivery { origin, published_timestamp_ns: 100 };
+                q.delivery = QuoteDelivery { receipt: Default::default(), origin, published_timestamp_ns: 100 };
             }
             assert!(enqueue_market_event(&lane, Arc::new(event), key));
         }
@@ -19258,7 +19321,7 @@ mod market_router_tests {
     }
 
     fn order_req(coid: &str, instance_id: &str) -> OrderRequest {
-        OrderRequest {
+        OrderRequest { hot_path: Default::default(),
             prepared_token: None,
             order_slot: Default::default(),
             client_order_id: coid.into(),
@@ -19482,7 +19545,7 @@ mod market_router_tests {
                 instance_id: "btc".into(),
             },
         ];
-        let trigger = OrderBookSnapshot {
+        let trigger = OrderBookSnapshot { receipt: crate::types::ReceiptSequencer::new().received().parsed(),
             exchange: Exchange::Binance,
             symbol: "BTCUSDT".into(),
             bids: vec![PriceLevel {
@@ -19497,7 +19560,7 @@ mod market_router_tests {
             local_timestamp_ns: 22,
         };
 
-        stamp_quote_trigger(&mut signals, &trigger, false);
+        stamp_quote_trigger(&mut signals, &trigger, false, crate::types::monotonic_now_ns());
 
         let orders: Vec<&OrderRequest> = signals
             .iter()
@@ -19509,6 +19572,9 @@ mod market_router_tests {
             .collect();
         assert_eq!(orders.len(), 2);
         for order in orders {
+            assert_eq!(order.hot_path.receipt, trigger.receipt);
+            assert_eq!(order.hot_path.clock_domain_ns, trigger.receipt.clock_domain_ns);
+            assert!(order.hot_path.signal_mono_ns >= order.hot_path.strategy_dequeued_mono_ns);
             assert_eq!(order.quote_trigger_exchange_timestamp_ns, 11);
             assert_eq!(order.quote_trigger_local_timestamp_ns, 22);
             assert_eq!(
@@ -19524,15 +19590,18 @@ mod market_router_tests {
             cancel_trigger: Default::default(), exchange: Exchange::Polymarket,
             client_order_id: "cancel-existing".into(), instance_id: "btc".into(), timestamp_ns: 30,
         }];
-        let trigger = OrderBookSnapshot { exchange: Exchange::Coinbase, symbol: "BTC-USD".into(),
+        let trigger = OrderBookSnapshot { receipt: crate::types::ReceiptSequencer::new().received().parsed(), exchange: Exchange::Coinbase, symbol: "BTC-USD".into(),
             bids: vec![], asks: vec![], exchange_timestamp_ns: 11, local_timestamp_ns: 22 };
-        stamp_quote_trigger(&mut signals, &trigger, false);
+        stamp_quote_trigger(&mut signals, &trigger, false, crate::types::monotonic_now_ns());
         let Signal::CancelOrder { cancel_trigger, timestamp_ns, .. } = &signals[0] else { panic!() };
-        assert_eq!(*cancel_trigger, CancelTrigger { source: QuoteTriggerSource::OrderBook(Exchange::Coinbase), exchange_ns: 11, local_ns: 22 });
+        assert_eq!(cancel_trigger.source, QuoteTriggerSource::OrderBook(Exchange::Coinbase));
+        assert_eq!((cancel_trigger.exchange_ns, cancel_trigger.local_ns), (11, 22));
+        assert_eq!(cancel_trigger.hot_path.receipt, trigger.receipt);
+        assert!(cancel_trigger.hot_path.signal_mono_ns > 0);
         assert_eq!(*timestamp_ns, 30);
         stamp_execution_requote(&mut signals, 44);
         let Signal::CancelOrder { cancel_trigger, .. } = &signals[0] else { panic!() };
-        assert_eq!(*cancel_trigger, CancelTrigger { source: QuoteTriggerSource::ExecutionCapacityResume, exchange_ns: 0, local_ns: 44 });
+        assert_eq!(*cancel_trigger, CancelTrigger { hot_path: Default::default(), source: QuoteTriggerSource::ExecutionCapacityResume, exchange_ns: 0, local_ns: 44 });
     }
 
     fn direct_signal_fixture(capacity: usize) -> (SignalSender, LiveSignalIngress) {

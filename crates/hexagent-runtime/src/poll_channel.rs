@@ -4,8 +4,8 @@
 //! `try_send` retains the value on contention/full. Lossless cold producers may
 //! use `send`, which retains that exact value and sleeps between retries; this
 //! method is not for quote callbacks. The consumer polls, and must yield when
-//! `has_pending` is true but the head has not been committed. No notification
-//! channel is used. FIFO follows successful reservations, not producer clocks.
+//! `has_pending` is true but the head has not been committed. An optional futex hint wakes an idle consumer without a notification
+//! channel or crossbeam waiter lock. FIFO follows successful reservations, not producer clocks.
 use crate::try_queue::TryQueue;
 use crossbeam_channel::{SendError, TryRecvError, TrySendError};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -44,6 +44,7 @@ struct Shared<T> {
     queue: TryQueue<T>,
     senders: AtomicUsize,
     receiver_alive: AtomicBool,
+    wake: Option<Arc<crate::wake::Wake>>,
 }
 
 pub struct Sender<T>(Arc<Shared<T>>);
@@ -51,10 +52,18 @@ pub struct Sender<T>(Arc<Shared<T>>);
 pub struct Receiver<T>(Arc<Shared<T>>);
 
 pub fn bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+    bounded_with_wake(capacity, None)
+}
+
+/// Several inboxes consumed by one dispatcher may share one startup-created
+/// wake handle. Each connection owner instead owns a private handle. Queue
+/// capacity, reservation ordering and overflow semantics are unchanged.
+pub fn bounded_with_wake<T>(capacity: usize, wake: Option<Arc<crate::wake::Wake>>) -> (Sender<T>, Receiver<T>) {
     let shared = Arc::new(Shared {
         queue: TryQueue::new(capacity),
         senders: AtomicUsize::new(1),
         receiver_alive: AtomicBool::new(true),
+        wake,
     });
     (Sender(shared.clone()), Receiver(shared))
 }
@@ -68,7 +77,9 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.0.senders.fetch_sub(1, Ordering::Release);
+        if self.0.senders.fetch_sub(1, Ordering::Release) == 1 {
+            if let Some(wake) = &self.0.wake { wake.notify(); }
+        }
     }
 }
 
@@ -91,7 +102,9 @@ impl<T> Sender<T> {
         if !self.0.receiver_alive.load(Ordering::Acquire) {
             return Err(TrySendError::Disconnected(value));
         }
-        self.0.queue.try_push(value).map_err(TrySendError::Full)
+        self.0.queue.try_push(value).map_err(TrySendError::Full)?;
+        if let Some(wake) = &self.0.wake { wake.notify(); }
+        Ok(())
     }
 
     pub fn send(&self, mut value: T) -> Result<(), SendError<T>> {
@@ -107,6 +120,13 @@ impl<T> Sender<T> {
 }
 
 impl<T> Receiver<T> {
+    pub fn has_wake(&self) -> bool { self.0.wake.is_some() }
+    pub fn arm_wake(&self) { if let Some(wake) = &self.0.wake { wake.arm(); } }
+    pub fn cancel_wake(&self) { if let Some(wake) = &self.0.wake { wake.cancel(); } }
+    pub fn wait_for_wake(&self, timeout: Duration) {
+        if let Some(wake) = &self.0.wake { wake.wait(timeout); }
+        else { std::thread::sleep(timeout); }
+    }
     /// Cold owners/tests only. Wait without spinning on an unpublished slot.
     pub fn recv(&self) -> Result<T, crossbeam_channel::RecvError> {
         loop {
@@ -140,7 +160,18 @@ impl<T> Receiver<T> {
             if remaining.is_zero() {
                 return Err(crossbeam_channel::RecvTimeoutError::Timeout);
             }
-            std::thread::sleep(remaining.min(poll));
+            if self.0.wake.is_some() {
+                self.arm_wake();
+                match self.try_recv() {
+                    Ok(value) => { self.cancel_wake(); return Ok(value); }
+                    Err(TryRecvError::Disconnected) => {
+                        self.cancel_wake();
+                        return Err(crossbeam_channel::RecvTimeoutError::Disconnected);
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+                self.wait_for_wake(remaining);
+            } else { std::thread::sleep(remaining.min(poll)); }
         }
     }
 
@@ -439,5 +470,48 @@ mod tests {
             tx.try_send(value).unwrap();
             assert_eq!(black_box(rx.try_recv().unwrap()), value);
         });
+    }
+}
+
+#[cfg(test)]
+mod wake_lane_tests {
+    use super::*;
+    #[test]
+    fn woke_lane_retains_full_value_order_and_disconnect() {
+        let (tx, rx) = bounded_with_wake(2, Some(Arc::new(crate::wake::Wake::default())));
+        rx.arm_wake();
+        tx.try_send((1, 10)).unwrap(); tx.try_send((2, 20)).unwrap();
+        assert!(matches!(tx.try_send((3, 30)), Err(TrySendError::Full((3, 30)))));
+        rx.wait_for_wake(Duration::from_millis(10));
+        assert_eq!(rx.recv_timeout(Duration::from_millis(10)).unwrap(), (1, 10));
+        tx.try_send((3, 30)).unwrap(); drop(tx);
+        assert_eq!(rx.recv().unwrap(), (2, 20)); assert_eq!(rx.recv().unwrap(), (3, 30));
+        assert!(matches!(rx.recv(), Err(crossbeam_channel::RecvError)));
+    }
+    #[test]
+    fn shared_dispatcher_wake_notifies_every_inbox_without_reordering() {
+        let wake = Arc::new(crate::wake::Wake::default());
+        let (a, ar) = bounded_with_wake(8, Some(wake.clone()));
+        let (b, br) = bounded_with_wake(8, Some(wake));
+        ar.arm_wake(); b.try_send((2, 0)).unwrap(); ar.wait_for_wake(Duration::from_millis(1));
+        a.try_send((1, 0)).unwrap(); b.try_send((2, 1)).unwrap();
+        assert_eq!(ar.try_recv().unwrap(), (1, 0));
+        assert_eq!(br.try_recv().unwrap(), (2, 0)); assert_eq!(br.try_recv().unwrap(), (2, 1));
+    }
+    #[test]
+    fn concurrent_publication_and_sleep_deliver_exactly_once() {
+        let (tx, rx) = bounded_with_wake(8, Some(Arc::new(crate::wake::Wake::default())));
+        let producer = std::thread::spawn(move || {
+            for id in 0..10_000 {
+                let mut value = id;
+                loop { match tx.try_send(value) {
+                    Ok(()) => break,
+                    Err(TrySendError::Full(v)) => { value = v; std::thread::yield_now(); }
+                    Err(TrySendError::Disconnected(_)) => panic!(),
+                } }
+            }
+        });
+        for id in 0..10_000 { assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), id); }
+        producer.join().unwrap(); assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
     }
 }

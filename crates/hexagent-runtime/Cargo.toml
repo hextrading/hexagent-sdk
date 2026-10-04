@@ -5,6 +5,7 @@ edition = "2021"
 description = "hexagent-sdk: low-level runtime utilities — OS tuning, async runtime helper, latency instrumentation + record/replay."
 
 [dependencies]
+hexagent-types = { path = "../hexagent-types" }
 hexagent-config = { path = "../hexagent-config" }
 anyhow = "1"
 log = "0.4"

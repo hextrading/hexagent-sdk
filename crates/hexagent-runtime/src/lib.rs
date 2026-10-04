@@ -23,6 +23,7 @@ pub mod memory;
 pub mod os_tune;
 pub mod owner_timer;
 pub mod poll_channel;
+pub mod wake;
 pub mod precise_interval;
 mod reactor_probe;
 pub mod shutdown;

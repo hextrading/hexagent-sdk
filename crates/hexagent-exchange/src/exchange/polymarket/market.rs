@@ -1705,7 +1705,7 @@ impl ClobEventSender {
         let replaceable = Self::is_replaceable(&event);
         let published_ns = if matches!(&event, MarketEvent::Quote(_) | MarketEvent::OrderBook(_)) { now_ns() } else { 0 };
         if let MarketEvent::Quote(quote) = &mut event {
-            quote.delivery = QuoteDelivery {
+            quote.delivery = QuoteDelivery { receipt: quote.delivery.receipt,
                 origin: if checkpoint { QuoteOrigin::SubscriptionCheckpoint } else { QuoteOrigin::Wire },
                 published_timestamp_ns: published_ns,
             };
@@ -2896,6 +2896,8 @@ struct ClobPollInstrumentedStream<S> {
     inner: S,
     last_poll_at: Option<Instant>,
     pending: ClobSocketPollWindow,
+    receipts: crate::types::ReceiptSequencer,
+    last_receipt: crate::types::MarketReceipt,
 }
 
 impl<S> ClobPollInstrumentedStream<S> {
@@ -2904,6 +2906,8 @@ impl<S> ClobPollInstrumentedStream<S> {
             inner,
             last_poll_at: None,
             pending: ClobSocketPollWindow::default(),
+            receipts: crate::types::ReceiptSequencer::new(),
+            last_receipt: Default::default(),
         }
     }
 
@@ -2922,7 +2926,9 @@ where
         let this = self.as_mut().get_mut();
         this.pending
             .record_poll(&mut this.last_poll_at, Instant::now());
-        Pin::new(&mut this.inner).poll_next(cx)
+        let result = Pin::new(&mut this.inner).poll_next(cx);
+        if matches!(&result, Poll::Ready(Some(_))) { this.last_receipt = this.receipts.received(); }
+        result
     }
 }
 
@@ -4203,6 +4209,7 @@ fn spawn_clob_seeded_candidate(
                         lane.protocol.as_mut(),
                         &mut frame_batch,
                     );
+                    stamp_clob_receipt(&mut frame_batch.events, lane.read.last_receipt.parsed());
                     let batch = &mut frame_batch;
                     frame_phases.record();
                     lane.burst.record_frame(received_at, frame_len);
@@ -6046,6 +6053,7 @@ async fn clob_ws_task(
                                 active.protocol.as_mut(),
                                 &mut frame_batch,
                             );
+                            stamp_clob_receipt(&mut frame_batch.events, active.read.last_receipt.parsed());
                             let batch = &mut frame_batch;
                             frame_phases.record();
                             let parse_apply_elapsed = t_parse.elapsed();
@@ -7713,7 +7721,7 @@ impl ClobLocalBook {
                 .map(|(price, quantity)| level(*price, *quantity)))?;
             (bids, asks)
         };
-        Some(OrderBookSnapshot {
+        Some(OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol,
             bids,
@@ -7729,7 +7737,7 @@ impl ClobLocalBook {
 /// snapshot. Reserve the full-book wire capacity during subscription setup;
 /// cumulative deltas exceeding that capacity retain full depth via Vec growth.
 fn empty_canonical_snapshot(symbol: &str) -> OrderBookSnapshot {
-    OrderBookSnapshot {
+    OrderBookSnapshot { receipt: Default::default(),
         exchange: Exchange::Polymarket,
         symbol: symbol.to_owned(),
         bids: Vec::with_capacity(CLOB_BOOK_LEVEL_CAPACITY),
@@ -7739,7 +7747,18 @@ fn empty_canonical_snapshot(symbol: &str) -> OrderBookSnapshot {
     }
 }
 
+fn stamp_clob_receipt(events: &mut [MarketEvent], receipt: crate::types::MarketReceipt) {
+    for event in events {
+        match event {
+            MarketEvent::OrderBook(book) => book.receipt = receipt,
+            MarketEvent::Quote(quote) => quote.delivery.receipt = receipt,
+            _ => {}
+        }
+    }
+}
+
 fn update_canonical_snapshot(cached: &mut OrderBookSnapshot, snapshot: &OrderBookSnapshot) {
+    cached.receipt = snapshot.receipt;
     cached.exchange = snapshot.exchange;
     cached.symbol.clone_from(&snapshot.symbol);
     cached.bids.clone_from(&snapshot.bids);
@@ -10375,7 +10394,7 @@ mod clob_event_lane_tests {
         let level = |(price, quantity): (&Decimal, &Decimal)| Some(PriceLevel {
             price: price.to_f64()?, quantity: quantity.to_f64()?,
         });
-        OrderBookSnapshot {
+        OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket, symbol: String::new(),
             bids: book.bids.iter().rev().map(level).collect::<Option<Vec<_>>>().unwrap(),
             asks: book.asks.iter().map(level).collect::<Option<Vec<_>>>().unwrap(),
