@@ -31,7 +31,7 @@
   },
   "workspace_all_targets_locked_check": {
     "passed": true,
-    "log_sha256": "beaab2f728db5ff5d20545828dfc43215c9e5abf96e38241bbf485ffcac41882"
+    "log_sha256": "76d04cb5099bfe0c2d46ff5f1fc9ccb620195d5b789f2114c4103118299533ce"
   },
   "runtime_arm": {
     "passed": 115,
@@ -50,5 +50,25 @@
   },
   "tls-arm.log": {
     "sha256": "f46f442bc242403ab1b0bc60a89fcbe23b4281fee6085ede11aee2734c9205e0"
+  },
+  "exchange_macos_final": {
+    "passed": 1008,
+    "ignored": 54,
+    "sha256": "eab5f4151229741c31d33f2ff217aa64f86b8c879ca17393f1ab0f2d7ccd054f"
+  },
+  "cold_reconcile_macos": {
+    "passed": 7,
+    "ignored": 0,
+    "sha256": "6f7566fd08add726e5fb036140212c3140d41a4b3b041591d82373b61d980666"
+  },
+  "audit_arm_final": {
+    "passed": 39,
+    "ignored": 1,
+    "sha256": "74d9aa1ca962b3ccca2d1a4bea64c907009057a0bc31dbe7add052f9669d4f24"
+  },
+  "cold_reconcile_arm": {
+    "passed": 7,
+    "ignored": 0,
+    "sha256": "2ef5f3a5c8ea391e455a57c2267eed33af4e1102c48e2cc85ef5dcd633c00924"
   }
 }
