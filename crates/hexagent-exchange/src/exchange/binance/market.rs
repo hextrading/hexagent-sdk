@@ -449,7 +449,7 @@ fn parse_depth_update(data: &serde_json::Value) -> Option<MarketEvent> {
             .collect()
     };
 
-    Some(MarketEvent::OrderBook(OrderBookSnapshot {
+    Some(MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
         exchange: Exchange::Binance,
         symbol: symbol.to_uppercase(),
         bids: parse_levels("b")?,
@@ -481,7 +481,7 @@ fn parse_partial_depth(data: &serde_json::Value, symbol_hint: &str) -> Option<Ma
             .collect()
     };
 
-    Some(MarketEvent::OrderBook(OrderBookSnapshot {
+    Some(MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
         exchange: Exchange::Binance,
         symbol: symbol_hint.to_uppercase(),
         bids: parse_levels("bids")?,
@@ -933,6 +933,7 @@ async fn binance_ws_task(
         backoff.reset();
         info!("[{}] Connected", tag);
         let (mut write, mut read) = stream.split();
+        let mut receipts = crate::types::ReceiptSequencer::new();
 
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.tick().await;
@@ -988,6 +989,7 @@ async fn binance_ws_task(
                             break;
                         }
                     };
+                    let receipt = receipts.received();
                     inbound_deadline.received();
                     match msg {
                         Message::Text(text) => {
@@ -1000,9 +1002,14 @@ async fn binance_ws_task(
                             // Non-kline events flow straight through;
                             // closed klines go through gap-detection +
                             // REST-fill before being forwarded.
-                            if let Some(event) =
+                            if let Some(mut event) =
                                 parse_message_to_event(&text, futures, &symbol_hint)
                             {
+                                match &mut event {
+                                    MarketEvent::OrderBook(book) => book.receipt = receipt.parsed(),
+                                    MarketEvent::Quote(quote) => quote.delivery.receipt = receipt.parsed(),
+                                    _ => {}
+                                }
                                 if !dispatch_event(
                                     event,
                                     &event_tx,

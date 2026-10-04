@@ -159,9 +159,9 @@ pub struct OrderSignerV2 {
 
 /// Numeric live signing result. Compatibility OrderV2 remains unchanged.
 #[derive(Debug)]
-pub struct NumericSignedOrderV2 {
+pub struct NumericSignedOrderV2<'a> {
     pub salt: u64, pub timestamp: u64, pub maker_amount: u128, pub taker_amount: u128,
-    pub maker: String, pub signer: String, pub builder: String, pub signature_type: u8,
+    pub maker: &'a str, pub signer: &'a str, pub builder: &'a str, pub signature_type: u8,
     pub signature: String, pub order_hash: String,
 }
 
@@ -272,7 +272,7 @@ impl OrderSignerV2 {
     pub fn build_signed_order_numeric(
         &self, token_id: &str, prepared: Option<&crate::types::PreparedToken>,
         price: f64, size: f64, side: crate::types::Side,
-    ) -> Result<NumericSignedOrderV2> {
+    ) -> Result<NumericSignedOrderV2<'_>> {
         super::signer::validate_price_size(price, size)?;
         let token_word = if let Some(token) = prepared {
             if !token.matches(token_id) { return Err(anyhow!("prepared token does not match order symbol")); }
@@ -300,8 +300,8 @@ impl OrderSignerV2 {
         let signature = if poly1271 { self.sign_order_poly1271(contents, self.maker_word)? } else { self.sign_digest(&digest)? };
         Ok(NumericSignedOrderV2 {
             salt, timestamp, maker_amount, taker_amount, signature,
-            maker: self.maker_address.clone(), signer: signer_address.to_string(),
-            builder: self.builder_hex.clone(), signature_type: self.signature_type as u8,
+            maker: &self.maker_address, signer: signer_address,
+            builder: &self.builder_hex, signature_type: self.signature_type as u8,
             order_hash: prefixed_hex(&digest),
         })
     }
@@ -640,11 +640,11 @@ mod tests {
                         let signed = signer.build_signed_order_numeric(token, Some(&prepared), price, size, side).unwrap();
                         let (maker, taker) = compute_amounts(price, size, side);
                         assert_eq!(signed.maker_amount.to_string(), maker); assert_eq!(signed.taker_amount.to_string(), taker);
-                        let order = OrderV2 { salt: signed.salt.to_string(), maker: signed.maker, signer: signed.signer,
+                        let order = OrderV2 { salt: signed.salt.to_string(), maker: signed.maker.to_owned(), signer: signed.signer.to_owned(),
                             token_id: token.to_string(), maker_amount: maker, taker_amount: taker,
                             side: if side == crate::types::Side::Buy { 0 } else { 1 }, signature_type: signed.signature_type,
                             timestamp: signed.timestamp.to_string(), metadata: METADATA_ZERO_HEX.to_string(),
-                            builder: signed.builder, taker: "0x0000000000000000000000000000000000000000".into(), expiration: "0".into() };
+                            builder: signed.builder.to_owned(), taker: "0x0000000000000000000000000000000000000000".into(), expiration: "0".into() };
                         assert_eq!(signed.order_hash, signer.order_hash_hex(&order));
                         let signature = if matches!(kind, SignatureType::Poly1271) {
                             signer.sign_order_poly1271(order_v2_struct_hash(&order), address_to_bytes32(&order.signer)).unwrap()

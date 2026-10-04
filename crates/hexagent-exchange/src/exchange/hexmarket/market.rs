@@ -165,7 +165,7 @@ impl HexmarketMarket {
             })
             .collect();
 
-        Ok(MarketEvent::OrderBook(OrderBookSnapshot {
+        Ok(MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Hexmarket,
             symbol: outcome_id.to_string(),
             bids,
@@ -249,7 +249,7 @@ fn parse_ws_message(text: &str) -> Vec<MarketEvent> {
             let best_bid = bids.last().map(|l| (l.price, l.quantity));
             let best_ask = asks.last().map(|l| (l.price, l.quantity));
 
-            let mut events = vec![MarketEvent::OrderBook(OrderBookSnapshot {
+            let mut events = vec![MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
                 exchange: Exchange::Hexmarket,
                 symbol: asset_id.to_string(),
                 bids,

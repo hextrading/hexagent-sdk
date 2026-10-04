@@ -123,11 +123,15 @@ pub(crate) struct AdmissionCapacityDetail {
 /// Each account receives a separate instance, including separate failure windows
 /// and recovery probes. `Fast` and `Cancel` slots form the complete registry;
 /// query/reconcile/replay observations cannot affect order admission.
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct AccountExecutionAdmission {
     config: AdmissionConfig,
     fast: Vec<LaneState>,
     cancel: Vec<LaneState>,
     admission: ExecutionAdmission,
+    dirty: bool,
+    next_change_ns: u64,
+    probation_busy: bool,
     recovery_required: bool,
     recovery_successes: u8,
     probe: Option<RecoveryProbe>,
@@ -163,6 +167,7 @@ impl AccountExecutionAdmission {
                 available_place_slots: 0,
                 observed_at_ns: now_ns,
             },
+            dirty: true, next_change_ns: 0, probation_busy: false,
             recovery_required: true,
             recovery_successes: 0,
             probe: None,
@@ -181,6 +186,7 @@ impl AccountExecutionAdmission {
     /// order-endpoint request without a complete HTTP response. Old ACKs must
     /// not heal these lanes; new prewarmed generations enter normal recovery.
     pub(crate) fn retire_transport_generations(&mut self, now_ns: u64) {
+        self.dirty = true;
         self.transport_reset_peer = None;
         for lane in self.fast.iter_mut().chain(self.cancel.iter_mut()) {
             lane.retired_generation = Some(lane.generation);
@@ -222,6 +228,7 @@ impl AccountExecutionAdmission {
     /// Startup-only designation: emergency-only cancel capacity cannot justify
     /// admitting new places whose ordinary cancels use a different owner lane.
     pub(crate) fn reserve_cancel_slot(&mut self, slot: usize) {
+        self.dirty = true;
         if let Some(lane) = self.cancel.get_mut(slot) {
             lane.reserved_cancel = true;
         }
@@ -408,6 +415,22 @@ impl AccountExecutionAdmission {
     }
 
     pub(crate) fn refresh(&mut self, now_ns: u64) -> ExecutionAdmission {
+        if !self.dirty && now_ns >= self.admission.observed_at_ns && now_ns < self.next_change_ns {
+            self.admission.observed_at_ns = now_ns;
+            return self.admission;
+        }
+        self.dirty = false;
+        // Freshness is inclusive, so expiration occurs one nanosecond later.
+        // Never allow a cached result to cross a lease/recovery boundary.
+        self.next_change_ns = u64::MAX;
+        for lane in self.fast.iter().chain(self.cancel.iter()) {
+            for deadline in [lane.observed_at_ns,
+                lane.observed_at_ns.saturating_add(self.config.stale_after_ns).saturating_add(1),
+                lane.failure_eligible_after_ns] {
+                if deadline > now_ns { self.next_change_ns = self.next_change_ns.min(deadline); }
+            }
+        }
+        if self.pause_until_ns > now_ns { self.next_change_ns = self.next_change_ns.min(self.pause_until_ns); }
         let fresh = self
             .fast
             .iter()
@@ -450,6 +473,7 @@ impl AccountExecutionAdmission {
                     && lane.ready() && !lane.verified && lane.busy
             })
             .count();
+        self.probation_busy = probation_busy > 0;
         let free_fast = self
             .fast
             .iter()
@@ -515,10 +539,7 @@ impl AccountExecutionAdmission {
         self.can_place(now_ns)
             && self.fast.get(slot).is_some_and(|lane| {
                 lane.fresh(now_ns, self.config.stale_after_ns) && lane.ready() && !lane.busy
-                    && (self.recovery_required || lane.verified || !self.fast.iter().any(|other| {
-                        other.fresh(now_ns, self.config.stale_after_ns)
-                            && other.ready() && !other.verified && other.busy
-                    }))
+                    && (self.recovery_required || lane.verified || !self.probation_busy)
             })
     }
 
@@ -562,6 +583,7 @@ impl AccountExecutionAdmission {
     /// Call immediately after successful owner enqueue, before considering the
     /// next place. This closes the propagation race for the one-probe budget.
     pub(crate) fn place_dispatched(&mut self, slot: usize, now_ns: u64) {
+        self.dirty = true;
         if let Some(lane) = self.fast.get_mut(slot) {
             if self.recovery_required && self.probe.is_none() {
                 self.probe = Some(RecoveryProbe {
@@ -580,6 +602,7 @@ impl AccountExecutionAdmission {
     /// For a root-owned dispatch known not to have reached an owner. Ordinary
     /// owner preflight completions release through their complete observation.
     pub(crate) fn place_not_sent(&mut self, slot: usize, now_ns: u64) {
+        self.dirty = true;
         if let Some(lane) = self.fast.get_mut(slot) {
             lane.busy = false;
             lane.dispatched_at_ns = None;
@@ -599,6 +622,7 @@ impl AccountExecutionAdmission {
     }
 
     fn lane_mut(&mut self, role: Role, slot: usize) -> Option<&mut LaneState> {
+        self.dirty = true;
         match role {
             Role::Fast => self.fast.get_mut(slot),
             Role::Cancel => self.cancel.get_mut(slot),
@@ -631,6 +655,7 @@ impl AccountExecutionAdmission {
     }
 
     fn pause_for_recovery(&mut self, now_ns: u64) {
+        self.dirty = true;
         let shift = self.failure_streak.min(3);
         let duration = self
             .config
@@ -1368,15 +1393,15 @@ mod tests {
             ExecutionAdmissionState::Degraded
         );
         assert!(harness.state.can_place(harness.now));
-        harness.state.fast[1].observed_at_ns = 1;
+        harness.state.lane_mut(Role::Fast, 1).unwrap().observed_at_ns = 1;
         assert_eq!(
             harness.state.refresh(harness.now).state,
             ExecutionAdmissionState::Degraded
         );
         assert!(!harness.state.lane_place_allowed(1, harness.now));
         assert!(harness.state.lane_place_allowed(2, harness.now));
-        harness.state.cancel[1].observed_at_ns = 1;
-        harness.state.cancel[2].observed_at_ns = 1;
+        harness.state.lane_mut(Role::Cancel, 1).unwrap().observed_at_ns = 1;
+        harness.state.lane_mut(Role::Cancel, 2).unwrap().observed_at_ns = 1;
         assert_eq!(
             harness.state.refresh(harness.now).state,
             ExecutionAdmissionState::Paused
@@ -1648,4 +1673,45 @@ mod tests {
         assert_eq!(high_water, 1);
         assert_eq!(overflows, N.div_ceil(64));
     }
+    #[test]
+    fn cached_admission_matches_forced_refresh_at_lease_and_recovery_boundaries() {
+        let mut harness = Harness::healthy(4, 4);
+        let mut reference = harness.state.clone();
+        for now in [harness.now, harness.now + 1,
+            harness.now + harness.state.config.stale_after_ns,
+            harness.now + harness.state.config.stale_after_ns + 1] {
+            reference.dirty = true;
+            let expected = reference.refresh(now); let actual = harness.state.refresh(now);
+            assert_eq!(actual.state, expected.state); assert_eq!(actual.available_place_slots, expected.available_place_slots);
+            for slot in 0..4 { assert_eq!(harness.state.lane_place_allowed(slot, now), reference.lane_place_allowed(slot, now)); }
+        }
+        let mut harness = Harness::healthy(4, 4);
+        harness.outcome(Role::Cancel, 1, BusinessHttpOutcome::Failure);
+        let mut reference = harness.state.clone(); let eligible = harness.state.cancel[1].failure_eligible_after_ns;
+        for now in [harness.now, eligible - 1, eligible, eligible + 1] {
+            reference.dirty = true;
+            let expected = reference.refresh(now); let actual = harness.state.refresh(now);
+            assert_eq!(actual.state, expected.state); assert_eq!(actual.available_place_slots, expected.available_place_slots);
+        }
+        harness.state.retire_transport_generations(eligible + 2);
+        assert!(!harness.state.can_place(eligible + 2));
+    }
+
+    #[test]
+    #[ignore = "focused cached versus forced full recomputation benchmark"]
+    fn admission_candidate_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        const N: usize = 100_000;
+        for force in [true, false] {
+            let mut h = Harness::healthy(4, 4); let mut samples = Vec::with_capacity(N);
+            for _ in 0..N {
+                let started = Instant::now();
+                for slot in 0..4 { if force { h.state.dirty = true; } black_box(h.state.lane_place_allowed(slot, h.now)); }
+                samples.push(started.elapsed().as_nanos() as u64);
+            }
+            samples.sort_unstable();
+            eprintln!("admission_candidate force_full={force} n={N} median_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0 boundary=four_candidate_eligibility_checks", samples[N/2], samples[N*99/100], samples[N*999/1000], samples[N-1]);
+        }
+    }
+
 }

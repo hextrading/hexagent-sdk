@@ -126,6 +126,8 @@ pub struct CorePlan {
     pub allow_shared_private_cold_core: bool,
     pub allow_private_cold_on_background_core: bool,
     pub allow_cancel_on_execution_core: bool,
+    pub allow_execution_aux_on_router_core: bool,
+    pub execution_wakeup: bool,
     /// Per-account private order/trade application cores.
     pub private_apply_cores: HashMap<String, usize>,
     /// Per-account cold ledger/lifecycle cores. These stay SCHED_OTHER and
@@ -171,6 +173,8 @@ impl CorePlan {
             allow_shared_private_cold_core: false,
             allow_private_cold_on_background_core: false,
             allow_cancel_on_execution_core: false,
+            allow_execution_aux_on_router_core: false,
+            execution_wakeup: false,
             private_apply_cores: HashMap::new(),
             private_cold_cores: HashMap::new(),
             execution: DEFAULT_EXECUTION_CORE,
@@ -226,6 +230,8 @@ impl CorePlan {
             allow_shared_private_cold_core: cfg.allow_shared_private_cold_core,
             allow_private_cold_on_background_core: cfg.allow_private_cold_on_background_core,
             allow_cancel_on_execution_core: cfg.allow_cancel_on_execution_core,
+            allow_execution_aux_on_router_core: cfg.allow_execution_aux_on_router_core,
+            execution_wakeup: cfg.execution_wakeup,
             private_apply_cores: cfg.private_apply_cores.clone(),
             private_cold_cores: cfg.private_cold_cores.clone(),
             execution: cfg.execution_core.unwrap_or(DEFAULT_EXECUTION_CORE),
@@ -375,6 +381,12 @@ impl CorePlan {
                 "strict_core_isolation requires at least two distinct Polymarket dispatch/completion cores".into(),
             );
         }
+        if self.allow_execution_aux_on_router_core && (
+            self.strategy == self.execution || !self.execution_wakeup
+            || self.fifo_strategy <= self.fifo_cancel || self.fifo_strategy <= self.fifo_completion
+            || self.poly_exec_cores.contains(&self.strategy)) {
+            return Err("execution auxiliary sharing requires a separate dispatcher, wakeups, router priority above cancel/completion, and disjoint Fast cores".into());
+        }
         let dispatch_cores: HashSet<_> = self
             .poly_exec_cores
             .iter()
@@ -384,7 +396,7 @@ impl CorePlan {
         if self
             .poly_completion_cores
             .iter()
-            .any(|core| dispatch_cores.contains(core))
+            .any(|core| dispatch_cores.contains(core) && !(self.allow_execution_aux_on_router_core && *core == self.strategy))
         {
             return Err(
                 "strict_core_isolation requires poly_completion_cores to be disjoint from place/cancel dispatch cores"
@@ -498,7 +510,7 @@ impl CorePlan {
             let background_cold = self.allow_private_cold_on_background_core
                 && self.background_cores.contains(&cold_core)
                 && (cold_core != self.execution || self.allow_background_on_execution_core);
-            if background_cold && cold_core == self.execution {
+            if background_cold && (cold_core == self.execution || (self.allow_execution_aux_on_router_core && cold_core == self.strategy)) {
                 cold_cores.insert(cold_core);
                 continue;
             }
@@ -569,7 +581,10 @@ impl CorePlan {
                     && core == self.execution
                     && self.fifo_cancel > self.fifo_execution
                     && (self.strategy != self.execution || self.fifo_cancel < self.fifo_strategy);
-                if !allowed_private_completion && !allowed_cancel_dispatcher {
+                let allowed_aux_router = self.allow_execution_aux_on_router_core
+                    && core == self.strategy && core != self.execution
+                    && matches!(pool_name, "poly_cancel_cores" | "poly_completion_cores");
+                if !allowed_private_completion && !allowed_cancel_dispatcher && !allowed_aux_router {
                     return Err(format!("poly-exec/done core {} overlaps {}", core, role));
                 }
             }
@@ -612,7 +627,8 @@ impl CorePlan {
                 {
                     continue;
                 }
-                if self.allow_background_on_execution_core && core == self.execution {
+                if (self.allow_background_on_execution_core && core == self.execution)
+                    || (self.allow_execution_aux_on_router_core && core == self.strategy) {
                     continue;
                 }
                 return Err(format!(
@@ -692,6 +708,8 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     info!("[os_tune] dispatch sharing: cold_on_background={} cancel_on_execution={} fifo_cancel={}",
         plan.allow_private_cold_on_background_core, plan.allow_cancel_on_execution_core, plan.fifo_cancel);
     info!("[os_tune] archive recorder_core={:?} policy=SCHED_OTHER fallback=background", plan.recorder_core);
+    info!("[os_tune] execution_wakeup={} auxiliary_router_sharing={} dispatcher_core={} router_core={}",
+        plan.execution_wakeup, plan.allow_execution_aux_on_router_core, plan.execution, plan.strategy);
     let _ = CORE_PLAN.set(plan);
 }
 
@@ -1459,6 +1477,28 @@ mod tests {
         cfg.fifo_strategy = Some(60);
         let enabled = vec!["btc01".into(), "btc02".into(), "btc03".into()];
         assert!(CorePlan::from_config(&cfg).validate_strategy_isolation(&enabled).is_ok());
+        let mut isolated = cfg.clone();
+        isolated.execution_core = Some(15);
+        isolated.poly_completion_cores = vec![4];
+        isolated.allow_background_on_execution_core = false;
+        isolated.allow_strategy_router_on_execution_core = false;
+        isolated.allow_cancel_on_execution_core = false;
+        isolated.allow_execution_aux_on_router_core = true;
+        isolated.execution_wakeup = true;
+        assert!(CorePlan::from_config(&isolated).validate_strategy_isolation(&enabled).is_ok());
+        for case in 0..7 {
+            let mut bad = isolated.clone();
+            match case {
+                0 => bad.execution_wakeup = false,
+                1 => bad.allow_execution_aux_on_router_core = false,
+                2 => bad.fifo_completion = Some(60),
+                3 => bad.fifo_cancel = Some(60),
+                4 => bad.poly_exec_cores.push(4),
+                5 => bad.execution_core = Some(4),
+                _ => bad.poly_completion_cores.push(9),
+            }
+            assert!(CorePlan::from_config(&bad).validate_strategy_isolation(&enabled).is_err(), "isolated case {case}");
+        }
         for case in 0..8 {
             let mut bad = cfg.clone();
             match case {

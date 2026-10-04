@@ -2230,6 +2230,9 @@ enum LifecycleEvidence {
 
 #[derive(Debug)]
 struct AttemptAuditJob {
+    account_id: String,
+    hot_path: crate::types::HotPathTrace,
+    completed_mono_ns: u64,
     cancel_trigger: CancelTrigger,
     attempt: crate::http1_pool::AttemptTraceSnapshot,
     kind: &'static str,
@@ -2338,6 +2341,11 @@ impl OrderAttemptRecorder {
         let attempt = job.attempt;
         let order = job.order.as_ref();
         let record = serde_json::json!({
+                "account": job.account_id,
+                "hot_path": job.hot_path,
+                "completed_mono_ns": job.completed_mono_ns,
+                "market_receive_to_dispatch_ns": job.hot_path.receive_to_dispatch_ns(),
+                "measurement_boundary": "ws_message_ready_before_json_to_http_submit_return",
                 "attempt_id": attempt.attempt_id,
                 "kind": job.kind,
                 "role": format!("{:?}", attempt.role),
@@ -3299,8 +3307,8 @@ async fn execute_http_with_cancel_connection_failure_hedge(
 /// the server (JSON object).
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(untagged)]
-pub(crate) enum PolyOrderBody {
-    V2(WireBodyV2),
+pub(crate) enum PolyOrderBody<'a> {
+    V2(WireBodyV2<'a>),
 }
 
 /// One-pass `DELETE /order` body for the hot cancel path.
@@ -3311,25 +3319,25 @@ struct CancelBody<'a> {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct WireBodyV2 {
-    pub owner: String,
+pub(crate) struct WireBodyV2<'a> {
+    pub owner: &'a str,
     #[serde(rename = "orderType")]
     pub order_type: &'static str,
     #[serde(rename = "postOnly")]
     pub post_only: bool,
     #[serde(rename = "deferExec")]
     pub defer_exec: bool,
-    pub order: WireOrderV2,
+    pub order: WireOrderV2<'a>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct WireOrderV2 {
+pub(crate) struct WireOrderV2<'a> {
     pub salt: u64,
-    pub maker: String,
-    pub signer: String,
-    pub taker: String,
+    pub maker: &'a str,
+    pub signer: &'a str,
+    pub taker: &'a str,
     #[serde(rename = "tokenId")]
-    pub token_id: String,
+    pub token_id: &'a str,
     #[serde(rename = "makerAmount")]
     #[serde(serialize_with = "decimal_string")]
     pub maker_amount: u128,
@@ -3341,9 +3349,9 @@ pub(crate) struct WireOrderV2 {
     pub signature_type: u8,
     #[serde(serialize_with = "decimal_string")]
     pub timestamp: u64,
-    pub expiration: String,
-    pub metadata: String,
-    pub builder: String,
+    pub expiration: &'a str,
+    pub metadata: &'a str,
+    pub builder: &'a str,
     pub signature: String,
 }
 
@@ -5125,6 +5133,7 @@ impl SharedState {
         kind: &'static str,
         order: Option<&OrderRequest>,
         cancel_trigger: CancelTrigger,
+        hot_path: crate::types::HotPathTrace,
         route_instance_id: &str,
         client_order_id: &str,
         exchange_order_id: Option<&str>,
@@ -5150,6 +5159,8 @@ impl SharedState {
             elapsed_ns,
         );
         let job = AttemptAuditJob {
+            account_id: self.account_state.account_id().to_owned(),
+            hot_path, completed_mono_ns: crate::types::monotonic_now_ns(),
             cancel_trigger,
             attempt,
             kind,
@@ -6831,6 +6842,7 @@ impl SharedState {
 /// [`PolymarketTrade::complete_submit`] off-thread. Fields are private so
 /// the engine holds it opaquely (never touching `HttpReply`).
 pub struct PendingSubmit {
+    hot_path: crate::types::HotPathTrace,
     local_oid: String,
     rx: HttpReplyReceiver,
     timing: Arc<HttpCompletionTiming>,
@@ -6850,6 +6862,7 @@ pub struct PendingCancel {
 }
 
 struct PreparedSubmit {
+    hot_path: crate::types::HotPathTrace,
     local_oid: String,
     body: Bytes,
     prep_ns: u64,
@@ -9831,10 +9844,10 @@ impl PolymarketTrade {
     ///     `metadata` / `builder` (bytes32 each). The HTTP body follows
     ///     suit. Fee is computed protocol-side at match time, so
     ///     `order.fee_rate_bps` is informational only and not signed.
-    fn sign_and_build_body(
-        &self,
-        order: &OrderRequest,
-    ) -> Result<(String /* order_hash */, PolyOrderBody)> {
+    fn sign_and_build_body<'a>(
+        &'a self,
+        order: &'a OrderRequest,
+    ) -> Result<(String /* order_hash */, PolyOrderBody<'a>)> {
         let price = validate_order_for_signing(order)?;
 
         self.sign_and_build_body_v2(order, price)
@@ -9855,11 +9868,11 @@ impl PolymarketTrade {
         }
     }
 
-    fn sign_and_build_body_v2(
-        &self,
-        order: &OrderRequest,
+    fn sign_and_build_body_v2<'a>(
+        &'a self,
+        order: &'a OrderRequest,
         price: f64,
-    ) -> Result<(String, PolyOrderBody)> {
+    ) -> Result<(String, PolyOrderBody<'a>)> {
         let signer_v2 =
             self.shared.signer_v2.as_ref().ok_or_else(|| {
                 anyhow!("clob_version=v2 but signer_v2 is None — constructor bug")
@@ -9867,17 +9880,17 @@ impl PolymarketTrade {
         let signed = signer_v2.build_signed_order_numeric(
             &order.symbol, order.prepared_token.as_deref(), price, order.quantity, order.side)?;
         let body = PolyOrderBody::V2(WireBodyV2 {
-            owner: self.owner.clone(), order_type: Self::poly_order_type_str(order.order_type),
+            owner: &self.owner, order_type: Self::poly_order_type_str(order.order_type),
             post_only: order.post_only, defer_exec: false,
             order: WireOrderV2 {
                 salt: signed.salt, maker: signed.maker, signer: signed.signer,
-                taker: "0x0000000000000000000000000000000000000000".to_string(),
-                token_id: order.symbol.clone(), maker_amount: signed.maker_amount,
+                taker: "0x0000000000000000000000000000000000000000",
+                token_id: &order.symbol, maker_amount: signed.maker_amount,
                 taker_amount: signed.taker_amount,
                 side: if order.side == Side::Buy { "BUY" } else { "SELL" },
                 signature_type: signed.signature_type, timestamp: signed.timestamp,
-                expiration: "0".to_string(),
-                metadata: super::signer_v2::METADATA_ZERO_HEX.to_string(),
+                expiration: "0",
+                metadata: super::signer_v2::METADATA_ZERO_HEX,
                 builder: signed.builder, signature: signed.signature,
             },
         });
@@ -11587,6 +11600,7 @@ impl PolymarketTrade {
             "/order",
             prepared.body, None, Some(completion),
         );
+        let http_submitted_mono_ns = crate::types::monotonic_now_ns();
         let dispatched_ns = now_ns();
         attempt.mark_dispatched(dispatched_ns);
         let trace = attempt
@@ -11611,6 +11625,7 @@ impl PolymarketTrade {
                 .saturating_sub(trace.account_recorded_ns),
         );
         Ok(PendingSubmit {
+            hot_path: crate::types::HotPathTrace { http_submitted_mono_ns, ..prepared.hot_path },
             local_oid: prepared.local_oid,
             rx,
             timing,
@@ -11622,6 +11637,7 @@ impl PolymarketTrade {
     /// handler (open_orders / coid bookkeeping, balance-error trigger).
     pub fn complete_submit(&mut self, order: &OrderRequest, pending: PendingSubmit) -> OrderUpdate {
         let PendingSubmit {
+            hot_path,
             local_oid,
             rx,
             timing,
@@ -11658,6 +11674,7 @@ impl PolymarketTrade {
             "place",
             Some(order),
             CancelTrigger::default(),
+            hot_path,
             &self.instance_id,
             &order.client_order_id,
             Some(&local_oid),
@@ -11682,8 +11699,10 @@ impl PolymarketTrade {
         &mut self,
         client_order_id: &str,
         client: crate::http1_pool::PooledClient,
-        cancel_trigger: CancelTrigger,
+        mut cancel_trigger: CancelTrigger,
     ) -> PendingCancel {
+        cancel_trigger.hot_path.clock_domain_ns = crate::types::monotonic_clock_domain_ns();
+        cancel_trigger.hot_path.prep_mono_ns = crate::types::monotonic_now_ns();
         let signal_ns = self.gen_ns_hint;
         let prep_ns = now_ns();
         let completion = self.reply_slots.checkout(reset_reply_timing);
@@ -11720,6 +11739,7 @@ impl PolymarketTrade {
                 (Some(HttpReplyReceiver::Dedicated(rx)), None, None)
             }
         };
+        if attempt.is_some() { cancel_trigger.hot_path.http_submitted_mono_ns = crate::types::monotonic_now_ns(); }
         let dispatched_ns = rx.as_ref().map(|_| now_ns()).unwrap_or(0);
         if let Some(attempt) = &attempt {
             attempt.mark_dispatched(dispatched_ns);
@@ -11799,6 +11819,7 @@ impl PolymarketTrade {
                 "cancel",
                 None,
                 cancel_trigger,
+                cancel_trigger.hot_path,
                 &self.instance_id,
                 client_order_id,
                 update.exchange_order_id.as_deref(),
@@ -11849,6 +11870,9 @@ impl PolymarketTrade {
         order: &OrderRequest,
         legacy_trace: bool,
     ) -> std::result::Result<PreparedSubmit, OrderUpdate> {
+        let mut hot_path = order.hot_path;
+        hot_path.clock_domain_ns = crate::types::monotonic_clock_domain_ns();
+        hot_path.prep_mono_ns = crate::types::monotonic_now_ns();
         let prep_ns = now_ns();
         if legacy_trace {
             self.shared.register_order_lifecycle(order);
@@ -11881,6 +11905,7 @@ impl PolymarketTrade {
         };
         let local_oid = order_hash;
         let signed_ns = now_ns();
+        hot_path.signed_mono_ns = crate::types::monotonic_now_ns();
         if legacy_trace {
             self.shared.log_order_lifecycle(
                 &order.client_order_id,
@@ -11912,6 +11937,7 @@ impl PolymarketTrade {
             }
         };
         let account_recorded_ns = now_ns();
+        hot_path.account_recorded_mono_ns = crate::types::monotonic_now_ns();
         if legacy_trace {
             self.shared.log_order_lifecycle(
                 &order.client_order_id,
@@ -11956,6 +11982,7 @@ impl PolymarketTrade {
         }
 
         Ok(PreparedSubmit {
+            hot_path,
             local_oid,
             body: body_json.freeze(),
             prep_ns,
@@ -14554,6 +14581,37 @@ mod tests {
         shutdown.finish();
         assert_eq!(shared.join_background_workers(), 3);
         assert_eq!(shared.join_background_workers(), 0);
+    }
+
+    #[test]
+    fn persisted_place_and_cancel_audits_keep_cause_and_monotonic_boundaries() {
+        let receipt = crate::types::ReceiptSequencer::new().received().parsed();
+        let trace = crate::types::HotPathTrace { receipt, clock_domain_ns: receipt.clock_domain_ns,
+            http_submitted_mono_ns: receipt.ws_received_mono_ns + 321, ..Default::default() };
+        let directory = std::env::temp_dir().join(format!("hexagent-receipt-audit-{}-{}", std::process::id(), now_ns()));
+        let mut recorder = OrderAttemptRecorder { directory: directory.clone(), hour: -1, writer: None };
+        for kind in ["place", "cancel"] {
+            recorder.write_attempt(&AttemptAuditJob {
+                account_id: "account-2".into(), hot_path: trace, completed_mono_ns: trace.http_submitted_mono_ns + 500,
+                cancel_trigger: CancelTrigger { hot_path: trace, ..Default::default() },
+                attempt: crate::http1_pool::AttemptTraceSnapshot { attempt_id: 1,
+                    role: crate::http1_pool::Role::Cancel, slot: 2,
+                    signal_ns: 1, prep_ns: 2, signed_ns: 3, account_recorded_ns: 4, dispatched_ns: 5 },
+                kind, route_instance_id: "owner-2".into(), order: None,
+                client_order_id: "existing-order".into(), exchange_order_id: None,
+                status: OrderStatus::Cancelled, error: None, completed_ns: 6, enqueued_ns: 7,
+            }).unwrap();
+        }
+        recorder.writer.as_mut().unwrap().flush().unwrap(); let hour = recorder.hour; drop(recorder);
+        let text = std::fs::read_to_string(directory.join(format!("order-audit-{hour}.jsonl"))).unwrap();
+        for (line, kind) in text.lines().zip(["place", "cancel"]) {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value["kind"], kind); assert_eq!(value["iid"], "owner-2");
+            assert_eq!(value["market_receive_to_dispatch_ns"], 321);
+            let stored: crate::types::HotPathTrace = serde_json::from_value(value["hot_path"].clone()).unwrap();
+            assert_eq!(stored, trace);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

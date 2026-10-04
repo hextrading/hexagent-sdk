@@ -8,6 +8,8 @@ use std::io::{self, IoSlice};
 /// A successful write means accepted by the transport, not acknowledged by TCP.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Http1IoTimings {
+    pub first_write_mono_ns: u64,
+    pub first_read_mono_ns: u64,
     pub first_write_offset_ns: u64,
     pub write_span_ns: u64,
     pub first_read_offset_ns: u64,
@@ -28,6 +30,8 @@ pub(super) struct IoTrace {
     origin: Instant,
     active_start: AtomicU64,
     first_write: AtomicU64,
+    first_write_mono: AtomicU64,
+    first_read_mono: AtomicU64,
     last_write: AtomicU64,
     first_read: AtomicU64,
     written: AtomicU64,
@@ -46,6 +50,8 @@ impl Default for IoTrace {
             origin: Instant::now(),
             active_start: AtomicU64::new(0),
             first_write: AtomicU64::new(0),
+            first_write_mono: AtomicU64::new(0),
+            first_read_mono: AtomicU64::new(0),
             last_write: AtomicU64::new(0),
             first_read: AtomicU64::new(0),
             written: AtomicU64::new(0),
@@ -69,6 +75,8 @@ impl IoTrace {
         self.active_start.store(0, Ordering::Release);
         for value in [
             &self.first_write,
+            &self.first_write_mono,
+            &self.first_read_mono,
             &self.last_write,
             &self.first_read,
             &self.written,
@@ -97,6 +105,8 @@ impl IoTrace {
         let read = self.first_read.load(Ordering::Acquire);
         let flushed = self.flush.load(Ordering::Acquire);
         Http1IoTimings {
+            first_write_mono_ns: self.first_write_mono.load(Ordering::Acquire),
+            first_read_mono_ns: self.first_read_mono.load(Ordering::Acquire),
             first_write_offset_ns: write.saturating_sub(start),
             write_span_ns: last.saturating_sub(write),
             first_read_offset_ns: read.saturating_sub(start),
@@ -157,6 +167,7 @@ impl<T> TimedIo<T> {
                 .compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
+                io.first_write_mono.store(hexagent_types::types::monotonic_now_ns(), Ordering::Release);
                 self.sample_tcp(true);
             }
             io.last_write.store(now, Ordering::Release);
@@ -234,6 +245,7 @@ impl<T: Read + Unpin> Read for TimedIo<T> {
                 .compare_exchange(0, io.now(), Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
+                io.first_read_mono.store(hexagent_types::types::monotonic_now_ns(), Ordering::Release);
                 self.sample_tcp(false);
             }
             io.read.fetch_add(bytes as u64, Ordering::Relaxed);

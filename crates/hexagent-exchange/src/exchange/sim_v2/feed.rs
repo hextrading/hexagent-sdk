@@ -561,7 +561,7 @@ mod tests {
     }
 
     fn snapshot(token: &str, source: u64, receive: u64, ask: f64, bid_qty: f64) -> MarketEvent {
-        MarketEvent::OrderBook(OrderBookSnapshot {
+        MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: token.into(),
             bids: vec![PriceLevel {
@@ -591,7 +591,7 @@ mod tests {
     }
 
     fn bid(coid: &str, price: f64) -> OrderRequest {
-        OrderRequest {
+        OrderRequest { hot_path: Default::default(),
             prepared_token: None,
             client_order_id: coid.into(),
             exchange: Exchange::Polymarket,

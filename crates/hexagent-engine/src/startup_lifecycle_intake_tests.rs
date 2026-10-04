@@ -227,7 +227,7 @@ fn startup_lifecycle_intake_retains_full_buffer_message_and_resumes_both_lanes_i
     worker
         .market
         .send(QueuedMarketEvent::Direct(QueuedMarketPayload {
-            event: Arc::new(MarketEvent::OrderBook(OrderBookSnapshot {
+            event: Arc::new(MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
                 exchange: Exchange::Binance,
                 symbol: "BTCUSDT".into(),
                 bids: vec![],

@@ -108,6 +108,8 @@ pub struct OrderBookSnapshot {
     pub asks: Vec<PriceLevel>,
     pub exchange_timestamp_ns: u64,
     pub local_timestamp_ns: u64,
+    #[serde(default)]
+    pub receipt: super::hot_path::MarketReceipt,
 }
 
 /// A single trade event
@@ -145,6 +147,8 @@ pub struct QuoteDelivery {
     /// Source-owner publication time. Does not replace the original receipt
     /// timestamp used by freshness, ordering and replay guards.
     pub published_timestamp_ns: u64,
+    #[serde(default)]
+    pub receipt: super::hot_path::MarketReceipt,
 }
 
 /// Best bid/ask quote tick (from bookTicker stream)
@@ -368,7 +372,7 @@ mod tests {
     }
 
     fn book(exchange: Exchange, bids: Vec<PriceLevel>, asks: Vec<PriceLevel>) -> OrderBookSnapshot {
-        OrderBookSnapshot {
+        OrderBookSnapshot { receipt: Default::default(),
             exchange,
             symbol: "TEST".to_string(),
             bids,
@@ -526,7 +530,7 @@ mod quote_delivery_tests {
         assert_eq!(serde_json::to_value(&q).unwrap()["delivery"]["origin"], "Unspecified");
         assert_eq!(q.publication_age_ns(500), None);
         for origin in [QuoteOrigin::Wire, QuoteOrigin::SubscriptionCheckpoint] {
-            q.delivery = QuoteDelivery { origin, published_timestamp_ns: 400 };
+            q.delivery = QuoteDelivery { receipt: Default::default(), origin, published_timestamp_ns: 400 };
             let copy: QuoteTick = serde_json::from_value(serde_json::to_value(&q).unwrap()).unwrap();
             assert_eq!(copy.delivery, q.delivery);
             assert_eq!(copy.local_timestamp_ns, 200);

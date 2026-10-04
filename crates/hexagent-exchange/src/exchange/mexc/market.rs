@@ -136,7 +136,7 @@ async fn mexc_ws_task(
                                         })
                                         .collect();
                                     if bids.is_empty() || asks.is_empty() { continue; }
-                                    let event = MarketEvent::OrderBook(OrderBookSnapshot {
+                                    let event = MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
                                         exchange: Exchange::Mexc,
                                         symbol,
                                         bids,

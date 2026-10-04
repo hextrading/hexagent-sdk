@@ -96,7 +96,7 @@ fn canonical_cache_update_reuses_buffers_and_keeps_complete_independent_depth() 
     let mut cached = empty_canonical_snapshot("up");
     let original_bids = cached.bids.as_ptr();
     let original_asks = cached.asks.as_ptr();
-    let mut published = OrderBookSnapshot {
+    let mut published = OrderBookSnapshot { receipt: Default::default(),
         exchange: Exchange::Polymarket,
         symbol: "up".into(),
         bids: vec![
@@ -226,7 +226,7 @@ fn older_complementary_seed_reemits_the_newest_cached_book() {
 fn benchmark_canonical_cache_maintenance_ab() {
     const N: usize = 20_000;
     for depth in [1, 16, CLOB_BOOK_LEVEL_CAPACITY] {
-        let published = OrderBookSnapshot {
+        let published = OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: specs()[0].up_token.clone(),
             bids: vec![

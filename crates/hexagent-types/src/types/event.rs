@@ -263,6 +263,7 @@ pub enum MarketEvent {
 /// Copy-only metadata travels with the bounded signal and pending completion.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CancelTrigger {
+    pub hot_path: super::hot_path::HotPathTrace,
     pub source: super::order::QuoteTriggerSource,
     pub exchange_ns: u64,
     pub local_ns: u64,
@@ -550,7 +551,7 @@ mod tests {
 
     #[test]
     fn market_event_finite_validation_covers_string_parsed_payload_shapes() {
-        let orderbook = MarketEvent::OrderBook(OrderBookSnapshot {
+        let orderbook = MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Binance,
             symbol: "BTCUSDT".to_string(),
             bids: vec![PriceLevel {

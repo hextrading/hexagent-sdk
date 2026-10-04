@@ -208,7 +208,7 @@ async fn gate_ws_task(
                             let asks = parse_levels("asks");
                             if bids.is_empty() || asks.is_empty() { continue; }
                             let ts_ms = result.get("t").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let event = MarketEvent::OrderBook(OrderBookSnapshot {
+                            let event = MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
                                 exchange: Exchange::Gate,
                                 symbol,
                                 bids,

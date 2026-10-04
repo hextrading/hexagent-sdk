@@ -239,7 +239,7 @@ fn signal(command: &Command, ordinal: usize) -> Result<Signal> {
     if generation == 0 {
         bail!("diagnostic slot generation exhausted")
     }
-    Ok(Signal::NewOrder(OrderRequest {
+    Ok(Signal::NewOrder(OrderRequest { hot_path: Default::default(),
         prepared_token: None,
         order_slot: OrderSlot::with_generation(index, generation),
         client_order_id: command.coid.clone(),

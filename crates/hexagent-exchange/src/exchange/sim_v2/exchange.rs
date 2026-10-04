@@ -5850,7 +5850,7 @@ mod tests {
         exchange_ts: u64,
         local_ts: u64,
     ) -> OrderBookSnapshot {
-        OrderBookSnapshot {
+        OrderBookSnapshot { receipt: Default::default(),
             exchange: Exchange::Polymarket,
             symbol: symbol.into(),
             bids: bids
@@ -5881,7 +5881,7 @@ mod tests {
         post_only: bool,
         ot: OrderType,
     ) -> OrderRequest {
-        OrderRequest {
+        OrderRequest { hot_path: Default::default(),
             prepared_token: None,
             client_order_id: coid.into(),
             exchange: Exchange::Polymarket,
