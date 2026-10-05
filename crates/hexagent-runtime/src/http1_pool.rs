@@ -431,7 +431,12 @@ impl KeepWarmTarget {
         now_ns.saturating_sub(last) >= KEEP_WARM_IDLE.as_nanos() as u64
     }
 
+    #[cfg(test)]
     fn try_acquire(&self) -> Option<KeepWarmLease> {
+        self.try_acquire_for(false)
+    }
+
+    fn try_acquire_for(&self, instrumented: bool) -> Option<KeepWarmLease> {
         if !self.eligible_at(activity_now_ns()) {
             return None;
         }
@@ -452,9 +457,24 @@ impl KeepWarmTarget {
             drop(global);
             return None;
         }
+        let state = &self.pool.slots[self.slot];
+        if instrumented && state.execution_owner.load(Ordering::Acquire)
+            && !state.quarantined.load(Ordering::Acquire)
+        {
+            // The permanent actor retains the slot permit. Maintenance uses
+            // that exact client's lower-priority request gate, never another
+            // permit or a business admission/outcome proof.
+            return Some(KeepWarmLease {
+                permit: None,
+                owned_client: Some(self.pool.pooled_client_for_slot(self.slot)),
+                pool_inflight: self.pool.keep_warm_inflight.clone(),
+                _global: global,
+            });
+        }
         match self.pool.try_acquire_slot(self.slot) {
             Some(permit) => Some(KeepWarmLease {
                 permit: Some(permit),
+                owned_client: None,
                 pool_inflight: self.pool.keep_warm_inflight.clone(),
                 _global: global,
             }),
@@ -497,12 +517,14 @@ impl Drop for GlobalKeepWarmLease {
 
 struct KeepWarmLease {
     permit: Option<Permit>,
+    owned_client: Option<PooledClient>,
     pool_inflight: Arc<AtomicBool>,
     _global: GlobalKeepWarmLease,
 }
 
 impl KeepWarmLease {
     fn pooled_client(&self) -> PooledClient {
+        if let Some(client) = &self.owned_client { return client.clone(); }
         self.permit
             .as_ref()
             .expect("keep-warm permit missing")
@@ -557,8 +579,11 @@ pub fn spawn_keep_warm(label: &'static str, warm_url: String, full_sweep: Durati
 }
 
 /// Polymarket variant of [`spawn_keep_warm`] using the measured connector.
-/// It owns the same admission slots and therefore replaces, rather than adds
-/// to, the CLOB prewarm/keep-warm connection set.
+/// Uses the existing CLOB slot clients. Permanent execution owners retain
+/// their admission permits; their probes instead try the transport's idle
+/// request gate and yield to business requests. Probe results never grant
+/// business admission. Cancellation can retire HTTP/1 and cause a measured
+/// cold reconnect, but business never waits for the probe's response timeout.
 pub fn spawn_instrumented_keep_warm(label: &'static str, warm_url: String, full_sweep: Duration) {
     spawn_keep_warm_transport(label, warm_url, full_sweep, KeepWarmTransport::Instrumented);
 }
@@ -699,7 +724,7 @@ fn spawn_keep_warm_transport(
                 if !target.eligible_at(now_ns) {
                     continue;
                 }
-                let Some(lease) = target.try_acquire() else {
+                let Some(lease) = target.try_acquire_for(matches!(transport, KeepWarmTransport::Instrumented)) else {
                     continue;
                 };
                 cursor = (index + 1) % targets.len();
@@ -707,6 +732,31 @@ fn spawn_keep_warm_transport(
                 let url = warm_url.clone();
                 tokio::spawn(async move {
                     let client = lease.pooled_client();
+                    if lease.owned_client.is_some() {
+                        use crate::instrumented_http1::KeepWarmOutcome;
+                        let started = Instant::now();
+                        let outcome = client.instrumented.keep_warm(&url, KEEP_WARM_TIMEOUT).await;
+                        let outcome_index = match outcome {
+                            KeepWarmOutcome::Busy => 1,
+                            KeepWarmOutcome::Preempted => 2,
+                            KeepWarmOutcome::Completed(Ok(response)) => {
+                                client.health.last_activity_ns.store(activity_now_ns(), Ordering::Release);
+                                client.note_transport_success();
+                                if response.status.is_success() { 0 } else { 3 }
+                            }
+                            KeepWarmOutcome::Completed(Err(_)) => {
+                                client.health.last_activity_ns.store(activity_now_ns(), Ordering::Release);
+                                client.note_instrumented_transport_failure(url.clone());
+                                4
+                            }
+                        };
+                        let stats = &target.pool.slots[target.slot].keep_warm;
+                        stats.outcomes[outcome_index].fetch_add(1, Ordering::Relaxed);
+                        stats.max_ns.fetch_max(started.elapsed().as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+                        // Counters only here; the existing pinned statistics
+                        // worker formats/exports per-slot coverage off I/O.
+                        return;
+                    }
                     let outcome =
                         run_keep_warm_probe(&client, transport, &url, KEEP_WARM_TIMEOUT).await;
                     match outcome {
@@ -784,6 +834,8 @@ fn spawn_keep_warm_transport(
 /// One connection slot: a warm h1.1 client + an in-use flag. Held by at
 /// most one in-flight request at a time.
 struct Slot {
+    keep_warm: OwnerKeepWarmCounters,
+    execution_owner: Arc<AtomicBool>,
     client: Arc<ArcSwap<reqwest::Client>>,
     /// Polymarket's measured HTTP/1 transport. It shares this slot's
     /// admission owner and pool cardinality; it is not an additional slot.
@@ -806,6 +858,7 @@ struct Slot {
 
 #[derive(Clone)]
 struct ConnectionHealth {
+    last_activity_ns: Arc<AtomicU64>,
     role: Role,
     slot: usize,
     generation_at_pick: u64,
@@ -1273,9 +1326,11 @@ impl PooledClient {
         crate::instrumented_http1::InstrumentedHttp1Response,
         crate::instrumented_http1::InstrumentedHttp1Error,
     > {
-        self.instrumented
+        let result = self.instrumented
             .request(method, url, headers, body, timeout)
-            .await
+            .await;
+        self.health.last_activity_ns.store(activity_now_ns(), Ordering::Release);
+        result
     }
 
     pub fn role(&self) -> Role {
@@ -1465,6 +1520,7 @@ pub struct PooledConnectionSnapshot {
 /// Admission permit: owns an exclusive slot's client for the duration of
 /// one request. Dropping it frees the slot for the next request.
 pub struct Permit {
+    execution_owner: Arc<AtomicBool>,
     role: Role,
     slot: usize,
     acquired_generation: u64,
@@ -1550,6 +1606,7 @@ impl Permit {
 
     fn health(&self, generation_at_pick: u64) -> ConnectionHealth {
         ConnectionHealth {
+            last_activity_ns: self.last_activity_ns.clone(),
             role: self.role,
             slot: self.slot,
             generation_at_pick,
@@ -1596,6 +1653,7 @@ impl Permit {
 
 impl Drop for Permit {
     fn drop(&mut self) {
+        self.execution_owner.store(false, Ordering::Release);
         // Eligibility is measured from request completion. Every permit user
         // (business and keep-warm) refreshes the same slot activity clock.
         self.last_activity_ns
@@ -1662,6 +1720,8 @@ impl RolePool {
         let mut slots = Vec::with_capacity(n);
         for slot in 0..n {
             slots.push(Slot {
+                keep_warm: OwnerKeepWarmCounters::default(),
+                execution_owner: Arc::new(AtomicBool::new(false)),
                 client: Arc::new(ArcSwap::from(Arc::new(build_h1_client(timeout)?))),
                 instrumented: Arc::new(ArcSwap::from(Arc::new(
                     crate::instrumented_http1::InstrumentedHttp1Client::new(
@@ -1798,6 +1858,7 @@ impl RolePool {
             .store(activity_now_ns(), Ordering::Release);
         let acquired_generation = s.generation.load(Ordering::Acquire);
         Some(Permit {
+            execution_owner: s.execution_owner.clone(),
             role: self.role,
             slot,
             acquired_generation,
@@ -1832,6 +1893,7 @@ impl RolePool {
             client: state.client.load_full(),
             instrumented: state.instrumented.load_full(),
             health: ConnectionHealth {
+                last_activity_ns: state.last_activity_ns.clone(),
                 role: self.role,
                 slot,
                 generation_at_pick: generation,
@@ -2071,9 +2133,11 @@ pub fn account_execution_slot_manifest() -> Vec<(String, Role, usize)> {
 /// actor lifetime and use `current_pooled_client()` for each sequential
 /// request.  Taking the same slot twice fails closed.
 pub fn take_account_execution_slot(account_id: &str, role: Role, slot: usize) -> Option<Permit> {
-    account_by_id(account_id)?
+    let permit = account_by_id(account_id)?
         .role(role)?
-        .try_acquire_slot(slot)
+        .try_acquire_slot(slot)?;
+    permit.execution_owner.store(true, Ordering::Release);
+    Some(permit)
 }
 
 fn account_for_instance(instance: &str) -> Option<&'static AccountPools> {
@@ -2150,6 +2214,46 @@ pub fn exempt_client(instance: &str, role: Role) -> Arc<reqwest::Client> {
         }
     }
     client(role)
+}
+
+#[derive(Default)]
+struct OwnerKeepWarmCounters {
+    // completed OK, business busy, business preemption, HTTP error, transport error
+    outcomes: [AtomicU64; 5],
+    max_ns: AtomicU64,
+}
+
+/// Background-only reporting. Counters are bounded per physical slot and
+/// survive its transport replacements; no maintenance event is a business proof.
+pub struct OwnerKeepWarmStats {
+    pub account: String,
+    pub role: Role,
+    pub slot: usize,
+    pub generation: u64,
+    pub outcomes: [u64; 5],
+    pub max_ns: u64,
+    pub idle_ms: u64,
+}
+
+pub fn owner_keep_warm_stats() -> Vec<OwnerKeepWarmStats> {
+    let mut out = Vec::new();
+    if let Some(registry) = ACCOUNT_POOLS.get() {
+        for (account, pools) in &registry.by_account {
+            for pool in [&pools.fast, &pools.cancel, &pools.reconcile] {
+                for (slot, state) in pool.slots.iter().enumerate() {
+                    if !state.execution_owner.load(Ordering::Acquire) { continue; }
+                    out.push(OwnerKeepWarmStats {
+                        account: account.clone(), role: pool.role, slot,
+                        generation: state.generation.load(Ordering::Acquire),
+                        outcomes: std::array::from_fn(|i| state.keep_warm.outcomes[i].load(Ordering::Relaxed)),
+                        max_ns: state.keep_warm.max_ns.load(Ordering::Relaxed),
+                        idle_ms: activity_now_ns().saturating_sub(state.last_activity_ns.load(Ordering::Acquire)) / 1_000_000,
+                    });
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Observability snapshot: `(account, role, acquires, skips, waits, busy_now)`
@@ -2419,6 +2523,22 @@ mod tests {
         assert_eq!(KEEP_WARM_INFLIGHT.load(Ordering::Acquire), 0);
         assert!(!first_pool.keep_warm_inflight.load(Ordering::Acquire));
         assert!(!first_pool.slots[0].busy.load(Ordering::Acquire));
+
+        let owner = first_pool.try_acquire_slot(0).unwrap();
+        owner.execution_owner.store(true, Ordering::Release);
+        first_pool.slots[0].last_activity_ns.store(0, Ordering::Release);
+        let target = KeepWarmTarget { pool: first_pool, slot: 0 };
+        assert!(target.try_acquire().is_none(), "legacy permit reacquisition misses permanent owners");
+        let lease = target.try_acquire_for(true).expect("owner transport must be maintained");
+        assert!(lease.permit.is_none());
+        assert!(first_pool.try_acquire_slot(0).is_none(), "maintenance cannot release the actor's permit");
+        assert!(owner.business_outcome().is_none(), "maintenance grants no business proof");
+        assert!(target.try_acquire_for(true).is_none(), "duplicate maintenance bounded by pool guard");
+        drop(lease);
+        assert!(first_pool.slots[0].busy.load(Ordering::Acquire));
+        drop(owner);
+        assert!(!first_pool.slots[0].execution_owner.load(Ordering::Acquire));
+        assert!(first_pool.try_acquire_slot(0).is_some());
     }
 
     // ── admission control ──────────────────────────────────────────

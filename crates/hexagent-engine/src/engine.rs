@@ -13057,6 +13057,11 @@ impl Engine {
                                             );
                                         }
                                     }
+                                    for warm in hexagent_runtime::http1_pool::owner_keep_warm_stats() {
+                                        info!("[http1_owner_keep_warm] account={} role={:?} slot={} pool_generation={} ok={} busy={} preempted={} http_error={} transport_error={} max_ns={} idle_ms={}",
+                                            warm.account, warm.role, warm.slot, warm.generation,
+                                            warm.outcomes[0], warm.outcomes[1], warm.outcomes[2], warm.outcomes[3], warm.outcomes[4], warm.max_ns, warm.idle_ms);
+                                    }
                                     for lane in &connection_metrics {
                                         let occupied = lane.occupied.load(Ordering::Acquire);
                                         let enqueued_ns = lane.enqueued_ns.load(Ordering::Acquire);
