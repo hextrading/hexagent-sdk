@@ -97,7 +97,7 @@ fn testnet_user_feed() {
     let _ = hexagent_exchange::async_rt::init();
     let (account, _key) = creds();
     let lane = hexagent_exchange::exchange::hyperliquid::user_feed::spawn_user_feed(WS, &account);
-    let rx = lane.updates.clone();
+    let rx = &lane.updates;
     std::thread::sleep(Duration::from_secs(2)); // connect + snapshot
     while rx.try_recv().is_ok() {} // drain snapshot
 

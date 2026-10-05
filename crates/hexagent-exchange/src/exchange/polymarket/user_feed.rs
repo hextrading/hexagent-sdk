@@ -5718,8 +5718,8 @@ mod tests {
     #[test]
     fn direct_private_lane_preserves_fifo_duplicates_and_instance_isolation() {
         let shared = test_shared();
-        let (owner0_tx, owner0_rx) = crossbeam_channel::bounded(4);
-        let (owner1_tx, owner1_rx) = crossbeam_channel::bounded(4);
+        let (owner0_tx, owner0_rx) = hexagent_runtime::poll_channel::bounded(4);
+        let (owner1_tx, owner1_rx) = hexagent_runtime::poll_channel::bounded(4);
         shared.install_strategy_private_routes(HashMap::from([(0, owner0_tx), (1, owner1_tx)]));
         let (root_tx, root_rx) = crossbeam_channel::bounded(4);
         let frozen_fee = Some(TradeFee {

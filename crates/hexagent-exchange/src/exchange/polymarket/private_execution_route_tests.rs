@@ -848,7 +848,7 @@ fn legacy_route_private_event_fast(
 #[test]
 fn startup_lifecycle_backpressure_timeout_enters_recovery_and_replay_preserves_economics() {
     let shared = route_fixture();
-    let (direct_tx, direct_rx) = crossbeam_channel::bounded(1);
+    let (direct_tx, direct_rx) = hexagent_runtime::poll_channel::bounded(1);
     let (root_tx, root_rx) = crossbeam_channel::bounded(4);
     let blocked_event = route_event(2, "startup-backpressured");
     let mut fixture_cache = PrivateExecutionCache::new(Vec::new()).unwrap();

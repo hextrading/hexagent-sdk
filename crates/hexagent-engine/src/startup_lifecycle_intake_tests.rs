@@ -98,10 +98,8 @@ fn update(coid: &str) -> OrderUpdate {
 
 struct Worker {
     market: hexagent_runtime::poll_channel::Sender<QueuedMarketEvent>,
-    direct: Sender<RoutedOrderUpdate>,
-    compat: Sender<QueuedOrderUpdate>,
-    direct_rx: Receiver<RoutedOrderUpdate>,
-    compat_rx: Receiver<QueuedOrderUpdate>,
+    direct: hexagent_runtime::poll_channel::Sender<RoutedOrderUpdate>,
+    compat: hexagent_runtime::poll_channel::Sender<QueuedOrderUpdate>,
     observed: Receiver<Observed>,
     release: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
@@ -111,8 +109,8 @@ struct Worker {
 impl Worker {
     fn new(id: &'static str, paused: bool, pause_on_first: bool) -> Self {
         let (market, market_rx) = hexagent_runtime::poll_channel::bounded(8);
-        let (direct, direct_rx) = bounded(4);
-        let (compat, compat_rx) = bounded(4);
+        let (direct, direct_rx) = hexagent_runtime::poll_channel::bounded(4);
+        let (compat, compat_rx) = hexagent_runtime::poll_channel::bounded(4);
         let (observed_tx, observed) = bounded(64);
         let (signals, signal_rx) = bounded(8);
         let (shutdown_ack, _shutdown_ack_rx) = bounded(1);
@@ -126,8 +124,8 @@ impl Worker {
             received: 0,
             last_callback_was_market: false,
         };
-        let worker_direct_rx = direct_rx.clone();
-        let worker_compat_rx = compat_rx.clone();
+        let worker_direct_rx = direct_rx;
+        let worker_compat_rx = compat_rx;
         let join = thread::Builder::new()
             .name(format!("startup-intake-{id}"))
             .stack_size(STRATEGY_WORKER_STACK_BYTES)
@@ -155,8 +153,6 @@ impl Worker {
             market,
             direct,
             compat,
-            direct_rx,
-            compat_rx,
             observed,
             release,
             join: Some(join),
@@ -224,7 +220,7 @@ fn startup_lifecycle_intake_retains_full_buffer_message_and_resumes_both_lanes_i
     worker.send_compat("compat-first");
     worker.send_compat("compat-second");
     worker.wait_for(|v| *v == Observed::Watchdog(true));
-    assert_eq!((worker.direct_rx.len(), worker.compat_rx.len()), (1, 2));
+    assert_eq!((worker.direct.len(), worker.compat.len()), (1, 2));
     worker
         .market
         .send(QueuedMarketEvent::Direct(QueuedMarketPayload {
@@ -241,7 +237,7 @@ fn startup_lifecycle_intake_retains_full_buffer_message_and_resumes_both_lanes_i
         .unwrap();
     worker.wait_for(|v| *v == Observed::Market);
     worker.wait_for(|v| *v == Observed::Watchdog(true));
-    assert_eq!((worker.direct_rx.len(), worker.compat_rx.len()), (1, 2));
+    assert_eq!((worker.direct.len(), worker.compat.len()), (1, 2));
     worker.release.store(true, Ordering::Release);
     for expected in [
         Observed::Lifecycle("direct-second".into(), 2, LifecycleSource::PrivateFeed),
@@ -253,7 +249,7 @@ fn startup_lifecycle_intake_retains_full_buffer_message_and_resumes_both_lanes_i
             expected
         );
     }
-    assert_eq!((worker.direct_rx.len(), worker.compat_rx.len()), (0, 0));
+    assert_eq!((worker.direct.len(), worker.compat.len()), (0, 0));
     worker.stop();
 }
 
@@ -268,7 +264,7 @@ fn startup_lifecycle_intake_pause_is_instance_local_and_does_not_block_watchdog(
         Observed::Lifecycle("ready-owner".into(), 1, LifecycleSource::Execution)
     );
     paused.wait_for(|v| *v == Observed::Watchdog(true));
-    assert_eq!(paused.compat_rx.len(), 1);
+    assert_eq!(paused.compat.len(), 1);
     paused.release.store(true, Ordering::Release);
     assert_eq!(
         paused.wait_for(|v| matches!(v, Observed::Lifecycle(..))),
@@ -285,16 +281,11 @@ fn startup_lifecycle_intake_shutdown_drain_does_not_bypass_paused_owner() {
     worker.send_compat("retained-compat");
     worker.wait_for(|v| *v == Observed::Watchdog(true));
     worker.stop();
-    // A test receiver clone observes ownership remained in each upstream lane.
-    // Process exit durability still relies on the existing replay/reconciliation.
-    assert_eq!(
-        worker.direct_rx.try_recv().unwrap().update.client_order_id,
-        "retained-direct"
-    );
-    assert_eq!(
-        worker.compat_rx.try_recv().unwrap().update.client_order_id,
-        "retained-compat"
-    );
+    // Only the strategy owns receivers. Sender-side occupancy proves shutdown
+    // did not consume the retained envelopes; replay/reconciliation recovers
+    // these after owner teardown. Do not clone a consumer to inspect payloads.
+    assert_eq!((worker.direct.len(), worker.compat.len()), (1, 1));
+    assert!(worker.direct.is_disconnected() && worker.compat.is_disconnected());
     assert!(!worker
         .observed
         .try_iter()
@@ -478,8 +469,8 @@ fn startup_lifecycle_intake_terminal_fault_retains_ownership_until_each_controll
         let exit_calls = Arc::new(AtomicUsize::new(0));
         let (market_tx, market_rx) = hexagent_runtime::poll_channel::bounded(1);
         let mut market_tx = Some(market_tx);
-        let (direct_tx, direct_rx) = bounded(1);
-        let (compat_tx, compat_rx) = bounded(1);
+        let (direct_tx, direct_rx) = hexagent_runtime::poll_channel::bounded(1);
+        let (compat_tx, compat_rx) = hexagent_runtime::poll_channel::bounded(1);
         direct_tx
             .send(RoutedOrderUpdate {
                 owner: 0,
@@ -501,8 +492,8 @@ fn startup_lifecycle_intake_terminal_fault_retains_ownership_until_each_controll
         let quarantined = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
         let worker_quarantined = Arc::clone(&quarantined);
-        let worker_direct = direct_rx.clone();
-        let worker_compat = compat_rx.clone();
+        let worker_direct = direct_rx;
+        let worker_compat = compat_rx;
         let strategy = FaultStrategy {
             faulted: false,
             dropped: Arc::clone(&dropped),
@@ -543,7 +534,7 @@ fn startup_lifecycle_intake_terminal_fault_retains_ownership_until_each_controll
         assert!(!dropped.load(Ordering::Acquire));
         assert_eq!(exit_calls.load(Ordering::Acquire), 0);
         assert!(!worker.is_finished());
-        assert_eq!((direct_rx.len(), compat_rx.len()), (1, 1));
+        assert_eq!((direct_tx.len(), compat_tx.len()), (1, 1));
         assert_eq!(
             health.recovery_delivery_progress(generation),
             Some((true, 1))
@@ -581,7 +572,7 @@ fn startup_lifecycle_intake_terminal_fault_retains_ownership_until_each_controll
         worker.join().unwrap();
         assert!(dropped.load(Ordering::Acquire));
         assert_eq!(exit_calls.load(Ordering::Acquire), 1);
-        assert_eq!((direct_rx.len(), compat_rx.len()), (1, 1));
+        assert_eq!((direct_tx.len(), compat_tx.len()), (1, 1));
         assert_eq!(
             health.recovery_delivery_progress(generation),
             Some((true, 1))

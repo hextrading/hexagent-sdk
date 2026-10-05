@@ -8,6 +8,8 @@ mod publication_observation;
 mod recovery_diagnostics;
 mod null_cancel_recovery;
 mod audit_writer;
+mod persistent_http;
+pub use persistent_http::HttpOrderLane;
 use audit_writer::RecordBatchWriter;
 pub use null_cancel_recovery::NullCancelRecovery;
 use http_phase_audit::{HttpPhaseAudit, HttpPhaseContext, HttpPhaseRecord};
@@ -3522,7 +3524,7 @@ pub struct SharedState {
     /// Startup-published numeric owner → dedicated strategy lifecycle lane.
     /// Live private events bypass the root router; replay and compatibility
     /// traffic retain the existing root path.
-    strategy_private_routes: ArcSwap<HashMap<u16, crossbeam_channel::Sender<RoutedOrderUpdate>>>,
+    strategy_private_routes: ArcSwap<HashMap<u16, hexagent_runtime::poll_channel::Sender<RoutedOrderUpdate>>>,
     /// Startup-published message endpoint. Terminal REST backfill must pass
     /// through the same private owner that freezes live execution economics.
     private_apply_lane: OnceLock<super::user_feed::PrivateApplyLane>,
@@ -4177,7 +4179,7 @@ impl SharedState {
 
     pub fn install_strategy_private_routes(
         &self,
-        routes: HashMap<u16, crossbeam_channel::Sender<RoutedOrderUpdate>>,
+        routes: HashMap<u16, hexagent_runtime::poll_channel::Sender<RoutedOrderUpdate>>,
     ) {
         self.strategy_private_routes.store(Arc::new(routes));
     }
@@ -4185,7 +4187,7 @@ impl SharedState {
     pub(crate) fn direct_private_route(
         &self,
         owner: u16,
-    ) -> Option<crossbeam_channel::Sender<RoutedOrderUpdate>> {
+    ) -> Option<hexagent_runtime::poll_channel::Sender<RoutedOrderUpdate>> {
         self.strategy_private_routes.load().get(&owner).cloned()
     }
 
@@ -6742,7 +6744,7 @@ impl SharedState {
         HttpReplyReceiver,
         Arc<HttpCompletionTiming>,
     ) {
-        self.http_call_async_on_completion(client, attempt_id, method, path, body, rec_kind_override, None, None)
+        self.http_call_async_on_completion(client, attempt_id, method, path, body, rec_kind_override, None, None, None)
     }
 
     fn http_call_async_on_completion(
@@ -6750,6 +6752,7 @@ impl SharedState {
         method: &str, path: &str, body: Bytes,
         rec_kind_override: Option<crate::latency_record::RequestKind>, completion: Option<PooledReply>,
         mut hot_path: Option<&mut crate::types::HotPathTrace>,
+        dispatch: Option<&persistent_http::Dispatch>,
     ) -> (HttpReplyReceiver, Arc<HttpCompletionTiming>) {
         let (reply_tx, reply_rx, timing) = if let Some((tx, rx, timing)) = completion {
             (HttpReplySender::Reused(tx), HttpReplyReceiver::Reused(rx), timing)
@@ -6793,11 +6796,8 @@ impl SharedState {
             let body_a = body;
             let url_a = url.clone();
             let tx_a = reply_tx;
-            let iid_a = self.instance_id.clone();
-            let account_id = self.account_state.account_id().to_string();
-            let auth_failure_blocked = Arc::clone(&self.auth_failure_blocked);
-            let request_buffers = Arc::clone(&self.request_buffers);
-            let phase_audit = Arc::clone(&self.http_phase_audit);
+            let context = dispatch.map(|dispatch| dispatch.context.clone())
+                .unwrap_or_else(|| persistent_http::Context::new(self, &self.instance_id));
             let phase_kind = http_phase_audit::request_kind(rec_kind, stage);
             let enqueued_at = crate::latency::Instant::now();
             let timing_a = Arc::clone(&timing);
@@ -6807,67 +6807,13 @@ impl SharedState {
             let peer_failure_observer = (!matches!(client.role(),
                 crate::http1_pool::Role::Fast | crate::http1_pool::Role::Cancel))
                 .then(|| (client.clone(), self.execution_peer_failure.sender()));
-            async_rt::order_handle().spawn(async move {
-                let runtime_queue_ns =
-                    enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                crate::latency::record(runtime_queue_stage, enqueued_at);
-                let network_started = crate::latency::Instant::now();
-                // Keep one cheap Bytes handle so the unique allocation can be
-                // recovered and returned to the startup-filled pool after
-                // reqwest drops its request body.
-                let recyclable = body_a.clone();
-                let reply = execute_http_with_cancel_connection_failure_hedge(
-                    client,
-                    attempt_id,
-                    &account_id,
-                    &method_a,
-                    &url_a,
-                    &path_a,
-                    &headers,
-                    body_a,
-                    &phase_audit,
-                    HttpPhaseContext {
-                        root_attempt_id: attempt_id,
-                        leg: 0,
-                        kind: phase_kind,
-                        runtime_queue_ns,
-                    },
-                )
-                .await;
-                report_cold_http_peer_failure(peer_failure_observer, &reply);
-                observe_authenticated_reply_gate(
-                    &reply,
-                    &account_id,
-                    auth_failure_blocked.as_ref(),
-                );
-                if let Ok(mut buffer) = recyclable.try_into_mut() {
-                    buffer.clear();
-                    let _ = request_buffers.push(buffer);
-                }
-                crate::latency::record(network_stage, network_started);
-                timing_a
-                    .response_ready_ns
-                    .store(now_ns(), Ordering::Release);
-                let rec = rec_kind
-                    .filter(|_| crate::latency_record::is_active())
-                    .map(|k| (k, latency_record_status(&reply)));
-                let reply_enqueue_started = crate::latency::Instant::now();
-                if tx_a.try_send(reply).is_ok() {
-                    timing_a
-                        .reply_enqueued_ns
-                        .store(now_ns(), Ordering::Release);
-                    crate::latency::record(reply_enqueue_stage, reply_enqueue_started);
-                    crate::latency::record(stage, t_start);
-                    if let Some((k, status)) = rec {
-                        crate::latency_record::record(
-                            &iid_a,
-                            k,
-                            t_start.elapsed().as_secs_f64() * 1000.0,
-                            status,
-                        );
-                    }
-                }
-            });
+            let command = persistent_http::Command {
+                context, client, attempt_id, method_a, path_a, body_a, url_a, headers,
+                tx_a, timing_a, phase_kind, rec_kind, stage, runtime_queue_stage, network_stage,
+                reply_enqueue_stage, t_start, enqueued_at, peer_failure_observer,
+            };
+            if let Some(dispatch) = dispatch { dispatch.send(command); }
+            else { async_rt::order_handle().spawn(command.run()); }
         }
 
         if let Some(trace) = hot_path { trace.http_task_enqueued_mono_ns = crate::types::monotonic_now_ns(); }
@@ -7002,6 +6948,7 @@ pub struct PolymarketTrade {
     gen_ns_hint: u64,
     /// Connection-owner local; initialized before signals can reach this worker.
     reply_slots: ReplyPool,
+    http_dispatch: Option<persistent_http::Dispatch>,
 }
 
 impl PolymarketTrade {
@@ -7533,6 +7480,7 @@ impl PolymarketTrade {
             instance_id: String::new(),
             gen_ns_hint: 0,
             reply_slots: new_reply_pool(),
+            http_dispatch: None,
         })
     }
 
@@ -7697,13 +7645,22 @@ impl PolymarketTrade {
             instance_id: instance_id.to_string(),
             gen_ns_hint: 0,
             reply_slots: new_reply_pool(),
+            http_dispatch: None,
         }
     }
 
-    /// Clone for callers that need a fresh value (e.g. thread-scope
-    /// parallel dispatch). Shares the SharedState via Arc, and the
-    /// reqwest client is a process-wide singleton accessed via
-    /// `async_rt::http_client()` — no per-clone state.
+    /// Bind at startup, before any business request. Routes served by the same
+    /// physical connection owner share its bounded actor mailbox; immutable
+    /// account/instance labels are allocated here, never copied per request.
+    pub fn bind_http_order_lane(&mut self, lane: HttpOrderLane) {
+        self.http_dispatch = Some(persistent_http::Dispatch {
+            lane, context: persistent_http::Context::new(&self.shared, &self.instance_id),
+        });
+    }
+
+    /// Fresh connection-worker completion slots. A live Fast/Cancel worker
+    /// must bind its own persistent lane before receiving execution commands;
+    /// cold compatibility callers retain the legacy async dispatch bridge.
     pub fn clone_worker(&self) -> Self {
         Self {
             shared: self.shared.clone(),
@@ -7711,6 +7668,7 @@ impl PolymarketTrade {
             instance_id: self.instance_id.clone(),
             gen_ns_hint: self.gen_ns_hint,
             reply_slots: new_reply_pool(),
+            http_dispatch: None,
         }
     }
 
@@ -11707,7 +11665,7 @@ impl PolymarketTrade {
             attempt.attempt_id(),
             "POST",
             "/order",
-            prepared.body, None, Some(completion), Some(&mut prepared.hot_path),
+            prepared.body, None, Some(completion), Some(&mut prepared.hot_path), self.http_dispatch.as_ref(),
         );
         let http_submitted_mono_ns = crate::types::monotonic_now_ns();
         let dispatched_ns = now_ns();
@@ -11835,7 +11793,7 @@ impl PolymarketTrade {
                     attempt.attempt_id(),
                     "DELETE",
                     "/order",
-                    body_bytes, None, completion, Some(&mut cancel_trigger.hot_path),
+                    body_bytes, None, completion, Some(&mut cancel_trigger.hot_path), self.http_dispatch.as_ref(),
                 );
                 (Some(rx), Some(timing), Some(attempt))
             }

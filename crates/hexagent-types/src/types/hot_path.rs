@@ -94,6 +94,9 @@ pub struct HotPathTrace {
     pub attempt_bound_mono_ns: u64,
     #[serde(default)]
     pub l2_auth_done_mono_ns: u64,
+    /// Handoff returned: persistent owner mailbox publication in live mode,
+    /// or legacy task spawn on compatibility paths. Kept under the historical
+    /// field name so before/after receipt-to-dispatch audits remain comparable.
     #[serde(default)]
     pub http_task_enqueued_mono_ns: u64,
     /// Zero means a historical/unmeasured publication, otherwise includes the target slot.

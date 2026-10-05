@@ -9,7 +9,7 @@
 use crate::try_queue::TryQueue;
 use crossbeam_channel::{SendError, TryRecvError, TrySendError};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// Transport-neutral cold private/recovery producer. Live uses the polling
@@ -44,7 +44,7 @@ struct Shared<T> {
     queue: TryQueue<T>,
     senders: AtomicUsize,
     receiver_alive: AtomicBool,
-    wake: Option<Arc<crate::wake::Wake>>,
+    wake: OnceLock<Arc<crate::wake::Wake>>,
 }
 
 pub struct Sender<T>(Arc<Shared<T>>);
@@ -63,7 +63,7 @@ pub fn bounded_with_wake<T>(capacity: usize, wake: Option<Arc<crate::wake::Wake>
         queue: TryQueue::new(capacity),
         senders: AtomicUsize::new(1),
         receiver_alive: AtomicBool::new(true),
-        wake,
+        wake: wake.map(OnceLock::from).unwrap_or_default(),
     });
     (Sender(shared.clone()), Receiver(shared))
 }
@@ -78,12 +78,22 @@ impl<T> Clone for Sender<T> {
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         if self.0.senders.fetch_sub(1, Ordering::Release) == 1 {
-            if let Some(wake) = &self.0.wake { wake.notify(); }
+            if let Some(wake) = self.0.wake.get() { wake.notify(); }
         }
     }
 }
 
 impl<T> Sender<T> {
+    /// Actor teardown only. After receiver ownership is released, a racing
+    /// producer may finish a previously reserved slot. The actor and that
+    /// producer both drain through the queue's exclusive-pop protocol, so
+    /// queued reply guards are dropped promptly rather than kept by senders.
+    pub(crate) fn discard_if_disconnected(&self) {
+        if self.is_disconnected() { while self.0.queue.try_pop().is_some() {} }
+    }
+    /// Notify another (control) lane consumed by the same owner.
+    pub fn notify_owner(&self) { if let Some(wake) = self.0.wake.get() { wake.notify(); } }
+
     /// Advisory occupancy, including reserved but unpublished messages.
     pub fn len(&self) -> usize {
         self.0.queue.len()
@@ -103,8 +113,23 @@ impl<T> Sender<T> {
             return Err(TrySendError::Disconnected(value));
         }
         self.0.queue.try_push(value).map_err(TrySendError::Full)?;
-        if let Some(wake) = &self.0.wake { wake.notify(); }
+        if let Some(wake) = self.0.wake.get() { wake.notify(); }
         Ok(())
+    }
+
+    /// Bounded cold recovery wait. Retains the exact message on timeout/close.
+    pub fn send_timeout(&self, mut value: T, timeout: Duration) -> Result<(), crossbeam_channel::SendTimeoutError<T>> {
+        let started = std::time::Instant::now();
+        loop {
+            match self.try_send(value) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Disconnected(value)) => return Err(crossbeam_channel::SendTimeoutError::Disconnected(value)),
+                Err(TrySendError::Full(returned)) => value = returned,
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() { return Err(crossbeam_channel::SendTimeoutError::Timeout(value)); }
+            std::thread::sleep(remaining.min(IDLE_POLL));
+        }
     }
 
     pub fn send(&self, mut value: T) -> Result<(), SendError<T>> {
@@ -119,12 +144,33 @@ impl<T> Sender<T> {
     }
 }
 
+/// Disabled lane: no sender exists and no disconnect event is generated.
+/// Its one unused slot is reclaimed normally with the receiver.
+pub fn never<T>() -> Receiver<T> {
+    Receiver(Arc::new(Shared {
+        queue: TryQueue::new(1), senders: AtomicUsize::new(1),
+        receiver_alive: AtomicBool::new(true), wake: OnceLock::new(),
+    }))
+}
 impl<T> Receiver<T> {
-    pub fn has_wake(&self) -> bool { self.0.wake.is_some() }
-    pub fn arm_wake(&self) { if let Some(wake) = &self.0.wake { wake.arm(); } }
-    pub fn cancel_wake(&self) { if let Some(wake) = &self.0.wake { wake.cancel(); } }
+    pub(crate) fn close_and_discard(&self) {
+        self.0.receiver_alive.store(false, Ordering::Release);
+        while self.0.queue.try_pop().is_some() {}
+    }
+    /// Startup-only binding, before this owner begins parking. Producers which
+    /// published before binding are covered by arm + recheck of every inbox.
+    pub fn bind_wake(&self, wake: Arc<crate::wake::Wake>) {
+        if let Err(wake) = self.0.wake.set(wake) {
+            assert!(Arc::ptr_eq(self.0.wake.get().unwrap(), &wake), "one inbox must have exactly one wake owner");
+        }
+    }
+    pub fn wake_handle(&self) -> Option<Arc<crate::wake::Wake>> { self.0.wake.get().cloned() }
+
+    pub fn has_wake(&self) -> bool { self.0.wake.get().is_some() }
+    pub fn arm_wake(&self) { if let Some(wake) = self.0.wake.get() { wake.arm(); } }
+    pub fn cancel_wake(&self) { if let Some(wake) = self.0.wake.get() { wake.cancel(); } }
     pub fn wait_for_wake(&self, timeout: Duration) {
-        if let Some(wake) = &self.0.wake { wake.wait(timeout); }
+        if let Some(wake) = self.0.wake.get() { wake.wait(timeout); }
         else { std::thread::sleep(timeout); }
     }
     /// Cold owners/tests only. Wait without spinning on an unpublished slot.
@@ -160,7 +206,7 @@ impl<T> Receiver<T> {
             if remaining.is_zero() {
                 return Err(crossbeam_channel::RecvTimeoutError::Timeout);
             }
-            if self.0.wake.is_some() {
+            if self.0.wake.get().is_some() {
                 self.arm_wake();
                 match self.try_recv() {
                     Ok(value) => { self.cancel_wake(); return Ok(value); }

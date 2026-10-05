@@ -182,7 +182,7 @@ impl<T: hexagent_runtime::poll_channel::EventSender<crate::types::RoutedOrderUpd
 }
 enum PrivateDeliveryTarget {
     Root(Arc<dyn PrivateUpdateSink>),
-    Direct(crossbeam_channel::Sender<crate::types::RoutedOrderUpdate>),
+    Direct(hexagent_runtime::poll_channel::Sender<crate::types::RoutedOrderUpdate>),
 }
 impl PrivateDeliveryTarget {
     fn try_deliver(
@@ -528,7 +528,7 @@ impl UserFeedHealth {
     pub(crate) fn deliver_private_owned(
         &self,
         update: crate::types::RoutedOrderUpdate,
-        direct: Option<crossbeam_channel::Sender<crate::types::RoutedOrderUpdate>>,
+        direct: Option<hexagent_runtime::poll_channel::Sender<crate::types::RoutedOrderUpdate>>,
     ) -> Result<(), String> {
         LOCAL_RECOVERY_OWNER.with(|owner| {
             let mut owner = owner.borrow_mut();

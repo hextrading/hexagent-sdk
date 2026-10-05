@@ -393,7 +393,7 @@ pub enum PrivateFeedControl {
 ///   authenticated websocket rather than consuming and discarding more data;
 /// - dropping the lane requests feed shutdown.
 pub struct PrivateUpdateLane {
-    pub updates: crossbeam_channel::Receiver<OrderUpdate>,
+    pub updates: hexagent_runtime::poll_channel::Receiver<OrderUpdate>,
     pub control: crossbeam_channel::Receiver<PrivateFeedControl>,
     shutdown: Arc<AtomicBool>,
 }
@@ -415,7 +415,7 @@ impl Drop for PrivateUpdateLane {
 /// an overflow notice can always occupy the one-slot latest-value mailbox.
 pub(crate) struct PrivateUpdatePublisher {
     exchange: Exchange,
-    updates: crossbeam_channel::Sender<OrderUpdate>,
+    updates: hexagent_runtime::poll_channel::Sender<OrderUpdate>,
     control: crossbeam_channel::Sender<PrivateFeedControl>,
     control_replace: crossbeam_channel::Receiver<PrivateFeedControl>,
     shutdown: Arc<AtomicBool>,
@@ -455,13 +455,14 @@ impl PrivateUpdatePublisher {
                 let _ = self.control.try_send(control);
             }
         }
+        self.updates.notify_owner();
     }
 }
 
 pub(crate) fn private_update_lane(
     exchange: Exchange,
 ) -> (PrivateUpdatePublisher, PrivateUpdateLane) {
-    let (update_tx, update_rx) = crossbeam_channel::bounded(PRIVATE_UPDATE_LANE_CAPACITY);
+    let (update_tx, update_rx) = hexagent_runtime::poll_channel::bounded(PRIVATE_UPDATE_LANE_CAPACITY);
     // Connectivity is replaceable latest state. Overflow replaces an older
     // connectivity notification and makes this generation terminal.
     let (control_tx, control_rx) = crossbeam_channel::bounded(1);

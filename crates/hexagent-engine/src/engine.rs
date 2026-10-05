@@ -2744,9 +2744,9 @@ fn should_spawn_per_instance_strategy_workers(backtest: bool, strategy_count: us
 #[inline]
 fn startup_lifecycle_receiver<'a, T>(
     paused: bool,
-    receiver: &'a Receiver<T>,
-    never: &'a Receiver<T>,
-) -> &'a Receiver<T> {
+    receiver: &'a T,
+    never: &'a T,
+) -> &'a T {
     if paused {
         never
     } else {
@@ -2805,7 +2805,7 @@ impl LifecycleOwnerOutboxes {
         Ok(())
     }
 
-    fn try_flush_one(&mut self, update_txs: &[Sender<QueuedOrderUpdate>]) -> LifecycleRouteResult {
+    fn try_flush_one(&mut self, update_txs: &[hexagent_runtime::poll_channel::Sender<QueuedOrderUpdate>]) -> LifecycleRouteResult {
         if self.queues.is_empty() {
             return Ok(());
         }
@@ -2855,7 +2855,7 @@ impl LifecycleOwnerOutboxes {
 
     fn flush_all_blocking(
         &mut self,
-        update_txs: &[Sender<QueuedOrderUpdate>],
+        update_txs: &[hexagent_runtime::poll_channel::Sender<QueuedOrderUpdate>],
     ) -> LifecycleRouteResult {
         for owner in 0..self.queues.len() {
             while let Some(queued) = self.queues[owner].pop_front() {
@@ -9077,14 +9077,14 @@ impl Engine {
         // through Arc instead of deep-cloning order-book vectors and Strings
         // once per subscribing strategy instance.
         let mut market_lanes: Vec<MarketEventLane> = Vec::with_capacity(strategies.len());
-        let mut update_txs: Vec<Sender<QueuedOrderUpdate>> = Vec::with_capacity(strategies.len());
-        let mut direct_private_routes = HashMap::<u16, Sender<RoutedOrderUpdate>>::new();
+        let mut update_txs: Vec<hexagent_runtime::poll_channel::Sender<QueuedOrderUpdate>> = Vec::with_capacity(strategies.len());
+        let mut direct_private_routes = HashMap::<u16, hexagent_runtime::poll_channel::Sender<RoutedOrderUpdate>>::new();
         let mut specs: Vec<(
             Box<dyn Strategy>,
             hexagent_runtime::poll_channel::Receiver<QueuedMarketEvent>,
             Arc<LatestMarketStore>,
-            Receiver<QueuedOrderUpdate>,
-            Receiver<RoutedOrderUpdate>,
+            hexagent_runtime::poll_channel::Receiver<QueuedOrderUpdate>,
+            hexagent_runtime::poll_channel::Receiver<RoutedOrderUpdate>,
         )> = Vec::with_capacity(strategies.len());
         for (owner, s) in strategies.into_iter().enumerate() {
             let (mtx, mrx) = hexagent_runtime::poll_channel::bounded::<QueuedMarketEvent>(CHANNEL_CAPACITY);
@@ -9094,8 +9094,8 @@ impl Engine {
             // lifecycle inputs until that event is accepted. Market-data and
             // supervisor work continue independently while bounded upstream
             // channels propagate backpressure to their producers.
-            let (utx, urx) = bounded::<QueuedOrderUpdate>(CHANNEL_CAPACITY);
-            let (direct_tx, direct_rx) = bounded::<RoutedOrderUpdate>(CHANNEL_CAPACITY);
+            let (utx, urx) = hexagent_runtime::poll_channel::bounded::<QueuedOrderUpdate>(CHANNEL_CAPACITY);
+            let (direct_tx, direct_rx) = hexagent_runtime::poll_channel::bounded::<RoutedOrderUpdate>(CHANNEL_CAPACITY);
             market_lanes.push(MarketEventLane {
                 tx: mtx,
                 latest: Arc::clone(&latest),
@@ -9573,7 +9573,7 @@ impl Engine {
     fn route_executor_update(
         mut routed: RoutedOrderUpdate,
         iid_to_idx: &HashMap<String, usize>,
-        update_txs: &[Sender<QueuedOrderUpdate>],
+        update_txs: &[hexagent_runtime::poll_channel::Sender<QueuedOrderUpdate>],
         worker_quarantined: &[Arc<AtomicBool>],
         lifecycle_outboxes: &mut LifecycleOwnerOutboxes,
     ) -> LifecycleRouteResult {
@@ -9608,7 +9608,7 @@ impl Engine {
     fn route_private_update(
         mut routed: RoutedOrderUpdate,
         iid_to_idx: &HashMap<String, usize>,
-        update_txs: &[Sender<QueuedOrderUpdate>],
+        update_txs: &[hexagent_runtime::poll_channel::Sender<QueuedOrderUpdate>],
         worker_quarantined: &[Arc<AtomicBool>],
         lifecycle_outboxes: &mut LifecycleOwnerOutboxes,
     ) -> LifecycleRouteResult {
@@ -9641,7 +9641,7 @@ impl Engine {
         update: OrderUpdate,
         source: LifecycleSource,
         iid_to_idx: &HashMap<String, usize>,
-        update_txs: &[Sender<QueuedOrderUpdate>],
+        update_txs: &[hexagent_runtime::poll_channel::Sender<QueuedOrderUpdate>],
         worker_quarantined: &[Arc<AtomicBool>],
         lifecycle_outboxes: &mut LifecycleOwnerOutboxes,
     ) -> LifecycleRouteResult {
@@ -9887,8 +9887,8 @@ impl Engine {
         mut strategy: Box<dyn Strategy>,
         market_rx: hexagent_runtime::poll_channel::Receiver<QueuedMarketEvent>,
         latest_market: Arc<LatestMarketStore>,
-        update_rx: Receiver<QueuedOrderUpdate>,
-        direct_private_rx: Receiver<RoutedOrderUpdate>,
+        update_rx: hexagent_runtime::poll_channel::Receiver<QueuedOrderUpdate>,
+        direct_private_rx: hexagent_runtime::poll_channel::Receiver<RoutedOrderUpdate>,
         signal_tx: SignalSender,
         data_dirs: Vec<PathBuf>,
         instance_id: &str,
@@ -9904,14 +9904,17 @@ impl Engine {
         // startup and consumed only by this strategy owner. Its FIFO updates and
         // one-slot replaceable control state are selected before public market
         // data, so fills do not depend on quote cadence.
+        let owner_wake = market_rx.wake_handle().unwrap_or_else(|| Arc::new(hexagent_runtime::wake::Wake::default()));
+        market_rx.bind_wake(owner_wake.clone());
+        update_rx.bind_wake(owner_wake.clone());
+        direct_private_rx.bind_wake(owner_wake.clone());
         let private_lane = strategy.take_private_update_lane();
-        let private_feed_update_rx = private_lane
-            .as_ref()
-            .map(|lane| lane.updates.clone())
-            .unwrap_or_else(crossbeam_channel::never);
-        let private_feed_control_rx = private_lane
-            .as_ref()
-            .map(|lane| lane.control.clone())
+        let never_private_update_rx = hexagent_runtime::poll_channel::never::<OrderUpdate>();
+        let private_feed_update_rx = if let Some(lane) = &private_lane {
+            lane.updates.bind_wake(owner_wake.clone());
+            &lane.updates
+        } else { &never_private_update_rx };
+        let private_feed_control_rx = private_lane.as_ref().map(|lane| lane.control.clone())
             .unwrap_or_else(crossbeam_channel::never);
         let mut private_feed_updates_open = private_lane.is_some();
         let mut private_feed_control_open = private_lane.is_some();
@@ -9919,7 +9922,7 @@ impl Engine {
         // Cold historical reads run on the process-wide bounded background
         // owner pool; one strategy no longer creates a dedicated mostly-idle
         // OS thread. Results still return to this sole strategy writer.
-        let (hist_result_tx, hist_result_rx) = bounded::<HistoricalLoadResult>(8);
+        let (hist_result_tx, hist_result_rx) = hexagent_runtime::poll_channel::bounded_with_wake::<HistoricalLoadResult>(8, Some(owner_wake));
         crate::os_tune::pin_strategy_instance(&format!("strategy-{}", instance_id), instance_id);
         crate::strategy::prepare_strategy_span(instance_id);
         crate::latency::prepare_scheduler_tail_queue();
@@ -9953,9 +9956,8 @@ impl Engine {
         let mut watchdog_timer = hexagent_runtime::owner_timer::OwnerTimer::new(
             Duration::from_millis(100), std::time::Instant::now(),
         );
-        let never_private_update_rx = crossbeam_channel::never::<OrderUpdate>();
-        let never_direct_private_rx = crossbeam_channel::never::<RoutedOrderUpdate>();
-        let never_compat_update_rx = crossbeam_channel::never::<QueuedOrderUpdate>();
+        let never_direct_private_rx = hexagent_runtime::poll_channel::never::<RoutedOrderUpdate>();
+        let never_compat_update_rx = hexagent_runtime::poll_channel::never::<QueuedOrderUpdate>();
         // Sole writer: this strategy worker. Refresh only at lifecycle/watchdog
         // boundaries; market/quote callbacks never poll strategy bootstrap state.
         let mut lifecycle_intake_paused = strategy.startup_lifecycle_intake_paused();
@@ -9981,7 +9983,7 @@ impl Engine {
             // mutation is already queued for this sole-writer strategy.
             let selectable_private_update_rx = startup_lifecycle_receiver(
                 lifecycle_intake_paused || !private_feed_updates_open,
-                &private_feed_update_rx,
+                private_feed_update_rx,
                 &never_private_update_rx,
             );
             let selectable_direct_private_rx = startup_lifecycle_receiver(
@@ -12894,7 +12896,13 @@ impl Engine {
                             routes.health_lanes.push((role, slot, receiver));
                             Some(publisher)
                         } else { None };
-                        let router = LiveRouter::new_with_poly_map(&config, &poly_states);
+                        let mut router = LiveRouter::new_with_poly_map(&config, &poly_states);
+                        if matches!(role, Role::Fast | Role::Cancel) {
+                            let lane = hexagent_exchange::exchange::polymarket::trade::HttpOrderLane::new()
+                                .expect("bind persistent HTTP actor before accepting execution commands");
+                            for route in router.poly_routes.values_mut() { route.bind_http_order_lane(lane.clone()); }
+                        }
+
                         let prewarm_url: Arc<str> = poly_states.values()
                             .find(|shared| shared.account_state.account_id() == account_id)
                             .map(|shared| Arc::from(format!("{}/", shared.clob_base_url.trim_end_matches('/'))))
@@ -13834,7 +13842,7 @@ fn classify_private_update_route(
 fn enqueue_lifecycle_delivery(
     owner: usize,
     queued: QueuedOrderUpdate,
-    update_txs: &[Sender<QueuedOrderUpdate>],
+    update_txs: &[hexagent_runtime::poll_channel::Sender<QueuedOrderUpdate>],
     quarantined: &[Arc<AtomicBool>],
     outboxes: &mut LifecycleOwnerOutboxes,
 ) -> LifecycleRouteResult {
@@ -18779,7 +18787,7 @@ mod market_router_tests {
     #[test]
     fn single_instance_worker_runs_watchdog_without_market_events() {
         let (market_tx, market_rx) = hexagent_runtime::poll_channel::bounded(1);
-        let (_update_tx, update_rx) = bounded(1);
+        let (_update_tx, update_rx) = hexagent_runtime::poll_channel::bounded(1);
         let (routed_signal_tx, _routed_signal_rx) = bounded(1);
         let (shutdown_ack_tx, _shutdown_ack_rx) = bounded(1);
         let (watchdog_tx, watchdog_rx) = bounded(1);
@@ -18798,7 +18806,7 @@ mod market_router_tests {
                     market_rx,
                     Arc::new(LatestMarketStore::default()),
                     update_rx,
-                    crossbeam_channel::never(),
+                    hexagent_runtime::poll_channel::never(),
                     SignalSender::system(routed_signal_tx).with_owner(0),
                     Vec::new(),
                     "single",
@@ -21088,8 +21096,8 @@ mod market_router_tests {
 
     #[test]
     fn executor_update_uses_numeric_owner_without_coid_parsing() {
-        let (owner0_tx, owner0_rx) = bounded(4);
-        let (owner1_tx, owner1_rx) = bounded(4);
+        let (owner0_tx, owner0_rx) = hexagent_runtime::poll_channel::bounded(4);
+        let (owner1_tx, owner1_rx) = hexagent_runtime::poll_channel::bounded(4);
         let flags = vec![
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
@@ -21140,8 +21148,8 @@ mod market_router_tests {
 
     #[test]
     fn private_update_uses_numeric_owner_without_coid_parsing() {
-        let (owner0_tx, owner0_rx) = bounded(4);
-        let (owner1_tx, owner1_rx) = bounded(4);
+        let (owner0_tx, owner0_rx) = hexagent_runtime::poll_channel::bounded(4);
+        let (owner1_tx, owner1_rx) = hexagent_runtime::poll_channel::bounded(4);
         let flags = vec![
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
@@ -21187,7 +21195,7 @@ mod market_router_tests {
 
     #[test]
     fn full_lifecycle_lane_retains_exact_event_until_owner_accepts_it() {
-        let (owner_tx, owner_rx) = bounded(1);
+        let (owner_tx, owner_rx) = hexagent_runtime::poll_channel::bounded(1);
         let flags = vec![Arc::new(AtomicBool::new(false))];
         let mut outboxes = LifecycleOwnerOutboxes::new(1);
         let occupied = QueuedOrderUpdate {
@@ -21264,8 +21272,8 @@ mod market_router_tests {
 
     #[test]
     fn full_owner_lifecycle_lane_does_not_block_sibling_delivery() {
-        let (owner0_tx, owner0_rx) = bounded(1);
-        let (owner1_tx, owner1_rx) = bounded(1);
+        let (owner0_tx, owner0_rx) = hexagent_runtime::poll_channel::bounded(1);
+        let (owner1_tx, owner1_rx) = hexagent_runtime::poll_channel::bounded(1);
         let update = |coid: &str| OrderUpdate {
             order_slot: Default::default(),
             client_order_id: coid.into(),
