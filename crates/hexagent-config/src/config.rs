@@ -437,6 +437,20 @@ pub struct BacktestConfig {
     /// Assumed outbound share of the network RTT, not a measured venue clock.
     #[serde(default = "default_sim_v2_network_outbound_fraction_bps")]
     pub sim_v2_network_outbound_fraction_bps: u16,
+    /// Offline placement service model: connected-peer network RTT. Default
+    /// 2310us is the maker02 BTC calibration; 0 explicitly selects legacy timing.
+    /// Residual service is split separately. Recalibrate for a different venue/path.
+    /// This is an estimated processing budget, not a venue arrival measurement.
+    #[serde(default = "default_sim_v2_place_service_network_rtt_us")]
+    pub sim_v2_place_service_network_rtt_us: u64,
+    /// Residual service fraction before evaluation, in basis points. Calibrated
+    /// 95% leaves a post-match HTTP tail compatible with training private pushes.
+    #[serde(default = "default_sim_v2_place_service_pre_fraction_bps")]
+    pub sim_v2_place_service_pre_fraction_bps: u16,
+    /// Apply synthetic venue hold/overhead only after a marketable arrival.
+    /// Recorded HTTP budgets retain their complete observed duration.
+    #[serde(default)]
+    pub sim_v2_conditional_synthetic_hold: bool,
     /// Startup-validated per-token rule/effective-time journal. Empty means no
     /// historical rule is asserted; never infer taker hold from today's metadata.
     #[serde(default)]
@@ -1393,6 +1407,9 @@ impl Default for BacktestConfig {
             sim_v2_historical_self_depth_fraction: default_sim_v2_historical_self_depth_fraction(),
             sim_v2_queue_uncertainty_strength: 0.0,
             sim_v2_network_outbound_fraction_bps: default_sim_v2_network_outbound_fraction_bps(),
+            sim_v2_place_service_network_rtt_us: default_sim_v2_place_service_network_rtt_us(),
+            sim_v2_place_service_pre_fraction_bps: default_sim_v2_place_service_pre_fraction_bps(),
+            sim_v2_conditional_synthetic_hold: false,
             sim_v2_market_rules_path: String::new(),
             sim_v2_arrival_interval_audit: false,
             data_dir: default_output_dir(),
@@ -2734,4 +2751,21 @@ fn feed_idle_poll_defaults_and_fifo_safe_bounds() {
     assert_eq!(parse("name = 'binance'").unwrap().idle_poll_us, 100);
     assert_eq!(parse("name = 'coinbase'\nidle_poll_us = 25").unwrap().idle_poll_us, 25);
     for value in [0, 9, 1001] { assert!(parse(&format!("name = 'binance'\nidle_poll_us = {value}")).is_err()); }
+}
+
+fn default_sim_v2_place_service_network_rtt_us() -> u64 { 2310 }
+fn default_sim_v2_place_service_pre_fraction_bps() -> u16 { 9500 }
+
+#[test]
+fn placement_service_defaults_match_deserialization_and_allow_explicit_legacy_timing() {
+    for cfg in [BacktestConfig::default(), toml::from_str::<BacktestConfig>("").unwrap()] {
+        assert_eq!(cfg.sim_v2_place_service_network_rtt_us, 2310);
+        assert_eq!(cfg.sim_v2_place_service_pre_fraction_bps, 9500);
+        assert!(!cfg.sim_v2_conditional_synthetic_hold);
+    }
+    let legacy: BacktestConfig = toml::from_str("sim_v2_place_service_network_rtt_us = 0").unwrap();
+    assert_eq!(legacy.sim_v2_place_service_network_rtt_us, 0);
+    let custom: BacktestConfig = toml::from_str("sim_v2_place_service_network_rtt_us = 4000\nsim_v2_place_service_pre_fraction_bps = 9000").unwrap();
+    assert_eq!(custom.sim_v2_place_service_network_rtt_us, 4000);
+    assert_eq!(custom.sim_v2_place_service_pre_fraction_bps, 9000);
 }

@@ -122,6 +122,9 @@ fn config(
         liquidity_ledger_enabled: bt.sim_v2_liquidity_ledger,
         match_time_liquidity: bt.sim_v2_match_time_liquidity,
         network_outbound_fraction_bps: bt.sim_v2_network_outbound_fraction_bps,
+            place_service_network_rtt_ns: bt.sim_v2_place_service_network_rtt_us.checked_mul(1000).expect("placement network budget overflow"),
+            conditional_synthetic_hold: bt.sim_v2_conditional_synthetic_hold,
+            place_service_pre_fraction_bps: bt.sim_v2_place_service_pre_fraction_bps,
         market_rules_path: bt.sim_v2_market_rules_path.clone(),
         arrival_interval_audit: bt.sim_v2_arrival_interval_audit,
         historical_self_depth_path: bt.sim_v2_historical_self_depth_path.clone(),
@@ -382,6 +385,7 @@ fn main() -> Result<()> {
         continuity_path = Some(bt.sim_v2_book_continuity_evidence_path.clone());
     }
     anyhow::ensure!(transport_path.is_none() || arrival_path.is_none(), "choose one arrival evidence source");
+    anyhow::ensure!(bt.sim_v2_place_service_network_rtt_us == 0 || (transport_path.is_none() && arrival_path.is_none()), "choose measured placement interval or sampled service model, never stack them");
     anyhow::ensure!(cancel_transport_path.is_none() || (cancel_fraction.is_none()
         && bt.sim_v2_cancel_processing_ms==0 && bt.sim_v2_cancel_processing_fraction_bps==0
         && bt.sim_v2_cancel_finality_delay_frac==0.0 && bt.sim_v2_network_outbound_fraction_bps==5000

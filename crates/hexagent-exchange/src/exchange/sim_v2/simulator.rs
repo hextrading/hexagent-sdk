@@ -97,6 +97,9 @@ pub struct SimV2Config {
     pub liquidity_ledger_enabled: bool,
     pub match_time_liquidity: bool,
     pub network_outbound_fraction_bps: u16,
+    pub place_service_network_rtt_ns: u64,
+    pub place_service_pre_fraction_bps: u16,
+    pub conditional_synthetic_hold: bool,
     pub market_rules_path: String,
     pub arrival_interval_audit: bool,
     pub historical_self_depth_path: String,
@@ -310,12 +313,18 @@ struct RuleHold {
     // A short observed success can be valid for a non-marketable order. Its
     // unchanged RTT cannot reserve this hold; check crossing only at arrival.
     budget_reserved: bool,
+    /// Synthetic HTTP is sampled from a passive request profile; only add
+    /// taker service if arrival actually crosses. Observed RTTs are immutable.
+    conditional_synthetic: bool,
     effective_until_ns: Option<u64>,
 }
 
 pub struct Simulator {
     match_time_liquidity: bool,
     network_outbound_fraction_bps: u16,
+    place_service_network_rtt_ns: u64,
+    place_service_pre_fraction_bps: u16,
+    conditional_synthetic_hold: bool,
     arrival_intervals: crate::exchange::sim_v2::arrival_interval::ArrivalIntervalAudit,
     market_rules: crate::exchange::sim_v2::market_rules::MarketRules,
     rule_holds: HashMap<String, RuleHold>,
@@ -544,6 +553,11 @@ impl Simulator {
             (1..10_000).contains(&cfg.network_outbound_fraction_bps),
             "network outbound fraction must be in 1..10000 bps"
         );
+        anyhow::ensure!(cfg.place_service_pre_fraction_bps <= 10_000, "placement service fraction exceeds 10000 bps");
+        anyhow::ensure!(
+            !cfg.conditional_synthetic_hold || cfg.separate_taker_private_fills,
+            "conditional synthetic hold requires explicit HTTP deadlines"
+        );
         anyhow::ensure!(
             !cfg.match_time_liquidity || cfg.causal_matching,
             "matching-time liquidity requires causal_matching"
@@ -702,6 +716,9 @@ impl Simulator {
         Ok(Self {
             match_time_liquidity: cfg.match_time_liquidity,
             network_outbound_fraction_bps: cfg.network_outbound_fraction_bps,
+            place_service_network_rtt_ns: cfg.place_service_network_rtt_ns,
+            place_service_pre_fraction_bps: cfg.place_service_pre_fraction_bps,
+            conditional_synthetic_hold: cfg.conditional_synthetic_hold,
             arrival_intervals: crate::exchange::sim_v2::arrival_interval::ArrivalIntervalAudit::new(
                 cfg.arrival_interval_audit,
             ),
@@ -2600,13 +2617,23 @@ impl Simulator {
                                 rule_hold.is_none_or(|hold| hold.budget_reserved),
                                 "historical HTTP budget contradicts configured venue hold for marketable arrival; no match scheduled"
                             );
+                            let conditional_extra = rule_hold.filter(|hold| hold.conditional_synthetic)
+                                .map_or(0, |hold| {
+                                    let sampled = self.latency.sample_taker_overhead(when);
+                                    self.rule_hold_budget_floors += u64::from(sampled < hold.hold_ns);
+                                    sampled.saturating_sub(hold.hold_ns)
+                                });
+                            let conditional_pre = if self.place_service_network_rtt_ns > 0 {
+                                ((conditional_extra as u128 * self.place_service_pre_fraction_bps as u128) / 10_000) as u64
+                            } else { conditional_extra / 2 };
+                            let l2_ns = l2_ns.saturating_add(conditional_extra - conditional_pre);
                             let overhead = if rule_hold.is_some() {
                                 0
                             } else {
                                 self.latency.sample_taker_overhead(when)
                             };
                             let match_at = when.saturating_add(
-                                rule_hold.map_or(overhead / 2, |hold| hold.hold_ns),
+                                rule_hold.map_or(overhead / 2, |hold| hold.hold_ns.saturating_add(conditional_pre)),
                             );
                             if let Some(hold) = self.rule_holds.get_mut(&o.client_order_id) {
                                 hold.effective_until_ns = Some(match_at);
@@ -2655,7 +2682,7 @@ impl Simulator {
                             let unused_hold = self
                                 .rule_holds
                                 .remove(&o.client_order_id)
-                                .filter(|hold| hold.budget_reserved)
+                                .filter(|hold| hold.budget_reserved && !hold.conditional_synthetic)
                                 .map_or(0, |hold| hold.hold_ns);
                             self.pending_taker_races.remove(&o.client_order_id);
                             // Maker race: peek the queue `maker_race_horizon` ahead
@@ -3630,11 +3657,14 @@ impl Simulator {
         };
         let mut reserved_rule_hold_ns = 0;
         if rule_hold_ns > 0 {
+            let conditional_synthetic = self.conditional_synthetic_hold && !recorded_rtt;
             let base = l1.checked_add(l2).expect("place RTT overflow");
             // Historical commands already include all processing. Synthetic
             // requests replace the old midpoint processing approximation with
             // a known hold, retaining only nonnegative residual overhead.
-            let total = if recorded_rtt && http_response_observed {
+            let total = if conditional_synthetic {
+                base
+            } else if recorded_rtt && http_response_observed {
                 base
             } else if recorded_rtt {
                 // A timed-out request supplies only a lower bound; satisfying
@@ -3652,8 +3682,8 @@ impl Simulator {
             // An observed success shorter than the hold may simply be passive.
             // Keep its ordinary partition and defer the contradiction check to
             // arrival, without looking ahead or stretching the recorded RTT.
-            let budget_reserved = total >= rule_hold_ns.saturating_add(2);
-            if budget_reserved {
+            let budget_reserved = conditional_synthetic || total >= rule_hold_ns.saturating_add(2);
+            if budget_reserved && !conditional_synthetic {
                 (l1, l2) = crate::exchange::sim_v2::market_rules::partition_hold_budget(
                     total,
                     rule_hold_ns,
@@ -3661,7 +3691,7 @@ impl Simulator {
                 )
                 .expect("validated venue hold budget must have two positive legs");
                 reserved_rule_hold_ns = rule_hold_ns;
-            } else {
+            } else if !conditional_synthetic {
                 assert!(
                     recorded_rtt && http_response_observed,
                     "unreserved venue hold requires a short observed HTTP success"
@@ -3678,12 +3708,21 @@ impl Simulator {
                     RuleHold {
                         hold_ns: rule_hold_ns,
                         budget_reserved,
+                        conditional_synthetic,
                         effective_until_ns: None,
                     },
                 );
             }
         }
-        if self.network_outbound_fraction_bps != 5000 || reserved_rule_hold_ns > 0 {
+        let service_partition = self.place_service_network_rtt_ns > 0
+            && matches!(&action, ReachAction::Place(_));
+        if service_partition {
+            // Keep the total HTTP budget and any separately reserved rule hold.
+            // This model separates pre/post evaluation service; it never
+            // extends cancels, changes private clocks, or consumes an RNG draw.
+            (l1, l2) = placement_service_split(l1, l2, self.place_service_network_rtt_ns, self.place_service_pre_fraction_bps);
+        }
+        if service_partition || self.network_outbound_fraction_bps != 5000 || reserved_rule_hold_ns > 0 {
             arrival_evidence.selected_ns = t_emit.saturating_add(l1);
             arrival_evidence.selected_kind = "modeled_budget_partition";
         }
@@ -3947,6 +3986,20 @@ impl Simulator {
     }
 }
 
+/// Pure offline budget partition. Network RTT is an estimated connected-peer
+/// path; residual service is split before/after engine evaluation. Both legs
+/// stay positive when the original budget permits, and the sum is unchanged.
+fn placement_service_split(l1: u64, l2: u64, network_ns: u64, pre_bps: u16) -> (u64, u64) {
+    let total = l1.checked_add(l2).expect("placement HTTP budget overflow");
+    if network_ns == 0 || total < 2 { return (l1, l2); }
+    assert!(pre_bps <= 10_000, "placement service fraction exceeds 10000 bps");
+    let network = network_ns.min(total);
+    let residual = total - network;
+    let pre = ((residual as u128 * pre_bps as u128) / 10_000) as u64;
+    let inbound = (network - network / 2 + residual - pre).clamp(1, total - 1);
+    (total - inbound, inbound)
+}
+
 /// True when a reach action is a cancel (vs a place). Used by the
 /// `use_batch_orders=false` split path to pick the cancel vs place RTT
 /// sampler per action.
@@ -4077,6 +4130,9 @@ mod tests {
         Simulator {
             match_time_liquidity: false,
             network_outbound_fraction_bps: 5000,
+            place_service_network_rtt_ns: 0,
+            place_service_pre_fraction_bps: 9500,
+            conditional_synthetic_hold: false,
             arrival_intervals: crate::exchange::sim_v2::arrival_interval::ArrivalIntervalAudit::new(
                 false,
             ),
@@ -4205,6 +4261,9 @@ mod tests {
         Simulator {
             match_time_liquidity: false,
             network_outbound_fraction_bps: 5000,
+            place_service_network_rtt_ns: 0,
+            place_service_pre_fraction_bps: 9500,
+            conditional_synthetic_hold: false,
             arrival_intervals: crate::exchange::sim_v2::arrival_interval::ArrivalIntervalAudit::new(
                 false,
             ),
@@ -4803,6 +4862,95 @@ mod tests {
             .unwrap();
         assert_eq!(http.timestamp_ns, emit + 300_000_000);
         assert!(sim.rule_holds.is_empty());
+    }
+
+    #[test]
+    fn placement_service_preserves_budget_and_cannot_change_cancel_split() {
+        for total in [0_u64, 1, 2, 3, 100, 100_000_000] {
+            for network in [0, 1, 2, 3, 20_000_000, u64::MAX] {
+                let (a,b) = placement_service_split(total/2,total-total/2,network,9500);
+                assert_eq!(a+b,total);
+                if total >= 2 && network > 0 { assert!(a>0 && b>0); }
+                if network==0 { assert_eq!((a,b),(total/2,total-total/2)); }
+            }
+        }
+        let mut sim=sim_with_fixed_rtt(100);
+        sim.place_service_network_rtt_ns=20_000_000;
+        sim.submit(&place_signal("service"),1_000_000_000);
+        assert_eq!(sim.peek_server_when(),Some(1_086_000_000));
+        while sim.peek_when().is_some() { sim.step(); }
+        sim.submit(&cancel_signal("service",2_000_000_000),2_000_000_000);
+        assert_eq!(sim.peek_server_when(),Some(2_050_000_000));
+    }
+
+    #[test]
+    fn conditional_hold_passive_synthetic_has_no_taker_service_but_recorded_rtt_is_preserved() {
+        for recorded in [false,true] {
+            let (mut sim,mut signal)=separated_taker_sim(10);
+            set_fixture_hold(&mut sim);
+            sim.conditional_synthetic_hold=true;
+            if let Signal::NewOrder(o)=&mut signal {
+                o.order_type=crate::types::OrderType::Limit;
+                o.price=Some(0.5);
+                o.instance_id="owner-a".into();
+            }
+            let emit=1_000_000_000;
+            if recorded {sim.submit_with_latency_split(&signal,emit,150_000_000,150_000_000).unwrap();}
+            else {sim.submit(&signal,emit);}
+            let mut updates=Vec::new();
+            while sim.peek_when().is_some(){updates.extend(sim.step());}
+            assert_eq!(updates.len(),1);
+            assert_eq!(updates[0].status,OrderStatus::Accepted);
+            assert_eq!(updates[0].timestamp_ns,emit+if recorded{300_000_000}else{100_000_000});
+            assert_eq!(updates[0].order_slot,OrderSlot::with_generation(2,17));
+            assert_eq!(sim.rule_hold_applied,0);
+            assert!(sim.rule_holds.is_empty());
+        }
+    }
+
+    #[test]
+    fn conditional_hold_waits_only_on_crossing_and_private_fill_survives_http_timeout() {
+        for service in [0,20_000_000] {
+            let (mut sim,signal)=separated_taker_sim(10);
+            set_fixture_hold(&mut sim);
+            sim.conditional_synthetic_hold=true;
+            sim.place_service_network_rtt_ns=service;
+            sim.client_timeout_ns=200_000_000;
+            let emit=1_000_000_000;
+            sim.submit(&signal,emit);
+            let arrival=emit+if service==0{50_000_000}else{86_000_000};
+            assert_eq!(sim.peek_server_when(),Some(arrival));
+            assert!(sim.step().is_empty());
+            assert_eq!(sim.rule_hold_applied,1);
+            sim.submit_with_latency_split(&cancel_signal("taker-private",arrival+1),arrival+1,1,1).unwrap();
+            let mut updates=Vec::new();
+            while sim.peek_when().is_some(){updates.extend(sim.step());}
+            assert!(updates.iter().any(|u|u.status==OrderStatus::CancelUncertain));
+            assert!(updates.iter().any(|u|u.status==OrderStatus::NewOrderTimeout));
+            let fills:Vec<_>=updates.iter().filter(|u|u.trade_id.is_some()).collect();
+            assert_eq!(fills.len(),1);
+            assert_eq!(fills[0].filled_quantity,10.0);
+            assert_eq!(fills[0].exchange_event_timestamp_ns,Some(arrival+250_000_000));
+            assert_eq!(fills[0].order_slot,OrderSlot::with_generation(2,17));
+            assert!(sim.rule_holds.is_empty());
+            assert_eq!(sim.pending_private_fills.len(),0);
+        }
+    }
+
+    #[test]
+    #[ignore="focused offline timing benchmark"]
+    fn benchmark_placement_service_budget() {
+        use std::{hint::black_box,time::Instant};
+        for network in [0,2_310_000] {
+            let mut samples=Vec::with_capacity(100_000);
+            for i in 0..100_000 {
+                let now=Instant::now();
+                black_box(placement_service_split(black_box(10_000_000+i),black_box(10_000_000+i),black_box(network),black_box(9500)));
+                samples.push(now.elapsed().as_nanos());
+            }
+            samples.sort_unstable();
+            println!("placement_service_budget network_ns={network} n={} median_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0 boundary=pure_budget_partition",samples.len(),samples[50_000],samples[99_000],samples[99_900],samples[99_999]);
+        }
     }
 
     #[test]
