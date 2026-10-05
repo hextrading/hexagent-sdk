@@ -18,7 +18,7 @@ use hyper_util::rt::TokioExecutor;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -329,6 +329,33 @@ pub struct InstrumentedHttp1Client {
     /// phase attribution remains request-exact and Hyper cannot open a second
     /// active CLOB socket behind the same slot.
     request_gate: Arc<tokio::sync::Semaphore>,
+    maintenance: Arc<MaintenancePriority>,
+}
+
+#[derive(Default)]
+struct MaintenancePriority {
+    business: AtomicUsize,
+    active: AtomicBool,
+    cancel: tokio::sync::Notify,
+}
+
+struct BusinessRequest<'a>(&'a MaintenancePriority);
+impl Drop for BusinessRequest<'_> {
+    fn drop(&mut self) { self.0.business.fetch_sub(1, Ordering::SeqCst); }
+}
+struct MaintenanceRequest<'a>(&'a MaintenancePriority);
+impl Drop for MaintenanceRequest<'_> {
+    fn drop(&mut self) { self.0.active.store(false, Ordering::SeqCst); }
+}
+
+/// Maintenance never queues behind business and yields its request gate as
+/// soon as a business request arrives. A cancelled HTTP/1 GET can retire its
+/// socket; the business request then follows the normal measured cold path.
+/// It must never wait for the maintenance response deadline.
+pub(crate) enum KeepWarmOutcome {
+    Busy,
+    Preempted,
+    Completed(Result<InstrumentedHttp1Response, InstrumentedHttp1Error>),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -503,6 +530,7 @@ impl InstrumentedHttp1Client {
             client,
             trace,
             request_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            maintenance: Arc::new(MaintenancePriority::default()),
         })
     }
 
@@ -514,6 +542,11 @@ impl InstrumentedHttp1Client {
         body: Bytes,
         timeout: Duration,
     ) -> Result<InstrumentedHttp1Response, InstrumentedHttp1Error> {
+        self.maintenance.business.fetch_add(1, Ordering::SeqCst);
+        let _business = BusinessRequest(&self.maintenance);
+        if self.maintenance.active.load(Ordering::SeqCst) {
+            self.maintenance.cancel.notify_waiters();
+        }
         let gate_started = Instant::now();
         let deadline = tokio::time::Instant::now() + timeout;
         let _request_guard = match tokio::time::timeout_at(deadline, self.request_gate.acquire()).await {
@@ -531,6 +564,37 @@ impl InstrumentedHttp1Client {
             }),
         };
         let slot_wait_ns = duration_ns(gate_started.elapsed());
+        self.request_on_gate(method, url, headers, body, deadline, slot_wait_ns).await
+    }
+
+    pub(crate) async fn keep_warm(&self, url: &str, timeout: Duration) -> KeepWarmOutcome {
+        // Register before publishing active, then recheck business after
+        // acquiring the gate. SeqCst closes the check/publish race in both
+        // directions, including a business future queued before this probe.
+        let cancelled = self.maintenance.cancel.notified();
+        tokio::pin!(cancelled);
+        cancelled.as_mut().enable();
+        if self.maintenance.active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return KeepWarmOutcome::Busy;
+        }
+        let _active = MaintenanceRequest(&self.maintenance);
+        let Ok(_gate) = self.request_gate.try_acquire() else { return KeepWarmOutcome::Busy; };
+        if self.maintenance.business.load(Ordering::SeqCst) != 0 {
+            return KeepWarmOutcome::Busy;
+        }
+        tokio::select! {
+            biased;
+            _ = &mut cancelled => KeepWarmOutcome::Preempted,
+            result = self.request_on_gate(reqwest::Method::GET, url,
+                reqwest::header::HeaderMap::new(), Bytes::new(),
+                tokio::time::Instant::now() + timeout, 0) => KeepWarmOutcome::Completed(result),
+        }
+    }
+
+    async fn request_on_gate(&self, method: reqwest::Method, url: &str,
+        headers: reqwest::header::HeaderMap, body: Bytes,
+        deadline: tokio::time::Instant, slot_wait_ns: u64,
+    ) -> Result<InstrumentedHttp1Response, InstrumentedHttp1Error> {
         let attempts_before = self.trace.attempts.load(Ordering::Acquire);
         let generation_before = self.trace.generation.load(Ordering::Acquire);
         let request = match Request::builder()
@@ -629,7 +693,7 @@ impl InstrumentedHttp1Client {
                 let headers_ns = headers_completed_ns.load(Ordering::Acquire);
                 Err(InstrumentedHttp1Error {
                     kind: InstrumentedHttp1ErrorKind::Timeout,
-                    message: format!("HTTP/1.1 request timed out after {}ms", timeout.as_millis()),
+                    message: "HTTP/1.1 request deadline exceeded".to_owned(),
                     timings: self.snapshot(
                         attempts_before,
                         generation_before,
@@ -1323,3 +1387,6 @@ mod tests {
         server.await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod keep_warm_tests;
