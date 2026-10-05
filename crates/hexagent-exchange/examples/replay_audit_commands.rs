@@ -1,3 +1,5 @@
+#[path = "replay_audit_commands/cancel_transport.rs"]
+mod cancel_transport;
 // Offline-only adapter for strict order_audit commands. No strategy or live account.
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -5,7 +7,7 @@ use hexagent_exchange::{
     config::BacktestConfig,
     exchange::sim::latency_record_replay::RecordReplayData,
     exchange::sim_v2::{
-        ArrivalEvidence, ArrivalEvidenceReplay, BookContinuityReplay, SimV2Config, Simulator,
+        ArrivalEvidence, evidence::{ArrivalEvidenceKind, EvidenceClockDomain}, ArrivalEvidenceReplay, BookContinuityReplay, SimV2Config, Simulator,
     },
     recorder::{MarketReplayer, ReplayOptions, ReplayTimePolicy},
     types::{
@@ -44,6 +46,55 @@ struct Command {
     attempt_id: u64,
     #[serde(default)]
     observed_http_status: Option<String>,
+}
+
+/// Startup-only per-owner HTTP transport evidence. The selected point remains
+/// modeled; TCP_INFO observes the peer path, not the exchange matching clock.
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct PlacementTransport {
+    coid: String, iid: String, token: String, event_id: String,
+    epoch: u64, attempt_id: u64, dispatched_ns: u64, completed_ns: u64,
+    lower_ns: Option<u64>, upper_ns: Option<u64>, selected_ns: Option<u64>,
+    provenance: String,
+}
+impl PlacementTransport {
+    fn validate(&self, c: &Command) -> Result<()> {
+        anyhow::ensure!(c.kind=="place" && self.coid==c.coid && self.iid==c.iid
+            && self.token==c.token && self.event_id==c.event_id && self.epoch==c.epoch
+            && self.attempt_id==c.attempt_id && self.dispatched_ns==c.dispatched_ns
+            && self.completed_ns==c.completed_ns && !self.provenance.is_empty(), "transport identity mismatch");
+        match (self.lower_ns,self.upper_ns,self.selected_ns) {
+            (Some(lo),Some(hi),Some(point)) => anyhow::ensure!(
+                c.dispatched_ns<=lo && lo<=point && point<=hi && hi<=c.completed_ns
+                && !c.observed_http_status.as_deref().is_some_and(|s| s.to_ascii_lowercase().contains("timeout")),
+                "invalid/censored transport interval"),
+            (None,None,None) => {},
+            _ => bail!("incomplete transport evidence"),
+        }
+        Ok(())
+    }
+    fn selected(&self, fallback: u64, row: u64) -> (u64,ArrivalEvidence) {
+        if let (Some(point),Some(lo),Some(hi))=(self.selected_ns,self.lower_ns,self.upper_ns) {
+            (point,ArrivalEvidence {kind:ArrivalEvidenceKind::MeasuredClientTransportInterval,
+                lower_ns:Some(lo),upper_ns:Some(hi),selected_ns:point,selected_kind:"modeled_transport_tcp",
+                clock_domain:EvidenceClockDomain::ClientWall,clock_offset_lower_ns:None,
+                clock_offset_upper_ns:None,provenance_row:Some(row)})
+        } else {(fallback,ArrivalEvidence::modeled(fallback))}
+    }
+}
+fn load_transport(path: &str, commands: &[Command]) -> Result<HashMap<String,(u64,PlacementTransport)>> {
+    let place_count=commands.iter().filter(|c| c.kind=="place").count();
+    let mut table=HashMap::with_capacity(place_count);
+    for (index,line) in BufReader::new(File::open(path)?).lines().enumerate() {
+        anyhow::ensure!(index < place_count,"transport row count exceeds fixed placement population");
+        let row:PlacementTransport=serde_json::from_str(&line?)?;
+        anyhow::ensure!(table.insert(row.coid.clone(),(index as u64+1,row)).is_none(),"duplicate transport coid");
+    }
+    let places:Vec<_>=commands.iter().filter(|c| c.kind=="place").collect();
+    anyhow::ensure!(table.len()==places.len(),"transport evidence must exactly cover places");
+    for c in places {table.get(&c.coid).context("missing transport coid")?.1.validate(c)?;}
+    Ok(table)
 }
 
 fn config(
@@ -265,7 +316,7 @@ fn signal(command: &Command, ordinal: usize) -> Result<Signal> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 7 {
-        bail!("usage: replay_audit_commands COMMANDS_JSONL EXCHANGE_TOML DATA_DIR LATENCY2_DIR OUTPUT_DIR OUTBOUND_FRACTION [CANCEL_FINALITY] [--arrival-evidence JSONL] [--book-continuity-evidence JSONL]")
+        bail!("usage: replay_audit_commands COMMANDS_JSONL EXCHANGE_TOML DATA_DIR LATENCY2_DIR OUTPUT_DIR OUTBOUND_FRACTION [CANCEL_FINALITY] [--arrival-evidence JSONL | --placement-transport JSONL] [--cancel-transport JSONL] [--book-continuity-evidence JSONL]")
     }
     let fraction: f64 = args[6].parse()?;
     if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
@@ -301,16 +352,27 @@ fn main() -> Result<()> {
         bt.sim_v2_cancel_finality_delay_frac = value.parse()?;
         option_index += 1;
     }
+    let mut cancel_transport_path: Option<String> = None;
+    let mut transport_path: Option<String> = None;
     let mut arrival_path: Option<String> = None;
     let mut continuity_path: Option<String> = None;
+    let mut cancel_fraction: Option<f64> = None;
     while option_index < args.len() {
         let value = args
             .get(option_index + 1)
             .context("missing evidence option value")?;
         match args[option_index].as_str() {
+            "--cancel-transport" if cancel_transport_path.is_none() => cancel_transport_path = Some(value.clone()),
+            "--placement-transport" if transport_path.is_none() => transport_path = Some(value.clone()),
             "--arrival-evidence" if arrival_path.is_none() => arrival_path = Some(value.clone()),
             "--book-continuity-evidence" if continuity_path.is_none() => {
                 continuity_path = Some(value.clone())
+            }
+            "--cancel-arrival-fraction" if cancel_fraction.is_none() => {
+                let v: f64 = value.parse()?;
+                anyhow::ensure!(v.is_finite() && v > 0.0 && v < 1.0,
+                    "cancel arrival fraction must be finite and strictly between 0 and 1");
+                cancel_fraction = Some(v);
             }
             other => bail!("unknown or duplicate evidence option: {other}"),
         }
@@ -319,6 +381,14 @@ fn main() -> Result<()> {
     if continuity_path.is_none() && !bt.sim_v2_book_continuity_evidence_path.trim().is_empty() {
         continuity_path = Some(bt.sim_v2_book_continuity_evidence_path.clone());
     }
+    anyhow::ensure!(transport_path.is_none() || arrival_path.is_none(), "choose one arrival evidence source");
+    anyhow::ensure!(cancel_transport_path.is_none() || (cancel_fraction.is_none()
+        && bt.sim_v2_cancel_processing_ms==0 && bt.sim_v2_cancel_processing_fraction_bps==0
+        && bt.sim_v2_cancel_finality_delay_frac==0.0 && bt.sim_v2_network_outbound_fraction_bps==5000
+        && bt.sim_v2_cancel_timing_mode=="staged_rtt_fraction"),
+        "cancel transport cannot combine with other timing transformations");
+    let cancel_overrides=cancel_transport_path.as_ref().map(|p|cancel_transport::load(p,&commands)).transpose()?;
+    let transport_replay = transport_path.as_ref().map(|p| load_transport(p,&commands)).transpose()?;
     let arrival_replay = arrival_path
         .as_ref()
         .map(ArrivalEvidenceReplay::from_path)
@@ -465,21 +535,27 @@ fn main() -> Result<()> {
         } else {
             let command = &commands[cursor];
             let rtt = command.completed_ns - command.dispatched_ns;
-            let l1 = if bt.sim_v2_network_outbound_fraction_bps == 5000 {
+            // Diagnostic interval sensitivity only. Do not consume the observed
+            // cancel status/private fills or change the placement clock.
+            let mut l1 = if let Some(f) = cancel_fraction.filter(|_| command.kind == "cancel") {
+                (rtt as f64 * f).round() as u64
+            } else if bt.sim_v2_network_outbound_fraction_bps == 5000 {
                 (rtt as f64 * fraction).round() as u64
             } else {
                 ((rtt as u128 * bt.sim_v2_network_outbound_fraction_bps as u128) / 10_000) as u64
             };
+            let transport_selected = transport_replay.as_ref().filter(|_| command.kind=="place")
+                .and_then(|t| t.get(&command.coid)).map(|(row,t)| t.selected(command.dispatched_ns.saturating_add(l1),*row));
+            if let Some((point,_))=transport_selected {l1=point-command.dispatched_ns;}
             let l2 = rtt.saturating_sub(l1);
-            let cancel_timing = if command.kind == "cancel" {
-                sim.cancel_timing_preview(command.dispatched_ns, l1, l2)
-            } else {
-                None
-            };
+            let cancel_override=cancel_overrides.as_ref().and_then(|v|v[cursor]);
+            let cancel_timing=cancel_override.or_else(|| if command.kind=="cancel" {
+                sim.cancel_timing_preview(command.dispatched_ns,l1,l2)
+            } else {None});
             // Place evidence remains on its original L1. Cancel evidence is a
             // modeled partition of the same RTT, never an observed arrival.
             let nominal_arrival = command.dispatched_ns.saturating_add(l1);
-            let arrival_evidence = if command.kind == "place" {
+            let arrival_evidence = if let Some((_,evidence))=transport_selected { evidence } else if command.kind == "place" {
                 arrival_replay
                     .as_ref()
                     .and_then(|replay| replay.get(&command.coid))
@@ -500,6 +576,9 @@ fn main() -> Result<()> {
             );
             let http_response_observed =
                 !(bt.sim_v2_cancel_timing_mode != "legacy_l2_multiplier" && recorded_timeout);
+            if let Some(timing)=cancel_override {
+                sim.submit_with_recorded_cancel_timing(&signal(command,cursor)?,timing,http_response_observed)?;
+            } else {
             sim.submit_with_latency_split_and_transport_observation(
                 &signal(command, cursor)?,
                 command.dispatched_ns,
@@ -508,6 +587,7 @@ fn main() -> Result<()> {
                 arrival_evidence,
                 http_response_observed,
             )?;
+            }
             serde_json::to_writer(
                 &mut arrivals,
                 &json!({"coid": command.coid, "kind": command.kind,
@@ -519,6 +599,8 @@ fn main() -> Result<()> {
                 "nominal_arrival_ns": cancel_timing.map_or(nominal_arrival, |t| t.nominal_arrival_ns),
                 "arrival_evidence": cancel_timing.map_or(arrival_evidence, |t| ArrivalEvidence::modeled(t.nominal_arrival_ns)),
                 "cancel_timing_mode": bt.sim_v2_cancel_timing_mode,
+                "cancel_transport_override": cancel_override.is_some(),
+                "cancel_interval_fraction_sensitivity": cancel_fraction,
                 "cancel_timing": cancel_timing,
                 "http_response_observed": http_response_observed,
                 "rtt_observation": if recorded_timeout { "right_censored_lower_bound" } else { "observed_client_interval" },
@@ -579,6 +661,8 @@ fn main() -> Result<()> {
                 "cancel_result": row.cancel_result, "rest_time_ns": row.rest_time_ns,
                 "rest_qty_ns": row.rest_qty_ns, "q_init": row.q_init,
                 "q_ahead_final": row.q_ahead_final, "visible_depth_at_entry": row.visible_depth_at_entry,
+                "depth_observed_at_entry": row.depth_observed_at_entry,
+                "depth_censored_n": row.depth_censored_n, "depth_rebase_n": row.depth_rebase_n,
                 "entry_mid": row.entry_mid, "queue_seq": row.queue_seq,
                 "simulated_own_ahead_qty": row.simulated_own_ahead_qty,
                 "replay_self_depth_credit": row.replay_self_depth_credit,
@@ -658,6 +742,10 @@ fn main() -> Result<()> {
         "raw_older_books_dropped": sim.raw_older_books_dropped(),
         "admission_audit": sim.admission_audit_stats(),
         "book_continuity_mode": bt.sim_v2_book_continuity_mode,
+        "cancel_transport_path": cancel_transport_path,
+        "cancel_transport_modeled_requests": cancel_overrides.as_ref().map_or(0,|v|v.iter().filter(|r|r.is_some()).count()),
+        "placement_transport_path": transport_path,
+        "placement_transport_rows": transport_replay.as_ref().map_or(0,|r|r.len()),
         "arrival_evidence_path": arrival_path,
         "arrival_evidence_rows": arrival_replay.as_ref().map_or(0, |rows| rows.len()),
         "book_continuity_evidence_path": continuity_path,
@@ -677,4 +765,61 @@ fn main() -> Result<()> {
     )?;
     println!("{}", summary);
     Ok(())
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    fn command() -> Command {
+        serde_json::from_value(json!({"kind":"place","coid":"btc01-a","iid":"btc01","event_id":"event","token":"up","side":"BUY","order_type":"Limit","price":0.5,"quantity":10.,"post_only":false,"reduce_only":false,"fee_rate_bps":700,"dispatched_ns":100,"completed_ns":200,"trigger_exchange_ns":0,"trigger_local_ns":0,"epoch":1,"attempt_id":3})).unwrap()
+    }
+    fn row() -> PlacementTransport { PlacementTransport {coid:"btc01-a".into(),iid:"btc01".into(),token:"up".into(),event_id:"event".into(),epoch:1,attempt_id:3,dispatched_ns:100,completed_ns:200,lower_ns:Some(120),upper_ns:Some(190),selected_ns:Some(130),provenance:"test transport".into()} }
+    #[test]
+    fn transport_point_preserves_client_interval_and_model_status() {
+        let c=command();let r=row();r.validate(&c).unwrap();let (t,e)=r.selected(150,1);
+        assert_eq!(t,130);assert_eq!(e.kind,ArrivalEvidenceKind::MeasuredClientTransportInterval);
+        assert_eq!(e.selected_kind,"modeled_transport_tcp");assert_eq!(e.clock_offset_lower_ns,None);
+        let mut invalid=row();invalid.iid="btc02".into();assert!(invalid.validate(&c).is_err());
+        let mut invalid=row();invalid.selected_ns=Some(110);assert!(invalid.validate(&c).is_err());
+        let mut timeout=command();timeout.observed_http_status=Some("NewOrderTimeout".into());assert!(r.validate(&timeout).is_err());
+        let mut missing=row();missing.lower_ns=None;missing.upper_ns=None;missing.selected_ns=None;
+        missing.validate(&c).unwrap();assert_eq!(missing.selected(150,1).0,150);
+    }
+    #[test]
+    fn transport_replay_duplicate_and_missing_owner_fail_closed() {
+        let path=std::env::temp_dir().join(format!("transport-test-{}.jsonl",std::process::id()));
+        let encoded=serde_json::to_string(&row()).unwrap();
+        std::fs::write(&path,format!("{encoded}\n{encoded}\n")).unwrap();
+        assert!(load_transport(path.to_str().unwrap(),&[command()]).is_err());
+        std::fs::write(&path,format!("{encoded}\n")).unwrap();let table=load_transport(path.to_str().unwrap(),&[command()]).unwrap();
+        for _ in 0..2 {assert_eq!(table["btc01-a"].1.selected(150,1).0,130);}
+        std::fs::write(&path, "").unwrap();
+        assert!(load_transport(path.to_str().unwrap(),&[command()]).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "focused optimized offline selector benchmark; no live latency claim"]
+    fn transport_selection_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut table=HashMap::with_capacity(10_000);
+        let keys:Vec<_>=(0..10_000).map(|i| format!("btc0{}-{}", i%3+1, i)).collect();
+        for (i,key) in keys.iter().enumerate() { table.insert(key.clone(), (i as u64,row())); }
+        for enabled in [false,true] {
+            let mut elapsed=Vec::with_capacity(100_000);
+            for i in 0..100_000 {
+                let key=&keys[i%keys.len()];
+                let start=Instant::now();
+                let value=if black_box(enabled) {
+                    let (line, r)=black_box(&table).get(black_box(key)).unwrap();
+                    r.selected(black_box(150),*line)
+                } else { (black_box(150), ArrivalEvidence::modeled(black_box(150))) };
+                black_box(value);
+                elapsed.push(start.elapsed().as_nanos() as u64);
+            }
+            elapsed.sort_unstable();
+            println!("selector_bench {{\"transport\":{},\"count\":{},\"median_ns\":{},\"p99_ns\":{},\"p999_ns\":{},\"max_ns\":{},\"queue_depth\":0,\"queue_overflow\":0}}",enabled,elapsed.len(),elapsed[50_000],elapsed[99_000],elapsed[99_900],elapsed[99_999]);
+        }
+    }
 }

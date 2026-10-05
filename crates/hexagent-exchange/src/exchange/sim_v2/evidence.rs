@@ -515,6 +515,7 @@ impl BookContinuityReplay {
 pub enum ArrivalEvidenceKind {
     ModeledSplit,
     MeasuredClientInterval,
+    MeasuredClientTransportInterval,
     MeasuredExchangePoint,
     Unknown,
 }
@@ -613,6 +614,13 @@ impl ArrivalEvidenceRecord {
                     return Err(invalid(
                         "client arrival interval must use dispatched/completed endpoints",
                     ));
+                }
+            }
+            ArrivalEvidenceKind::MeasuredClientTransportInterval => {
+                if self.clock_domain != EvidenceClockDomain::ClientWall
+                    || self.lower_ns.is_none_or(|lower| lower < self.dispatched_ns)
+                    || self.upper_ns.is_none_or(|upper| self.completed_ns.is_none_or(|done| upper > done)) {
+                    return Err(invalid("transport bounds must lie within the measured client request"));
                 }
             }
             ArrivalEvidenceKind::MeasuredExchangePoint => {

@@ -47,7 +47,12 @@ pub struct CancelTiming {
     pub network_l1_ns: u64,
     pub processing_requested_ns: u64,
     pub processing_ns: u64,
+    /// Work after the order stops matching; must not extend fill eligibility.
+    pub post_effect_ns: u64,
     pub network_l2_ns: u64,
+    /// Client transport observations, not verified exchange-clock bounds.
+    pub transport_lower_ns: Option<u64>,
+    pub transport_upper_ns: Option<u64>,
     pub nominal_arrival_ns: u64,
     pub nominal_effective_ns: u64,
     pub nominal_http_ns: u64,
@@ -106,13 +111,84 @@ impl CancelTiming {
             network_l1_ns: outbound,
             processing_requested_ns: requested,
             processing_ns: processing,
+            post_effect_ns: 0,
             network_l2_ns: network - outbound,
+            transport_lower_ns: None,
+            transport_upper_ns: None,
             nominal_arrival_ns: arrival,
             nominal_effective_ns: effective,
             nominal_http_ns: http,
             processing_capped: requested > rtt,
             evidence_confidence: "estimated_rtt_partition",
         }
+    }
+
+    /// Offline observed HTTP budget with separately modeled arrival/effect.
+    /// `network_l1_ns` includes dispatch-to-write and unobserved ingress work.
+    /// Neither TCP peer RTT nor these endpoints certify exchange timestamps.
+    pub fn from_transport_stages(
+        dispatch: u64,
+        completed: u64,
+        lower: u64,
+        upper: u64,
+        arrival: u64,
+        effective: u64,
+        return_ns: u64,
+    ) -> Result<Self, &'static str> {
+        if !(dispatch < lower
+            && lower <= arrival
+            && arrival <= effective
+            && effective <= upper
+            && upper <= completed
+            && effective < completed)
+            || return_ns == 0
+            || return_ns > completed - effective
+        {
+            return Err("invalid cancel transport clock ordering/budget");
+        }
+        let rtt = completed - dispatch;
+        Ok(Self {
+            dispatch_ns: dispatch,
+            input_l1_ns: rtt / 2,
+            input_l2_ns: rtt - rtt / 2,
+            rtt_ns: rtt,
+            network_l1_ns: arrival - dispatch,
+            processing_requested_ns: effective - arrival,
+            processing_ns: effective - arrival,
+            post_effect_ns: completed - effective - return_ns,
+            network_l2_ns: return_ns,
+            transport_lower_ns: Some(lower),
+            transport_upper_ns: Some(upper),
+            nominal_arrival_ns: arrival,
+            nominal_effective_ns: effective,
+            nominal_http_ns: completed,
+            processing_capped: false,
+            evidence_confidence: "modeled_with_client_transport_bounds",
+        })
+    }
+
+    pub fn validate_transport_stages(&self) -> Result<(), &'static str> {
+        let rebuilt = Self::from_transport_stages(
+            self.dispatch_ns,
+            self.nominal_http_ns,
+            self.transport_lower_ns
+                .ok_or("missing cancel transport lower bound")?,
+            self.transport_upper_ns
+                .ok_or("missing cancel transport upper bound")?,
+            self.nominal_arrival_ns,
+            self.nominal_effective_ns,
+            self.network_l2_ns,
+        )?;
+        if self != &rebuilt {
+            return Err("mutated cancel transport budget");
+        }
+        Ok(())
+    }
+
+    pub fn after_effect_ns(&self) -> u64 {
+        self.post_effect_ns
+            .checked_add(self.network_l2_ns)
+            .expect("cancel return budget overflow")
     }
 }
 
@@ -233,6 +309,67 @@ pub struct CancelTimingStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transport_stages_conserve_rtt_and_separate_post_effect_work() {
+        let t = CancelTiming::from_transport_stages(100, 200, 110, 195, 120, 150, 20).unwrap();
+        assert_eq!(
+            (
+                t.network_l1_ns,
+                t.processing_ns,
+                t.post_effect_ns,
+                t.network_l2_ns
+            ),
+            (20, 30, 30, 20)
+        );
+        assert_eq!(t.after_effect_ns(), 50);
+        t.validate_transport_stages().unwrap();
+        let mut bad = t;
+        bad.post_effect_ns += 1;
+        assert!(bad.validate_transport_stages().is_err());
+        for (a, e, ret) in [
+            (109, 150, 20),
+            (130, 120, 20),
+            (120, 196, 1),
+            (120, 150, 51),
+            (120, 150, 0),
+        ] {
+            assert!(CancelTiming::from_transport_stages(100, 200, 110, 195, a, e, ret).is_err());
+        }
+        let large = CancelTiming::from_transport_stages(
+            u64::MAX - 100,
+            u64::MAX,
+            u64::MAX - 99,
+            u64::MAX - 1,
+            u64::MAX - 80,
+            u64::MAX - 50,
+            20,
+        )
+        .unwrap();
+        large.validate_transport_stages().unwrap();
+    }
+
+    #[test]
+    #[ignore = "optimized offline stage constructor benchmark"]
+    fn transport_stage_partition_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        for transport in [false, true] {
+            let mut ns = Vec::with_capacity(100_000);
+            for _ in 0..100_000 {
+                let start = Instant::now();
+                let t = if black_box(transport) {
+                    CancelTiming::from_transport_stages(black_box(100), 200, 110, 195, 120, 150, 20)
+                        .unwrap()
+                } else {
+                    CancelTiming::fraction(black_box(100), 50, 50, 0)
+                };
+                black_box(t);
+                ns.push(start.elapsed().as_nanos());
+            }
+            ns.sort_unstable();
+            println!("cancel_partition_bench transport={} count={} median_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0",transport,ns.len(),ns[50_000],ns[99_000],ns[99_900],ns[99_999]);
+        }
+    }
+
     #[test]
     fn fraction_conserves_rtt_without_erasing_network_and_does_not_overflow() {
         for (l1, l2) in [
