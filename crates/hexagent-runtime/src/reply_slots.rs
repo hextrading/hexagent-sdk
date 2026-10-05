@@ -3,11 +3,11 @@
 //! A slot is reusable only after BOTH endpoints AND metadata readers are gone.
 //! Channels retain one value; generations cannot overlap and abandoned producer
 //! tasks publish a typed failure. No lock, allocation, or wait on checkout.
-use crossbeam_channel::{bounded, RecvError, RecvTimeoutError};
+use crossbeam_channel::{RecvError, RecvTimeoutError};
 use std::sync::Arc;
 struct Slot<T, M> {
-    tx: crossbeam_channel::Sender<T>,
-    rx: crossbeam_channel::Receiver<T>,
+    tx: crate::poll_channel::Sender<T>,
+    rx: crate::poll_channel::Receiver<T>,
     metadata: Arc<M>,
 }
 pub struct Pool<T, M> {
@@ -27,7 +27,7 @@ impl<T, M> Pool<T, M> {
         Self {
             slots: (0..capacity)
                 .map(|_| {
-                    let (tx, rx) = bounded(1);
+                    let (tx, rx) = crate::poll_channel::bounded_with_wake(1, Some(Arc::new(crate::wake::Wake::default())));
                     Arc::new(Slot {
                         tx,
                         rx,

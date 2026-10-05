@@ -1,0 +1,53 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.46
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.186
+   Compiling syn v2.0.118
+   Compiling crossbeam-utils v0.8.21
+   Compiling mio v1.2.1
+   Compiling socket2 v0.6.4
+   Compiling futures-macro v0.3.32
+   Compiling tokio-macros v2.7.0
+   Compiling futures-task v0.3.32
+   Compiling futures-core v0.3.32
+   Compiling futures-util v0.3.32
+   Compiling tokio v1.52.3
+   Compiling crossbeam-channel v0.5.15
+   Compiling hexagent-runtime v0.0.0 (/tmp/hexbot-persistent-handoff-20261006)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.59s
+     Running unittests src/lib.rs (target/debug/deps/hexagent_runtime-62a94ed694ca59bf)
+
+running 25 tests
+test poll_channel::tests::cold_timeout_checks_ready_and_disconnected_before_deadline ... ok
+test poll_channel::tests::closing_consumer_returns_the_exact_retained_record ... ok
+test poll_channel::tests::crossbeam_and_poll_lane_roundtrip_benchmark ... ignored, focused release microbenchmark; prints distributions, no timing assertion
+test poll_channel::tests::exact_capacity_order_and_disconnect_after_drain ... ok
+test poll_channel::tests::preempted_cold_ingress_benchmark ... ignored, manual preempted-ingress benchmark; release --ignored --nocapture
+test poll_channel::tests::retained_head_retries_without_duplication_and_lanes_are_isolated ... ok
+test poll_channel::tests::sender_observes_owner_shutdown_with_queued_values ... ok
+test poll_channel::tests::timed_owner_receive_yields_for_preempted_publication_and_keeps_fifo ... ok
+test poll_channel::tests::unfinished_publication_returns_immediately_without_overtaking ... ok
+test poll_channel::wake_lane_tests::concurrent_publication_and_sleep_deliver_exactly_once ... ok
+test poll_channel::wake_lane_tests::shared_dispatcher_wake_notifies_every_inbox_without_reordering ... ok
+test poll_channel::wake_lane_tests::woke_lane_retains_full_value_order_and_disconnect ... ok
+test root_owner::tests::abandoned_actor_releases_all_reply_guards_while_sender_stays_alive ... ok
+test root_owner::tests::bounded_registration_and_mailbox_preserve_values_before_first_poll ... ok
+test root_owner::tests::parked_root_wakes_for_commands_and_last_sender_drop ... ok
+test poll_channel::tests::concurrent_producers_deliver_every_record_once_in_per_producer_order ... ok
+test try_queue::tests::competing_consumers_and_producers_transfer_every_value_exactly_once ... ok
+test try_queue::tests::concurrent_producers_preserve_each_fifo_without_duplicates_or_loss ... ok
+test try_queue::tests::counters_wrap_without_confusing_empty_and_full_stamps ... ok
+test try_queue::tests::drop_releases_each_owned_value_once ... ok
+test try_queue::tests::fifo_exact_capacity_and_reuse_including_one_and_non_power_of_two ... ok
+test try_queue::tests::preempted_consumer_cannot_trap_producer_reusing_the_slot ... ok
+test try_queue::tests::preempted_publisher_cannot_trap_higher_priority_producer_or_consumer ... ok
+test wake::tests::publication_between_arm_and_wait_is_not_lost ... ok
+test root_owner::tests::slow_owner_timer_and_panicked_owner_do_not_block_other_instances ... ok
+
+test result: ok. 23 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+   Doc-tests hexagent_runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

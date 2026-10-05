@@ -97,7 +97,7 @@ fn mainnet_fill_and_pushes() {
     let mut market_symbols = HashMap::new();
     market_symbols.insert(MARKET_ID, SYMBOL.to_string());
     let lane = user_feed::spawn_user_feed(&ws, signer, market_symbols);
-    let rx = lane.updates.clone();
+    let rx = &lane.updates;
     std::thread::sleep(Duration::from_secs(2));
     while rx.try_recv().is_ok() {} // drain any initial state
 

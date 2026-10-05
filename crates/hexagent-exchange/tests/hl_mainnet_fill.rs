@@ -46,7 +46,7 @@ fn mainnet_fill_and_pushes() {
         WS,
         &auth.account_address,
     );
-    let rx = lane.updates.clone();
+    let rx = &lane.updates;
     std::thread::sleep(Duration::from_secs(2));
     while rx.try_recv().is_ok() {} // drain snapshot
 

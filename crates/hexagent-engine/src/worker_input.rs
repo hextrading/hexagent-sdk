@@ -1,6 +1,6 @@
-//! Owner-local input arbitration. Ready messages never register channel
-//! waiters. Only the idle path parks, for at most IDLE_POLL: market producers
-//! publish to a bounded polling FIFO and never enter a consumer's wake lock.
+//! Owner-local input arbitration, with a shared futex hint for idle parking.
+//! No ready or idle path registers Crossbeam waiters. Lifecycle FIFO messages
+//! precede replaceable market snapshots on both sides of the park handshake.
 use super::*;
 use crossbeam_channel::{RecvError, TryRecvError};
 
@@ -28,14 +28,6 @@ pub(super) fn take_execution_requote(
     else { strategy.take_execution_requote() }
 }
 
-fn ready<T>(rx: &Receiver<T>) -> Option<Result<T, RecvError>> {
-    match rx.try_recv() {
-        Ok(value) => Some(Ok(value)),
-        Err(TryRecvError::Disconnected) => Some(Err(RecvError)),
-        Err(TryRecvError::Empty) => None,
-    }
-}
-
 /// Priority is identical in the ready and idle paths. Every invocation handles
 /// at most one input, so queued private/lifecycle events are checked again
 /// before each market callback. Absent admission owners supply None; other
@@ -44,51 +36,59 @@ fn ready<T>(rx: &Receiver<T>) -> Option<Result<T, RecvError>> {
 pub(super) fn next_input(
     admission: Option<&hexagent_runtime::latest_snapshot::Receiver<ExecutionAdmission>>,
     control: &Receiver<crate::exchange::PrivateFeedControl>,
-    direct: &Receiver<RoutedOrderUpdate>,
-    private: &Receiver<OrderUpdate>,
-    compat: &Receiver<QueuedOrderUpdate>,
-    history: &Receiver<HistoricalLoadResult>,
+    direct: &hexagent_runtime::poll_channel::Receiver<RoutedOrderUpdate>,
+    private: &hexagent_runtime::poll_channel::Receiver<OrderUpdate>,
+    compat: &hexagent_runtime::poll_channel::Receiver<QueuedOrderUpdate>,
+    history: &hexagent_runtime::poll_channel::Receiver<HistoricalLoadResult>,
     market: &hexagent_runtime::poll_channel::Receiver<QueuedMarketEvent>,
     watchdog_wait: std::time::Duration,
 ) -> WorkerInput {
-    macro_rules! take {
-        ($rx:expr, $variant:ident) => {
-            if let Some(message) = ready($rx) {
-                return WorkerInput::$variant(message);
+    let ready = || {
+        macro_rules! take {
+            ($rx:expr, $variant:ident) => {
+                match $rx.try_recv() {
+                    Ok(value) => return Some(WorkerInput::$variant(Ok(value))),
+                    Err(TryRecvError::Disconnected) => return Some(WorkerInput::$variant(Err(RecvError))),
+                    Err(TryRecvError::Empty) => {}
+                }
+            };
+        }
+        if let Some(admission) = admission { take!(admission, Admission); }
+        take!(control, PrivateControl);
+        take!(direct, DirectPrivate);
+        take!(private, PrivateUpdate);
+        take!(compat, CompatUpdate);
+        take!(history, History);
+        // A preempted lifecycle producer may have reserved, but not published,
+        // its head. Yield so it can finish; public quotes must not overtake it.
+        if direct.has_pending() || private.has_pending() || compat.has_pending() || history.has_pending() {
+            return None;
+        }
+        let pending = market.len();
+        match market.try_recv() {
+            Ok(message) => {
+                crate::latency::observe_ns("strategy.market.pending_depth", pending as u64);
+                Some(WorkerInput::Market(Ok(message)))
             }
-        };
-    }
-    if let Some(admission) = admission {
-        match admission.try_recv() {
-            Ok(value) => return WorkerInput::Admission(Ok(value)),
-            Err(TryRecvError::Disconnected) => return WorkerInput::Admission(Err(RecvError)),
-            Err(TryRecvError::Empty) => {},
+            Err(TryRecvError::Disconnected) => Some(WorkerInput::Market(Err(RecvError))),
+            Err(TryRecvError::Empty) => None,
         }
-    }
-    take!(control, PrivateControl);
-    take!(direct, DirectPrivate);
-    take!(private, PrivateUpdate);
-    take!(compat, CompatUpdate);
-    take!(history, History);
-    let pending = market.len();
-    match market.try_recv() {
-        Ok(message) => {
-            crate::latency::observe_ns("strategy.market.pending_depth", pending as u64);
-            return WorkerInput::Market(Ok(message));
-        }
-        Err(TryRecvError::Disconnected) => return WorkerInput::Market(Err(RecvError)),
-        Err(TryRecvError::Empty) => {}
-    }
-    // An unpublished market head is not permission to spin: its producer may
-    // have been preempted. Timed idle parking also leaves the CPU available.
-    crossbeam_channel::select_biased! {
-        recv(control) -> message => WorkerInput::PrivateControl(message),
-        recv(direct) -> message => WorkerInput::DirectPrivate(message),
-        recv(private) -> message => WorkerInput::PrivateUpdate(message),
-        recv(compat) -> message => WorkerInput::CompatUpdate(message),
-        recv(history) -> message => WorkerInput::History(message),
-        default(watchdog_wait.min(hexagent_runtime::poll_channel::IDLE_POLL)) => WorkerInput::Idle,
-    }
+    };
+    if let Some(input) = ready() { return input; }
+    // One futex hint shared by all FIFO inboxes. Arm BEFORE rechecking ALL
+    // priorities; publication in the check-to-park window clears the word, so
+    // FUTEX_WAIT returns EAGAIN. No Crossbeam waiter is ever registered.
+    market.arm_wake();
+    if let Some(input) = ready() { market.cancel_wake(); return input; }
+    // Admission/latest-control and shutdown remain bounded polling snapshots.
+    // Keep their old 10us polling ceiling; FIFO messages wake immediately.
+    let timeout = watchdog_wait.min(hexagent_runtime::poll_channel::IDLE_POLL);
+    if !timeout.is_zero() { market.wait_for_wake(timeout); }
+    else { market.cancel_wake(); }
+    // Consume the wake's message after a fresh priority scan. Returning Idle
+    // unconditionally would add another strategy-loop housekeeping pass to
+    // every idle private/market delivery.
+    ready().unwrap_or(WorkerInput::Idle)
 }
 
 #[cfg(test)]
@@ -127,8 +127,8 @@ mod tests {
         })).unwrap();
         let next = |admission: &crate::execution_admission_lane::AdmissionConsumer| {
             next_input(admission.receiver(), &crossbeam_channel::never(),
-                &crossbeam_channel::never(), &crossbeam_channel::never(),
-                &crossbeam_channel::never(), &crossbeam_channel::never(),
+                &hexagent_runtime::poll_channel::never(), &hexagent_runtime::poll_channel::never(),
+                &hexagent_runtime::poll_channel::never(), &hexagent_runtime::poll_channel::never(),
                 &market, std::time::Duration::ZERO)
         };
         for (epoch, state) in [(1, ExecutionAdmissionState::Healthy), (2, ExecutionAdmissionState::Paused)] {
@@ -152,15 +152,15 @@ mod tests {
     #[test]
     fn control_reconnect_and_history_precede_market_without_loss_or_duplicates() {
         let (control_tx, control) = bounded(2);
-        let (history_tx, history) = bounded(1);
+        let (history_tx, history) = hexagent_runtime::poll_channel::bounded(1);
         let (market_tx, market) = hexagent_runtime::poll_channel::bounded(2);
         let next = || {
             next_input(
                 None,
                 &control,
-                &crossbeam_channel::never(),
-                &crossbeam_channel::never(),
-                &crossbeam_channel::never(),
+                &hexagent_runtime::poll_channel::never(),
+                &hexagent_runtime::poll_channel::never(),
+                &hexagent_runtime::poll_channel::never(),
                 &history,
                 &market,
                 std::time::Duration::ZERO,

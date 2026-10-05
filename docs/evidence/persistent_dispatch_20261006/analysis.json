@@ -1,0 +1,399 @@
+{
+  "scope": "Persistent Polymarket live Fast/Cancel I/O actors and strategy/completion idle wakes; production deployment pending",
+  "environment": {
+    "host": "maker02",
+    "architecture": "aarch64",
+    "kernel": "6.12.0-211.16.1.el10_2.0.1",
+    "producer_cpu": 0,
+    "consumer_cpu": 1,
+    "nice": 19,
+    "scheduling": "SCHED_OTHER; shared housekeeping CPUs",
+    "allocator": "System (live hexbot uses mimalloc)",
+    "tokio": "1.52.3",
+    "crossbeam_channel": "0.5.15",
+    "transitive_versions": "benchmark.Cargo.lock, copied from SDK Cargo.lock and pruned by Cargo",
+    "collected_utc": "2026-10-05T16:57:39.499076+00:00"
+  },
+  "source_findings": [
+    "Tokio current_thread Handle::spawn allocates a task, binds it through OwnedTasks list shards and pushes remote tasks through Mutex<Synced> injection; single-thread runtime does not remove these locks.",
+    "Notify/async channel waking a spawned Tokio task still uses remote task scheduling; spawn_local or FuturesUnordered per request alone does not eliminate all per-request task/node allocation.",
+    "Crossbeam SyncWaker register/unregister and notify with waiters lock a mutex. The affected ready queues were lock-free but idle strategy select and completion recv registered waiters.",
+    "The previous live auth-to-task audit interval includes strings, allocation, scheduling, wake syscalls and OS preemption; it does not uniquely attribute its entire tail to a lock."
+  ],
+  "ownership_and_backpressure": {
+    "io_actor": "One startup-boxed Future per physical Fast/Cancel owner; polled by existing hexbot-async-ord CPU 2 root future. No new production OS threads.",
+    "registry": "Fixed 256 actor capacity, startup-only registration; sole writer is I/O root. Saturation fails startup; completed/failed actors release reservations.",
+    "io_mailbox": "Capacity 2; physical connection owner admits one business request at a time. FIFO owned command transfer. Full/stopped queue returns typed NotSent without spawn fallback.",
+    "completion": "Two startup slots per trade route, one reply each, futex wake. Reuse requires all endpoint and timing-generation references to be released. Actor teardown drops outstanding reply guards.",
+    "strategy_inboxes": "Direct private, execution, and market capacities remain 10000 per strategy; venue private FIFO remains 4096; history remains 8. One receiver/strategy thread, shared startup-bound futex hint. No idle Crossbeam select.",
+    "priority": "Admission state, control, direct private, venue private, execution lifecycle, history, then market. A reserved/unpublished lifecycle head blocks market processing. Startup pause, quarantine and replay acknowledgements are retained.",
+    "overflow": "Private/execution envelopes remain retained in existing bounded recovery/router outboxes. Cold timed sends retain their exact value on full/close. Quote snapshots keep existing coalescing policy.",
+    "wake_protocol": "arm -> recheck all priorities -> futex wait -> recheck all priorities. Admission/watchdog fallback polling remains bounded by the existing 10us ceiling.",
+    "identity": "Immutable account/instance labels prepared at lane binding; per-request commands retain context by Arc. Client attempt/generation and audit timestamps stay attached to the request."
+  },
+  "benchmark": {
+    "io_order": "old/new/new/old, each with bursts 1 and 6; 24 startup actors on new path; 1200 warmup messages, 100000 measured messages per case",
+    "idle_order": "old/new/new/old, 100 warmup messages then 20000 measured messages per case; 50us producer sleep outside measurement before each send",
+    "boundaries": {
+      "before_publish_to_return": "Instant immediately before spawn/try_send through return; includes wake and scheduling/preemption on producer",
+      "before_publish_to_consume": "Same Instant through first consumer instruction after task start or mailbox receive; excludes signing, HTTP, response and strategy work"
+    },
+    "queue_measurement": "inflight_high_water is the enforced maximum burst window, not an instrumented Tokio internal queue depth; new per-actor mailbox capacity 2; idle queue capacity 1; all measured retries/drops 0",
+    "allocation_measurement": "Thread-local counting System allocator enabled only around producer publication, startup excluded",
+    "results": [
+      {
+        "lane": "tokio_spawn-burst1",
+        "boundary": "before_publish_to_return",
+        "n": 100000,
+        "median_ns": 834,
+        "p99_ns": 1180,
+        "p999_ns": 4730,
+        "max_ns": 117214,
+        "producer_allocations": 100000,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "tokio_spawn-burst1",
+        "boundary": "before_publish_to_consume",
+        "n": 100000,
+        "median_ns": 655,
+        "p99_ns": 1142,
+        "p999_ns": 7424,
+        "max_ns": 90398,
+        "producer_allocations": 100000,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "tokio_spawn-burst6",
+        "boundary": "before_publish_to_return",
+        "n": 100000,
+        "median_ns": 811,
+        "p99_ns": 1571,
+        "p999_ns": 4443,
+        "max_ns": 72257,
+        "producer_allocations": 100000,
+        "inflight_high_water": 6,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "tokio_spawn-burst6",
+        "boundary": "before_publish_to_consume",
+        "n": 100000,
+        "median_ns": 747,
+        "p99_ns": 2318,
+        "p999_ns": 39976,
+        "max_ns": 90611,
+        "producer_allocations": 100000,
+        "inflight_high_water": 6,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "root_owner-burst1",
+        "boundary": "before_publish_to_return",
+        "n": 100000,
+        "median_ns": 145,
+        "p99_ns": 244,
+        "p999_ns": 1976,
+        "max_ns": 31365,
+        "producer_allocations": 0,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "root_owner-burst1",
+        "boundary": "before_publish_to_consume",
+        "n": 100000,
+        "median_ns": 648,
+        "p99_ns": 932,
+        "p999_ns": 3602,
+        "max_ns": 88755,
+        "producer_allocations": 0,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "root_owner-burst6",
+        "boundary": "before_publish_to_return",
+        "n": 100000,
+        "median_ns": 140,
+        "p99_ns": 752,
+        "p999_ns": 1974,
+        "max_ns": 9832,
+        "producer_allocations": 0,
+        "inflight_high_water": 6,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "root_owner-burst6",
+        "boundary": "before_publish_to_consume",
+        "n": 100000,
+        "median_ns": 655,
+        "p99_ns": 1189,
+        "p999_ns": 17172,
+        "max_ns": 263553,
+        "producer_allocations": 0,
+        "inflight_high_water": 6,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "root_owner-burst1",
+        "boundary": "before_publish_to_return",
+        "n": 100000,
+        "median_ns": 150,
+        "p99_ns": 218,
+        "p999_ns": 2046,
+        "max_ns": 30966,
+        "producer_allocations": 0,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "root_owner-burst1",
+        "boundary": "before_publish_to_consume",
+        "n": 100000,
+        "median_ns": 634,
+        "p99_ns": 931,
+        "p999_ns": 6962,
+        "max_ns": 111770,
+        "producer_allocations": 0,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "root_owner-burst6",
+        "boundary": "before_publish_to_return",
+        "n": 100000,
+        "median_ns": 145,
+        "p99_ns": 744,
+        "p999_ns": 2052,
+        "max_ns": 33747,
+        "producer_allocations": 0,
+        "inflight_high_water": 6,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "root_owner-burst6",
+        "boundary": "before_publish_to_consume",
+        "n": 100000,
+        "median_ns": 636,
+        "p99_ns": 1206,
+        "p999_ns": 12396,
+        "max_ns": 65479,
+        "producer_allocations": 0,
+        "inflight_high_water": 6,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "tokio_spawn-burst1",
+        "boundary": "before_publish_to_return",
+        "n": 100000,
+        "median_ns": 811,
+        "p99_ns": 1301,
+        "p999_ns": 3509,
+        "max_ns": 10502,
+        "producer_allocations": 100000,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "tokio_spawn-burst1",
+        "boundary": "before_publish_to_consume",
+        "n": 100000,
+        "median_ns": 619,
+        "p99_ns": 1339,
+        "p999_ns": 5591,
+        "max_ns": 168923,
+        "producer_allocations": 100000,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "tokio_spawn-burst6",
+        "boundary": "before_publish_to_return",
+        "n": 100000,
+        "median_ns": 855,
+        "p99_ns": 1802,
+        "p999_ns": 4815,
+        "max_ns": 353850,
+        "producer_allocations": 100000,
+        "inflight_high_water": 6,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "tokio_spawn-burst6",
+        "boundary": "before_publish_to_consume",
+        "n": 100000,
+        "median_ns": 732,
+        "p99_ns": 3331,
+        "p999_ns": 38976,
+        "max_ns": 571834,
+        "producer_allocations": 100000,
+        "inflight_high_water": 6,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "crossbeam_select_idle",
+        "boundary": "before_publish_to_return",
+        "n": 20000,
+        "median_ns": 1915,
+        "p99_ns": 2235,
+        "p999_ns": 4427,
+        "max_ns": 8689,
+        "producer_allocations": 0,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "crossbeam_select_idle",
+        "boundary": "before_publish_to_consume",
+        "n": 20000,
+        "median_ns": 2803,
+        "p99_ns": 4839,
+        "p999_ns": 64192,
+        "max_ns": 3276966,
+        "producer_allocations": 0,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "futex_idle",
+        "boundary": "before_publish_to_return",
+        "n": 20000,
+        "median_ns": 1704,
+        "p99_ns": 1838,
+        "p999_ns": 5330,
+        "max_ns": 7774,
+        "producer_allocations": 0,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "futex_idle",
+        "boundary": "before_publish_to_consume",
+        "n": 20000,
+        "median_ns": 2567,
+        "p99_ns": 8999,
+        "p999_ns": 75965,
+        "max_ns": 322496,
+        "producer_allocations": 0,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "futex_idle",
+        "boundary": "before_publish_to_return",
+        "n": 20000,
+        "median_ns": 1685,
+        "p99_ns": 1813,
+        "p999_ns": 5271,
+        "max_ns": 12793,
+        "producer_allocations": 0,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "futex_idle",
+        "boundary": "before_publish_to_consume",
+        "n": 20000,
+        "median_ns": 2533,
+        "p99_ns": 25565,
+        "p999_ns": 213706,
+        "max_ns": 976022,
+        "producer_allocations": 0,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "crossbeam_select_idle",
+        "boundary": "before_publish_to_return",
+        "n": 20000,
+        "median_ns": 1845,
+        "p99_ns": 2191,
+        "p999_ns": 6836,
+        "max_ns": 12723,
+        "producer_allocations": 0,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      },
+      {
+        "lane": "crossbeam_select_idle",
+        "boundary": "before_publish_to_consume",
+        "n": 20000,
+        "median_ns": 2757,
+        "p99_ns": 77900,
+        "p999_ns": 611271,
+        "max_ns": 1918671,
+        "producer_allocations": 0,
+        "inflight_high_water": 1,
+        "overflow_retries": 0,
+        "drops": 0
+      }
+    ],
+    "limitations": [
+      "Synthetic handoff benchmark, not live market-receipt-to-first-write latency.",
+      "Ordinary scheduling on CPU 0-1 leaves P999/max vulnerable to IRQ/background work; no claim that all maximums improve.",
+      "Futex publication is cheaper, but receive-tail results overlap or reverse between runs; isolated live P99/P999 benefit remains unproven.",
+      "Preliminary non-locked-transitive run is retained separately; locked run is the primary comparison."
+    ]
+  },
+  "validation": {
+    "sdk_workspace": {
+      "passed": 1751,
+      "ignored": 125,
+      "failed": 0
+    },
+    "hexbot_workspace_with_local_sdk_patch": {
+      "passed": 1421,
+      "ignored": 63,
+      "failed": 0
+    },
+    "linux_primitive_tests": {
+      "passed": 23,
+      "ignored": 2,
+      "failed": 0
+    },
+    "final_engine_priority_recheck": {
+      "passed": 179,
+      "ignored": 10,
+      "failed": 0
+    }
+  },
+  "remaining_migration": [
+    "Legacy/cold compatibility calls retain per-call spawn; live physical Fast/Cancel owners bind persistent lanes before accepting commands.",
+    "HTTP/header/signature allocations, downstream transport synchronization, account ownership migration, and same-core Fast preparation serialization remain separate profiling work.",
+    "Keep-warm/repair and cold HTTP still use Tokio tasks on their existing runtime ownership.",
+    "Deploy through the existing restart script and compare market receipt -> dispatch -> first write plus private application before attributing a live end-to-end tail improvement."
+  ],
+  "source_sha256": {
+    "crates/hexagent-runtime/src/root_owner.rs": "7b186db0ce21850dc0cc92cb8085e5b9ce898e2c03496153e41b1fc5856a10d0",
+    "crates/hexagent-runtime/src/poll_channel.rs": "48817b37d2f421bfb22635c6386e6f74b5a485edc0d977ee878766399f52948d",
+    "crates/hexagent-runtime/src/try_queue.rs": "e64976a0e6d0b82b6d64e95443db409981e940916bc401cf2a6df7e62984673e",
+    "crates/hexagent-runtime/src/wake.rs": "17a8916c74a0fba81361f90fe3c75371c4c5b5d1a09c0b8991bfc312cae22b0d",
+    "crates/hexagent-runtime/examples/dispatch_handoff_latency.rs": "6c44f0ee958216198469f3e64d1d61d41aed47b7198f34b82fe2d2035b89a475"
+  }
+}

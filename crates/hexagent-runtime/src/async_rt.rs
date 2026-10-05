@@ -20,7 +20,7 @@
 //!         Optional pinning via `[os_tune] async_ord_core` (default:
 //!         unpinned, normal priority).
 //!   - The public CLOB reader is spawned via `clob_handle`; latency-critical
-//!     order I/O is spawned via `order_handle` /
+//!     hot order I/O uses persistent `order_owners` actors; cold I/O uses `order_handle` /
 //!     `block_on_order_runtime`; feeds and misc I/O via `handle` /
 //!     `block_on_runtime`
 //!   - Sync callers bridge via the `block_on_*` helpers (a
@@ -31,7 +31,8 @@
 //! Why current_thread?
 //!   - Deterministic, no work-stealing surprises for tail latency
 //!   - HTTP/2 multiplexes on a single connection, one scheduler thread is plenty
-//!   - Locks-free (no Send required on futures that stay local)
+//!   - Ordinary remote spawn/wake still locks the injection queue. Hot order
+//!     actors instead live in the root future and use `root_owner` mailboxes.
 //!
 //! Shared globals:
 //!   - `RUNTIME_HANDLE`: `OnceLock` of the tokio Handle
@@ -64,6 +65,10 @@ use tokio::sync::oneshot;
 static RUNTIME_HANDLE: OnceLock<Handle> = OnceLock::new();
 static CLOB_RUNTIME_HANDLE: OnceLock<Handle> = OnceLock::new();
 static ORDER_RUNTIME_HANDLE: OnceLock<Handle> = OnceLock::new();
+static ORDER_OWNERS: OnceLock<crate::root_owner::Registry> = OnceLock::new();
+
+/// Startup registration for persistent order I/O actors on the existing order CPU.
+pub fn order_owners() -> Option<&'static crate::root_owner::Registry> { ORDER_OWNERS.get() }
 
 /// Number of HTTP/2 clients per role. Each client owns its own connection
 /// pool → in practice one h2 TCP connection per host, per client.
@@ -250,6 +255,7 @@ pub fn init() -> Result<()> {
     // Second runtime, dedicated to order I/O (see module doc). Same
     // current_thread shape; pinning is optional (`async_ord_core`).
     let (ord_tx, ord_rx) = std::sync::mpsc::sync_channel::<Handle>(1);
+    let (owners, order_driver) = crate::root_owner::driver(256);
     std::thread::Builder::new()
         .name("hexbot-async-ord".into())
         .spawn(move || {
@@ -269,11 +275,12 @@ pub fn init() -> Result<()> {
             };
             let handle = rt.handle().clone();
             let _ = ord_tx.send(handle);
-            rt.block_on(futures_util::future::pending::<()>());
+            rt.block_on(order_driver);
         })
         .context("spawn order runtime thread")?;
 
     let ord_handle = ord_rx.recv().context("receive order runtime handle")?;
+    let _ = ORDER_OWNERS.set(owners);
 
     // Third runtime, dedicated to the public Polymarket CLOB socket.  Keep it
     // separate from the general runtime because gap-replay response decoding
