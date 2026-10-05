@@ -1,5 +1,15 @@
 # Hexagent SDK Permanent Low-Latency Principles
 
+## Record02 / maker02 backtest policy
+
+For this workspace's new BTC backtests, use the four-platform pure mean
+receive-time calibration selected on 2026-10-05. Hexbot prepares and verifies
+the immutable public-data overlay before SDK replay merge, warmup and cutoff.
+Keep Coinbase lead 40ms and Chainlink lag 2300ms. Never add the same correction
+inside strategy callbacks, shift private/order timestamps, or silently fall
+back to raw/native inputs. Explicit historical reproduction and input-ablation
+tools retain their recorded contracts; they are not the default strategy score.
+
 These instructions apply to the entire SDK repository and to every future
 design, implementation, review, refactor, and performance investigation.
 

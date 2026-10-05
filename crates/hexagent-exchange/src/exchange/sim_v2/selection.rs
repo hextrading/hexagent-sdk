@@ -28,6 +28,17 @@ pub struct ChannelModel {
     #[serde(default)]
     pub quantity_markout_weight: f64,
 }
+/// Offline joint transition model. Each stage is conditioned on the previous
+/// sampled stage; it never changes GTC acceptance or cancellation semantics.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JointModel {
+    pub full: RoleModel,
+    pub partial: RoleModel,
+    /// Diagnostic eventual-maker outcome only, NOT acceptance/resting state.
+    /// X[4] is immediate filled/requested fraction, replacing zero taker age.
+    pub residual: RoleModel,
+}
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectionModel {
@@ -43,6 +54,8 @@ pub struct SelectionModel {
     pub maker_book: Option<ChannelModel>,
     #[serde(default)]
     pub taker_sweep: Option<ChannelModel>,
+    #[serde(default)]
+    pub joint: Option<JointModel>,
 }
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
@@ -72,6 +85,9 @@ pub struct SelectionAudit {
     pub strength: f64,
     pub quantity_fraction: f64,
     pub channel_model: bool,
+    pub full_probability: Option<f64>,
+    pub residual_probability: Option<f64>,
+    pub residual_gate: Option<bool>,
 }
 #[derive(Default, Serialize)]
 pub struct SelectionStats {
@@ -86,6 +102,7 @@ pub struct SelectionStats {
     pub audit_drained: u64,
     pub audit_high_water: usize,
     pub audit_overflows: u64,
+    pub residual_suppressed_candidates: u64,
 }
 pub struct Selection {
     pub mode: Mode,
@@ -185,7 +202,7 @@ impl Selection {
         } else {
             let m: SelectionModel = serde_json::from_reader(std::fs::File::open(path)?)?;
             ensure!(
-                (m.schema_version == 1 || m.schema_version == 2)
+                (1..=3).contains(&m.schema_version)
                     && m.horizon_ms > 0
                     && m.horizon_ms <= 5000
                     && m.max_label_gap_ms <= 1000,
@@ -202,7 +219,14 @@ impl Selection {
                 );
             }
             let channels = [&m.maker_trade, &m.maker_book, &m.taker_sweep];
-            ensure!(m.schema_version == 2 || channels.iter().all(|c| c.is_none()), "channel models require schema 2");
+            ensure!(m.schema_version >= 2 || channels.iter().all(|c| c.is_none()), "channel models require schema >=2");
+            ensure!(m.schema_version == 3 || m.joint.is_none(), "joint model requires schema 3");
+            if let Some(j) = &m.joint {
+                ensure!(m.taker_sweep.is_none(), "joint and taker channel quantity are exclusive");
+                for r in [&j.full, &j.partial, &j.residual] {
+                    ensure!(r.markout.iter().chain(r.retention.iter()).all(|v| v.is_finite()) && r.markout_weight.is_finite(), "nonfinite joint model");
+                }
+            }
             for c in channels.into_iter().flatten() {
                 ensure!(c.fill.markout.iter().chain(c.fill.retention.iter()).all(|v| v.is_finite())
                     && c.fill.markout_weight.is_finite() && c.quantity_markout_weight.is_finite()
@@ -286,6 +310,9 @@ impl Selection {
         let mut prediction = 0.;
         let mut quantity_fraction = 1.;
         let mut channel_model = false;
+        let mut full_probability = None;
+        let mut residual_probability = None;
+        let residual_gate = None;
         let probability = if matches!(self.mode, Mode::Causal | Mode::Forward) {
             let model = self.model.as_ref().unwrap();
             let channel_fit = match (role, channel) {
@@ -324,6 +351,25 @@ impl Selection {
             1.
         };
         let u = uniform(iid, coid, role, self.seed);
+        // The full atom avoids creating tiny resting leftovers on every order.
+        if role == "taker" && matches!(self.mode,Mode::Causal|Mode::Forward) {
+            if let Some(j) = self.model.as_ref().and_then(|m| m.joint.as_ref()) {
+                let predict = |m: &RoleModel, xx: &[f64;N]| {
+                    let causal=dot(&m.markout,xx).clamp(-20.,20.);
+                    let markout=if self.mode==Mode::Forward {fwd.map(|f| (side*(f-mid)/tick.max(1e-6)).clamp(-20.,20.)).unwrap_or(causal)} else {causal};
+                    1./(1.+(-(dot(&m.retention,xx)+m.markout_weight*markout)).clamp(-40.,40.).exp())
+                };
+                let pf=1.-strength*(1.-predict(&j.full,&x));
+                full_probability=Some(pf);
+                quantity_fraction=if uniform(iid,coid,"taker_full",self.seed)<pf {1.} else {predict(&j.partial,&x)};
+                let immediate=if u<probability {quantity_fraction*x[5]} else {0.};
+                let mut rx=x;rx[4]=immediate;
+                let pr=1.-strength*(1.-predict(&j.residual,&rx));
+                residual_probability=Some(pr);
+                // This label predicts eventual fill, not exchange acceptance.
+                // GTC remainder must stay eligible for future native candidates.
+            }
+        }
         let kept = if u < probability { qty * quantity_fraction } else { 0. };
         self.stats.partial_candidates += (kept > 0. && kept < qty) as u64;
         self.stats.candidates += 1;
@@ -356,6 +402,7 @@ impl Selection {
                 strength,
                 quantity_fraction,
                 channel_model,
+                full_probability, residual_probability, residual_gate,
             });
             self.stats.audit_emitted += 1;
             self.stats.audit_high_water = self.stats.audit_high_water.max(self.rows.len());
@@ -377,7 +424,7 @@ mod tests {
             horizon_ms: 1000,
             max_label_gap_ms: 250,
             training_end_ns: 1,
-            maker_trade: None, maker_book: None, taker_sweep: None,
+            maker_trade: None, maker_book: None, taker_sweep: None, joint: None,
             maker: RoleModel {
                 markout: [0.; N],
                 retention: [0.; N],
@@ -388,6 +435,52 @@ mod tests {
                 retention: [0.; N],
                 markout_weight: 1.,
             },
+        }
+    }
+    fn joint_model() -> SelectionModel {
+        let mut model=m();model.schema_version=3;
+        let mut yes=model.taker.clone();yes.retention=[0.;N];yes.retention[0]=40.;yes.markout_weight=0.;
+        let mut no=yes.clone();no.retention[0]=-40.;
+        let mut half=yes.clone();half.retention[0]=0.;
+        model.taker=yes;model.joint=Some(JointModel {full:no.clone(),partial:half,residual:no});model
+    }
+    #[test]
+    fn joint_partial_full_atoms_and_stable_conditional_residual() {
+        let mut s=Selection::default();s.configure("collect","",1.,42,true).unwrap();s.mode=Mode::Causal;s.model=Some(joint_model());
+        let mut x=[0.;N];x[0]=1.;x[5]=1.;
+        for _ in 0..2 {
+            assert_eq!(s.select("one","o","up",1,"taker","sweep",x,0.5,0.01,1.,10.),5.);
+            assert_eq!(s.rows.back().unwrap().residual_gate,None);
+        }
+        s.configure_role_strengths(Some(0.),None).unwrap();
+        assert_eq!(s.select("one","o","up",2,"maker","book",x,0.5,0.01,1.,5.),5.);
+        s.configure_role_strengths(None,Some(0.)).unwrap();
+        assert_eq!(s.select("one","o","up",1,"taker","sweep",x,0.5,0.01,1.,10.),10.);
+        assert_eq!(s.rows.back().unwrap().residual_probability,Some(1.));
+        s.configure_role_strengths(None,Some(1.)).unwrap();
+        s.model.as_mut().unwrap().joint.as_mut().unwrap().full.retention[0]=40.;
+        assert_eq!(s.select("one","o","up",1,"taker","sweep",x,0.5,0.01,1.,10.),10.);
+        s.model.as_mut().unwrap().taker.retention[0]=-40.;
+        assert_eq!(s.select("one","o","up",1,"taker","sweep",x,0.5,0.01,1.,10.),0.);
+        s.mode=Mode::Collect;
+        assert_eq!(s.select("one","o","up",2,"maker","book",x,0.5,0.01,1.,5.),5.);
+        assert_ne!(uniform("one","o","residual",42),uniform("two","o","residual",42));
+    }
+    #[test]
+    #[ignore = "focused offline benchmark"]
+    fn joint_selection_latency_distribution() {
+        use std::time::Instant;
+        for joint in [false,true] {
+            let mut s=Selection::default();s.configure("collect","",1.,42,true).unwrap();s.mode=Mode::Causal;s.model=Some(joint_model());
+            if !joint {s.model.as_mut().unwrap().joint=None;}
+            let mut x=[0.;N];x[0]=1.;x[5]=1.;
+            let mut ns=Vec::with_capacity(100000);
+            for i in 0..100000 {
+                let t=Instant::now();std::hint::black_box(s.select("owner","coid","up",i,"taker","sweep",x,0.5,0.01,1.,10.));ns.push(t.elapsed().as_nanos());
+                if i%128==127 {s.drain().for_each(drop);}
+            }
+            s.drain().for_each(drop);ns.sort_unstable();
+            println!("joint={joint} n=100000 select+bounded_audit_ns p50={} p99={} p999={} max={} queue_high_water={} overflow={}",ns[50000],ns[99000],ns[99900],ns[99999],s.stats.audit_high_water,s.stats.audit_overflows);
         }
     }
     #[test]

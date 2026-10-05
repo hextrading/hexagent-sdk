@@ -70,8 +70,10 @@ const REPLAYER_BOOTSTRAP_MAX_ROWS: usize = REPLAYER_BATCH_ROWS * 2;
 // plus one final batch (observed 22,792 rows on legacy Polymarket tapes).
 const REPLAY_CACHE_MAX_BATCH_ROWS: usize = REPLAYER_BOOTSTRAP_MAX_ROWS + REPLAYER_BATCH_ROWS;
 const REPLAY_CACHE_MAGIC: [u8; 8] = *b"HXRPLY01";
-// QuoteDelivery adds positional MessagePack fields; rebuild caches from source.
-const REPLAY_CACHE_VERSION: u32 = 3;
+// v5 canonicalizes depth for the QuoteDelivery-capable message schema.
+// v4 is reserved for the isolated pre-QuoteDelivery historical replay build:
+// it must never share a positional MessagePack cache with this schema.
+const REPLAY_CACHE_VERSION: u32 = 5;
 const REPLAY_CACHE_HEADER_BYTES: usize = 48;
 const REPLAY_CACHE_MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -320,7 +322,7 @@ fn replay_cache_fingerprint(
     options: ReplayOptions,
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"hexagent-replay-cache-v3-quote-delivery-batched-market-event-rmp");
+    hash.update(b"hexagent-replay-cache-v5-quote-delivery-canonical-depth-batched-market-event-rmp");
     hash.update(source.as_bytes());
     hash.update(start_ns.to_le_bytes());
     hash.update(end_ns.to_le_bytes());
@@ -1705,6 +1707,18 @@ fn parse_price_levels(s: &str) -> Vec<PriceLevel> {
     simd_json::serde::from_slice::<Vec<PriceLevel>>(&mut buf).unwrap_or_default()
 }
 
+/// Offline decoder only. Historical recorders preserve each venue's depth
+/// orientation; current adapters/strategy callbacks require best at index 0.
+/// Reorder in place before publishing the replay batch, preserving every level,
+/// quantity, duplicate, and source/receive clock. No quote-path sorting or I/O.
+fn canonical_replay_levels(s: &str, bids: bool) -> Vec<PriceLevel> {
+    let mut levels = parse_price_levels(s);
+    levels.sort_unstable_by(|a, b| {
+        if bids { b.price.total_cmp(&a.price) } else { a.price.total_cmp(&b.price) }
+    });
+    levels
+}
+
 #[inline]
 fn skip_ws(b: &[u8], mut i: usize) -> usize {
     while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
@@ -1974,11 +1988,11 @@ fn stream_parquet_event_batches_selected(
                 "orderbook" => {
                     let bids = bids_json_col
                         .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) })
-                        .map(parse_price_levels)
+                        .map(|s| canonical_replay_levels(s, true))
                         .unwrap_or_default();
                     let asks = asks_json_col
                         .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) })
-                        .map(parse_price_levels)
+                        .map(|s| canonical_replay_levels(s, false))
                         .unwrap_or_default();
 
                     MarketEvent::OrderBook(OrderBookSnapshot { receipt: Default::default(),
@@ -2138,6 +2152,65 @@ fn read_parquet_events(path: &Path, start_ns: u64, end_ns: u64) -> Result<Vec<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_depth_replay_roundtrip_preserves_clocks_quantity_and_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut recorder = crate::recorder::MarketRecorder::new(directory.path().to_path_buf()).unwrap();
+        let source = 1_790_936_737_796_000_000_u64;
+        let receive = 1_790_936_737_917_846_781_u64;
+        // Exact ascending-bid/descending-ask shape of the 10:25 historical case.
+        let snapshot = OrderBookSnapshot {
+            receipt: Default::default(),
+            exchange: Exchange::Binance, symbol: "BTCUSDT".into(),
+            bids: vec![PriceLevel {price:0.58,quantity:166.},PriceLevel {price:0.62,quantity:777.26}],
+            asks: vec![PriceLevel {price:0.67,quantity:149.},PriceLevel {price:0.63,quantity:127.5}],
+            exchange_timestamp_ns:source,local_timestamp_ns:receive,
+        };
+        for _ in 0..2 { recorder.write_event(&MarketEvent::OrderBook(snapshot.clone())).unwrap(); }
+        recorder.flush().unwrap();
+        let mut replay = MarketReplayer::new_with_options(directory.path(), "binance", "BTCUSDT",
+            DateTime::from_timestamp_nanos(receive as i64), DateTime::from_timestamp_nanos((receive+1) as i64),
+            ReplayOptions {time_policy:ReplayTimePolicy::ArrivalTimeStrict,..ReplayOptions::default()}).unwrap();
+        for _ in 0..2 {
+            let (ts, MarketEvent::OrderBook(book)) = replay.next_event().unwrap().unwrap() else {panic!("missing book")};
+            assert_eq!((ts,book.local_timestamp_ns,book.exchange_timestamp_ns),(receive,receive,source));
+            assert_eq!((book.bids[0].price,book.bids[0].quantity),(0.62,777.26));
+            assert_eq!((book.asks[0].price,book.asks[0].quantity),(0.63,127.5));
+            assert_eq!((book.bids[1].quantity,book.asks[1].quantity),(166.,149.));
+        }
+        assert!(replay.next_event().unwrap().is_none());
+    }
+
+    #[test]
+    fn canonical_depth_replay_handles_both_orientations_and_keeps_invalid_levels_visible() {
+        let a = r#"[{"price":0.6,"quantity":10},{"price":0.5,"quantity":20}]"#;
+        let b = r#"[{"price":0.5,"quantity":20},{"price":0.6,"quantity":10}]"#;
+        for bids in [false,true] {
+            let x=canonical_replay_levels(a,bids);let y=canonical_replay_levels(b,bids);
+            assert_eq!(x.iter().map(|p|(p.price,p.quantity)).collect::<Vec<_>>(),y.iter().map(|p|(p.price,p.quantity)).collect::<Vec<_>>());
+        }
+        let invalid=canonical_replay_levels(r#"[{"price":0.5,"quantity":-1},{"price":0.6,"quantity":2}]"#,true);
+        assert_eq!(invalid.len(),2);assert_eq!(invalid[1].quantity,-1.);
+        assert!(canonical_replay_levels("[]",false).is_empty());
+    }
+
+    #[test]
+    #[ignore = "offline decoder benchmark: parse plus canonicalization; no strategy lane"]
+    fn canonical_depth_replay_latency_distribution() {
+        let input=r#"[{"price":0.58,"quantity":166},{"price":0.59,"quantity":920.8},{"price":0.60,"quantity":175},{"price":0.61,"quantity":784.92},{"price":0.62,"quantity":777.26}]"#;
+        for normalize in [false,true] {
+            let mut samples=Vec::with_capacity(20_000);
+            for _ in 0..20_000 {
+                let start=std::time::Instant::now();
+                let levels=if normalize { canonical_replay_levels(std::hint::black_box(input),true) } else {parse_price_levels(std::hint::black_box(input))};
+                std::hint::black_box(&levels);
+                samples.push(start.elapsed().as_nanos());
+            }
+            samples.sort_unstable();
+            eprintln!("canonical_depth normalize={normalize} events=20000 median_ns={} p99_ns={} p999_ns={} maximum_ns={} queue_depth=0 overflow=0 boundary=parse_plus_optional_in_place_sort excludes=Parquet_IO_and_destruction offline_decoder=true",samples[10000],samples[19800],samples[19980],samples[19999]);
+        }
+    }
 
     fn write_receive_fixture(
         path: &Path,

@@ -186,6 +186,14 @@ pub struct AdmissionAuditRow {
     pub source_age_stale: bool,
     pub crossing: Option<bool>,
     pub coverage: &'static str,
+    /// Every request is retained, including unknown-depth and zero candidates.
+    pub candidate_state: &'static str,
+    /// Clean observed capacity BEFORE stochastic/race selection; None is unknown,
+    /// never a fabricated zero. It is not a private outcome or a fill promise.
+    pub observed_executable_qty: Option<f64>,
+    pub reported_filled_qty: f64,
+    pub resting_qty: f64,
+    pub resting_state: &'static str,
     pub decision: &'static str,
     pub status: OrderStatus,
     pub error: Option<String>,
@@ -294,6 +302,8 @@ struct RestingOrder {
     historical_depth_at_sync: f64,
     /// Visible level depth at the last book snapshot (cancel-attribution ref).
     level_qty_at_sync: f64,
+    /// Consecutive observable endpoints are required to infer L2 depletion.
+    depth_observed_at_sync: bool,
     /// Canonical-frame effective mid at the last snapshot. The signed move
     /// vs the current mid is the adverse-selection signal for the cancel
     /// attribution (see `resync_queues`). 0.0 ⇒ no mid at placement.
@@ -454,7 +464,7 @@ pub struct FillAuditRow {
 /// Enabled only with the backtest fill-audit switch.  These immutable/request
 /// fields plus causal queue transitions are the sim half of the live
 /// `[order_attempt]` replica join; none feed back into matching.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct MakerOrderAuditRow {
     pub slug: String,
     pub iid: String,
@@ -475,6 +485,9 @@ pub struct MakerOrderAuditRow {
     pub rest_qty_ns: f64,
     pub await_fresh_book: bool,
     pub visible_depth_at_entry: f64,
+    /// None in older archives; false means top-N censored, not observed empty.
+    #[serde(default)]
+    pub depth_observed_at_entry: Option<bool>,
     pub entry_mid: f64,
     pub queue_seq: u64,
     pub q_init: f64,
@@ -506,7 +519,44 @@ pub struct MakerOrderAuditRow {
     pub cancel_arrival_ns: u64,
     pub cancel_result: &'static str,
     pub q_ahead_final: f64,
+    #[serde(default)]
+    pub depth_censored_n: u64,
+    #[serde(default)]
+    pub depth_rebase_n: u64,
     pub remaining_final: f64,
+}
+
+fn add_maker_exposure(row: &mut FillAuditRow, order: &MakerOrderAuditRow) {
+    if order.cancel_result == "open" {
+        row.maker_open_orders += 1;
+        if order.post_only {
+            row.passive_open_orders += 1;
+        }
+    } else if matches!(order.cancel_result, "cancelled" | "event_retired") {
+        row.maker_cancel_orders += 1;
+        row.maker_cancel_qty += order.remaining_final.max(0.0);
+        if order.post_only {
+            row.passive_cancel_orders += 1;
+            row.passive_cancel_qty += order.remaining_final.max(0.0);
+        }
+    }
+    if order.fill_qty > EPS {
+        row.maker_orders_with_fill += 1;
+        if order.post_only {
+            row.passive_orders_with_fill += 1;
+            row.passive_fill_qty += order.fill_qty;
+        }
+    }
+    row.maker_rest_time_ns = row
+        .maker_rest_time_ns
+        .saturating_add(order.rest_time_ns as u128);
+    row.maker_rest_qty_ns += order.rest_qty_ns;
+    if order.post_only {
+        row.passive_rest_time_ns = row
+            .passive_rest_time_ns
+            .saturating_add(order.rest_time_ns as u128);
+        row.passive_rest_qty_ns += order.rest_qty_ns;
+    }
 }
 
 fn flip(s: Side) -> Side {
@@ -627,14 +677,21 @@ pub struct SimExchangeV2 {
     canonical_book_seen: HashSet<String>,
     pub folded_sibling_books_ignored: u64,
     fold_to: HashMap<String, String>,
-    /// Token → event slug, retained only while the token is live. Audit rows
-    /// themselves are retained for the complete replay and emitted at exit.
+    /// Token → event slug, retained only while the token is live. Per-event
+    /// summaries remain through exit; retired per-order records are streamed.
     event_slug_by_token: HashMap<String, String>,
     fill_audit: BTreeMap<(String, String), FillAuditRow>,
     /// Per-order rows are opt-in because a multi-day replay can place hundreds
-    /// of thousands of orders.  BTreeMap keeps output deterministic by coid.
+    /// of thousands of orders. BTreeMap keeps each transfer ordered by coid.
     maker_order_audit_enabled: bool,
     maker_order_audit: BTreeMap<String, MakerOrderAuditRow>,
+    // Sole owner: offline matching coordinator. Retired rows transfer directly
+    // to its buffered diagnostic writer, never through live private lanes.
+    maker_order_exposure: BTreeMap<(String, String), FillAuditRow>,
+    maker_audit_retirement_pending: bool,
+    maker_audit_high_water: usize,
+    maker_audit_created: u64,
+    maker_audit_drained: u64,
     // Sole writer: the backtest matching core. This is not live account state.
     order_evidence: BTreeMap<String, SimOrderEvidence>,
     order_evidence_overflows: u64,
@@ -951,6 +1008,11 @@ impl SimExchangeV2 {
             selection: super::selection::Selection::default(),
             maker_order_audit_enabled: false,
             maker_order_audit: BTreeMap::new(),
+            maker_order_exposure: BTreeMap::new(),
+            maker_audit_retirement_pending: false,
+            maker_audit_high_water: 0,
+            maker_audit_created: 0,
+            maker_audit_drained: 0,
             order_evidence: BTreeMap::new(),
             order_evidence_overflows: 0,
             order_evidence_high_water: 0,
@@ -1414,54 +1476,89 @@ impl SimExchangeV2 {
 
     pub fn fill_audit_rows(&self) -> Vec<FillAuditRow> {
         let mut rows = self.fill_audit.clone();
+        for (key, archived) in &self.maker_order_exposure {
+            let row = rows.entry(key.clone()).or_insert_with(|| FillAuditRow {
+                slug: key.0.clone(), iid: key.1.clone(), ..FillAuditRow::default()
+            });
+            row.maker_open_orders += archived.maker_open_orders;
+            row.passive_open_orders += archived.passive_open_orders;
+            row.maker_cancel_orders += archived.maker_cancel_orders;
+            row.maker_cancel_qty += archived.maker_cancel_qty;
+            row.passive_cancel_orders += archived.passive_cancel_orders;
+            row.passive_cancel_qty += archived.passive_cancel_qty;
+            row.maker_orders_with_fill += archived.maker_orders_with_fill;
+            row.passive_orders_with_fill += archived.passive_orders_with_fill;
+            row.passive_fill_qty += archived.passive_fill_qty;
+            row.maker_rest_qty_ns += archived.maker_rest_qty_ns;
+            row.passive_rest_qty_ns += archived.passive_rest_qty_ns;
+            row.maker_rest_time_ns = row.maker_rest_time_ns.saturating_add(archived.maker_rest_time_ns);
+            row.passive_rest_time_ns = row.passive_rest_time_ns.saturating_add(archived.passive_rest_time_ns);
+        }
         for order in self.maker_order_audit.values() {
             let key = (order.slug.clone(), order.iid.clone());
             let row = rows.entry(key.clone()).or_insert_with(|| FillAuditRow {
-                slug: key.0,
-                iid: key.1,
-                ..FillAuditRow::default()
+                slug: key.0, iid: key.1, ..FillAuditRow::default()
             });
             let mut snapshot = order.clone();
             if snapshot.cancel_result == "open" {
                 let remaining = snapshot.remaining_final;
                 accrue_order_exposure(&mut snapshot, self.audit_clock_ns, remaining);
-                row.maker_open_orders += 1;
-                if snapshot.post_only {
-                    row.passive_open_orders += 1;
-                }
-            } else if matches!(snapshot.cancel_result, "cancelled" | "event_retired") {
-                row.maker_cancel_orders += 1;
-                row.maker_cancel_qty += snapshot.remaining_final.max(0.0);
-                if snapshot.post_only {
-                    row.passive_cancel_orders += 1;
-                    row.passive_cancel_qty += snapshot.remaining_final.max(0.0);
-                }
             }
-            if snapshot.fill_qty > EPS {
-                row.maker_orders_with_fill += 1;
-                if snapshot.post_only {
-                    row.passive_orders_with_fill += 1;
-                    row.passive_fill_qty += snapshot.fill_qty;
-                }
-            }
-            row.maker_rest_time_ns = row
-                .maker_rest_time_ns
-                .saturating_add(snapshot.rest_time_ns as u128);
-            row.maker_rest_qty_ns += snapshot.rest_qty_ns;
-            if snapshot.post_only {
-                row.passive_rest_time_ns = row
-                    .passive_rest_time_ns
-                    .saturating_add(snapshot.rest_time_ns as u128);
-                row.passive_rest_qty_ns += snapshot.rest_qty_ns;
-            }
+            add_maker_exposure(row, &snapshot);
         }
         rows.into_values().collect()
+    }
+
+    pub fn has_retired_maker_order_audit(&self) -> bool {
+        self.maker_audit_retirement_pending
+    }
+
+    /// Called only by the offline engine after a replay step. Scan once per
+    /// event retirement, never per tick. A retained scheduler reference delays
+    /// transfer until a later retirement (or the final lossless shutdown drain).
+    pub fn drain_maker_order_audit(&mut self, final_drain: bool)
+        -> impl Iterator<Item = MakerOrderAuditRow> + '_
+    {
+        self.maker_audit_retirement_pending = false;
+        let tokens = &self.event_slug_by_token;
+        let evidence = &self.order_evidence;
+        let clock = self.audit_clock_ns;
+        let totals = &mut self.maker_order_exposure;
+        let drained = &mut self.maker_audit_drained;
+        self.maker_order_audit.extract_if(.., move |coid, row| {
+            final_drain || (!tokens.contains_key(&row.token)
+                && evidence.get(coid).is_none_or(|owner| owner.pending_messages == 0))
+        }).map(move |(_, mut row)| {
+            if row.cancel_result == "open" {
+                let remaining = row.remaining_final;
+                accrue_order_exposure(&mut row, clock, remaining);
+            }
+            let key = (row.slug.clone(), row.iid.clone());
+            let total = totals.entry(key.clone()).or_insert_with(|| FillAuditRow {
+                slug: key.0, iid: key.1, ..FillAuditRow::default()
+            });
+            add_maker_exposure(total, &row);
+            *drained += 1;
+            row
+        })
+    }
+
+    pub fn maker_order_audit_stats(&self) -> serde_json::Value {
+        serde_json::json!({"created": self.maker_audit_created, "drained": self.maker_audit_drained,
+            "retained": self.maker_order_audit.len(), "high_water": self.maker_audit_high_water,
+            "capacity": MAX_ORDER_EVIDENCE, "overflows": 0,
+            "policy": "abort_on_capacity; retire only after final pending simulator message; offline owned transfer"})
     }
 
     pub fn configure_maker_order_audit(&mut self, enabled: bool) {
         self.maker_order_audit_enabled = enabled;
         if !enabled {
             self.maker_order_audit.clear();
+            self.maker_order_exposure.clear();
+            self.maker_audit_retirement_pending = false;
+            self.maker_audit_created = 0;
+            self.maker_audit_drained = 0;
+            self.maker_audit_high_water = 0;
         }
     }
 
@@ -1947,6 +2044,12 @@ impl SimExchangeV2 {
             if !o.await_fresh_book || o.match_symbol != canon {
                 continue;
             }
+            if self.liquidity_ledger_enabled
+                && !books.level_is_observed(&o.match_symbol, o.match_side, o.match_price, o.tick)
+            {
+                o.depth_observed_at_sync = false;
+                continue; // A fresh top-N snapshot still does not expose this level.
+            }
             let depth = books.level_depth(&o.match_symbol, o.match_side, o.match_price, o.tick);
             o.replay_self_depth_credit =
                 o.replay_self_depth_credit
@@ -1958,6 +2061,8 @@ impl SimExchangeV2 {
                     });
             o.q_ahead = (depth - o.replay_self_depth_credit).max(0.0) + o.own_q_ahead;
             o.level_qty_at_sync = depth;
+            o.depth_observed_at_sync = books.level_is_observed(
+                &o.match_symbol, o.match_side, o.match_price, o.tick);
             let mid = books.eff_mid(&o.match_symbol);
             o.mid_at_sync = mid;
             if o.entry_mid <= 0.0 && mid > 0.0 {
@@ -2862,6 +2967,21 @@ impl SimExchangeV2 {
                 continue;
             }
             // Queue depth tracked in the canonical matching frame.
+            // Top-N truncation is missing evidence, never an observed cancel.
+            // Exact public trades still drain/fill the queue in match_trade.
+            // Re-entry anchors a new interval without attributing the blind gap.
+            if self.liquidity_ledger_enabled
+                && !books.level_is_observed(&o.match_symbol, o.match_side, o.match_price, o.tick)
+            {
+                o.depth_observed_at_sync = false;
+                if let Some(a) = order_audits.get_mut(coid) { a.depth_censored_n += 1; }
+                continue;
+            }
+            let depth_continuous = !self.liquidity_ledger_enabled || o.depth_observed_at_sync;
+            o.depth_observed_at_sync = true;
+            if !depth_continuous {
+                if let Some(a) = order_audits.get_mut(coid) { a.depth_rebase_n += 1; }
+            }
             let l_now = books.level_depth(&o.match_symbol, o.match_side, o.match_price, o.tick);
             let l_prev = o.level_qty_at_sync;
             let historical_now = if historical_enabled {
@@ -2911,8 +3031,16 @@ impl SimExchangeV2 {
             } else {
                 0.0
             };
+            if !depth_continuous {
+                // Priority through the blind interval is unknown. Rejoin behind
+                // the currently observed public depth and simulated predecessors;
+                // do not infer executions/cancellations from the missing interval.
+                let credit = if historical_enabled { historical_now }
+                             else { o.replay_self_depth_credit.min(l_now) };
+                o.q_ahead = (l_now - credit).max(0.0) + o.own_q_ahead;
+            }
             let explained = o.traded_since_sync.max(historical_removed);
-            let unexplained = (l_prev - explained - l_now).max(0.0);
+            let unexplained = if depth_continuous { (l_prev - explained - l_now).max(0.0) } else { 0.0 };
             let shrink_frac = if l_prev > EPS {
                 (unexplained / l_prev).clamp(0.0, 1.0)
             } else {
@@ -3026,6 +3154,19 @@ impl SimExchangeV2 {
                     ),
                     self.queue_uncertainty_strength,
                 )
+            } else if self.liquidity_ledger_enabled
+                && af_override.is_none()
+                && effective_dynamic_strength == 0.0
+                && adv_rate == 0.0
+            {
+                // Neutral proportional cancellation applies to PUBLIC depth.
+                // Own simulated FIFO quantity cannot be cancelled by the tape.
+                // Remove already-consumed public prints before assigning the
+                // remaining unexplained shrinkage to front/behind positions.
+                let public_ahead = (q_before - o.own_q_ahead).max(0.0);
+                let public_total =
+                    (l_prev - o.traded_since_sync - o.replay_self_depth_credit).max(public_ahead);
+                proportional_public_cancel_advance(public_ahead, public_total, cancels)
             } else {
                 cancels * ahead_frac
             };
@@ -3946,6 +4087,7 @@ impl SimExchangeV2 {
     /// order also frees its `locked_usdc`/share reservation, identical to the
     /// cancel path; verified result-neutral by the 5-day per-event PnL key.
     fn retire_event(&mut self, condition: &str, tokens: &[String; 2]) {
+        self.maker_audit_retirement_pending |= self.maker_order_audit_enabled;
         // Residual orders for this dead event — finalize their exposure at the
         // current causal exchange clock before retiring the tokens. Leaving the
         // audit row "open" would otherwise snapshot it through the end of the
@@ -4034,6 +4176,13 @@ impl SimExchangeV2 {
                 continue;
             }
             o.tick = t.new_tick_size;
+            if self.liquidity_ledger_enabled
+                && !books.level_is_observed(&o.match_symbol, o.match_side, o.match_price, o.tick)
+            {
+                o.depth_observed_at_sync = false;
+                o.traded_since_sync = 0.0;
+                continue;
+            }
             let d = books.level_depth(
                 &o.match_symbol,
                 o.match_side,
@@ -4050,6 +4199,8 @@ impl SimExchangeV2 {
                     });
             o.q_ahead = o.q_ahead.min((d - o.replay_self_depth_credit).max(0.0));
             o.level_qty_at_sync = d;
+            o.depth_observed_at_sync = books.level_is_observed(
+                &o.match_symbol, o.match_side, o.match_price, o.tick);
             o.traded_since_sync = 0.0;
         }
     }
@@ -4384,13 +4535,20 @@ impl SimExchangeV2 {
                 "post_only_cross_rejected"
             } else if update.status == OrderStatus::Rejected {
                 "other_rejected"
-            } else if row.crossing == Some(true) {
+            } else if update.filled_quantity > EPS {
                 "taker_match"
             } else if update.status == OrderStatus::Cancelled {
                 "nonmarketable_cancelled"
             } else {
                 "rest"
             };
+            row.reported_filled_qty = update.filled_quantity;
+            row.resting_qty = self.orders.get(&o.client_order_id)
+                .filter(|r| r.request.instance_id == o.instance_id)
+                .map_or(0., |r| r.remaining);
+            row.resting_state = if row.resting_qty > EPS { "resting" }
+                else if update.status == OrderStatus::Rejected { "rejected" }
+                else { "terminal" };
             row.status = update.status;
             row.error = update.error.clone();
             self.admission_audit_total += 1;
@@ -4429,7 +4587,18 @@ impl SimExchangeV2 {
             (Some(best), Side::Sell, Some(limit), false) => best >= limit - EPS,
             _ => false,
         });
+        let observed = self.admission_crossing_observation(o, now_ns);
+        let observed_executable_qty = if o.post_only { None } else {
+            observed.map(|_| self.replay_clean_taker_available(&o.instance_id,
+                &canonical, side, &ladder, if is_market {None} else {price}, now_ns).min(o.quantity))
+        };
+        let candidate_state = if o.post_only { "post_only_not_taker" }
+            else if observed.is_none() { "capacity_unknown" }
+            else if observed == Some(false) { "observed_noncrossing_or_depleted" }
+            else { "observed_crossing_capacity" };
         AdmissionAuditRow {
+            candidate_state, observed_executable_qty,
+            reported_filled_qty: 0., resting_qty: 0., resting_state: "pending",
             attempt_sequence: self.admission_audit_total + 1,
             coid: o.client_order_id.clone(),
             iid: o.instance_id.clone(),
@@ -4850,7 +5019,8 @@ impl SimExchangeV2 {
                 a.taker_zero_fills += 1;
             }
             if matches!(o.order_type, OrderType::Limit | OrderType::LimitMaker) {
-                return self.rest(o, now_ns, o.quantity);
+                let update = self.rest(o, now_ns, o.quantity);
+                return update;
             }
             return self.cancelled(o, now_ns, o.quantity);
         }
@@ -4963,6 +5133,7 @@ impl SimExchangeV2 {
         // transiently differ if only one outcome stream emitted a tick-size change.
         let tick = self.tick_of(&msym);
         let now_depth = self.books.level_depth(&msym, mside, match_price, tick);
+        let depth_observed_at_sync = self.books.level_is_observed(&msym, mside, match_price, tick);
         let same_level_own_remaining = self
             .orders
             .values()
@@ -5164,6 +5335,12 @@ impl SimExchangeV2 {
         if self.maker_order_audit_enabled {
             if let Some((slug, _)) = self.audit_key(&o.symbol, &o.instance_id) {
                 let exposure_end_ns = event_exposure_end_ns(&slug);
+                assert!(self.maker_order_audit.len() < MAX_ORDER_EVIDENCE,
+                    "bounded maker diagnostic capacity exhausted; drain retired offline records");
+                assert!(!self.maker_order_audit.contains_key(&o.client_order_id),
+                    "duplicate maker diagnostic identity");
+                self.maker_audit_created += 1;
+                self.maker_audit_high_water = self.maker_audit_high_water.max(self.maker_order_audit.len()+1);
                 self.maker_order_audit.insert(
                     o.client_order_id.clone(),
                     MakerOrderAuditRow {
@@ -5186,6 +5363,8 @@ impl SimExchangeV2 {
                         rest_qty_ns: 0.0,
                         await_fresh_book,
                         visible_depth_at_entry: now_depth,
+                        depth_observed_at_entry: Some(self.books.level_is_observed(
+                            &msym, mside, match_price, tick)),
                         entry_mid: mid0,
                         queue_seq,
                         q_init: q_ahead,
@@ -5217,6 +5396,8 @@ impl SimExchangeV2 {
                         cancel_arrival_ns: 0,
                         cancel_result: "open",
                         q_ahead_final: q_ahead,
+                        depth_censored_n: 0,
+                        depth_rebase_n: 0,
                         remaining_final: remaining,
                     },
                 );
@@ -5240,6 +5421,7 @@ impl SimExchangeV2 {
                 replay_self_depth_credit,
                 historical_depth_at_sync: replay_self_depth_credit,
                 level_qty_at_sync: now_depth,
+                depth_observed_at_sync,
                 mid_at_sync: mid0,
                 entry_mid: mid0,
                 traded_since_sync: 0.0,
@@ -5757,6 +5939,17 @@ fn stable_queue_level_sample(token: &str, side: Side, ticks: i64) -> f64 {
     ((hash >> 11) as f64) / ((1_u64 << 53) as f64)
 }
 
+fn proportional_public_cancel_advance(public_ahead: f64, public_total: f64, cancels: f64) -> f64 {
+    let front = public_ahead.max(0.0);
+    let total = public_total.max(front);
+    if total <= EPS { return 0.0; }
+    let count = cancels.max(0.0).min(total);
+    let hi = count.min(front);
+    // Full-depth cancellation can differ by an ulp after subtraction.
+    let lo = (count - (total - front)).max(0.0).min(hi);
+    (count * (front / total)).clamp(lo, hi)
+}
+
 fn bounded_cancel_advance(
     public_ahead: f64,
     public_total: f64,
@@ -5943,9 +6136,69 @@ mod tests {
         let r=RoleModel { markout:[0.;N],retention:b,markout_weight:0. };
         c.selection.configure("collect","",1.,42,false).unwrap();
         c.selection.mode=Mode::Causal;
-        c.selection.model=Some(SelectionModel { schema_version:2,horizon_ms:1000,max_label_gap_ms:250,training_end_ns:0,
+        c.selection.model=Some(SelectionModel { joint:None, schema_version:2,horizon_ms:1000,max_label_gap_ms:250,training_end_ns:0,
             maker:r.clone(),taker:r.clone(),maker_trade:None,maker_book:None,
             taker_sweep:Some(ChannelModel { fill:r,quantity:Some([0.;N]),quantity_markout_weight:0. }) });
+    }
+    #[test]
+    fn joint_gtc_remainder_stays_fillable_regardless_of_eventual_fill_prediction() {
+        use super::super::selection::JointModel;
+        for immediate in [false,true] {
+            let mut c=liquidity_core();half_taker_selection(&mut c);
+            let model=c.selection.model.as_mut().unwrap();model.schema_version=3;model.taker_sweep=None;
+            let mut no=model.taker.clone();no.retention[0]=-40.;let mut half=no.clone();half.retention[0]=0.;
+            model.joint=Some(JointModel {full:no.clone(),partial:half,residual:no.clone()});
+            if !immediate {model.taker=no;}
+            c.on_orderbook(&book_ts("up",vec![(0.49,100.)],vec![(0.51,2.),(0.52,8.)],1));
+            let u=c.submit_order(&order("joint","up",Side::Buy,0.52,10.,false,OrderType::Limit),2);
+            let qt=if immediate {5.} else {0.};
+            assert_eq!(u.filled_quantity,qt);
+            assert_eq!(c.orders["joint"].remaining,10.-qt);
+            // Only observed future book/trade evidence can fill this remainder.
+            c.selection.configure_role_strengths(Some(0.),Some(1.)).unwrap();
+            let fills=c.on_trade_tick(&trade_ts("up",Side::Sell,0.52,10000.,3));
+            assert!(!c.orders.contains_key("joint"));
+            assert!(!fills.is_empty());
+            c.cancel_order(Exchange::Polymarket,"joint",3_000_000_000);
+            assert!(!c.orders.contains_key("joint"));
+        }
+    }
+    #[test]
+    fn partial_gtc_rest_idempotence_cancel_and_audit_capacity_are_distinct() {
+        let mut c=liquidity_core(); half_taker_selection(&mut c);
+        c.admission_audit_enabled=true;
+        c.on_orderbook(&book_ts("up",vec![(0.49,100.)],vec![(0.51,10.)],1));
+        let o=order("residual","up",Side::Buy,0.51,10.,false,OrderType::Limit);
+        let first=c.submit_order(&o,2);
+        assert_eq!(first.filled_quantity,5.);
+        assert_eq!(c.orders["residual"].remaining,5.);
+        let row=c.drain_admission_audit().next().unwrap();
+        assert_eq!(row.observed_executable_qty,Some(10.));
+        assert_eq!((row.reported_filled_qty,row.resting_qty),(5.,5.));
+        assert_eq!(row.resting_state,"resting");
+        let duplicate=c.submit_order(&o,3);
+        assert_eq!(duplicate.filled_quantity,0.,"idempotent lookup emits no additional fill");
+        assert_eq!(c.order_evidence["residual"].matched_quantity,5.);
+        assert_eq!(c.orders["residual"].remaining,5.);
+        assert_eq!(c.drain_admission_audit().next().unwrap().decision,"idempotent_lookup");
+        c.cancel_order(Exchange::Polymarket,"residual",4);
+        assert!(!c.orders.contains_key("residual"));
+        c.submit_order(&o,5);
+        assert!(!c.orders.contains_key("residual"),"replay must not reopen a cancelled remainder");
+    }
+    #[test]
+    fn no_book_is_unknown_capacity_and_noncrossing_is_observed_zero() {
+        let mut c=liquidity_core(); c.admission_audit_enabled=true;
+        c.submit_order(&order("unknown","up",Side::Buy,0.48,10.,false,OrderType::Limit),1);
+        let row=c.drain_admission_audit().next().unwrap();
+        assert_eq!(row.observed_executable_qty,None);
+        assert_eq!(row.candidate_state,"capacity_unknown");
+        c.on_orderbook(&book_ts("up",vec![(0.49,100.)],vec![(0.51,10.)],2));
+        c.submit_order(&order("zero","up",Side::Buy,0.48,10.,false,OrderType::Limit),3);
+        let row=c.drain_admission_audit().next().unwrap();
+        assert_eq!(row.observed_executable_qty,Some(0.));
+        assert_eq!(row.candidate_state,"observed_noncrossing_or_depleted");
+        assert_eq!((row.resting_state,row.resting_qty),("resting",10.));
     }
     #[test]
     fn calibrated_partial_taker_resweeps_prices_and_fok_does_not_spend() {
@@ -6299,6 +6552,171 @@ mod tests {
         ));
         c.on_orderbook(&book_ts("up", vec![(0.49, 80.0)], vec![(0.51, 100.0)], 4));
         assert_eq!(c.orders["rest"].q_ahead, 80.0);
+    }
+
+    #[test]
+    fn depth_visibility_censored_reentry_preserves_fifo_and_trade_idempotence() {
+        for side in [Side::Buy, Side::Sell] {
+            let mut c = liquidity_core();
+            c.configure(Some(1.0), 0);
+            c.on_orderbook(&book_ts("up", vec![(0.49, 100.)], vec![(0.51, 100.)], 1));
+            let price = if side == Side::Buy { 0.49 } else { 0.51 };
+            let first = order("first", "up", side, price, 5., true, OrderType::Limit);
+            let mut second = order("second", "up", side, price, 5., true, OrderType::Limit);
+            second.instance_id = "another-owner".into();
+            c.submit_order(&first, 2); c.submit_order(&second, 3);
+            // Better prices push both old levels beyond the recorded window.
+            let censored = book_ts("up", vec![(0.50, 70.)], vec![(0.50, 70.)], 4);
+            assert!(c.on_orderbook(&censored).is_empty());
+            assert!(c.on_orderbook(&censored).is_empty());
+            assert_eq!(c.orders["first"].q_ahead, 100.);
+            assert_eq!(c.orders["second"].q_ahead, 105.);
+            let aggressor = if side == Side::Buy { Side::Sell } else { Side::Buy };
+            let mut trade = trade_ts("up", aggressor, price, 20., 5);
+            trade.exchange_trade_id = Some("unique-print".into());
+            assert!(c.on_trade_tick(&trade).is_empty());
+            assert!(c.on_trade_tick(&trade).is_empty());
+            assert_eq!(c.orders["first"].q_ahead, 80.);
+            // Missing snapshots do not prove which orders left during the gap.
+            c.on_orderbook(&book_ts("up", vec![(0.49, 40.)], vec![(0.51, 40.)], 6));
+            assert_eq!(c.orders["first"].q_ahead, 40.);
+            c.on_orderbook(&book_ts("up", vec![(0.49, 30.)], vec![(0.51, 30.)], 7));
+            assert_eq!(c.orders["first"].q_ahead, 30.);
+            let mut trade = trade_ts("up", aggressor, price, 37., 8);
+            trade.exchange_trade_id = Some("next-print".into());
+            let fills = c.on_trade_tick(&trade);
+            assert_eq!(fills.iter().map(|x| x.filled_quantity).sum::<f64>(), 7.);
+            assert_eq!(fills[0].client_order_id, "first");
+            assert_eq!(fills[0].filled_quantity, 5.);
+            assert_eq!(fills[1].client_order_id, "second");
+            assert_eq!(fills[1].filled_quantity, 2.);
+        }
+    }
+
+    #[test]
+    #[ignore = "focused offline public cancellation benchmark"]
+    fn public_cancel_proportion_latency_distribution() {
+        for fixed in [true, false] {
+            let mut c = liquidity_core();
+            c.configure(if fixed { Some(0.5) } else { None }, 0);
+            c.on_orderbook(&book_ts("up", vec![(0.49, 100.)], vec![(0.51, 100.)], 1));
+            for iid in ["btc01", "btc02"] {
+                let mut request=order(iid, "up", Side::Buy, 0.49, 20., true, OrderType::Limit);
+                request.instance_id=iid.into(); c.submit_order(&request, 2);
+            }
+            let mut times = Vec::with_capacity(20_000);
+            for n in 0..22_000 {
+                let ts = 3 + n * 2;
+                c.on_orderbook(&book_ts("up", vec![(0.49, 200.)], vec![(0.51, 100.)], ts));
+                for iid in ["btc01", "btc02"] {
+                    let order=c.orders.get_mut(iid).unwrap();
+                    order.q_ahead=100. + order.own_q_ahead;
+                    order.level_qty_at_sync=200.; order.traded_since_sync=0.;
+                }
+                let snapshot=book_ts("up", vec![(0.49, 100.)], vec![(0.51, 100.)], ts+1);
+                let start=std::time::Instant::now();
+                std::hint::black_box(c.on_orderbook(&snapshot));
+                let elapsed=start.elapsed().as_nanos();
+                assert_eq!(c.orders["btc01"].q_ahead,50.);
+                assert_eq!(c.orders["btc02"].q_ahead,70.);
+                if n>=2_000 { times.push(elapsed); }
+            }
+            times.sort_unstable();
+            eprintln!("public_cancel fixed_override={} events=20000 median_ns={} p99_ns={} p999_ns={} max_ns={} active_orders=2 message_queue_depth=0 overflow=0 boundary=offline_sim_on_orderbook excludes=fixture_reset_and_checks",fixed,times[10000],times[19800],times[19980],times[19999]);
+        }
+    }
+
+    #[test]
+    fn public_cancel_proportion_obeys_bounds_without_own_fifo() {
+        for total in [1.0_f64, 20., 100., 1000.] {
+            for front_frac in [0., 0.01, 0.25, 0.9, 1.] {
+                let front = total * front_frac;
+                for cancel_frac in [0., 0.01, 0.25, 0.9, 1., 2.] {
+                    let count = (total * cancel_frac).min(total);
+                    let advance = proportional_public_cancel_advance(front, total, count);
+                    assert!(advance + EPS >= (count - (total - front)).max(0.));
+                    assert!(advance <= count.min(front) + EPS);
+                    assert!((advance - count * front_frac).abs() < EPS);
+                }
+            }
+        }
+        assert_eq!(proportional_public_cancel_advance(0., 0., 50.), 0.);
+    }
+
+    #[test]
+    fn public_cancel_proportion_preserves_instance_fifo_and_duplicate_book() {
+        for side in [Side::Buy, Side::Sell] {
+            let mut c = liquidity_core(); c.configure(None, 0);
+            let price = if side == Side::Buy { 0.49 } else { 0.51 };
+            c.on_orderbook(&book_ts("up", vec![(0.49, 100.)], vec![(0.51, 100.)], 1));
+            for (i, iid) in ["btc01", "btc02"].into_iter().enumerate() {
+                let mut request=order(iid, "up", side, price, 20., true, OrderType::Limit);
+                request.instance_id=iid.into(); c.submit_order(&request, 2+i as u64);
+            }
+            // 100 new public units join behind both orders; cancelling half
+            // advances each public front by 50, retaining the 20 own FIFO.
+            c.on_orderbook(&book_ts("up", vec![(0.49, 200.)], vec![(0.51, 200.)], 4));
+            let snapshot=book_ts("up", vec![(0.49, 100.)], vec![(0.51, 100.)], 5);
+            c.on_orderbook(&snapshot);
+            assert_eq!(c.orders["btc01"].q_ahead, 50.);
+            assert_eq!(c.orders["btc02"].q_ahead, 70.);
+            c.on_orderbook(&snapshot);
+            assert_eq!(c.orders["btc02"].q_ahead, 70.);
+            c.cancel_order(Exchange::Polymarket, "btc01", 6);
+            assert_eq!(c.orders["btc02"].q_ahead, 50.);
+        }
+    }
+
+    #[test]
+    fn depth_visibility_observed_empty_level_can_advance_queue() {
+        let mut c = liquidity_core(); c.configure(Some(1.0), 0);
+        c.on_orderbook(&book_ts("up", vec![(0.49, 100.), (0.47, 10.)], vec![(0.52, 100.)], 1));
+        c.submit_order(&order("rest", "up", Side::Buy, 0.49, 5., true, OrderType::Limit), 2);
+        c.on_orderbook(&book_ts("up", vec![(0.48, 100.), (0.47, 10.)], vec![(0.52, 100.)], 3));
+        assert_eq!(c.orders["rest"].q_ahead, 0.);
+        let fills = c.on_trade_tick(&trade_ts("up", Side::Sell, 0.49, 3., 4));
+        assert_eq!(fills.iter().map(|x| x.filled_quantity).sum::<f64>(), 3.);
+    }
+
+    #[test]
+    fn depth_visibility_reconnect_cannot_rebase_a_censored_level_to_zero() {
+        let mut c = liquidity_core();
+        c.on_orderbook(&book_ts("up", vec![(0.49, 100.)], vec![(0.52, 100.)], 1));
+        c.submit_order(&order("rest", "up", Side::Buy, 0.49, 5., true, OrderType::Limit), 2);
+        c.orders.get_mut("rest").unwrap().await_fresh_book = true;
+        c.on_orderbook(&book_ts("up", vec![(0.50, 70.)], vec![(0.52, 100.)], 3));
+        c.rebase_stale_orders("up");
+        assert!(c.orders["rest"].await_fresh_book);
+        assert_eq!(c.orders["rest"].q_ahead, 100.);
+        c.on_orderbook(&book_ts("up", vec![(0.49, 80.)], vec![(0.52, 100.)], 4));
+        c.rebase_stale_orders("up");
+        assert!(!c.orders["rest"].await_fresh_book);
+        assert_eq!(c.orders["rest"].q_ahead, 80.);
+    }
+
+    #[test]
+    #[ignore = "focused offline simulator benchmark, excludes fixture construction"]
+    fn depth_visibility_latency_distribution() {
+        let mut c = liquidity_core();
+        c.configure_maker_order_audit(true);
+        let visible = book_ts("up", vec![(0.49, 100.)], vec![(0.52, 100.)], 1);
+        let censored = book_ts("up", vec![(0.50, 100.)], vec![(0.52, 100.)], 2);
+        c.on_orderbook(&visible);
+        c.submit_order(&order("rest", "up", Side::Buy, 0.49, 5., true, OrderType::Limit), 2);
+        let mut times = Vec::with_capacity(20_000);
+        for n in 0..20_000 {
+            let mut snapshot = if n % 2 == 0 { censored.clone() } else { visible.clone() };
+            snapshot.exchange_timestamp_ns = n + 3;
+            snapshot.local_timestamp_ns = n + 3;
+            let start = std::time::Instant::now();
+            std::hint::black_box(c.on_orderbook(&snapshot));
+            times.push(start.elapsed().as_nanos());
+        }
+        times.sort_unstable();
+        assert_eq!(c.orders["rest"].q_ahead, 100.);
+        assert_eq!(c.maker_order_audit["rest"].depth_censored_n, 10_000);
+        assert_eq!(c.maker_order_audit["rest"].depth_rebase_n, 10_000);
+        eprintln!("depth_visibility events=20000 median_ns={} p99_ns={} p999_ns={} maximum_ns={} boundary=offline_sim_on_orderbook excludes=fixture_construction queue_depth=1 queue_overflow=0",times[10000],times[19800],times[19980],times[19999]);
     }
 
     #[test]
@@ -7760,6 +8178,121 @@ mod tests {
         let other_instance = probe(1.0, "other");
         assert_eq!(other_instance.status, OrderStatus::Filled);
         assert!((other_instance.avg_fill_price - 0.62).abs() < EPS);
+    }
+
+    #[test]
+    #[should_panic(expected = "bounded maker diagnostic capacity exhausted")]
+    fn maker_diagnostic_capacity_exhaustion_aborts_instead_of_dropping() {
+        let mut c=core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book("up",vec![(0.60,10.)],vec![(0.62,80.)]));
+        c.submit_order(&order("template","up",Side::Buy,0.60,1.,true,OrderType::Limit),1);
+        let template=c.maker_order_audit_rows().pop().unwrap();
+        c.maker_order_audit.clear();
+        for i in 0..MAX_ORDER_EVIDENCE {
+            c.maker_order_audit.insert(format!("stored-{i}"),template.clone());
+        }
+        c.submit_order(&order("overflow","up",Side::Buy,0.60,1.,true,OrderType::Limit),2);
+    }
+
+    #[test]
+    #[ignore = "focused offline diagnostic handoff benchmark"]
+    fn maker_diagnostic_handoff_latency_distribution() {
+        use std::{hint::black_box,time::Instant};
+        const BATCHES:usize=64;
+        const ROWS:usize=512;
+        let mut c=core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book("up",vec![(0.60,10.)],vec![(0.62,80.)]));
+        c.submit_order(&order("template","up",Side::Buy,0.60,1.,true,OrderType::Limit),1);
+        let template=c.maker_order_audit_rows().pop().unwrap();
+        c.maker_order_audit.clear();
+        for streaming in [false,true] {
+            let mut samples=Vec::with_capacity(BATCHES);
+            for _ in 0..BATCHES {
+                for i in 0..ROWS {
+                    let mut row=template.clone();
+                    row.coid=format!("row-{i:05}");
+                    row.cancel_result="cancelled";
+                    c.maker_order_audit.insert(row.coid.clone(),row);
+                }
+                let started=Instant::now();
+                if streaming {
+                    for row in c.drain_maker_order_audit(true) { black_box(row); }
+                } else {
+                    black_box(c.maker_order_audit_rows());
+                }
+                samples.push(started.elapsed().as_nanos());
+                c.maker_order_audit.clear();
+            }
+            samples.sort_unstable();
+            println!("maker_handoff streaming={streaming} events={BATCHES} rows_per_event={ROWS} total_rows={} median_ns={} p99_ns={} p999_ns={} maximum_ns={} queue_depth=0 overflow=0 boundary=ready_maker_map_to_owned_records_excludes_IO_and_matching",
+                ROWS*BATCHES,samples[BATCHES/2],samples[BATCHES*99/100],samples[BATCHES-1],samples[BATCHES-1]);
+        }
+    }
+
+    #[test]
+    fn retired_maker_diagnostics_transfer_once_and_preserve_exposure() {
+        let mut c = core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
+        assert_eq!(c.submit_order(&order("m", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit), 1).status,
+            OrderStatus::Accepted);
+        c.cancel_order(Exchange::Polymarket, "m", 150);
+        let prior = c.fill_audit_rows();
+        c.retire_event("cond1", &["up".into(), "down".into()]);
+        assert!(c.has_retired_maker_order_audit());
+        let moved: Vec<_> = c.drain_maker_order_audit(false).collect();
+        assert_eq!(moved.len(),1);
+        assert_eq!(moved[0].coid,"m");
+        assert!(!c.has_retired_maker_order_audit());
+        assert_eq!(c.drain_maker_order_audit(false).count(),0);
+        assert_eq!(c.drain_maker_order_audit(true).count(),0);
+        let after=c.fill_audit_rows();
+        assert_eq!(after[0].passive_cancel_orders,prior[0].passive_cancel_orders);
+        assert_eq!(after[0].maker_rest_time_ns,prior[0].maker_rest_time_ns);
+        assert_eq!(after[0].passive_rest_qty_ns,prior[0].passive_rest_qty_ns);
+        let stats=c.maker_order_audit_stats();
+        assert_eq!(stats["created"],1);
+        assert_eq!(stats["drained"],1);
+        assert_eq!(stats["retained"],0);
+    }
+
+    #[test]
+    fn maker_diagnostic_retirement_waits_for_private_delivery_reference() {
+        let mut c=core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book("up",vec![(0.60,10.)],vec![(0.62,80.)]));
+        c.submit_order(&order("m","up",Side::Buy,0.60,5.,true,OrderType::Limit),1);
+        c.retain_order_message("m");
+        c.retire_event("cond1", &["up".into(),"down".into()]);
+        assert_eq!(c.drain_maker_order_audit(false).count(),0);
+        assert!(c.order_owner("m").is_some());
+        c.record_fill_delivery("m",350);
+        c.release_order_message("m");
+        c.retire_event("next", &["other_up".into(),"other_down".into()]);
+        let rows:Vec<_>=c.drain_maker_order_audit(false).collect();
+        assert_eq!(rows.len(),1);
+        assert_eq!(rows[0].last_fill_delivery_ns,350);
+        assert_eq!(rows[0].cancel_result,"event_retired");
+        assert_eq!(c.drain_maker_order_audit(true).count(),0);
+    }
+
+    #[test]
+    fn partial_diagnostic_consumption_keeps_unconsumed_rows_owned() {
+        let mut c=core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book("up",vec![(0.60,10.)],vec![(0.62,80.)]));
+        for coid in ["a","b"] {
+            c.submit_order(&order(coid,"up",Side::Buy,0.60,1.,true,OrderType::Limit),1);
+        }
+        c.retire_event("cond1", &["up".into(),"down".into()]);
+        { let mut rows=c.drain_maker_order_audit(false); assert_eq!(rows.next().unwrap().coid,"a"); }
+        assert_eq!(c.maker_order_audit_stats()["retained"],1);
+        let final_rows:Vec<_>=c.drain_maker_order_audit(true).collect();
+        assert_eq!(final_rows.len(),1);
+        assert_eq!(final_rows[0].coid,"b");
+        assert_eq!(c.maker_order_audit_stats()["drained"],2);
     }
 
     #[test]

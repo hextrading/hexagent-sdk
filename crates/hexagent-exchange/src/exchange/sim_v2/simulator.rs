@@ -1305,6 +1305,20 @@ impl Simulator {
         self.core.configure_maker_order_audit(enabled);
     }
 
+    pub fn has_retired_maker_order_audit(&self) -> bool {
+        self.core.has_retired_maker_order_audit()
+    }
+
+    pub fn drain_maker_order_audit(&mut self, final_drain: bool)
+        -> impl Iterator<Item = MakerOrderAuditRow> + '_
+    {
+        self.core.drain_maker_order_audit(final_drain)
+    }
+
+    pub fn maker_order_audit_stats(&self) -> serde_json::Value {
+        self.core.maker_order_audit_stats()
+    }
+
     pub fn maker_order_audit_rows(&self) -> Vec<MakerOrderAuditRow> {
         self.core.maker_order_audit_rows()
     }
@@ -2772,7 +2786,7 @@ impl Simulator {
                     self.cancel_finality_matched += 1;
                 }
                 let deliver = cancel_timing.map_or(ack_deliver_ns.max(when), |timing| {
-                    when.saturating_add(timing.network_l2_ns)
+                    when.saturating_add(timing.after_effect_ns())
                 });
                 self.audit_transition(
                     ExecutionStage::CancelEffective,
@@ -2799,7 +2813,7 @@ impl Simulator {
                     .core
                     .cancel_all_owned(exchange, &instance_id, &symbols, when);
                 let deliver = when
-                    .saturating_add(timing.network_l2_ns)
+                    .saturating_add(timing.after_effect_ns())
                     .max(self.strategy_clock_ns);
                 self.audit_batch_transition(
                     ExecutionStage::CancelEffective,
@@ -3464,6 +3478,58 @@ impl Simulator {
         Ok(())
     }
 
+    /// Exact-command offline adapter. All validation precedes scheduling/state
+    /// mutation. Missing HTTP responses use the ordinary censored replay path.
+    pub fn submit_with_recorded_cancel_timing(
+        &mut self,
+        sig: &Signal,
+        timing: CancelTiming,
+        http_response_observed: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.cancel_timing_mode == CancelTimingMode::StagedRttFraction
+                && self.separate_taker_private_fills
+                && http_response_observed,
+            "transport stages require strict recorded cancel with observed response"
+        );
+        timing
+            .validate_transport_stages()
+            .map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(
+            timing.nominal_arrival_ns >= self.server_clock_ns,
+            "recorded cancel arrival would rewind server clock"
+        );
+        anyhow::ensure!(
+            matches!(sig, Signal::CancelOrder {timestamp_ns, ..}
+            if *timestamp_ns == timing.dispatch_ns),
+            "cancel transport requires one matching cancel signal"
+        );
+        self.validate_staged_cancel_owner(sig);
+        let Signal::CancelOrder {
+            exchange,
+            client_order_id,
+            ..
+        } = sig
+        else {
+            unreachable!()
+        };
+        self.last_dispatched_request_id = None;
+        self.dispatch_action_with_cancel_override(
+            ReachAction::Cancel {
+                exchange: *exchange,
+                client_order_id: client_order_id.clone(),
+            },
+            timing.dispatch_ns,
+            timing.input_l1_ns,
+            timing.input_l2_ns,
+            ArrivalEvidence::modeled(timing.nominal_arrival_ns),
+            true,
+            true,
+            Some(timing),
+        );
+        Ok(())
+    }
+
     fn validate_staged_cancel_owner(&self, signal: &Signal) {
         if !self.cancel_timing_mode.is_staged() {
             return;
@@ -3544,6 +3610,15 @@ impl Simulator {
         http_response_observed: bool,
         recorded_rtt: bool,
     ) {
+        self.dispatch_action_with_cancel_override(action,t_emit,l1,l2,arrival_evidence,
+            http_response_observed,recorded_rtt,None);
+    }
+
+    fn dispatch_action_with_cancel_override(
+        &mut self, action: ReachAction, t_emit: u64, l1: u64, l2: u64,
+        arrival_evidence: ArrivalEvidence, http_response_observed: bool,
+        recorded_rtt: bool, cancel_override: Option<CancelTiming>,
+    ) {
         let mut arrival_evidence = arrival_evidence;
         let (mut l1, mut l2) = self.partition_network_legs(l1, l2);
         let rule_hold_ns = match &action {
@@ -3616,17 +3691,15 @@ impl Simulator {
             self.core.register_dispatched_order(order);
             self.begin_causal_taker_race(order, t_emit);
         }
-        let cancel_timing = if action_is_cancel(&action) {
-            self.cancel_timing_preview(t_emit, l1, l2)
-        } else {
-            None
-        };
+        let cancel_timing = cancel_override.or_else(|| {
+            if action_is_cancel(&action) { self.cancel_timing_preview(t_emit,l1,l2) } else { None }
+        });
         let (l1, l2, arrival_evidence) = if let Some(timing) = cancel_timing {
             self.staged_cancel_requests += 1;
             self.staged_cancel_capped += u64::from(timing.processing_capped);
             (
                 timing.network_l1_ns,
-                timing.network_l2_ns,
+                timing.after_effect_ns(),
                 ArrivalEvidence::modeled(timing.nominal_arrival_ns),
             )
         } else {
@@ -6115,6 +6188,181 @@ mod tests {
             assert_eq!(row.exchange_event_timestamp_ns, Some(at));
         }
         assert_eq!(sim.execution_timing_stats().queued, 0);
+    }
+
+    fn transport_cancel_timing(emit: u64, effect_ms: u64) -> CancelTiming {
+        CancelTiming::from_transport_stages(
+            emit,
+            emit + 100_000_000,
+            emit + 1_000_000,
+            emit + 99_000_000,
+            emit + 10_000_000,
+            emit + effect_ms * 1_000_000,
+            10_000_000,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn transport_post_effect_wait_does_not_leave_order_matchable() {
+        for effect_ms in [20, 70] {
+            let mut sim = staged_sim(100, 0);
+            sim.cancel_timing_mode = CancelTimingMode::StagedRttFraction;
+            sim.latency.set_fill_push_mult(10.0);
+            owned_front_order(&mut sim, "transport", "one", "tok");
+            let emit = 1_000_000_000;
+            let t = transport_cancel_timing(emit, effect_ms);
+            sim.submit_with_recorded_cancel_timing(
+                &owned_cancel_signal("transport", emit),
+                t,
+                true,
+            )
+            .unwrap();
+            assert_eq!(sim.peek_when(), Some(emit + 10_000_000));
+            sim.step();
+            if effect_ms == 20 {
+                assert_eq!(sim.peek_when(), Some(emit + 20_000_000));
+                sim.step();
+            }
+            let fills = trade_front(&mut sim, 4., emit + 50_000_000);
+            assert_eq!(fills.len(), usize::from(effect_ms == 70));
+            for fill in fills {
+                sim.schedule_private_fill(fill, emit + 50_000_000);
+            }
+            let mut updates = Vec::new();
+            while sim.peek_when().is_some() {
+                updates.extend(sim.step());
+            }
+            let ack = updates
+                .iter()
+                .find(|u| u.status == OrderStatus::Cancelled)
+                .unwrap();
+            assert_eq!(ack.timestamp_ns, emit + 100_000_000);
+            assert_eq!(ack.filled_quantity, 0.);
+            assert_eq!(
+                updates.iter().map(|u| u.filled_quantity).sum::<f64>(),
+                if effect_ms == 70 { 4. } else { 0. }
+            );
+            assert!(trade_front(&mut sim, 6., emit + 200_000_000).is_empty());
+            let rows: Vec<_> = sim.drain_execution_timing_audit().collect();
+            assert_eq!(
+                rows.iter()
+                    .find(|r| r.stage == ExecutionStage::CancelEffective)
+                    .unwrap()
+                    .actual_ns,
+                t.nominal_effective_ns
+            );
+            if effect_ms == 70 {
+                assert_eq!(
+                    rows.iter()
+                        .find(|r| r.stage == ExecutionStage::PrivateDelivered)
+                        .unwrap()
+                        .actual_ns,
+                    emit + 550_000_000
+                );
+            }
+            assert_eq!(sim.execution_timing_stats().overflows, 0);
+        }
+    }
+
+    #[test]
+    fn transport_timeout_and_private_recovery_keep_exchange_effect_and_one_fill() {
+        let mut sim = staged_sim(100, 0);
+        sim.cancel_timing_mode = CancelTimingMode::StagedRttFraction;
+        sim.cancel_timeout_ns = 20_000_000;
+        sim.private_fill_reconcile_rate = 1.;
+        sim.private_fill_reconcile_delay_ns = 200_000_000;
+        owned_front_order(&mut sim, "timeout-transport", "one", "tok");
+        let emit = 1_000_000_000;
+        sim.submit_with_recorded_cancel_timing(
+            &owned_cancel_signal("timeout-transport", emit),
+            transport_cancel_timing(emit, 70),
+            true,
+        )
+        .unwrap();
+        sim.step(); // arrival at +10ms
+        let timeout = sim.step();
+        assert_eq!(timeout[0].status, OrderStatus::CancelOrderTimeout);
+        let fills = trade_front(&mut sim, 10., emit + 50_000_000);
+        assert_eq!(fills.len(), 1);
+        let id = fills[0].trade_id.clone();
+        sim.schedule_private_fill(fills[0].clone(), emit + 50_000_000);
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        assert_eq!(updates.iter().filter(|u| u.trade_id == id).count(), 1);
+        assert_eq!(updates.iter().map(|u| u.filled_quantity).sum::<f64>(), 10.);
+        let audit: Vec<_> = sim.drain_execution_timing_audit().collect();
+        assert!(audit
+            .iter()
+            .any(|r| r.stage == ExecutionStage::CancelEffective
+                && r.status == Some(OrderStatus::Filled)));
+        assert!(!audit
+            .iter()
+            .any(|r| r.stage == ExecutionStage::HttpDelivered));
+    }
+
+    #[test]
+    fn transport_pending_hold_remains_cancel_uncertain_with_original_reply_clock() {
+        let (mut sim, mut signal) = separated_taker_sim(10);
+        sim.cancel_timing_mode = CancelTimingMode::StagedRttFraction;
+        sim.execution_timing = ExecutionTimingAudit::new(true);
+        if let Signal::NewOrder(order) = &mut signal {
+            order.instance_id = "one".into();
+        }
+        set_fixture_hold(&mut sim);
+        let emit = 1_000_000_000;
+        sim.submit_with_latency_split(&signal, emit, 150_000_000, 150_000_000)
+            .unwrap();
+        assert!(sim.step().is_empty()); // hold starts at +25ms, expires +275ms
+        let dispatch = emit + 30_000_000;
+        sim.submit_with_recorded_cancel_timing(
+            &owned_cancel_signal("taker-private", dispatch),
+            transport_cancel_timing(dispatch, 70),
+            true,
+        )
+        .unwrap();
+        let mut updates = Vec::new();
+        while sim.peek_when().is_some() {
+            updates.extend(sim.step());
+        }
+        let cancel = updates
+            .iter()
+            .find(|u| u.status == OrderStatus::CancelUncertain)
+            .unwrap();
+        assert_eq!(cancel.timestamp_ns, dispatch + 100_000_000);
+        let fill = updates.iter().find(|u| u.trade_id.is_some()).unwrap();
+        assert_eq!(fill.exchange_event_timestamp_ns, Some(emit + 275_000_000));
+        assert_eq!(fill.filled_quantity, 10.);
+        assert_eq!(sim.rule_hold_cancel_rejected, 1);
+    }
+
+    #[test]
+    fn transport_invalid_or_unobserved_reply_fails_before_scheduling() {
+        let mut sim = staged_sim(100, 0);
+        sim.cancel_timing_mode = CancelTimingMode::StagedRttFraction;
+        let emit = 1_000_000_000;
+        owned_front_order(&mut sim, "bad-transport", "one", "tok");
+        let t = transport_cancel_timing(emit, 70);
+        let sig = owned_cancel_signal("bad-transport", emit);
+        assert!(sim
+            .submit_with_recorded_cancel_timing(&sig, t, false)
+            .is_err());
+        let mut bad = t;
+        bad.post_effect_ns += 1;
+        assert!(sim
+            .submit_with_recorded_cancel_timing(&sig, bad, true)
+            .is_err());
+        assert!(sim
+            .submit_with_recorded_cancel_timing(
+                &owned_cancel_signal("bad-transport", emit + 1),
+                t,
+                true
+            )
+            .is_err());
+        assert_eq!(sim.peek_when(), None);
+        assert_eq!(sim.execution_timing_stats().emitted, 0);
     }
 
     #[test]

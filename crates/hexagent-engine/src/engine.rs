@@ -6,6 +6,9 @@
 //! - Backtest: Parquet replay → strategy → sim_v2 DES
 //! - Paper: live feeds → strategy → sim_v2 matching core
 
+#[path = "decision_replay.rs"]
+mod decision_replay;
+
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use log::{debug, error, info, warn};
@@ -6462,6 +6465,13 @@ impl Engine {
         let mut replay_clocks = SimV2ReplayClocks::default();
 
         let mut lifecycle_router = SimLifecycleRouter::new(&strategies)?;
+        anyhow::ensure!(bt.sim_v2_decision_replay_path.is_empty() || !bt.sim_v2_owner_scheduler,
+            "explicit decision replay and virtual owner delays cannot be combined");
+        let mut decisions = decision_replay::DecisionReplay::load(
+            &bt.sim_v2_decision_replay_path, &lifecycle_router.owners, start_ns, end_ns)?;
+        // Offline measurements are collected outside the callback, never live.
+        let mut decision_callback_ns = Vec::with_capacity(decisions.len());
+
         anyhow::ensure!(
             !bt.sim_v2_owner_scheduler || strategies.len() <= 64,
             "virtual owner routing supports at most 64 strategies"
@@ -6545,6 +6555,13 @@ impl Engine {
         };
 
         // Offline simulator coordinator, outside strategy callback/quote processing.
+        // Offline coordinator owns this bounded buffer. Ownership transfers
+        // directly from the simulator; no new thread or private lifecycle lane.
+        let mut maker_order_writer = if bt.sim_v2_fill_audit {
+            Some(std::io::BufWriter::with_capacity(256*1024,
+                std::fs::File::create("sim_maker_order_audit.jsonl")?))
+        } else { None };
+        let mut maker_order_written = 0_u64;
         let mut selection_writer = if bt.sim_v2_selection_audit {
             Some(std::io::BufWriter::with_capacity(256*1024,std::fs::File::create("sim_selection_audit.jsonl")?))
         } else {None};
@@ -6583,13 +6600,30 @@ impl Engine {
                 .and_then(|s| s.peek_when())
                 .unwrap_or(u64::MAX);
             let recovery_ts = owner_recovery.peek_when().unwrap_or(u64::MAX);
-            let min_ts = strat_min.min(sim_ts).min(owner_ts).min(recovery_ts);
+            let decision_ts = decisions.peek();
+            let min_ts = strat_min.min(sim_ts).min(owner_ts).min(recovery_ts).min(decision_ts);
             let mut market_to_apply: Option<(u64, Arc<MarketEvent>, Option<usize>)> = None;
             if min_ts == u64::MAX {
                 break;
             }
 
-            if min_ts == recovery_ts
+            // Public and private ingress at the same timestamp precede the
+            // explicit decision. Never advance to a future quote/market row.
+            if decision_ts < strat_min && decision_ts < sim_ts
+                && decision_ts < owner_ts && decision_ts < recovery_ts
+            {
+                let decision = decisions.pop();
+                let strategy_now = replay_clocks.advance_strategy(decision.decision_ns);
+                anyhow::ensure!(strategy_now == decision.decision_ns, "decision clock regression");
+                sim.observe_strategy_clock(strategy_now);
+                set_sim_clock(strategy_now);
+                quote_signal_batch.clear();
+                let started = std::time::Instant::now();
+                strategies[decision.owner].on_quote_into(decision.callback_ns, &mut quote_signal_batch)
+                    .map_err(|_| anyhow::anyhow!("explicit decision signal overflow"))?;
+                decision_callback_ns.push(started.elapsed().as_nanos() as u64);
+                for sig in quote_signal_batch.drain(..) { sim.submit(&sig, strategy_now); }
+            } else if min_ts == recovery_ts
                 && (owner_recovery.peek_action() == Some(RecoveryAction::Stop)
                     || (sim_ts > recovery_ts && strat_min > recovery_ts))
             {
@@ -7148,7 +7182,7 @@ impl Engine {
                         // P(RTT>T) over threshold, decided per-event) — then
                         // fall back to the quote_interval (×N) throttle.
                         let tbt = strategy.quote_tick_by_tick() && !strategy.cadence_rtt_throttle();
-                        if owner_recovery.quote_allowed(i) && venue_ok && (tbt || interval > 0) {
+                        if !decisions.owns(i) && owner_recovery.quote_allowed(i) && venue_ok && (tbt || interval > 0) {
                             let fire = if tbt {
                                 true
                             } else {
@@ -7210,6 +7244,16 @@ impl Engine {
                         replay_clocks.strategy_ns.max(min_ts),
                     ) {
                         strategy.set_backtest_recovery_gate(false);
+                    }
+                }
+            }
+
+            if sim.has_retired_maker_order_audit() {
+                if let Some(writer) = maker_order_writer.as_mut() {
+                    for row in sim.drain_maker_order_audit(false) {
+                        serde_json::to_writer(&mut *writer, &row)?;
+                        std::io::Write::write_all(writer, b"\n")?;
+                        maker_order_written += 1;
                     }
                 }
             }
@@ -7296,6 +7340,20 @@ impl Engine {
             "sim_fidelity_summary.json",
             serde_json::to_vec_pretty(&sim.v6_fidelity_stats())?,
         )?;
+        if !bt.sim_v2_decision_replay_path.is_empty() {
+            anyhow::ensure!(decisions.completed() == decisions.len(), "unprocessed decisions");
+            decision_callback_ns.sort_unstable();
+            let n = decision_callback_ns.len();
+            let q = |p: f64| decision_callback_ns[((n - 1) as f64 * p).ceil() as usize];
+            std::fs::write("sim_decision_replay.json", serde_json::to_vec_pretty(&serde_json::json!({
+                "decisions": n, "completed": decisions.completed(),
+                "clock": "exact decision ns; original callback ns; receive <= decision; equal ingress first",
+                "limitations": "reconstructed receive availability is not observed live owner-consumption order",
+                "callback_duration_ns": {"median": q(0.5), "p99": q(0.99), "p999": q(0.999), "maximum": q(1.)},
+                "measurement_boundary": "on_quote_into entry through return; offline replay, excludes simulated network delay",
+                "decision_capacity": 2_000_000, "decision_overflows": 0
+            }))?)?;
+        }
         let perf_event_loop_ns = elapsed_nanos(perf_event_loop_started);
         if let Some(writer) = admission_writer.as_mut() {
             std::io::Write::flush(writer)?;
@@ -7722,61 +7780,23 @@ impl Engine {
                     a.taker_fill_qty,
                 );
             }
-            for a in sim.maker_order_audit_rows() {
-                info!(
-                    "  Sim v2 maker order audit: slug={} iid={} coid={} token={} side={} order_type={:?} price={} quantity={} post_only={} strategy_emit_ns={} trigger_exchange_ns={} trigger_local_ns={} place_arrival_ns={} rest_ms={:.6} rest_qty_s={:.6} await_fresh_book={} visible_depth_at_entry={:.4} entry_mid={:.6} queue_seq={} q_init={:.4} simulated_own_ahead_qty={:.4} own_cancel_queue_advance_qty={:.4} replay_self_depth_credit={:.4} trade_match_n={} trade_match_qty={:.4} queue_drained_qty={:.4} candidate_qty={:.4} maker_toxicity_suppressed_qty={:.4} depletion_observed_qty={:.4} depletion_exec_qty={:.4} depletion_cancel_advance_qty={:.4} depletion_candidate_qty={:.4} depletion_budget_suppressed_qty={:.4} depletion_fill_qty={:.4} inferred_residual_floor={:.6} inferred_residual_suppressed_qty={:.6} book_through_candidate_qty={:.4} book_through_fill_qty={:.4} book_markout_qty={:.4} book_markout_cost_usdc={:.4} fill_qty={:.4} first_fill_ns={} last_fill_ns={} first_fill_delivery_ns={} last_fill_delivery_ns={} cancel_arrival_ns={} cancel_result={} q_ahead_final={:.4} remaining_final={:.4}",
-                    a.slug,
-                    a.iid,
-                    a.coid,
-                    a.token,
-                    a.side,
-                    a.order_type,
-                    a.price,
-                    a.quantity,
-                    a.post_only,
-                    a.strategy_emit_ns,
-                    a.trigger_exchange_ns,
-                    a.trigger_local_ns,
-                    a.place_arrival_ns,
-                    a.rest_time_ns as f64 / 1_000_000.0,
-                    a.rest_qty_ns / 1_000_000_000.0,
-                    a.await_fresh_book,
-                    a.visible_depth_at_entry,
-                    a.entry_mid,
-                    a.queue_seq,
-                    a.q_init,
-                    a.simulated_own_ahead_qty,
-                    a.own_cancel_queue_advance_qty,
-                    a.replay_self_depth_credit,
-                    a.trade_match_n,
-                    a.trade_match_qty,
-                    a.queue_drained_qty,
-                    a.candidate_qty,
-                    a.maker_toxicity_suppressed_qty,
-                    a.depletion_observed_qty,
-                    a.depletion_exec_qty,
-                    a.depletion_cancel_advance_qty,
-                    a.depletion_candidate_qty,
-                    a.depletion_budget_suppressed_qty,
-                    a.depletion_fill_qty,
-                    a.inferred_residual_floor,
-                    a.inferred_residual_suppressed_qty,
-                    a.book_through_candidate_qty,
-                    a.book_through_fill_qty,
-                    a.book_markout_qty,
-                    a.book_markout_cost_usdc,
-                    a.fill_qty,
-                    a.first_fill_ns,
-                    a.last_fill_ns,
-                    a.first_fill_delivery_ns,
-                    a.last_fill_delivery_ns,
-                    a.cancel_arrival_ns,
-                    a.cancel_result,
-                    a.q_ahead_final,
-                    a.remaining_final,
-                );
+            if let Some(writer) = maker_order_writer.as_mut() {
+                for row in sim.drain_maker_order_audit(true) {
+                    serde_json::to_writer(&mut *writer, &row)?;
+                    std::io::Write::write_all(writer, b"\n")?;
+                    maker_order_written += 1;
+                }
+                std::io::Write::flush(writer)?;
             }
+            let mut summary = sim.maker_order_audit_stats();
+            summary["written"] = serde_json::json!(maker_order_written);
+            anyhow::ensure!(summary["created"] == summary["drained"]
+                && summary["drained"] == summary["written"] && summary["retained"] == 0,
+                "incomplete lossless maker diagnostic drain");
+            std::fs::write("sim_maker_order_summary.json", serde_json::to_vec_pretty(&summary)?)?;
+            info!("  Sim v2:   maker order audit {}", summary);
         }
+
         let replay_perf = crate::recorder::replayer_stats();
         let (deadline_pending, deadline_high_water, deadline_capacity) = sim.http_deadline_stats();
         let (recovery_pending, recovery_high_water, recovery_capacity) =

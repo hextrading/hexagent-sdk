@@ -410,6 +410,9 @@ pub struct BacktestConfig {
     /// Deterministic backtest-only owner application lane; no live threads/sleeps.
     #[serde(default)]
     pub sim_v2_owner_scheduler: bool,
+    /// Offline five-minute decision clock journal; requires legacy serial owner replay.
+    #[serde(default)]
+    pub sim_v2_decision_replay_path: String,
     #[serde(default)]
     pub sim_v2_owner_apply_delay_us: u64,
     #[serde(default)]
@@ -1378,6 +1381,7 @@ impl Default for BacktestConfig {
             sim_v2_liquidity_ledger: false,
             sim_v2_match_time_liquidity: false,
             sim_v2_owner_scheduler: false,
+            sim_v2_decision_replay_path: String::new(),
             sim_v2_owner_apply_delay_us: 0,
             sim_v2_owner_service_time_us: 0,
             sim_v2_owner_queue_capacity: default_sim_v2_owner_queue_capacity(),
