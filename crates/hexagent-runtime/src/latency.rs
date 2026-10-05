@@ -416,6 +416,7 @@ pub fn prepare_market_queue_stages() {
 /// the recorder so new critical stages have one reviewable registration site.
 pub fn prepare_polymarket_order_stages() {
     prepare_thread_stages(&[
+        "strategy.quote_signal_to_executor",
         "polymarket.cancel.prep_to_http_dispatch",
         "polymarket.cancel.trigger_to_dispatch",
         "polymarket.cancel.completion_queue",

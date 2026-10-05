@@ -103,6 +103,11 @@ const ACCOUNT_OWNER_REQUEST_TIMEOUT: Duration = Duration::from_millis(25);
 /// reviewable here and cannot capture arbitrary I/O or quote-path state.
 pub struct AccountOwnerCommand(AccountOwnerOperation);
 
+#[path = "snapshot_lease.rs"]
+mod snapshot_lease;
+pub use snapshot_lease::SnapshotLeaseTicket;
+use snapshot_lease::SnapshotLeaseOwner;
+
 /// Cloneable, message-only endpoint for the account's single writer.
 ///
 /// Runtime workers keep this handle; only [`SharedAccountOwnerState`] owns the
@@ -168,6 +173,33 @@ impl SharedAccountHandle {
             .map_err(|error| format!("account {} owner enqueue failed: {error}", self.account_id))
     }
 
+    /// Cold snapshot coordinator only: the caller polls or waits on a
+    /// background worker, never on a strategy/quote thread. The account owner
+    /// exclusively owns lease mutation; a full owner lane rejects admission.
+    pub fn submit_snapshot_lease_claim(
+        &self, instance_id: String, ttl: Duration,
+    ) -> Result<hexagent_runtime::poll_channel::Receiver<Result<Option<SnapshotLeaseTicket>, String>>, String> {
+        let (reply, completion) = hexagent_runtime::poll_channel::bounded(1);
+        self.try_send(AccountOwnerCommand(AccountOwnerOperation::SnapshotLeaseClaim {
+            instance_id, ttl, reply,
+        }))?;
+        Ok(completion)
+    }
+
+    /// Generation-fenced cold completion. Successful enqueue retains FIFO
+    /// ordering with later claims. Expiry recovers an abandoned request even
+    /// when a disconnected/full owner prevents publishing its completion.
+    pub fn submit_snapshot_lease_finish(
+        &self, ticket: SnapshotLeaseTicket, retain_for: Option<Duration>,
+    ) -> Result<(), String> {
+        if ticket.account_id() != self.account_id() {
+            return Err("snapshot lease account mismatch".into());
+        }
+        self.try_send(AccountOwnerCommand(AccountOwnerOperation::SnapshotLeaseFinish {
+            ticket, retain_for,
+        }))
+    }
+
     pub fn submit_register_token_interest(
         &self,
         instance_id: String,
@@ -223,18 +255,28 @@ impl SharedAccountHandle {
     }
 
     pub fn submit_sidecar_checkpoint(
-        &self,
-        sidecar_id: String,
-        checkpoint: DurableSidecarCheckpoint,
+        &self, sidecar_id: String, checkpoint: DurableSidecarCheckpoint,
     ) -> Result<crossbeam_channel::Receiver<Result<bool, String>>, String> {
+        self.try_submit_sidecar_checkpoint(sidecar_id, checkpoint).map_err(|(_, error)| error)
+    }
+
+    /// Preserve payload ownership when admission fails, allowing a strategy's
+    /// completion poll to retry without cloning a large recovery checkpoint.
+    pub fn try_submit_sidecar_checkpoint(
+        &self, sidecar_id: String, checkpoint: DurableSidecarCheckpoint,
+    ) -> Result<crossbeam_channel::Receiver<Result<bool, String>>, (DurableSidecarCheckpoint, String)> {
+        if !self.is_bound() {
+            return Err((checkpoint, "sidecar checkpoint account owner is not bound".into()));
+        }
         let (reply, completion) = crossbeam_channel::bounded(1);
-        self.try_send(AccountOwnerCommand(
-            AccountOwnerOperation::RecordSidecarCheckpoint {
-                sidecar_id,
-                checkpoint,
-                reply,
-            },
-        ))?;
+        let command = AccountOwnerCommand(AccountOwnerOperation::RecordSidecarCheckpoint {
+            sidecar_id, checkpoint, reply,
+        });
+        if let Err(error) = self.tx.try_send(command) {
+            let detail = format!("account {} sidecar enqueue failed: {error}", self.account_id);
+            let AccountOwnerOperation::RecordSidecarCheckpoint { checkpoint, .. } = error.into_inner().0 else { unreachable!() };
+            return Err((checkpoint, detail));
+        }
         Ok(completion)
     }
 
@@ -280,6 +322,7 @@ pub struct SharedAccountOwnerState {
     route_retirement_pending: std::cell::RefCell<Option<RetiredRouteBatch>>,
     // Startup-installed capabilities; only this cold account thread polls them.
     inactive_settled_gc: std::cell::RefCell<Option<InactiveSettledGcOwners>>,
+    snapshot_lease: std::cell::RefCell<SnapshotLeaseOwner>,
     history_archive_poll_after: Cell<Instant>,
     history_archive_reader: std::cell::RefCell<Option<rusqlite::Connection>>,
 }
@@ -336,6 +379,17 @@ impl SharedAccountOwnerState {
 
     pub fn execute(&self, command: AccountOwnerCommand) {
         match command.0 {
+            AccountOwnerOperation::SnapshotLeaseClaim { instance_id, ttl, reply } => {
+                if !reply.is_disconnected() {
+                    let result = self.snapshot_lease.borrow_mut().claim(
+                        self.account.account_id(), &instance_id, ttl, Instant::now(),
+                    );
+                    let _ = reply.try_send(result);
+                }
+            }
+            AccountOwnerOperation::SnapshotLeaseFinish { ticket, retain_for } => {
+                self.snapshot_lease.borrow_mut().finish(&ticket, retain_for, Instant::now());
+            }
             AccountOwnerOperation::ConfigureInactiveSettledGc {
                 active_instances,
                 reply,
@@ -474,6 +528,12 @@ impl SharedAccountOwnerState {
 }
 
 enum AccountOwnerOperation {
+    SnapshotLeaseClaim {
+        instance_id: String,
+        ttl: Duration,
+        reply: hexagent_runtime::poll_channel::Sender<Result<Option<SnapshotLeaseTicket>, String>>,
+    },
+    SnapshotLeaseFinish { ticket: SnapshotLeaseTicket, retain_for: Option<Duration> },
     ConfigureInactiveSettledGc {
         active_instances: HashSet<String>,
         reply: crossbeam_channel::Sender<Result<Vec<String>, String>>,
@@ -702,6 +762,13 @@ impl AccountOwnerCommand {
     pub fn execute(self, account: &SharedAccount) {
         use AccountOwnerOperation::*;
         match self.0 {
+            SnapshotLeaseClaim { reply, .. } => {
+                let _ = reply.try_send(Err("snapshot lease requires the cold account owner state".into()));
+            }
+            SnapshotLeaseFinish { .. } => {
+                // A misrouted completion cannot mutate another owner's lease.
+                // Its finite expiry remains the recovery boundary.
+            }
             ConfigureInactiveSettledGc { reply, .. } => {
                 let _ = reply.send(Err("inactive settled GC configuration requires the cold owner state".into()));
             }
@@ -7107,6 +7174,7 @@ impl SharedAccount {
             lifecycle_mirror_wake_rx,
             route_retirement_pending: std::cell::RefCell::new(None),
             inactive_settled_gc: std::cell::RefCell::new(None),
+            snapshot_lease: std::cell::RefCell::new(SnapshotLeaseOwner::default()),
             history_archive_poll_after: Cell::new(Instant::now()),
             history_archive_reader: std::cell::RefCell::new(None),
         };
