@@ -285,6 +285,7 @@ mod tests {
             client_order_id: "retire-0".into(),
             exchange_order_id: format!("0x{:064x}", 1),
             token: "new".into(),
+            tracked: None,
         });
         let mut work = RuntimeRetirement {
             tokens: HashSet::from(["old".into()]),

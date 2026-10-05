@@ -276,6 +276,10 @@ pub trait Strategy: Send {
         extend_signal_batch(out, self.on_lifecycle_update_owned(envelope)?)
     }
 
+    /// Observation-only hook after this lifecycle callback's signals were published.
+    /// Runs on the same sole strategy writer. Must not block, allocate or perform I/O.
+    fn on_lifecycle_dispatch_complete(&mut self, _sequence: u64, _completed_mono_ns: u64) {}
+
     /// Startup-only backpressure for an owner-local lifecycle handoff buffer.
     /// The worker caches this value after lifecycle/watchdog callbacks, never
     /// from a market/quote callback. While paused, all three lifecycle inputs

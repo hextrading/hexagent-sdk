@@ -412,6 +412,15 @@ pub struct LifecycleTiming {
     pub private_owner_dequeued_ns: u64,
     pub private_producer_ns: u64,
     pub root_router_dequeued_ns: u64,
+    /// Immutable identity of the original private WS frame; replay stays unknown.
+    #[serde(default)]
+    pub receipt: super::MarketReceipt,
+    #[serde(default)]
+    pub frame_event_index: u32,
+    /// Actual strategy worker dequeue; private_owner_dequeued_ns is a different worker.
+    #[serde(default)]
+    pub strategy_dequeued_ns: u64,
+
 }
 
 /// Strategy-owned lifecycle message used across execution and authenticated

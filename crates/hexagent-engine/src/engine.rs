@@ -9911,6 +9911,7 @@ impl Engine {
             "strategy.private_update.callback",
             "strategy.watchdog.callback",
             "strategy.private_feed.callback",
+            "strategy.private_direct.callback",
             "strategy.execution_capacity.publish_to_apply",
             "strategy.execution_capacity.resume_to_quote",
             "strategy.execution_capacity.requote",
@@ -10137,7 +10138,8 @@ impl Engine {
                 // lossless lane bypasses the root router and is drained before
                 // every compatibility lifecycle or market-data lane.
                 WorkerInput::DirectPrivate(msg) => match msg {
-                    Ok(routed) => {
+                    Ok(mut routed) => {
+                        routed.timing.strategy_dequeued_ns = crate::types::monotonic_now_ns();
                         if routed.owner as usize != idx {
                             error!(
                                 "[strategy_private_direct] instance={} owner_mismatch expected={} observed={} action=quarantine",
@@ -10177,6 +10179,9 @@ impl Engine {
                                 if !emit(sig) { break 'worker; }
                             }
                         }
+                        strategy.on_lifecycle_dispatch_complete(
+                            lifecycle_sequence, crate::types::monotonic_now_ns(),
+                        );
                         crate::latency::record(
                             "strategy.private_direct.callback",
                             callback_started,
@@ -10225,7 +10230,8 @@ impl Engine {
                     Err(_) => private_feed_updates_open = false,
                 },
                 WorkerInput::CompatUpdate(msg) => match msg {
-                    Ok(queued) => {
+                    Ok(mut queued) => {
+                        queued.timing.strategy_dequeued_ns = crate::types::monotonic_now_ns();
                         if queued.update.exchange == Exchange::Polymarket {
                             hexagent_runtime::latency::record_ns(
                                 "polymarket.update.root_router_to_instance_worker",
@@ -10268,6 +10274,9 @@ impl Engine {
                                 if !emit(sig) { break 'worker; }
                             }
                         }
+                        strategy.on_lifecycle_dispatch_complete(
+                            lifecycle_sequence, crate::types::monotonic_now_ns(),
+                        );
                         crate::latency::record(
                             "strategy.private_update.callback",
                             callback_started,
