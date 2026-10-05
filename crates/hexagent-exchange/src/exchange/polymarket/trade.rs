@@ -106,8 +106,29 @@ struct RuntimeOwnershipIndex {
 
 #[derive(Debug)]
 struct RuntimeOwnershipEntry {
-    normalized_order_id: Arc<str>,
+    normalized_order_id: RuntimeOrderId,
     ownership: OrderOwnership,
+}
+
+/// Canonical live OIDs fit inline; legacy recovery IDs retain exact semantics.
+#[derive(Debug)]
+enum RuntimeOrderId {
+    Inline(arrayvec::ArrayString<128>),
+    Legacy(Box<str>),
+}
+impl RuntimeOrderId {
+    fn new(order_id: &str) -> Self {
+        let view = runtime_order_id_view(order_id);
+        match arrayvec::ArrayString::from(view) {
+            Ok(mut inline) => { inline.make_ascii_lowercase(); Self::Inline(inline) }
+            Err(_) => Self::Legacy(view.to_ascii_lowercase().into_boxed_str()),
+        }
+    }
+}
+impl AsRef<str> for RuntimeOrderId {
+    fn as_ref(&self) -> &str {
+        match self { Self::Inline(value) => value.as_str(), Self::Legacy(value) => value }
+    }
 }
 
 impl RuntimeOwnershipIndex {
@@ -139,31 +160,38 @@ impl RuntimeOwnershipIndex {
 
     fn start_index(&self, order_id: &str) -> usize {
         let mut hasher = DefaultHasher::new();
-        for byte in runtime_order_id_view(order_id).bytes() {
-            hasher.write_u8(byte.to_ascii_lowercase());
+        // Hash contiguous bytes instead of re-entering SipHash once per byte.
+        for chunk in runtime_order_id_view(order_id).as_bytes().chunks(128) {
+            let mut normalized = [0_u8; 128];
+            for (out, byte) in normalized.iter_mut().zip(chunk) { *out = byte.to_ascii_lowercase(); }
+            hasher.write(&normalized[..chunk.len()]);
         }
         hasher.finish() as usize % self.slots.len()
     }
 
     fn insert(&self, order_id: &str, ownership: OrderOwnership) -> Result<(), String> {
-        let normalized = Arc::<str>::from(normalize_order_id(order_id));
+        self.publish(order_id, ownership).map(|_| ())
+    }
+
+    fn publish(&self, order_id: &str, ownership: OrderOwnership) -> Result<Arc<RuntimeOwnershipEntry>, String> {
         let entry = Arc::new(RuntimeOwnershipEntry {
-            normalized_order_id: Arc::clone(&normalized),
+            normalized_order_id: RuntimeOrderId::new(order_id),
             ownership,
         });
-        let start = self.start_index(&normalized);
+        let normalized = entry.normalized_order_id.as_ref();
+        let start = self.start_index(normalized);
         for offset in 0..RUNTIME_OWNERSHIP_MAX_PROBES {
             let slot = &self.slots[(start + offset) % self.slots.len()];
             slot.rcu(|current| match current {
-                Some(existing) if existing.normalized_order_id.as_ref() != normalized.as_ref() => {
+                Some(existing) if existing.normalized_order_id.as_ref() != normalized => {
                     Some(Arc::clone(existing))
                 }
                 _ => Some(Arc::clone(&entry)),
             });
             if slot.load().as_ref().is_some_and(|published| {
-                published.normalized_order_id.as_ref() == normalized.as_ref()
+                published.normalized_order_id.as_ref() == normalized
             }) {
-                return Ok(());
+                return Ok(entry);
             }
         }
         Err(format!(
@@ -2013,6 +2041,7 @@ enum ExecutionStateCommand {
         client_order_id: String,
         exchange_order_id: String,
         token: String,
+        tracked: Option<TrackedOrder>,
     },
     TrackOpen {
         client_order_id: String,
@@ -2065,6 +2094,7 @@ impl ExecutionStateOwner {
                 client_order_id,
                 exchange_order_id,
                 token,
+                tracked,
             } => {
                 let previous = next.coid_to_oid.get(&client_order_id).cloned();
                 let normalized = normalize_order_id(&exchange_order_id);
@@ -2091,6 +2121,9 @@ impl ExecutionStateOwner {
                     .with_insert(normalized, client_order_id.clone());
                 if let Some(observation) = observation.as_mut() {
                     observation.mark(4);
+                }
+                if let Some(tracked) = tracked {
+                    next.open_orders = next.open_orders.with_insert(client_order_id.clone(), tracked);
                 }
                 if !token.is_empty() {
                     if let Some(observation) = observation.as_mut() {
@@ -2443,12 +2476,33 @@ const EXECUTION_AUDIT_QUEUE_CAPACITY: usize = 4_096;
 #[path = "account_owner_loop.rs"]
 mod account_owner_loop;
 
+fn enqueue_prepared_order(
+    index: &RuntimeOwnershipIndex, tx: &crossbeam_channel::Sender<AccountLifecycleJob>,
+    local_oid: &str, ownership: OrderOwnership, trace: &mut crate::types::HotPathTrace,
+) -> Result<(), String> {
+    // The private route must be visible before HTTP can emit any bytes.
+    let entry = index.publish(local_oid, ownership)?;
+    trace.identity_published_mono_ns = crate::types::monotonic_now_ns();
+    if tx.try_send(AccountLifecycleJob::RegisterPreparedOrder(entry)).is_err() {
+        index.remove(local_oid);
+        return Err("ownership persistence queue unavailable before dispatch".into());
+    }
+    trace.registration_enqueued_mono_ns = crate::types::monotonic_now_ns();
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "trade/residual_tail_tests.rs"]
+mod residual_tail_tests;
+
 enum AccountLifecycleJob {
     StartupBarrier(crossbeam_channel::Sender<()>),
     RegisterLocalOrder {
         command: ExecutionStateCommand,
         ownership: Option<OrderOwnership>,
     },
+    // Immutable pre-POST identity; all string materialization stays on the cold owner.
+    RegisterPreparedOrder(Arc<RuntimeOwnershipEntry>),
     ExecutionState(ExecutionStateCommand),
     RebindServerIdentity {
         client_order_id: String,
@@ -3429,6 +3483,9 @@ pub struct SharedState {
     /// row in the per-request latency CSV so a single file can hold
     /// multiple instances. `"cli"` for one-off CLI subcommands.
     pub(crate) instance_id: String,
+    /// Immutable HTTP labels allocated once at startup, shared by request tasks.
+    request_instance_id: Arc<str>,
+    request_account_id: Arc<str>,
     /// Account-wide physical/virtual ledger shared by every executor route.
     pub account_state: Arc<hexagent_account::account::shared_account::SharedAccount>,
     /// Message-only endpoint for strategy/cold-control producers.  Keeping it
@@ -4244,6 +4301,21 @@ impl SharedState {
             AccountLifecycleJob::StartupBarrier(done) => {
                 let _ = done.send(());
             }
+            AccountLifecycleJob::RegisterPreparedOrder(entry) => {
+                let ownership = &entry.ownership;
+                if self.account_state.register_prepared_order(ownership).is_none() {
+                    self.runtime_order_ownership.remove(&ownership.order_id);
+                    self.user_feed_health.set_inventory_uncertain(true);
+                    log::error!("[PolymarketTrade] async ownership persistence conflict coid={} oid={}", ownership.client_order_id, ownership.order_id);
+                    return;
+                }
+                execution.apply(self, ExecutionStateCommand::InstallIdentity {
+                    client_order_id: ownership.client_order_id.clone(),
+                    exchange_order_id: ownership.order_id.clone(), token: ownership.token_id.clone(),
+                    tracked: Some(TrackedOrder { order_slot: ownership.order_slot, symbol: ownership.token_id.clone(),
+                        side: ownership.side, instance_id: ownership.instance_id.clone() }),
+                });
+            }
             AccountLifecycleJob::RegisterLocalOrder { command, ownership } => {
                 let started = crate::latency::Instant::now();
                 if let Some(ownership) = ownership {
@@ -4309,6 +4381,7 @@ impl SharedState {
                         client_order_id,
                         exchange_order_id,
                         token,
+                        tracked: None,
                     },
                 );
             }
@@ -4917,6 +4990,7 @@ impl SharedState {
             client_order_id: client_order_id.to_string(),
             exchange_order_id: exchange_order_id.to_string(),
             token: token.to_string(),
+            tracked: None,
         };
         if let Err(error) = self
             .account_lifecycle_tx
@@ -4949,6 +5023,7 @@ impl SharedState {
             client_order_id: client_order_id.to_string(),
             exchange_order_id: exchange_order_id.to_string(),
             token: token.to_string(),
+            tracked: None,
         };
         if let Err(error) = self
             .account_lifecycle_tx
@@ -4961,6 +5036,12 @@ impl SharedState {
             return Err(format!("ownership persistence queue unavailable: {error}"));
         }
         Ok(())
+    }
+
+    fn register_prepared_order(
+        &self, local_oid: &str, ownership: OrderOwnership, trace: &mut crate::types::HotPathTrace,
+    ) -> Result<(), String> {
+        enqueue_prepared_order(&self.runtime_order_ownership, &self.account_lifecycle_tx, local_oid, ownership, trace)
     }
 
     pub(crate) fn execution_snapshot(&self) -> Arc<ExecutionStateSnapshot> {
@@ -6523,8 +6604,8 @@ impl SharedState {
             let url_owned = url.clone();
             let method_owned = method.clone();
             let tx_a = reply_tx;
-            let iid_a = self.instance_id.clone();
-            let account_id = self.account_state.account_id().to_string();
+            let iid_a = Arc::clone(&self.request_instance_id);
+            let account_id = Arc::clone(&self.request_account_id);
             let auth_failure_blocked = Arc::clone(&self.auth_failure_blocked);
             let phase_audit = Arc::clone(&self.http_phase_audit);
             let phase_kind = http_phase_audit::request_kind(rec_kind, stage);
@@ -6646,13 +6727,14 @@ impl SharedState {
         HttpReplyReceiver,
         Arc<HttpCompletionTiming>,
     ) {
-        self.http_call_async_on_completion(client, attempt_id, method, path, body, rec_kind_override, None)
+        self.http_call_async_on_completion(client, attempt_id, method, path, body, rec_kind_override, None, None)
     }
 
     fn http_call_async_on_completion(
         &self, client: crate::http1_pool::PooledClient, attempt_id: u64,
         method: &str, path: &str, body: Bytes,
         rec_kind_override: Option<crate::latency_record::RequestKind>, completion: Option<PooledReply>,
+        mut hot_path: Option<&mut crate::types::HotPathTrace>,
     ) -> (HttpReplyReceiver, Arc<HttpCompletionTiming>) {
         let (reply_tx, reply_rx, timing) = if let Some((tx, rx, timing)) = completion {
             (HttpReplySender::Reused(tx), HttpReplyReceiver::Reused(rx), timing)
@@ -6690,8 +6772,9 @@ impl SharedState {
             let headers = self
                 .auth
                 .sign_request(method.as_str(), auth_path, body_text);
+            if let Some(trace) = hot_path.as_deref_mut() { trace.l2_auth_done_mono_ns = crate::types::monotonic_now_ns(); }
             let method_a = method.clone();
-            let path_a = path.to_string();
+            let path_a = if path == "/order" { std::borrow::Cow::Borrowed("/order") } else { std::borrow::Cow::Owned(path.to_string()) };
             let body_a = body;
             let url_a = url.clone();
             let tx_a = reply_tx;
@@ -6772,6 +6855,7 @@ impl SharedState {
             });
         }
 
+        if let Some(trace) = hot_path { trace.http_task_enqueued_mono_ns = crate::types::monotonic_now_ns(); }
         (reply_rx, timing)
     }
 
@@ -7301,6 +7385,8 @@ impl PolymarketTrade {
             #[cfg(test)]
             private_pending_apply_high: std::sync::atomic::AtomicUsize::new(0),
             instance_id: instance_id.to_string(),
+            request_instance_id: Arc::from(instance_id),
+            request_account_id: Arc::from(account_state.account_id()),
             account_state,
             account_owner_handle,
             execution_state: ArcSwap::from_pointee(initial_execution_state.clone()),
@@ -11583,7 +11669,7 @@ impl PolymarketTrade {
             self.shared.log_preflight_rejected(&order.client_order_id, None, &update);
             return Err(update);
         };
-        let prepared = match self.submit_prep(order, false) {
+        let mut prepared = match self.submit_prep(order, false) {
             Ok(prepared) => prepared,
             Err(update) => {
                 self.shared.log_preflight_rejected(
@@ -11600,12 +11686,13 @@ impl PolymarketTrade {
             prepared.signed_ns,
             prepared.account_recorded_ns,
         );
+        prepared.hot_path.attempt_bound_mono_ns = crate::types::monotonic_now_ns();
         let (rx, timing) = self.shared.http_call_async_on_completion(
             client,
             attempt.attempt_id(),
             "POST",
             "/order",
-            prepared.body, None, Some(completion),
+            prepared.body, None, Some(completion), Some(&mut prepared.hot_path),
         );
         let http_submitted_mono_ns = crate::types::monotonic_now_ns();
         let dispatched_ns = now_ns();
@@ -11727,12 +11814,13 @@ impl PolymarketTrade {
         let (rx, timing, attempt) = match body {
             PreparedCancelBody::Ready(body_bytes) => {
                 let attempt = client.begin_attempt(signal_ns, prep_ns, 0, 0);
+                cancel_trigger.hot_path.attempt_bound_mono_ns = crate::types::monotonic_now_ns();
                 let (rx, timing) = self.shared.http_call_async_on_completion(
                     client,
                     attempt.attempt_id(),
                     "DELETE",
                     "/order",
-                    body_bytes, None, completion,
+                    body_bytes, None, completion, Some(&mut cancel_trigger.hot_path),
                 );
                 (Some(rx), Some(timing), Some(attempt))
             }
@@ -11954,38 +12042,23 @@ impl PolymarketTrade {
                 None,
             );
         }
-        if let Err(error) = self.shared.register_local_order_id(
-            &order.client_order_id,
-            &local_oid,
-            &order.symbol,
-            ownership,
-        ) {
-            self.shared.recycle_request_buffer(body_json);
-            return Err(Self::make_rejected(order, &error));
-        }
-        // Track in `open_orders` BEFORE the HTTP call resolves: from this
-        // point on the order may already be live on the server (a
-        // POST landing but its reply timing out leaves an orphan-place
-        // whose collateral the server holds against our allowance).
-        // Inserting here makes `open_orders` the single source of truth
-        // for "may be on the server" — `handle_balance_error` snapshots
-        // it to issue targeted DELETEs, and `remove_order` is the
-        // symmetric removal on Rejected (keeps the coid↔oid map for
-        // a possible late fill). Order survives
-        // here through Submit success / NewOrderTimeout / orphan
-        // reconciliation; only definitive `Rejected` (server explicitly
-        // refused, e.g. balance / fee / post-only) removes it.
-        if let Err(error) = self.shared.track_open_order(
-            &order.client_order_id,
-            TrackedOrder {
-                order_slot: order.order_slot,
-                symbol: order.symbol.clone(),
-                side: order.side,
+        if let Some(ownership) = ownership {
+            if let Err(error) = self.shared.register_prepared_order(&local_oid, ownership, &mut hot_path) {
+                self.shared.recycle_request_buffer(body_json);
+                return Err(Self::make_rejected(order, &error));
+            }
+        } else {
+            // CLI/legacy submissions have no numeric strategy ownership.
+            if let Err(error) = self.shared.register_local_order_id(
+                &order.client_order_id, &local_oid, &order.symbol, None,
+            ).and_then(|()| self.shared.track_open_order(&order.client_order_id, TrackedOrder {
+                order_slot: order.order_slot, symbol: order.symbol.clone(), side: order.side,
                 instance_id: self.instance_id.clone(),
-            },
-        ) {
-            self.shared.recycle_request_buffer(body_json);
-            return Err(Self::make_rejected(order, &error));
+            })) {
+                self.shared.recycle_request_buffer(body_json);
+                return Err(Self::make_rejected(order, &error));
+            }
+            hot_path.registration_enqueued_mono_ns = crate::types::monotonic_now_ns();
         }
 
         Ok(PreparedSubmit {
@@ -14955,7 +15028,7 @@ mod tests {
         ));
     }
 
-    fn runtime_ownership(order_id: &str, client_order_id: &str) -> OrderOwnership {
+    pub(super) fn runtime_ownership(order_id: &str, client_order_id: &str) -> OrderOwnership {
         OrderOwnership {
             inferred_cancel: false,
             order_slot: Default::default(),

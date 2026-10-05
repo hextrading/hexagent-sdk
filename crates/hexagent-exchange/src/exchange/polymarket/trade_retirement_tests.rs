@@ -422,6 +422,7 @@ fn execution_owner_keeps_rebind_retirement_and_replay_in_one_generation() {
                 client_order_id: "owner-0".into(),
                 exchange_order_id: "0xabcdef".into(),
                 token: token.into(),
+                tracked: None,
             },
         )
     };
@@ -533,6 +534,7 @@ fn benchmark_execution_owner_capacity_boundary() {
                         client_order_id: coid,
                         exchange_order_id: oid,
                         token,
+                tracked: None,
                     },
                 );
                 new_times.push(start.elapsed().as_nanos() as u64);

@@ -316,8 +316,8 @@ async fn actual_http_phases_keep_identity_status_peer_and_reconnect_generation()
     let auth = super::super::auth::AuthHeaders {
         api_key: "test".into(),
         address: "test".into(),
-        signature: "test".into(),
-        timestamp: "1".into(),
+        signature: arrayvec::ArrayString::from("test").unwrap(),
+        timestamp: arrayvec::ArrayString::from("1").unwrap(),
         passphrase: "test".into(),
     };
     let url: Arc<str> = format!("http://{peer}/test").into();

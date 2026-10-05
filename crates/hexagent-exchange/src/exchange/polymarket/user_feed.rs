@@ -4961,6 +4961,7 @@ async fn user_feed_loop(
         let mut last_ping = Instant::now();
         // Transport heartbeats prove only that the socket is alive. They must
         // not masquerade as validated private order/trade traffic.
+        let mut private_receipts = crate::types::ReceiptSequencer::new();
         let mut last_transport = Instant::now();
         let apply_reconnect_generation = apply_lane.reconnect_generation.load(Ordering::Acquire);
 
@@ -5020,7 +5021,8 @@ async fn user_feed_loop(
             };
             match read_result {
                 Ok(Some(Ok(msg))) => {
-                    let private_ws_received_ns = crate::types::monotonic_now_ns();
+                    let receipt = private_receipts.received();
+                    let private_ws_received_ns = receipt.ws_received_mono_ns;
                     match msg {
                         Message::Text(text) => {
                             last_transport = Instant::now();
@@ -5071,11 +5073,13 @@ async fn user_feed_loop(
                             let frame_timing = LifecycleTiming {
                                 private_ws_received_ns,
                                 private_json_parsed_ns,
+                                receipt: crate::types::MarketReceipt { parsed_mono_ns: private_json_parsed_ns, ..receipt },
                                 ..LifecycleTiming::default()
                             };
-                            let events = events.into_iter()
-                            .filter_map(|payload| {
-                                PrivateEventDelta::classify_with_timing(payload, frame_timing)
+                            let events = events.into_iter().enumerate()
+                            .filter_map(|(index, payload)| {
+                                let timing = LifecycleTiming { frame_event_index: index as u32, ..frame_timing };
+                                PrivateEventDelta::classify_with_timing(payload, timing)
                             })
                             .filter(|event| !event.is_registered_probe_order(&shared))
                             .collect();

@@ -74,6 +74,18 @@ pub struct HotPathTrace {
     pub signed_mono_ns: u64,
     pub account_recorded_mono_ns: u64,
     pub http_submitted_mono_ns: u64,
+    /// Appended fields decode historical traces as unknown, never fake zero latency.
+    #[serde(default)]
+    pub identity_published_mono_ns: u64,
+    #[serde(default)]
+    pub registration_enqueued_mono_ns: u64,
+    #[serde(default)]
+    pub attempt_bound_mono_ns: u64,
+    #[serde(default)]
+    pub l2_auth_done_mono_ns: u64,
+    #[serde(default)]
+    pub http_task_enqueued_mono_ns: u64,
+
 }
 impl HotPathTrace {
     /// Unknown/replay/clock-domain mismatch remains null, never fake zero.
@@ -90,6 +102,20 @@ impl HotPathTrace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn historical_lifecycle_and_hot_path_decode_new_boundaries_as_unknown() {
+        let old = rmp_serde::to_vec(&(1_u64, 2_u64, 3_u64, 4_u64, 5_u64)).unwrap();
+        let timing: super::super::LifecycleTiming = rmp_serde::from_slice(&old).unwrap();
+        assert_eq!(timing.root_router_dequeued_ns, 5);
+        assert_eq!(timing.strategy_dequeued_ns, 0);
+        assert_eq!(timing.receipt, MarketReceipt::default());
+        let old = (1_u64, MarketReceipt::default(), 2_u64, 3_u64, 4_u64, 5_u64,
+            6_u64, 7_u64, 8_u64, 9_u64, 10_u64);
+        let restored: HotPathTrace = rmp_serde::from_slice(&rmp_serde::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(restored.http_submitted_mono_ns, 10);
+        assert_eq!(restored.registration_enqueued_mono_ns, 0);
+        assert_eq!(restored.l2_auth_done_mono_ns, 0);
+    }
     #[test]
     fn sessions_sequences_and_replay_are_explicit() {
         let mut a = ReceiptSequencer::new();

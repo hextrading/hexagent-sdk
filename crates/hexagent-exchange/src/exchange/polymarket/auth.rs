@@ -11,6 +11,8 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::sync::Arc;
+use arrayvec::ArrayString;
+use std::fmt::Write as _;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -18,7 +20,7 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Clone)]
 pub struct PolyAuth {
     pub api_key: String,
-    secret: Vec<u8>, // base64-decoded HMAC secret
+    signing_template: HmacSha256, // startup-keyed state; cloned per request
     /// Original base64-encoded secret as supplied by the operator,
     /// preserved so per-instance user_feed WS handshakes can re-sign
     /// without needing the raw bytes routed separately through engine
@@ -36,8 +38,8 @@ pub struct PolyAuth {
 pub struct AuthHeaders {
     pub api_key: Arc<str>,
     pub address: Arc<str>,
-    pub signature: String,
-    pub timestamp: String,
+    pub signature: ArrayString<44>,
+    pub timestamp: ArrayString<20>,
     pub passphrase: Arc<str>,
 }
 
@@ -57,7 +59,7 @@ impl PolyAuth {
             .map_err(|e| anyhow!("Failed to base64-decode API secret: {}", e))?;
         Ok(Self {
             api_key: api_key.to_string(),
-            secret,
+            signing_template: HmacSha256::new_from_slice(&secret).expect("HMAC accepts any key size"),
             api_secret_b64: api_secret_b64.to_string(),
             passphrase: passphrase.to_string(),
             wallet_address: wallet_address.to_string(),
@@ -100,17 +102,20 @@ impl PolyAuth {
         body: &str,
         timestamp_secs: u64,
     ) -> AuthHeaders {
-        let timestamp = timestamp_secs.to_string();
-
-        let mut mac = HmacSha256::new_from_slice(&self.secret)
-            .expect("HMAC accepts any key size");
+        let mut timestamp = ArrayString::<20>::new();
+        write!(&mut timestamp, "{timestamp_secs}").expect("u64 fits in 20 decimal bytes");
+        let mut mac = self.signing_template.clone();
         mac.update(timestamp.as_bytes());
         mac.update(method.as_bytes());
         mac.update(path.as_bytes());
         if !body.is_empty() {
             mac.update(body.as_bytes());
         }
-        let signature = B64_URL.encode(mac.finalize().into_bytes());
+        let mut encoded = [0_u8; 44];
+        let len = B64_URL.encode_slice(mac.finalize().into_bytes(), &mut encoded)
+            .expect("SHA256 base64 fits in 44 bytes");
+        let signature = ArrayString::from(std::str::from_utf8(&encoded[..len]).expect("base64 ASCII"))
+            .expect("fixed signature capacity");
 
         AuthHeaders {
             api_key: Arc::clone(&self.api_key_template),
@@ -150,6 +155,52 @@ impl AuthHeaders {
 mod tests {
     use super::*;
 
+    fn legacy_signature(secret: &[u8], method: &str, path: &str, body: &str, timestamp: u64) -> (String, String) {
+        let timestamp = timestamp.to_string();
+        let mut mac = HmacSha256::new_from_slice(secret).unwrap();
+        mac.update(timestamp.as_bytes()); mac.update(method.as_bytes()); mac.update(path.as_bytes());
+        mac.update(body.as_bytes());
+        (timestamp, B64_URL.encode(mac.finalize().into_bytes()))
+    }
+
+    #[test]
+    fn inline_auth_matches_legacy_bytes_for_all_methods_timestamps_and_utf8_bodies() {
+        for secret in [vec![], b"secret".to_vec(), vec![0xab; 128]] {
+            let auth = PolyAuth::new("key", &B64_URL.encode(&secret), "pass", "wallet").unwrap();
+            for timestamp in [0, 1_700_000_000, u64::MAX] {
+                for (method, path, body) in [("GET", "/data/orders", ""), ("POST", "/order", "{\"text\":\"测试\\n\"}"), ("DELETE", "/order", "{\"orderID\":\"0xabc\"}")] {
+                    let expected = legacy_signature(&secret, method, path, body, timestamp);
+                    let actual = auth.sign_request_at(method, path, body, timestamp);
+                    assert_eq!(actual.timestamp.as_str(), expected.0);
+                    assert_eq!(actual.signature.as_str(), expected.1);
+                    assert_eq!(actual.signature.len(), 44);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "focused release HMAC benchmark; no network"]
+    fn residual_auth_benchmark() {
+        let secret = b"deterministic-offline-benchmark-secret";
+        let auth = PolyAuth::new("key", &B64_URL.encode(secret), "pass", "wallet").unwrap();
+        let body = "x".repeat(1024);
+        for inline in [false, true] {
+            let mut samples = Vec::with_capacity(100_000);
+            for i in 0..101_000 {
+                let start = std::time::Instant::now();
+                if inline { std::hint::black_box(auth.sign_request_at("POST", "/order", &body, 1_790_000_000)); }
+                else { std::hint::black_box(legacy_signature(secret, "POST", "/order", &body, 1_790_000_000)); }
+                if i >= 1000 { samples.push(start.elapsed().as_nanos() as u64); }
+            }
+            samples.sort_unstable();
+            let n = samples.len();
+            eprintln!("residual_auth mode={} n={} median_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0 boundary=timestamp_hmac_base64 body_bytes={}",
+                if inline { "inline" } else { "legacy" }, n, (samples[n/2-1]+samples[n/2])/2,
+                samples[(n*99).div_ceil(100)-1], samples[(n*999).div_ceil(1000)-1], samples[n-1], body.len());
+        }
+    }
+
     #[test]
     fn test_sign_request_format() {
         // Verify that signing produces a non-empty base64 string
@@ -172,7 +223,7 @@ mod tests {
         let auth = PolyAuth::new("key", "c2VjcmV0", "pass", "0xabc").unwrap();
         let first = auth.sign_request_at("GET", "/auth/api-keys", "", 1_700_000_000);
         let second = auth.sign_request_at("GET", "/auth/api-keys", "", 1_700_000_000);
-        assert_eq!(first.timestamp, "1700000000");
+        assert_eq!(first.timestamp.as_str(), "1700000000");
         assert_eq!(first.signature, second.signature);
     }
 }
