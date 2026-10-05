@@ -61,6 +61,17 @@ impl MarketReceipt {
     }
 }
 
+/// Dispatcher-local observations before enqueue; hints never grant admission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastLaneSelection {
+    pub core: u32,
+    pub eligible_lanes: u16,
+    pub busy_lanes: u16,
+    pub unhealthy_lanes: u16,
+    pub minimum_pending: Option<u64>,
+    pub selected_pending: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HotPathTrace {
     pub clock_domain_ns: u64,
@@ -85,7 +96,11 @@ pub struct HotPathTrace {
     pub l2_auth_done_mono_ns: u64,
     #[serde(default)]
     pub http_task_enqueued_mono_ns: u64,
-
+    /// Zero means a historical/unmeasured publication, otherwise includes the target slot.
+    #[serde(default)]
+    pub identity_probes: u16,
+    #[serde(default)]
+    pub fast_selection: Option<FastLaneSelection>,
 }
 impl HotPathTrace {
     /// Unknown/replay/clock-domain mismatch remains null, never fake zero.
@@ -115,6 +130,8 @@ mod tests {
         assert_eq!(restored.http_submitted_mono_ns, 10);
         assert_eq!(restored.registration_enqueued_mono_ns, 0);
         assert_eq!(restored.l2_auth_done_mono_ns, 0);
+        assert_eq!(restored.identity_probes, 0);
+        assert_eq!(restored.fast_selection, None);
     }
     #[test]
     fn sessions_sequences_and_replay_are_explicit() {

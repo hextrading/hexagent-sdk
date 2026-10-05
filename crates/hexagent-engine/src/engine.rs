@@ -13423,25 +13423,30 @@ impl Engine {
                     };
                     let Some(mut routed) = routed else { continue };
                     stamp_execution_receive(&mut routed.signal, crate::types::monotonic_now_ns());
-                    let embedded_instance_id = extract_instance_id(&routed.signal);
+                    let embedded_instance_id = instance_id_view(&routed.signal);
                     let numeric_instance_id = (routed.owner != SYSTEM_SIGNAL_OWNER)
                         .then(|| owner_instance_ids.get(routed.owner as usize))
                         .flatten()
                         .filter(|instance_id| !instance_id.is_empty());
                     if let Some(expected) = numeric_instance_id {
                         assert!(
-                            embedded_instance_id.is_empty() || embedded_instance_id == *expected,
+                            embedded_instance_id.is_empty() || embedded_instance_id == expected.as_str(),
                             "signal owner mismatch: owner={} expected_instance={} embedded_instance={}",
                             routed.owner,
                             expected,
                             embedded_instance_id,
                         );
                     }
-                    let instance_id = numeric_instance_id
-                        .cloned()
-                        .unwrap_or(embedded_instance_id);
+                    // Numeric live owners borrow their startup-bound identity.
+                    // Only the cold/system compatibility path needs a copy to
+                    // outlive moving the signal. Previously every live signal
+                    // cloned both embedded and numeric strings here.
+                    let instance_id: std::borrow::Cow<'_, str> = match numeric_instance_id {
+                        Some(id) => std::borrow::Cow::Borrowed(id.as_str()),
+                        None => std::borrow::Cow::Owned(embedded_instance_id.to_owned()),
+                    };
                     let completion_tx = poly_states
-                        .get(&instance_id)
+                        .get(instance_id.as_ref())
                         .and_then(|shared| {
                             poly_completion_txs.get(shared.account_state.account_id())
                         })
@@ -13517,7 +13522,7 @@ impl Engine {
                             instance_id: signal_instance_id,
                             timestamp_ns,
                         } => {
-                            if let Some(pool) = instance_pools.get(&instance_id) {
+                            if let Some(pool) = instance_pools.get(instance_id.as_ref()) {
                                 for lane in pool {
                                     let shard_signal = Signal::CancelAll {
                                         exchange: Exchange::Hexmarket,
@@ -13548,7 +13553,7 @@ impl Engine {
                         | Signal::BatchNewOrders { exchange: Exchange::Hexmarket, .. }
                         | Signal::BatchCancelOrders { exchange: Exchange::Hexmarket, .. }
                         | Signal::CancelOrder { exchange: Exchange::Hexmarket, .. } => {
-                            if let Some(pool) = instance_pools.get(&instance_id) {
+                            if let Some(pool) = instance_pools.get(instance_id.as_ref()) {
                                 let idx = hexmarket_connection_slot(
                                     &signal,
                                     &instance_id,
@@ -13576,7 +13581,7 @@ impl Engine {
                                 };
                                 if let Err(error) = pool[idx].try_send((signal, update_sender.clone())) {
                                     let (signal, update_sender) = error.into_inner();
-                                    if let Some(routes) = hex_coid_routes.get_mut(&instance_id) {
+                                    if let Some(routes) = hex_coid_routes.get_mut(instance_id.as_ref()) {
                                         admission.rollback(routes);
                                     }
                                     for update in rejected_venue_signal(
@@ -13593,7 +13598,7 @@ impl Engine {
                             }
                         }
                         Signal::NewOrder(order) if order.exchange == Exchange::Hexmarket => {
-                            if let Some(pool) = instance_pools.get(&instance_id) {
+                            if let Some(pool) = instance_pools.get(instance_id.as_ref()) {
                                 let idx = hexmarket_connection_slot(
                                     &signal,
                                     &instance_id,
@@ -13621,7 +13626,7 @@ impl Engine {
                                 };
                                 if let Err(error) = pool[idx].try_send((signal, update_sender.clone())) {
                                     let (signal, update_sender) = error.into_inner();
-                                    if let Some(routes) = hex_coid_routes.get_mut(&instance_id) {
+                                    if let Some(routes) = hex_coid_routes.get_mut(instance_id.as_ref()) {
                                         admission.rollback(routes);
                                     }
                                     for update in rejected_venue_signal(
@@ -13645,11 +13650,11 @@ impl Engine {
                             // exchanges or paper/BT shims that pass
                             // an empty map.
                             let stale_threshold_ms = stale_threshold_handles
-                                .get(&instance_id)
+                                .get(instance_id.as_ref())
                                 .map(|h| h.load(std::sync::atomic::Ordering::Relaxed))
                                 .unwrap_or(150);
                             if signal_exchange(&signal) == Some(Exchange::Polymarket) {
-                                let Some(shared) = poly_states.get(&instance_id) else {
+                                let Some(shared) = poly_states.get(instance_id.as_ref()) else {
                                     let mut updates = rejected_venue_signal(
                                         &signal,
                                         "polymarket signal has no configured account owner",
@@ -13941,11 +13946,11 @@ fn parse_event_start_ts_secs(iso: &str) -> Option<u64> {
     Some((secs / 300) * 300)
 }
 
-fn extract_instance_id(signal: &Signal) -> String {
+fn instance_id_view(signal: &Signal) -> &str {
     match signal {
-        Signal::NewOrder(order) => order.instance_id.clone(),
-        Signal::CancelOrder { instance_id, .. } => instance_id.clone(),
-        Signal::CancelAll { instance_id, .. } => instance_id.clone(),
+        Signal::NewOrder(order) => order.instance_id.as_str(),
+        Signal::CancelOrder { instance_id, .. } => instance_id.as_str(),
+        Signal::CancelAll { instance_id, .. } => instance_id.as_str(),
         Signal::BatchNewOrders {
             instance_id,
             orders,
@@ -13955,14 +13960,14 @@ fn extract_instance_id(signal: &Signal) -> String {
             // instance_id for backward-compat with emit sites that pre-
             // dated the explicit-field addition.
             if !instance_id.is_empty() {
-                return instance_id.clone();
+                return instance_id.as_str();
             }
             orders
                 .first()
-                .map(|o| o.instance_id.clone())
+                .map(|o| o.instance_id.as_str())
                 .unwrap_or_default()
         }
-        Signal::BatchCancelOrders { instance_id, .. } => instance_id.clone(),
+        Signal::BatchCancelOrders { instance_id, .. } => instance_id.as_str(),
         Signal::BatchUpdateOrders {
             instance_id,
             place_orders,
@@ -13974,19 +13979,24 @@ fn extract_instance_id(signal: &Signal) -> String {
             ..
         } => {
             if !instance_id.is_empty() {
-                return instance_id.clone();
+                return instance_id.as_str();
             }
             place_orders
                 .first()
-                .map(|o| o.instance_id.clone())
+                .map(|o| o.instance_id.as_str())
                 .unwrap_or_default()
         }
-        Signal::ReconcilePolymarket { instance_id, .. } => instance_id.clone(),
-        Signal::PolymarketCancelAllOrders { instance_id, .. } => instance_id.clone(),
+        Signal::ReconcilePolymarket { instance_id, .. } => instance_id.as_str(),
+        Signal::PolymarketCancelAllOrders { instance_id, .. } => instance_id.as_str(),
         Signal::RetainPolymarketEventAudit { instance_id, .. }
-        | Signal::RetirePolymarketEventAudit { instance_id, .. } => instance_id.clone(),
-        _ => String::new(),
+        | Signal::RetirePolymarketEventAudit { instance_id, .. } => instance_id.as_str(),
+        _ => "",
     }
+}
+
+// Compatibility helpers build owned commands/results after leaving routing.
+fn extract_instance_id(signal: &Signal) -> String {
+    instance_id_view(signal).to_owned()
 }
 
 type AdmissionCounters = (u64, u64, u64);
@@ -15642,6 +15652,7 @@ fn try_send_poly_owner(
         return Err(command);
     }
     let mut start = *rr % lanes.len();
+    let mut selection = crate::types::FastLaneSelection::default();
     if role == hexagent_runtime::http1_pool::Role::Fast {
         if let Some(route) = lanes.first().and_then(|lane| lane.preparation.as_ref()) { route.refresh(); }
         // Rank only healthy idle candidates. Equal CPU load retains RR fairness.
@@ -15649,11 +15660,19 @@ fn try_send_poly_owner(
         for offset in 0..lanes.len() {
             let index = (*rr + offset) % lanes.len();
             let lane = &lanes[index];
-            if lane.metrics.occupied.load(Ordering::Acquire)
-                || health.as_mut().is_some_and(|health| !health.lane_place_allowed(lane.metrics.slot, now)) { continue; }
+            if lane.metrics.occupied.load(Ordering::Acquire) {
+                selection.busy_lanes = selection.busy_lanes.saturating_add(1);
+                continue;
+            }
+            if health.as_mut().is_some_and(|health| !health.lane_place_allowed(lane.metrics.slot, now)) {
+                selection.unhealthy_lanes = selection.unhealthy_lanes.saturating_add(1);
+                continue;
+            }
+            selection.eligible_lanes = selection.eligible_lanes.saturating_add(1);
             let score = lane.preparation.as_ref().map_or(0, |route| route.pending_on_core());
             if score < best { best = score; start = index; }
         }
+        selection.minimum_pending = (best != u64::MAX).then_some(best);
     }
     for offset in 0..lanes.len() {
         let index = (start + offset) % lanes.len();
@@ -15688,6 +15707,15 @@ fn try_send_poly_owner(
                 *expected_generation = health.as_ref().and_then(|health| health.lane_generation(lanes[index].metrics.slot));
             }
             _ => {}
+        }
+        if role == hexagent_runtime::http1_pool::Role::Fast {
+            if let PolyConnectionCommand::Place { order, .. } = &mut command {
+                order.hot_path.fast_selection = lanes[index].preparation.as_ref().map(|route| {
+                    selection.core = route.core() as u32;
+                    selection.selected_pending = route.pending_on_core();
+                    selection
+                });
+            }
         }
         match lanes[index].try_send(command) {
             Ok(()) => {
@@ -18762,6 +18790,8 @@ mod market_router_tests {
 
         let worker = thread::Builder::new()
             .name("strategy-single-test".into())
+            // Exercise the real worker with the production stack budget.
+            .stack_size(STRATEGY_WORKER_STACK_BYTES)
             .spawn(move || {
                 Engine::run_strategy_worker(
                     Box::new(WatchdogTestStrategy { watchdog_tx }),
@@ -20349,6 +20379,22 @@ mod market_router_tests {
         assert!(try_send_poly_owner(&mut accounts[0], Role::Fast, command()).is_ok());
         assert!(!receivers[1].2.is_empty());
         assert!(try_send_poly_owner(&mut accounts[0], Role::Fast, command()).is_err());
+        for (account, slot, rx) in &receivers {
+            if let Ok(PolyConnectionCommand::Place { order, .. }) = rx.try_recv() {
+                let trace = order.hot_path.fast_selection.expect("real CPU route is audited");
+                assert_eq!(trace.core, [5, 14][*slot]);
+                assert_eq!(trace.minimum_pending, Some(trace.selected_pending));
+                if *account == 0 && *slot == 1 {
+                    assert_eq!(trace.eligible_lanes, 1);
+                    assert_eq!(trace.busy_lanes, 1, "HTTP occupancy excludes the idle CPU slot");
+                    assert_eq!(trace.selected_pending, 1);
+                } else {
+                    assert_eq!(trace.eligible_lanes, 2);
+                    assert_eq!(trace.busy_lanes, 0);
+                }
+                assert_eq!(trace.unhealthy_lanes, 0);
+            }
+        }
     }
 
     #[test]

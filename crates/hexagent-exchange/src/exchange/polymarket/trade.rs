@@ -174,6 +174,10 @@ impl RuntimeOwnershipIndex {
     }
 
     fn publish(&self, order_id: &str, ownership: OrderOwnership) -> Result<Arc<RuntimeOwnershipEntry>, String> {
+        self.publish_counted(order_id, ownership).map(|(entry, _)| entry)
+    }
+
+    fn publish_counted(&self, order_id: &str, ownership: OrderOwnership) -> Result<(Arc<RuntimeOwnershipEntry>, u16), String> {
         let entry = Arc::new(RuntimeOwnershipEntry {
             normalized_order_id: RuntimeOrderId::new(order_id),
             ownership,
@@ -182,6 +186,16 @@ impl RuntimeOwnershipIndex {
         let start = self.start_index(normalized);
         for offset in 0..RUNTIME_OWNERSHIP_MAX_PROBES {
             let slot = &self.slots[(start + offset) % self.slots.len()];
+            // An unrelated collision is read-only. Even an RCU update that
+            // returns the same Arc pays outstanding reader debts across the
+            // process. Do not turn every probe into a publication on a Fast
+            // owner. The closure below still rechecks after a concurrent
+            // insert/remove; a stale observation cannot replace another OID.
+            if slot.load().as_ref().is_some_and(|existing| {
+                existing.normalized_order_id.as_ref() != normalized
+            }) {
+                continue;
+            }
             slot.rcu(|current| match current {
                 Some(existing) if existing.normalized_order_id.as_ref() != normalized => {
                     Some(Arc::clone(existing))
@@ -191,7 +205,7 @@ impl RuntimeOwnershipIndex {
             if slot.load().as_ref().is_some_and(|published| {
                 published.normalized_order_id.as_ref() == normalized
             }) {
-                return Ok(entry);
+                return Ok((entry, (offset + 1) as u16));
             }
         }
         Err(format!(
@@ -2481,7 +2495,8 @@ fn enqueue_prepared_order(
     local_oid: &str, ownership: OrderOwnership, trace: &mut crate::types::HotPathTrace,
 ) -> Result<(), String> {
     // The private route must be visible before HTTP can emit any bytes.
-    let entry = index.publish(local_oid, ownership)?;
+    let (entry, probes) = index.publish_counted(local_oid, ownership)?;
+    trace.identity_probes = probes;
     trace.identity_published_mono_ns = crate::types::monotonic_now_ns();
     if tx.try_send(AccountLifecycleJob::RegisterPreparedOrder(entry)).is_err() {
         index.remove(local_oid);

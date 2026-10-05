@@ -46,6 +46,9 @@ impl Route {
             }
         }
     }
+    pub(crate) fn core(&self) -> usize {
+        self.schedule.borrow().lanes[self.index].core
+    }
     pub(crate) fn pending_on_core(&self) -> u64 {
         let state = self.schedule.borrow();
         let core = state.lanes[self.index].core;

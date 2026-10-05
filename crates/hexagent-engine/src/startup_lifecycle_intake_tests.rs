@@ -130,6 +130,7 @@ impl Worker {
         let worker_compat_rx = compat_rx.clone();
         let join = thread::Builder::new()
             .name(format!("startup-intake-{id}"))
+            .stack_size(STRATEGY_WORKER_STACK_BYTES)
             .spawn(move || {
                 Engine::run_strategy_worker(
                     Box::new(strategy),
@@ -508,7 +509,9 @@ fn startup_lifecycle_intake_terminal_fault_retains_ownership_until_each_controll
             exit_calls: Arc::clone(&exit_calls),
             _retained: token,
         };
-        let worker = thread::spawn(move || {
+        let worker = thread::Builder::new()
+            .stack_size(STRATEGY_WORKER_STACK_BYTES)
+            .spawn(move || {
             Engine::run_strategy_worker(
                 Box::new(strategy),
                 market_rx,
@@ -526,7 +529,7 @@ fn startup_lifecycle_intake_terminal_fault_retains_ownership_until_each_controll
                 Arc::new(Instant::now()),
                 None,
             )
-        });
+        }).unwrap();
         let emergency = signals_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(emergency.owner, 0);
         assert!(
