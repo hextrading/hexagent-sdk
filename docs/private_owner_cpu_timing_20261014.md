@@ -5,6 +5,10 @@ the original receipt. `PrivateOwnerSpan.cpu_ns` is a duration measured on the
 calling thread; an unavailable or unmeasured CPU clock remains `None`. A CPU
 timestamp is never transferred to another worker for subtraction. The current
 worker's thread ID is distinct from the destination strategy's numeric owner.
+Wall entry is read before CPU entry; CPU completion is read before wall
+completion. Adjacent spans use independent paired marks: a start mark's wall
+read cannot serve as the preceding span's completion. Raw validation checks
+every measured CPU duration against its enclosing wall interval.
 
 The stages cover these boundaries:
 

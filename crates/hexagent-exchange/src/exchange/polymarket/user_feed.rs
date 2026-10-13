@@ -1832,14 +1832,6 @@ impl PrivateOwnerMark {
         }
     }
 
-    #[inline]
-    fn until(self, end: Self) -> PrivateOwnerSpan {
-        PrivateOwnerSpan {
-            started_ns: self.wall,
-            done_ns: end.wall,
-            cpu_ns: (self.cpu != 0 && end.cpu >= self.cpu).then(|| end.cpu - self.cpu),
-        }
-    }
 }
 
 fn private_owner_thread_id() -> u64 {
@@ -2773,8 +2765,11 @@ fn route_private_batch(
         if needs_archive && route_dedupe.repair_inflight {
             return Err("historical archive lookup is already in flight; replay required".into());
         }
+        // Each wall interval brackets its own CPU reads. Reusing a start
+        // mark as the previous span's end would put end.wall before end.cpu
+        // and could falsely report CPU greater than wall on a slow read.
+        let pre_route = turn.finish();
         let route_probe = PrivateOwnerMark::now();
-        let pre_route = turn.until(route_probe);
         let routed = match if durably_covered || needs_repair || needs_archive {
             Ok(Vec::new())
         } else {
@@ -6185,6 +6180,11 @@ mod tests {
         assert_eq!(first.owner,0);
         assert_eq!(first.timing.receipt.message_sequence,receipt.message_sequence);
         let stages=first.timing.private_owner;
+        for span in [stages.pre_route, stages.route_and_construct, stages.construct, stages.prepare_delivery] {
+            if let Some(cpu) = span.cpu_ns {
+                assert!(cpu <= span.done_ns - span.started_ns, "CPU interval must be bracketed by its wall interval");
+            }
+        }
         assert!(stages.pre_route.started_ns>1);
         assert!(stages.route_and_construct.started_ns>=stages.pre_route.done_ns);
         assert!(stages.construct.started_ns>=stages.route_and_construct.started_ns);
