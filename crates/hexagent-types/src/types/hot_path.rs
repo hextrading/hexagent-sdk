@@ -127,6 +127,14 @@ mod tests {
         assert_eq!(timing.root_router_dequeued_ns, 5);
         assert_eq!(timing.strategy_dequeued_ns, 0);
         assert_eq!(timing.receipt, MarketReceipt::default());
+        assert_eq!(timing.private_owner.pre_route.cpu_ns, None);
+        assert_eq!(timing.private_owner.publish_started_ns, 0);
+        let recent = (1_u64,2_u64,3_u64,4_u64,5_u64,MarketReceipt::default(),7_u32,8_u64);
+        let timing: super::super::LifecycleTiming = rmp_serde::from_slice(&rmp_serde::to_vec(&recent).unwrap()).unwrap();
+        assert_eq!(timing.root_router_dequeued_ns,5);
+        assert_eq!(timing.frame_event_index,7);
+        assert_eq!(timing.strategy_dequeued_ns,8);
+        assert_eq!(timing.private_owner.construct.cpu_ns,None);
         let old = (1_u64, MarketReceipt::default(), 2_u64, 3_u64, 4_u64, 5_u64,
             6_u64, 7_u64, 8_u64, 9_u64, 10_u64);
         let restored: HotPathTrace = rmp_serde::from_slice(&rmp_serde::to_vec(&old).unwrap()).unwrap();
