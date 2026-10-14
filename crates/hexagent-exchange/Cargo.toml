@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "hexagent-sdk: exchange adapters (market-data + execution traits), backtest sim (v2), market-data record/replay, and the cross-venue index price."
 
+[features]
+# Only selects the allocator in the offline libtest binary, never a consumer.
+offline-private-owner-mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+
 [dependencies]
+mimalloc = { version = "=0.1.52", default-features = false, features = ["extended"], optional = true }
+libmimalloc-sys = { version = "=0.1.49", features = ["extended"], optional = true }
 hexagent-types = { path = "../hexagent-types" }
 hexagent-config = { path = "../hexagent-config" }
 hexagent-account = { path = "../hexagent-account" }

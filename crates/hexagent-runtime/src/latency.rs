@@ -22,7 +22,7 @@ static DROPPED_STAGE_REGISTRATIONS: AtomicU64 = AtomicU64::new(0);
 /// CPU time of the calling worker, for separating work from scheduling waits.
 /// Returns zero where unavailable; callers must not label that wall time as CPU.
 pub fn thread_cpu_ns() -> u64 {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     unsafe {
         let mut clock: libc::timespec = std::mem::zeroed();
         if libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut clock) == 0 {
@@ -460,6 +460,8 @@ pub fn prepare_polymarket_private_stages() {
         "polymarket.user.cold_commit_ack_overflow",
         "polymarket.user.cold_committed_skip",
         "polymarket.user.dispatch",
+        "polymarket.user.dispatch_enqueue.wall",
+        "polymarket.user.dispatch_enqueue.cpu",
         "polymarket.user.event_parse",
         "polymarket.user.fast_route_to_account_owner",
         "polymarket.user.frame_total",

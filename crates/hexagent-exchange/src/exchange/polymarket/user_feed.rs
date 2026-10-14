@@ -36,6 +36,10 @@ use private_execution_cache::{ExecutionAckLane, ExecutionAckTicket, PrivateExecu
 #[path = "unified_private_owner.rs"]
 pub(crate) mod unified_private_owner;
 
+#[cfg(test)]
+#[path = "private_owner_benchmark.rs"]
+mod private_owner_benchmark;
+
 /// Current BTC crypto live default, matching the app's event fallback. Existing
 /// token curves take precedence; the selected amounts travel with the update.
 /// Non-crypto adapters must supply their own explicit basis instead of this policy.
@@ -1801,6 +1805,44 @@ struct FastPrivateUpdate {
     execution: Option<FrozenTradeExecution>,
 }
 
+/// No retained CPU timestamp crosses an owner/thread boundary. Marks live
+/// only on this routing turn's stack; the owned message carries durations.
+#[derive(Clone, Copy)]
+struct PrivateOwnerMark {
+    wall: u64,
+    cpu: u64,
+}
+
+impl PrivateOwnerMark {
+    #[inline]
+    fn now() -> Self {
+        Self {
+            wall: crate::types::monotonic_now_ns(),
+            cpu: hexagent_runtime::latency::thread_cpu_ns(),
+        }
+    }
+
+    #[inline]
+    fn finish(self) -> PrivateOwnerSpan {
+        let cpu = hexagent_runtime::latency::thread_cpu_ns();
+        PrivateOwnerSpan {
+            started_ns: self.wall,
+            done_ns: crate::types::monotonic_now_ns(),
+            cpu_ns: (self.cpu != 0 && cpu >= self.cpu).then(|| cpu - self.cpu),
+        }
+    }
+
+}
+
+fn private_owner_thread_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    unsafe { return libc::syscall(libc::SYS_gettid) as u64; }
+    #[cfg(target_os = "macos")]
+    unsafe { return libc::pthread_self() as u64; }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    0
+}
+
 #[derive(Debug)]
 struct PrivateRouteDedupe {
     capacity: usize,
@@ -2031,8 +2073,9 @@ fn route_private_event_fast_owned(
             };
             let produced_ns = now_ns();
             let mut timing = event.timing;
-            timing.private_producer_ns = crate::types::monotonic_now_ns();
-            Ok(vec![FastPrivateUpdate {
+            let construct = PrivateOwnerMark::now();
+            timing.private_producer_ns = construct.wall;
+            let mut routed = vec![FastPrivateUpdate {
                 execution: None,
                 owner: shared
                     .strategy_owner(&ownership.instance_id)
@@ -2067,7 +2110,9 @@ fn route_private_event_fast_owned(
                 },
                 identity,
                 timing,
-            }])
+            }];
+            routed[0].timing.private_owner.construct = construct.finish();
+            Ok(routed)
         }
         PrivateEventKind::Trade => {
             // A historical repair carries complete owner identity. Order/oid
@@ -2114,8 +2159,9 @@ fn route_private_event_fast_owned(
                     "historical repaired trade has no numeric strategy owner".to_string()
                 })?;
                 let mut timing = event.timing;
-                timing.private_producer_ns = crate::types::monotonic_now_ns();
-                return Ok(vec![FastPrivateUpdate {
+                let construct = PrivateOwnerMark::now();
+                timing.private_producer_ns = construct.wall;
+                let mut routed = vec![FastPrivateUpdate {
                     owner,
                     identity: PrivateRouteIdentity::TradeLifecycle {
                         fingerprint: private_route_fingerprint(b't', &[repair_trade]),
@@ -2142,7 +2188,9 @@ fn route_private_event_fast_owned(
                         order_audit: None,
                         error: private_failure_reason(data),
                     },
-                }]);
+                }];
+                routed[0].timing.private_owner.construct = construct.finish();
+                return Ok(routed);
             }
             let (status_name, status, rank) = private_status(data);
             // REST history commonly returns MATCHED even after the durable
@@ -2230,7 +2278,8 @@ fn route_private_event_fast_owned(
                             });
                         let produced_ns = now_ns();
                         let mut timing = event.timing;
-                        timing.private_producer_ns = crate::types::monotonic_now_ns();
+                        let construct = PrivateOwnerMark::now();
+                        timing.private_producer_ns = construct.wall;
                         routed.push(FastPrivateUpdate {
                             execution: None,
                             owner: shared.strategy_owner(&ownership.instance_id).ok_or_else(
@@ -2266,6 +2315,7 @@ fn route_private_event_fast_owned(
                             },
                             timing,
                         });
+                        routed.last_mut().unwrap().timing.private_owner.construct = construct.finish();
                     }
                 }
                 PrivateTradeRole::Taker => {
@@ -2374,7 +2424,8 @@ fn route_private_event_fast_owned(
                     }
                     let produced_ns = now_ns();
                     let mut timing = event.timing;
-                    timing.private_producer_ns = crate::types::monotonic_now_ns();
+                    let construct = PrivateOwnerMark::now();
+                    timing.private_producer_ns = construct.wall;
                     routed.push(FastPrivateUpdate {
                         execution: Some(execution),
                         owner: shared
@@ -2410,6 +2461,7 @@ fn route_private_event_fast_owned(
                         },
                         timing,
                     });
+                    routed.last_mut().unwrap().timing.private_owner.construct = construct.finish();
                 }
             }
             Ok(routed)
@@ -2507,7 +2559,7 @@ fn dispatch_private_update(
     let RoutedOrderUpdate {
         owner,
         update,
-        timing,
+        mut timing,
     } = routed;
     if update.client_order_id.is_empty() {
         if let Some(oid) = update.exchange_order_id.as_deref() {
@@ -2545,6 +2597,8 @@ fn dispatch_private_update(
         );
     }
     let dispatch_started = crate::latency::Instant::now();
+    let enqueue_probe = PrivateOwnerMark::now();
+    timing.private_owner.publish_started_ns = enqueue_probe.wall;
     let result = if let Some(generation) = recovery_generation {
         enqueue_recovery_update(shared, update_tx, generation, update)
             .map_err(|error| error.to_string())
@@ -2599,6 +2653,14 @@ fn dispatch_private_update(
                 }
             })
     };
+    let enqueue_span = enqueue_probe.finish();
+    crate::latency::record_ns(
+        "polymarket.user.dispatch_enqueue.wall",
+        enqueue_span.done_ns.saturating_sub(enqueue_span.started_ns),
+    );
+    if let Some(cpu) = enqueue_span.cpu_ns {
+        crate::latency::record_ns("polymarket.user.dispatch_enqueue.cpu", cpu);
+    }
     crate::latency::record("polymarket.user.dispatch", dispatch_started);
     result
 }
@@ -2654,6 +2716,7 @@ fn route_private_batch(
     let mut cold_identities = Vec::with_capacity(capacity);
     let mut durable_skips = 0usize;
     for mut event in events {
+        let turn = PrivateOwnerMark::now();
         // A cold archive/repair roundtrip retains the first ingress boundary.
         // Overwriting it would mislabel cold work as private queue residence.
         if event.timing.private_owner_dequeued_ns == 0 {
@@ -2702,6 +2765,11 @@ fn route_private_batch(
         if needs_archive && route_dedupe.repair_inflight {
             return Err("historical archive lookup is already in flight; replay required".into());
         }
+        // Each wall interval brackets its own CPU reads. Reusing a start
+        // mark as the previous span's end would put end.wall before end.cpu
+        // and could falsely report CPU greater than wall on a slow read.
+        let pre_route = turn.finish();
+        let route_probe = PrivateOwnerMark::now();
         let routed = match if durably_covered || needs_repair || needs_archive {
             Ok(Vec::new())
         } else {
@@ -2717,6 +2785,7 @@ fn route_private_batch(
                 return Err(error);
             }
         };
+        let route_span = route_probe.finish();
         let requires_revalidation = event.kind == PrivateEventKind::Trade
             && trade_payload_requires_revalidation(payload, shared);
         event.needs_execution_repair = needs_repair;
@@ -2727,6 +2796,7 @@ fn route_private_batch(
             && cold_committed
                 .is_some_and(|dedupe| routed.iter().all(|routed| dedupe.seen(&routed.identity)));
         for routed in routed {
+            let prepare_delivery = PrivateOwnerMark::now();
             if let Some(execution) = routed.execution {
                 event.execution = Some(execution);
                 event.execution_ack = route_dedupe
@@ -2741,10 +2811,15 @@ fn route_private_batch(
             if route_dedupe.seen(&routed.identity) {
                 continue;
             }
+            let mut timing = routed.timing;
+            timing.private_owner.pre_route = pre_route;
+            timing.private_owner.route_and_construct = route_span;
+            timing.private_owner.thread_id = private_owner_thread_id();
+            timing.private_owner.prepare_delivery = prepare_delivery.finish();
             let update = RoutedOrderUpdate {
                 owner: routed.owner,
                 update: routed.update,
-                timing: routed.timing,
+                timing,
             };
             if needs_delivery {
                 let instance = route_dedupe
@@ -6081,6 +6156,59 @@ mod tests {
         .unwrap();
         assert!(duplicate.events.is_empty());
         assert!(duplicate.identities.is_empty());
+    }
+
+    #[test]
+    fn private_owner_timing_overflow_retry_preserves_identity_and_commits_only_delivery() {
+        let shared=test_shared();
+        shared.account_state.register_instance("owner-1",1.0);
+        shared.account_state.apply_physical_snapshot(100.,HashMap::new()).unwrap();
+        shared.account_state.reserve_order("owner-1","owner-1-1","0xabc1","TOKEN",Side::Buy,5.,0.5,0).unwrap();
+        shared.register_order_id("owner-1-1","0xabc1","TOKEN");
+        shared.flush_execution_state_for_test();
+        let receipt=ReceiptSequencer::new().received().parsed();
+        let event=|kind:&str| PrivateEventDelta::classify_with_timing(serde_json::json!({
+            "event_type":"order","type":kind,"order_id":"0xabc1","asset_id":"TOKEN",
+            "side":"BUY","price":"0.5","original_size":"5","size_matched":"0"
+        }),LifecycleTiming{private_ws_received_ns:receipt.ws_received_mono_ns,
+            private_json_parsed_ns:receipt.parsed_mono_ns,receipt,private_owner_dequeued_ns:1,
+            ..Default::default()}).unwrap();
+        let (tx,rx)=crossbeam_channel::bounded(1);
+        let mut dedupe=PrivateRouteDedupe::new();
+        route_private_batch(&shared,&tx,[event("PLACEMENT")],None,&mut dedupe,None).unwrap();
+        let first=rx.recv().unwrap();
+        assert_eq!(first.owner,0);
+        assert_eq!(first.timing.receipt.message_sequence,receipt.message_sequence);
+        let stages=first.timing.private_owner;
+        for span in [stages.pre_route, stages.route_and_construct, stages.construct, stages.prepare_delivery] {
+            if let Some(cpu) = span.cpu_ns {
+                assert!(cpu <= span.done_ns - span.started_ns, "CPU interval must be bracketed by its wall interval");
+            }
+        }
+        assert!(stages.pre_route.started_ns>1);
+        assert!(stages.route_and_construct.started_ns>=stages.pre_route.done_ns);
+        assert!(stages.construct.started_ns>=stages.route_and_construct.started_ns);
+        assert!(stages.construct.done_ns<=stages.route_and_construct.done_ns);
+        assert!(stages.prepare_delivery.started_ns>=stages.route_and_construct.done_ns);
+        assert!(stages.publish_started_ns>=stages.prepare_delivery.done_ns);
+        #[cfg(any(target_os="linux",target_os="macos"))]
+        assert!(stages.pre_route.cpu_ns.is_some() && stages.route_and_construct.cpu_ns.is_some());
+        tx.send(first).unwrap();
+        let cancelled=event("CANCELLATION");
+        assert!(route_private_batch(&shared,&tx,[cancelled.clone()],None,&mut dedupe,None).is_err());
+        let cancelled_id=PrivateRouteIdentity::TradeLifecycle{fingerprint:private_route_fingerprint(b'o',&["0xabc1"]),rank:3};
+        assert!(!dedupe.seen(&cancelled_id));
+        rx.recv().unwrap();
+        let retry_started=crate::types::monotonic_now_ns();
+        route_private_batch(&shared,&tx,[cancelled.clone()],None,&mut dedupe,None).unwrap();
+        let retried=rx.recv().unwrap();
+        assert_eq!(retried.update.status,OrderStatus::Cancelled);
+        assert_eq!(retried.timing.private_owner_dequeued_ns,1);
+        assert_eq!(retried.timing.receipt.message_sequence,receipt.message_sequence);
+        assert!(retried.timing.private_owner.pre_route.started_ns>=retry_started);
+        assert!(dedupe.seen(&cancelled_id));
+        route_private_batch(&shared,&tx,[cancelled],None,&mut dedupe,None).unwrap();
+        assert!(rx.is_empty());
     }
 
     #[test]

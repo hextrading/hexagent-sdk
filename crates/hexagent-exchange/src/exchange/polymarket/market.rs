@@ -9978,10 +9978,15 @@ impl ExchangeMarket for PolymarketMarket {
 
 #[cfg(test)]
 pub(super) mod clob_test_allocator {
-    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::alloc::{GlobalAlloc, Layout};
+    #[cfg(not(feature = "offline-private-owner-mimalloc"))]
+    use std::alloc::System as UnderlyingAllocator;
+    #[cfg(feature = "offline-private-owner-mimalloc")]
+    use mimalloc::MiMalloc as UnderlyingAllocator;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub(super) struct CountingAllocator;
+    static ALLOCATOR: UnderlyingAllocator = UnderlyingAllocator;
 
     static TRACKED_THREAD: AtomicUsize = AtomicUsize::new(0);
     static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -10001,11 +10006,11 @@ pub(super) mod clob_test_allocator {
                 ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
                 ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
             }
-            unsafe { System.alloc(layout) }
+            unsafe { ALLOCATOR.alloc(layout) }
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            unsafe { System.dealloc(ptr, layout) }
+            unsafe { ALLOCATOR.dealloc(ptr, layout) }
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -10013,7 +10018,7 @@ pub(super) mod clob_test_allocator {
                 ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
                 ALLOCATED_BYTES.fetch_add(new_size, Ordering::Relaxed);
             }
-            unsafe { System.realloc(ptr, layout, new_size) }
+            unsafe { ALLOCATOR.realloc(ptr, layout, new_size) }
         }
     }
 

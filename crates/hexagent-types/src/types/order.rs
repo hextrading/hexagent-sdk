@@ -398,13 +398,36 @@ pub struct OrderUpdate {
     pub error: Option<String>,
 }
 
+/// Same-worker measured span. CPU is a duration, never a CPU timestamp from
+/// another worker; None denotes an unavailable clock or an unmeasured span.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrivateOwnerSpan {
+    pub started_ns: u64,
+    pub done_ns: u64,
+    pub cpu_ns: Option<u64>,
+}
+
+/// Current routing turn only. A cold repair may retain the original ingress
+/// stamp while these spans measure the retry on its actual owner thread.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrivateOwnerStages {
+    pub pre_route: PrivateOwnerSpan,
+    pub route_and_construct: PrivateOwnerSpan,
+    /// One output construction; nested in route_and_construct for a fanout.
+    pub construct: PrivateOwnerSpan,
+    pub prepare_delivery: PrivateOwnerSpan,
+    /// Before the enqueue attempt, not the successful enqueue/return time.
+    pub publish_started_ns: u64,
+    /// Actual current routing worker; zero where unavailable. This differs
+    /// from RoutedOrderUpdate.owner, which identifies the destination strategy.
+    pub thread_id: u64,
+}
+
 /// Monotonic, process-local timestamps carried with one lifecycle update.
-///
-/// Venue wall-clock time remains on [`OrderUpdate::exchange_event_timestamp_ns`].
-/// These boundaries deliberately use the local monotonic clock so network
-/// transit cannot be mistaken for private-owner or strategy scheduling delay.
-/// Zero means that the producer does not expose that boundary (execution,
-/// replay and non-Polymarket adapters use the default trace).
+/// Venue timestamps stay on OrderUpdate. Zero/None means unknown, including
+/// replay and adapters that do not expose a particular boundary.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct LifecycleTiming {
     pub private_ws_received_ns: u64,
@@ -421,6 +444,27 @@ pub struct LifecycleTiming {
     #[serde(default)]
     pub strategy_dequeued_ns: u64,
 
+    // Append only: MessagePack recordings encode this struct positionally.
+    #[serde(default)]
+    pub private_owner: PrivateOwnerStages,
+
+}
+
+#[cfg(test)]
+mod private_owner_timing_tests {
+    use super::*;
+    #[test]
+    fn private_owner_old_messages_keep_unknown_cpu_and_receipt() {
+        let value=serde_json::json!({"private_ws_received_ns":10,"private_json_parsed_ns":20,
+            "private_owner_dequeued_ns":30,"private_producer_ns":40,"root_router_dequeued_ns":50});
+        let timing:LifecycleTiming=serde_json::from_value(value).unwrap();
+        assert_eq!(timing.private_owner.pre_route.started_ns,0);
+        assert_eq!(timing.private_owner.pre_route.cpu_ns,None);
+        assert_eq!(timing.private_owner.publish_started_ns,0);
+        assert_eq!(timing.private_ws_received_ns,10);
+        let encoded=serde_json::to_value(timing).unwrap();
+        assert!(encoded["private_owner"]["construct"]["cpu_ns"].is_null());
+    }
 }
 
 /// Strategy-owned lifecycle message used across execution and authenticated
