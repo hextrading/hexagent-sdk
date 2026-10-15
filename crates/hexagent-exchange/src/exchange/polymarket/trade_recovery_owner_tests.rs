@@ -361,9 +361,6 @@ fn exact_cancel_ack_survives_history_failure_and_resumes_without_another_delete(
     assert_eq!(after_failure.filled_quantity, 0.0);
     let resumed = trade.cancel_unknown_order_via_owners(&after_failure, &order.order_id);
     let repeated_delete = server.join().unwrap();
-    shutdown.request();
-    shutdown.finish();
-    trade.shared.join_background_workers();
     assert!(
         !repeated_delete,
         "a successful DELETE must survive a failed audit"
@@ -384,6 +381,9 @@ fn exact_cancel_ack_survives_history_failure_and_resumes_without_another_delete(
             .unwrap(),
         sibling
     );
+    shutdown.request();
+    shutdown.finish();
+    trade.shared.join_background_workers();
 }
 
 #[test]
