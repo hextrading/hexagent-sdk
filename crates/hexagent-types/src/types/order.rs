@@ -411,8 +411,15 @@ pub struct PrivateOwnerSpan {
 /// Current routing turn only. A cold repair may retain the original ingress
 /// stamp while these spans measure the retry on its actual owner thread.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "PrivateOwnerStagesWire", into = "PrivateOwnerStagesWire")]
 pub struct PrivateOwnerStages {
+    // Retain routing storage order; serialization order is defined separately.
+    pub ownership_lookup: PrivateOwnerSpan,
+    pub ownership_cold_fallback: bool,
+    pub turn_started_ns: u64,
+    /// First dequeue to current turn, including prior CPU and cold waits.
+    pub prior_turn_elapsed_ns: u64,
+    pub route_turns: u32,
     pub pre_route: PrivateOwnerSpan,
     pub route_and_construct: PrivateOwnerSpan,
     /// One output construction; nested in route_and_construct for a fanout.
@@ -423,13 +430,60 @@ pub struct PrivateOwnerStages {
     /// Actual current routing worker; zero where unavailable. This differs
     /// from RoutedOrderUpdate.owner, which identifies the destination strategy.
     pub thread_id: u64,
-    // Append only: nested MessagePack records encode fields positionally.
-    pub ownership_lookup: PrivateOwnerSpan,
-    pub ownership_cold_fallback: bool,
-    pub turn_started_ns: u64,
-    /// First dequeue to current turn, including prior CPU and cold waits.
-    pub prior_turn_elapsed_ns: u64,
-    pub route_turns: u32,
+}
+
+// Append only: MessagePack records encode these fields positionally. Converting
+// on the recorder/reader keeps codec changes independent of routing storage.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct PrivateOwnerStagesWire {
+    pre_route: PrivateOwnerSpan,
+    route_and_construct: PrivateOwnerSpan,
+    construct: PrivateOwnerSpan,
+    prepare_delivery: PrivateOwnerSpan,
+    publish_started_ns: u64,
+    thread_id: u64,
+    ownership_lookup: PrivateOwnerSpan,
+    ownership_cold_fallback: bool,
+    turn_started_ns: u64,
+    prior_turn_elapsed_ns: u64,
+    route_turns: u32,
+}
+
+impl From<PrivateOwnerStages> for PrivateOwnerStagesWire {
+    fn from(value: PrivateOwnerStages) -> Self {
+        Self {
+            pre_route: value.pre_route,
+            route_and_construct: value.route_and_construct,
+            construct: value.construct,
+            prepare_delivery: value.prepare_delivery,
+            publish_started_ns: value.publish_started_ns,
+            thread_id: value.thread_id,
+            ownership_lookup: value.ownership_lookup,
+            ownership_cold_fallback: value.ownership_cold_fallback,
+            turn_started_ns: value.turn_started_ns,
+            prior_turn_elapsed_ns: value.prior_turn_elapsed_ns,
+            route_turns: value.route_turns,
+        }
+    }
+}
+
+impl From<PrivateOwnerStagesWire> for PrivateOwnerStages {
+    fn from(value: PrivateOwnerStagesWire) -> Self {
+        Self {
+            pre_route: value.pre_route,
+            route_and_construct: value.route_and_construct,
+            construct: value.construct,
+            prepare_delivery: value.prepare_delivery,
+            publish_started_ns: value.publish_started_ns,
+            thread_id: value.thread_id,
+            ownership_lookup: value.ownership_lookup,
+            ownership_cold_fallback: value.ownership_cold_fallback,
+            turn_started_ns: value.turn_started_ns,
+            prior_turn_elapsed_ns: value.prior_turn_elapsed_ns,
+            route_turns: value.route_turns,
+        }
+    }
 }
 
 /// Monotonic, process-local timestamps carried with one lifecycle update.
@@ -478,9 +532,12 @@ mod private_owner_timing_tests {
         assert_eq!(timing.private_ws_received_ns, 1);
         assert_eq!(timing.strategy_dequeued_ns, 6);
         let new = PrivateOwnerStages { route_turns: 2, prior_turn_elapsed_ns: 100,
+            turn_started_ns: 40, ownership_lookup: span,
             ownership_cold_fallback: true, ..restored };
         let roundtrip: PrivateOwnerStages = rmp_serde::from_slice(&rmp_serde::to_vec(&new).unwrap()).unwrap();
         assert_eq!(roundtrip.route_turns, 2);
+        assert_eq!(roundtrip.turn_started_ns, 40);
+        assert_eq!(roundtrip.ownership_lookup.cpu_ns, Some(7));
         assert_eq!(roundtrip.prior_turn_elapsed_ns, 100);
         assert!(roundtrip.ownership_cold_fallback);
         assert_eq!(roundtrip.thread_id, 60);
