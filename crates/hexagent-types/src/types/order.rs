@@ -413,6 +413,12 @@ pub struct PrivateOwnerSpan {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrivateOwnerStages {
+    pub ownership_lookup: PrivateOwnerSpan,
+    pub ownership_cold_fallback: bool,
+    pub turn_started_ns: u64,
+    /// First dequeue to current turn, including prior CPU and cold waits.
+    pub prior_turn_elapsed_ns: u64,
+    pub route_turns: u32,
     pub pre_route: PrivateOwnerSpan,
     pub route_and_construct: PrivateOwnerSpan,
     /// One output construction; nested in route_and_construct for a fanout.

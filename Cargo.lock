@@ -1239,6 +1239,7 @@ dependencies = [
  "sha2",
  "sha3",
  "simd-json",
+ "smallvec",
  "tempfile",
  "tokio",
  "tokio-tungstenite",

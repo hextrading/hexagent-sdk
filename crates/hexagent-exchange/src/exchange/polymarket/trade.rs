@@ -107,10 +107,24 @@ struct RuntimeOwnershipIndex {
 }
 
 #[derive(Debug)]
-struct RuntimeOwnershipEntry {
+pub(crate) struct RuntimeOwnershipEntry {
     normalized_order_id: RuntimeOrderId,
     ownership: OrderOwnership,
 }
+
+/// Immutable published ownership; the private owner borrows its fields rather
+/// than cloning every String before constructing its one owned output.
+pub(crate) enum PrivateOrderOwnership {
+    Runtime(Arc<RuntimeOwnershipEntry>),
+    Recovered(OrderOwnership),
+}
+impl std::ops::Deref for PrivateOrderOwnership {
+    type Target = OrderOwnership;
+    fn deref(&self) -> &OrderOwnership {
+        match self { Self::Runtime(entry) => &entry.ownership, Self::Recovered(owner) => owner }
+    }
+}
+
 
 /// Canonical live OIDs fit inline; legacy recovery IDs retain exact semantics.
 #[derive(Debug)]
@@ -5774,12 +5788,23 @@ impl SharedState {
             .cloned()
     }
 
+    pub(crate) fn lookup_private_order_ownership(&self, order_id: &str) -> Option<PrivateOrderOwnership> {
+        if let Some(entry) = self.runtime_order_ownership.find_entry(order_id) {
+            return Some(PrivateOrderOwnership::Runtime(entry));
+        }
+        self.lookup_order_ownership_cold(order_id).map(PrivateOrderOwnership::Recovered)
+    }
+
     pub(crate) fn lookup_order_ownership(&self, exchange_order_id: &str) -> Option<OrderOwnership> {
         // Runtime routing is published before asynchronous durable ownership.
         // Private messages therefore never wait for the shared ledger writer.
         if let Some(mirrored) = self.runtime_order_ownership.get(exchange_order_id) {
             return Some(mirrored);
         }
+        self.lookup_order_ownership_cold(exchange_order_id)
+    }
+
+    fn lookup_order_ownership_cold(&self, exchange_order_id: &str) -> Option<OrderOwnership> {
         // Restart/cold-recovery fallback only. Settled-event GC may have
         // retired the compact runtime route before a delayed private replay;
         // recover the retained durable terminal ownership by OID in that rare
