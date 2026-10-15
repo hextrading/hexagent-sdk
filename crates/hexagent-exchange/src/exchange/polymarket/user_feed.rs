@@ -1975,7 +1975,7 @@ fn route_private_event_fast_owned(
     event: &PrivateEventDelta,
     shared: &SharedState,
     cache: &mut PrivateExecutionCache,
-) -> std::result::Result<Vec<FastPrivateUpdate>, String> {
+) -> std::result::Result<smallvec::SmallVec<[FastPrivateUpdate; 1]>, String> {
     let data = event.payload();
     match event.kind {
         PrivateEventKind::Order => {
@@ -1999,9 +1999,16 @@ fn route_private_event_fast_owned(
                     "invalid order lifecycle economics order_id={order_id}"
                 ));
             }
-            let ownership = shared.lookup_order_ownership(order_id).ok_or_else(|| {
+            // The four main owner spans remain event-complete. Auxiliary
+            // lookup clocks are deterministic 1/64 receipt sampling: zeros
+            // mean unavailable, never zero work. Avoid two extra CPU-clock
+            // syscalls on every otherwise allocation-light ORDER.
+            let ownership_mark = (event.timing.receipt.message_sequence & 63 == 0)
+                .then(PrivateOwnerMark::now);
+            let ownership = shared.lookup_private_order_ownership(order_id).ok_or_else(|| {
                 format!("unowned private order lifecycle event for order_id `{order_id}`")
             })?;
+            let ownership_span = ownership_mark.map(PrivateOwnerMark::finish).unwrap_or_default();
             if ownership.token_id != asset_id
                 || ownership.side != side
                 || !close_enough(ownership.quantity, original_size)
@@ -2075,7 +2082,9 @@ fn route_private_event_fast_owned(
             let mut timing = event.timing;
             let construct = PrivateOwnerMark::now();
             timing.private_producer_ns = construct.wall;
-            let mut routed = vec![FastPrivateUpdate {
+            timing.private_owner.ownership_lookup = ownership_span;
+            timing.private_owner.ownership_cold_fallback = matches!(&ownership, super::trade::PrivateOrderOwnership::Recovered(_));
+            let mut routed: smallvec::SmallVec<[FastPrivateUpdate; 1]> = smallvec::smallvec![FastPrivateUpdate {
                 execution: None,
                 owner: shared
                     .strategy_owner(&ownership.instance_id)
@@ -2087,7 +2096,7 @@ fn route_private_event_fast_owned(
                     })?,
                 update: OrderUpdate {
                     order_slot: ownership.order_slot,
-                    client_order_id: ownership.client_order_id,
+                    client_order_id: ownership.client_order_id.clone(),
                     exchange: Exchange::Polymarket,
                     symbol: asset_id.to_string(),
                     side,
@@ -2102,8 +2111,11 @@ fn route_private_event_fast_owned(
                     trade_id: None,
                     trade_fee: None,
                     order_audit: Some(AuthoritativeOrderAudit {
-                        original_size: Some(original_size.to_string()),
-                        size_matched: Some(size_matched.to_string()),
+                        original_size: Some(data.get("original_size").or_else(|| data.get("size"))
+                            .and_then(serde_json::Value::as_str).map(str::to_owned)
+                            .unwrap_or_else(|| original_size.to_string())),
+                        size_matched: Some(data.get("size_matched").and_then(serde_json::Value::as_str)
+                            .map(str::to_owned).unwrap_or_else(|| size_matched.to_string())),
                         associate_trades,
                     }),
                     error: None,
@@ -2161,7 +2173,7 @@ fn route_private_event_fast_owned(
                 let mut timing = event.timing;
                 let construct = PrivateOwnerMark::now();
                 timing.private_producer_ns = construct.wall;
-                let mut routed = vec![FastPrivateUpdate {
+                let mut routed: smallvec::SmallVec<[FastPrivateUpdate; 1]> = smallvec::smallvec![FastPrivateUpdate {
                     owner,
                     identity: PrivateRouteIdentity::TradeLifecycle {
                         fingerprint: private_route_fingerprint(b't', &[repair_trade]),
@@ -2205,19 +2217,19 @@ fn route_private_event_fast_owned(
                     high_water_started,
                 );
                 if covered {
-                    return Ok(Vec::new());
+                    return Ok(smallvec::SmallVec::new());
                 }
             }
             let fields_started = crate::latency::Instant::now();
             let role = validate_trade_event(data, shared)?;
             crate::latency::record("polymarket.user.validate_trade_fields", fields_started);
             if rank == 0 || status_name == "RETRYING" {
-                return Ok(Vec::new());
+                return Ok(smallvec::SmallVec::new());
             }
             let trade_id = required_string(data, &["id", "trade_id"], "trade_id")?;
             let exchange_timestamp_ns = exchange_event_timestamp_ns(data);
             let failure_reason = private_failure_reason(data);
-            let mut routed = Vec::new();
+            let mut routed = smallvec::SmallVec::<[FastPrivateUpdate; 1]>::new();
             match role {
                 PrivateTradeRole::Maker => {
                     for maker in data
@@ -2327,7 +2339,7 @@ fn route_private_event_fast_owned(
                             // account as the taker. Defer the strict historical
                             // ownership proof to the cold single writer without
                             // broadcasting an unowned fill to any strategy.
-                            return Ok(Vec::new());
+                            return Ok(smallvec::SmallVec::new());
                         }
                         None => {
                             return Err(format!(
@@ -2354,7 +2366,7 @@ fn route_private_event_fast_owned(
                     // eligible for repricing or another strategy delivery.
                     if cached.is_none() && shared.account_state.has_private_trade_identity(trade_id)
                     {
-                        return Ok(Vec::new());
+                        return Ok(smallvec::SmallVec::new());
                     }
                     let execution = if let Some(execution) = cached {
                         if execution.gross_notional.is_some() {
@@ -2473,7 +2485,7 @@ fn route_private_event_fast_owned(
 fn route_private_event_fast(
     event: &PrivateEventDelta,
     shared: &SharedState,
-) -> std::result::Result<Vec<FastPrivateUpdate>, String> {
+) -> std::result::Result<smallvec::SmallVec<[FastPrivateUpdate; 1]>, String> {
     let mut cache = PrivateExecutionCache::new(shared.account_state.private_execution_seed())?;
     route_private_event_fast_owned(event, shared, &mut cache)
 }
@@ -2717,6 +2729,11 @@ fn route_private_batch(
     let mut durable_skips = 0usize;
     for mut event in events {
         let turn = PrivateOwnerMark::now();
+        event.timing.private_owner.turn_started_ns = turn.wall;
+        event.timing.private_owner.prior_turn_elapsed_ns = if event.timing.private_owner_dequeued_ns == 0 { 0 } else {
+            turn.wall.saturating_sub(event.timing.private_owner_dequeued_ns)
+        };
+        event.timing.private_owner.route_turns = event.timing.private_owner.route_turns.saturating_add(1);
         // A cold archive/repair roundtrip retains the first ingress boundary.
         // Overwriting it would mislabel cold work as private queue residence.
         if event.timing.private_owner_dequeued_ns == 0 {
@@ -2771,7 +2788,7 @@ fn route_private_batch(
         let pre_route = turn.finish();
         let route_probe = PrivateOwnerMark::now();
         let routed = match if durably_covered || needs_repair || needs_archive {
-            Ok(Vec::new())
+            Ok(smallvec::SmallVec::<[FastPrivateUpdate; 1]>::new())
         } else {
             route_private_event_fast_owned(
                 &event,
@@ -6175,9 +6192,15 @@ mod tests {
             ..Default::default()}).unwrap();
         let (tx,rx)=crossbeam_channel::bounded(1);
         let mut dedupe=PrivateRouteDedupe::new();
+        let inline = route_private_event_fast(&event("PLACEMENT"), &shared).unwrap();
+        assert!(!inline.spilled(), "single-owner ORDER must stay inline");
+        assert_eq!(inline[0].update.order_audit.as_ref().unwrap().original_size.as_deref(), Some("5"));
         route_private_batch(&shared,&tx,[event("PLACEMENT")],None,&mut dedupe,None).unwrap();
         let first=rx.recv().unwrap();
         assert_eq!(first.owner,0);
+        assert_eq!(first.timing.private_owner.route_turns, 1);
+        assert!(first.timing.private_owner.prior_turn_elapsed_ns > 0);
+        assert!(first.timing.private_owner.ownership_lookup.done_ns >= first.timing.private_owner.ownership_lookup.started_ns);
         assert_eq!(first.timing.receipt.message_sequence,receipt.message_sequence);
         let stages=first.timing.private_owner;
         for span in [stages.pre_route, stages.route_and_construct, stages.construct, stages.prepare_delivery] {

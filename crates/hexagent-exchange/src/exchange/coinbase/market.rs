@@ -26,6 +26,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// `read.next().await` doesn't surface as an error. Coinbase L2 +
 /// matches push at multiple Hz combined, so 30 s is generous.
 const STALE_THRESHOLD: Duration = Duration::from_secs(30);
+// Heartbeats/trades must not keep a stalled reference book alive. This is
+// connection recovery only; strategy freshness/clock calibration is unchanged.
+const BOOK_STALE_THRESHOLD: Duration = Duration::from_secs(3);
 
 /// Ordered f64 wrapper for BTreeMap keys (bid descending, ask ascending).
 #[derive(Clone, Copy, PartialEq)]
@@ -50,6 +53,8 @@ struct LocalBook {
     bids: BTreeMap<OrdF64, f64>,
     asks: BTreeMap<OrdF64, f64>,
     ready: bool,
+    last_usable_at: tokio::time::Instant,
+    last_source_ns: u64,
 }
 
 impl LocalBook {
@@ -58,7 +63,20 @@ impl LocalBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             ready: false,
+            last_usable_at: tokio::time::Instant::now(),
+            last_source_ns: 0,
         }
+    }
+
+    fn book_stalled(&self, now: tokio::time::Instant, unix_ns: u64) -> bool {
+        now.saturating_duration_since(self.last_usable_at) >= BOOK_STALE_THRESHOLD
+            || (self.last_source_ns != 0
+                && unix_ns.saturating_sub(self.last_source_ns) >= BOOK_STALE_THRESHOLD.as_nanos() as u64)
+    }
+
+    fn mark_usable(&mut self, source_ns: u64) {
+        self.last_usable_at = tokio::time::Instant::now();
+        self.last_source_ns = source_ns;
     }
 
     fn clear(&mut self) {
@@ -199,10 +217,21 @@ async fn coinbase_ws_task(
 
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.tick().await;
+        let mut book_watchdog = tokio::time::interval(Duration::from_millis(500));
+        book_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        book_watchdog.tick().await;
 
         loop {
             tokio::select! {
                 biased;
+                _ = book_watchdog.tick() => {
+                    let now = tokio::time::Instant::now();
+                    let unix_ns = now_ns();
+                    if books.values().any(|book| book.book_stalled(now, unix_ns)) {
+                        warn!("[Coinbase] Reference book stale for >=3s despite transport activity — reconnecting to re-snapshot");
+                        break;
+                    }
+                }
                 _ = ping_interval.tick() => {
                     if let Err(e) = write.send(Message::Ping(Vec::new())).await {
                         warn!("[Coinbase] Ping send failed: {}", e);
@@ -334,6 +363,7 @@ async fn coinbase_ws_task(
                                 if !book.bids.is_empty() && !book.asks.is_empty() { backoff.reset(); }
                                 let (bids, asks) = book.snapshot(MAX_DEPTH);
                                 if bids.is_empty() || asks.is_empty() { continue; }
+                                book.mark_usable(now_ns());
                                 let event = MarketEvent::OrderBook(OrderBookSnapshot { receipt: receipt.parsed(),
                                     exchange: Exchange::Coinbase,
                                     symbol: product_id.to_string(),
@@ -374,6 +404,7 @@ async fn coinbase_ws_task(
                                     .unwrap_or_else(now_ns);
                                 let (bids, asks) = book.snapshot(MAX_DEPTH);
                                 if bids.is_empty() || asks.is_empty() { continue; }
+                                book.mark_usable(exchange_ts);
                                 let event = MarketEvent::OrderBook(OrderBookSnapshot { receipt: receipt.parsed(),
                                     exchange: Exchange::Coinbase,
                                     symbol: product_id.to_string(),
@@ -456,6 +487,30 @@ impl ExchangeMarket for CoinbaseMarket {
 #[cfg(test)]
 mod gap_tests {
     use super::trade_id_gap;
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeats_cannot_mask_missing_snapshot_or_stalled_book_and_fresh_snapshot_recovers() {
+        let mut book = super::LocalBook::new();
+        let now = tokio::time::Instant::now();
+        assert!(!book.book_stalled(now, 1));
+        tokio::time::advance(std::time::Duration::from_millis(3000)).await;
+        assert!(book.book_stalled(tokio::time::Instant::now(), 1));
+        book.mark_usable(10_000_000_000);
+        assert!(!book.book_stalled(tokio::time::Instant::now(), 10_000_000_000));
+        // Fresh arrival with an old source timestamp is still stale.
+        book.mark_usable(1);
+        assert!(book.book_stalled(tokio::time::Instant::now(), 10_000_000_000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_product_cannot_hide_a_siblings_stall_or_refresh_its_book() {
+        let mut a = super::LocalBook::new();
+        let b = super::LocalBook::new();
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+        a.mark_usable(10);
+        assert!(!a.book_stalled(tokio::time::Instant::now(), 10));
+        assert!(b.book_stalled(tokio::time::Instant::now(), 10));
+    }
 
     #[test]
     fn baseline_first_trade_is_not_a_gap() {

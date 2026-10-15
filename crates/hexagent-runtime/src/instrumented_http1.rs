@@ -27,13 +27,12 @@ use tower_service::Service;
 type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 
 /// Connection establishment is cold work, including synchronous certificate
-/// verification inside a TLS future poll. The existing order runtime's
-/// demoted blocking workers poll it with that same runtime handle: TCP socket
-/// registration remains on the order reactor, while crypto does not delay
-/// another slot's first request poll. No worker is added to the quote lane.
-/// At most one connect per exclusive physical slot is submitted. The reply
-/// is capacity one; dropping the caller cancels the owned connect future,
-/// including a pending socket, rather than detaching an unlimited repair.
+/// verification inside a TLS future poll. A startup-owned SCHED_OTHER runtime
+/// polls at most 64 queued+active connects, with the original runtime entered
+/// for socket/timer registration. Warm I/O retains its reactor; a handshake
+/// no longer occupies a blocking worker on the shared background CPU.
+/// Each exclusive physical slot submits at most one connect. The reply is
+/// capacity one; caller cancellation drops the owned future and socket.
 async fn cold_connect<F>(future: F) -> std::io::Result<F::Output>
 where
     F: Future + Send + 'static,
@@ -47,33 +46,31 @@ pub(crate) async fn cold_connect_via<F>(future: F,
 ) -> std::io::Result<F::Output>
 where F: Future + Send + 'static, F::Output: Send + 'static,
 {
-    let runtime = tokio::runtime::Handle::current();
+    let registration = tokio::runtime::Handle::current();
     let (mut tx, rx) = tokio::sync::oneshot::channel();
-    submit(Box::new(move || {
+    submit(Box::pin(async move {
         if tx.is_closed() { return; }
-        // This call may create an OS worker synchronously. Its caller is the
-        // prestarted SCHED_OTHER submit owner, never the order I/O reactor.
-        let worker_runtime = runtime.clone();
-        runtime.spawn_blocking(move || {
-            crate::latency::prepare_scheduler_tail_queue();
-            worker_runtime.block_on(async move {
-                tokio::select! {
-                    biased;
-                    _ = tx.closed() => {}
-                    result = observe_cold_connect(future) => { let _ = tx.send(result); }
-                }
-            });
-        });
+        tokio::select! {
+            biased;
+            _ = tx.closed() => {}
+            result = observe_cold_connect(future, registration) => { let _ = tx.send(result); }
+        }
     }))?;
     rx.await.map_err(std::io::Error::other)
 }
 
-async fn observe_cold_connect<F: Future>(future: F) -> F::Output {
+async fn observe_cold_connect<F: Future>(future: F, registration: tokio::runtime::Handle) -> F::Output {
     let mut future = std::pin::pin!(future);
     std::future::poll_fn(|cx| {
         let started = Instant::now();
         let cpu = crate::latency::thread_cpu_ns();
-        let result = future.as_mut().poll(cx);
+        // Preserve TCP/timer registration on the caller's order reactor.
+        // CPU-heavy TLS polls run on the isolated cold owner, while warm I/O
+        // keeps its existing reactor and affinity.
+        let result = {
+            let _registration = registration.enter();
+            future.as_mut().poll(cx)
+        };
         let elapsed = duration_ns(started.elapsed());
         if elapsed >= 100_000 {
             let current_cpu = crate::latency::thread_cpu_ns();
@@ -85,7 +82,7 @@ async fn observe_cold_connect<F: Future>(future: F) -> F::Output {
                 span_cpu_ns: (cpu != 0 && current_cpu >= cpu).then(|| current_cpu - cpu),
                 expirations: 0,
                 error_code: None,
-                boundary: "single_connect_future_poll_on_background_worker",
+                boundary: "single_connect_future_poll_on_cold_owner",
             });
         }
         result

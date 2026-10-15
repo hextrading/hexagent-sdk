@@ -590,6 +590,10 @@ fn stale_live_after_cancel_proof_cannot_reopen_or_release_unknown_order() {
     });
     for _ in 0..2 {
         let pass = trade.reconcile_runtime_open_orders_with_updates();
+        // Recovery publishes the lifecycle result before the asynchronous
+        // durable-account projection necessarily catches up. Assert that
+        // projection after its existing FIFO barrier, without a live wait.
+        trade.shared.flush_execution_state_for_test();
         assert!(pass.updates.is_empty());
         assert_eq!(pass.errors.len(), 1);
         let pending = trade
@@ -602,6 +606,10 @@ fn stale_live_after_cancel_proof_cannot_reopen_or_release_unknown_order() {
         assert_eq!(pending.filled_quantity, 0.0);
     }
     let pass = trade.reconcile_runtime_open_orders_with_updates();
+        // Recovery publishes the lifecycle result before the asynchronous
+        // durable-account projection necessarily catches up. Assert that
+        // projection after its existing FIFO barrier, without a live wait.
+        trade.shared.flush_execution_state_for_test();
     assert!(pass.errors.is_empty());
     assert_eq!(pass.updates.len(), 1);
     assert_eq!(pass.updates[0].status, OrderStatus::Cancelled);

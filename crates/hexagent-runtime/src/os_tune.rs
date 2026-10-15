@@ -113,6 +113,7 @@ pub struct CorePlan {
     /// default — pinning it onto an already-claimed core with FIFO
     /// would starve one of the two).
     pub async_ord: Option<usize>,
+    pub cold_connect: Option<usize>,
     pub strategy: usize,
     /// Per-instance strategy-worker cores (live/paper): `instance_id →
     /// core`. Every strategy runs in its own worker thread; entries here also
@@ -166,6 +167,7 @@ impl CorePlan {
             async_rt: DEFAULT_ASYNC_RT_CORE,
             async_clob: None,
             async_ord: None,
+            cold_connect: None,
             strategy: DEFAULT_STRATEGY_CORE,
             strategy_cores: HashMap::new(),
             private_route_cores: HashMap::new(),
@@ -223,6 +225,7 @@ impl CorePlan {
             async_rt: cfg.async_rt_core.unwrap_or(DEFAULT_ASYNC_RT_CORE),
             async_clob: cfg.async_clob_core,
             async_ord: cfg.async_ord_core,
+            cold_connect: cfg.cold_connect_core,
             strategy: cfg.strategy_core.unwrap_or(DEFAULT_STRATEGY_CORE),
             strategy_cores: cfg.strategy_cores.clone(),
             private_route_cores: cfg.private_route_cores.clone(),
@@ -423,6 +426,9 @@ impl CorePlan {
             claim(core, "async_clob".into(), &mut exclusive)?;
         }
         claim(self.async_ord.unwrap(), "async_ord".into(), &mut exclusive)?;
+        if let Some(core) = self.cold_connect {
+            claim(core, "cold_connect".into(), &mut exclusive)?;
+        }
         claim(self.execution, "execution".into(), &mut exclusive)?;
         if self.strategy == self.execution {
             if !self.allow_strategy_router_on_execution_core {
@@ -707,6 +713,7 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     );
     info!("[os_tune] dispatch sharing: cold_on_background={} cancel_on_execution={} fifo_cancel={}",
         plan.allow_private_cold_on_background_core, plan.allow_cancel_on_execution_core, plan.fifo_cancel);
+    info!("[os_tune] cold_connect_core={:?} policy=SCHED_OTHER capacity=64", plan.cold_connect);
     info!("[os_tune] archive recorder_core={:?} policy=SCHED_OTHER fallback=background", plan.recorder_core);
     info!("[os_tune] execution_wakeup={} auxiliary_router_sharing={} dispatcher_core={} router_core={}",
         plan.execution_wakeup, plan.allow_execution_aux_on_router_core, plan.execution, plan.strategy);
@@ -832,7 +839,7 @@ pub fn pin_current(core_id: usize, thread_name: &str) {
         || p.poly_completion_cores.iter().any(|&c| c == core_id)
     {
         "HEXBOT_NO_PIN_EXECUTION"
-    } else if p.recorder_core == Some(core_id) || p.background_cores.iter().any(|&c| c == core_id) {
+    } else if p.cold_connect == Some(core_id) || p.recorder_core == Some(core_id) || p.background_cores.iter().any(|&c| c == core_id) {
         "HEXBOT_NO_PIN_BACKGROUND"
     } else {
         ""
@@ -1324,6 +1331,12 @@ pub fn pin_execution_role(thread_name: &str, role: ExecutionThreadRole) {
 /// pool. `SCHED_OTHER` (no FIFO). Use for: recorder (flushes every
 /// 60 s), latency-dump, paper-exec, async-task joiner threads
 /// (poly-heartbeat-join, poly-user-feed-join, hex-user-feed-join).
+/// Bounded cold-connect runtime and its DNS helpers, always SCHED_OTHER.
+pub fn pin_cold_connect(thread_name: &str) {
+    demote_current_to_other(thread_name);
+    pin_current(plan().cold_connect.unwrap_or_else(|| plan().route_background()), thread_name);
+}
+
 pub fn pin_background(thread_name: &str) {
     // pthreads inherit their creator's scheduling policy. Several background
     // join/persistence workers are spawned by FIFO runtime threads, so affinity
@@ -1642,6 +1655,17 @@ mod tests {
         let plan = CorePlan::from_config(&cfg);
         assert_eq!(plan.async_clob, Some(16));
         assert_eq!(plan.validate_strategy_isolation(&five_instances()), Ok(()));
+    }
+
+    #[test]
+    fn cold_connect_core_is_explicit_and_disjoint_from_every_existing_role() {
+        let mut cfg = five_instance_config();
+        cfg.cold_connect_core = Some(16);
+        assert_eq!(CorePlan::from_config(&cfg).validate_strategy_isolation(&five_instances()), Ok(()));
+        for core in 0..16 {
+            cfg.cold_connect_core = Some(core);
+            assert!(CorePlan::from_config(&cfg).validate_strategy_isolation(&five_instances()).is_err(), "core {core}");
+        }
     }
 
     #[test]

@@ -74,6 +74,9 @@ pub struct OsTuneConfig {
     /// Unset = thread floats unpinned at normal priority; set a core to
     /// pin it and (with `enable_fifo`) raise it to `fifo_async_rt`.
     pub async_ord_core: Option<usize>,
+    /// SCHED_OTHER cold-connect CPU, isolated from FIFO dispatch and strategy.
+    /// None preserves background placement. Socket registration stays on order I/O.
+    pub cold_connect_core: Option<usize>,
     pub strategy_core: Option<usize>,
     /// Per-instance strategy-worker cores for live/paper runs:
     /// `instance_id → core`. Every strategy runs in its own worker thread;
@@ -194,6 +197,7 @@ impl Default for OsTuneConfig {
             async_rt_core: None,
             async_clob_core: None,
             async_ord_core: None,
+            cold_connect_core: None,
             strategy_core: None,
             strategy_cores: HashMap::new(),
             private_route_cores: HashMap::new(),
