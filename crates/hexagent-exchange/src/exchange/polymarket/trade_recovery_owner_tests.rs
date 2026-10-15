@@ -1,5 +1,8 @@
 use super::reconcile_identity_tests::{install, ownership};
 use super::*;
+
+// Recovery tests assert the canonical ledger. Its published reporting projection
+// can lag a committed owner command; use the ordered cold read in assertions.
 use crate::http1_pool::Role;
 
 #[test]
@@ -43,7 +46,7 @@ fn recovery_queries_distinct_physical_owners_and_accepts_positive_terminal_evide
         trade
             .shared
             .account_state
-            .order(&order.client_order_id)
+            .recovery_order(&order.client_order_id).expect("canonical account-owner read")
             .unwrap()
             .reserved_quantity,
         0.0
@@ -87,7 +90,7 @@ fn recovery_nulls_wrong_slot_and_disconnected_mailbox_preserve_reservation() {
             trade
                 .shared
                 .account_state
-                .order(&order.client_order_id)
+                .recovery_order(&order.client_order_id).expect("canonical account-owner read")
                 .unwrap()
                 .reserved_quantity,
             16.0
@@ -96,7 +99,7 @@ fn recovery_nulls_wrong_slot_and_disconnected_mailbox_preserve_reservation() {
             trade
                 .shared
                 .account_state
-                .order(&sibling.client_order_id)
+                .recovery_order(&sibling.client_order_id).expect("canonical account-owner read")
                 .unwrap()
                 .reserved_cash,
             9.28
@@ -206,7 +209,7 @@ fn exact_cancel_recovery_entry(per_order: bool) {
         trade
             .shared
             .account_state
-            .order(&order.client_order_id)
+            .recovery_order(&order.client_order_id).expect("canonical account-owner read")
             .unwrap()
             .reserved_quantity,
         0.0
@@ -215,7 +218,7 @@ fn exact_cancel_recovery_entry(per_order: bool) {
         trade
             .shared
             .account_state
-            .order(&sibling.client_order_id)
+            .recovery_order(&sibling.client_order_id).expect("canonical account-owner read")
             .unwrap()
             .reserved_cash,
         9.28
@@ -292,7 +295,7 @@ fn ended_unknown_cancel_requires_exact_ack_and_complete_no_fill_history() {
             trade
                 .shared
                 .account_state
-                .order(&order.client_order_id)
+                .recovery_order(&order.client_order_id).expect("canonical account-owner read")
                 .unwrap()
                 .reserved_quantity,
             16.0
@@ -352,7 +355,7 @@ fn exact_cancel_ack_survives_history_failure_and_resumes_without_another_delete(
     let after_failure = trade
         .shared
         .account_state
-        .order(&order.client_order_id)
+        .recovery_order(&order.client_order_id).expect("canonical account-owner read")
         .unwrap();
     assert_eq!(after_failure.reserved_quantity, 16.0);
     assert_eq!(after_failure.filled_quantity, 0.0);
@@ -369,7 +372,7 @@ fn exact_cancel_ack_survives_history_failure_and_resumes_without_another_delete(
     let final_order = trade
         .shared
         .account_state
-        .order(&order.client_order_id)
+        .recovery_order(&order.client_order_id).expect("canonical account-owner read")
         .unwrap();
     assert_eq!(final_order.reserved_quantity, 0.0);
     assert_eq!(final_order.filled_quantity, 0.0);
@@ -377,7 +380,7 @@ fn exact_cancel_ack_survives_history_failure_and_resumes_without_another_delete(
         trade
             .shared
             .account_state
-            .order(&sibling.client_order_id)
+            .recovery_order(&sibling.client_order_id).expect("canonical account-owner read")
             .unwrap(),
         sibling
     );
@@ -422,7 +425,7 @@ fn active_cancel_proof_rechecks_late_trade_and_full_queue_preserves_reservation(
         trade
             .shared
             .account_state
-            .order(&order.client_order_id)
+            .recovery_order(&order.client_order_id).expect("canonical account-owner read")
             .unwrap()
             .reserved_quantity,
         16.0
@@ -456,7 +459,7 @@ fn active_cancel_proof_rechecks_late_trade_and_full_queue_preserves_reservation(
     let after = trade
         .shared
         .account_state
-        .order(&order.client_order_id)
+        .recovery_order(&order.client_order_id).expect("canonical account-owner read")
         .unwrap();
     assert_eq!(after.terminal_matched_quantity, Some(4.0));
     assert_eq!(after.terminal_trade_ids, ["late"]);
@@ -516,7 +519,7 @@ fn persisted_cancel_proof_resumes_ended_market_startup_audit() {
         trade
             .shared
             .account_state
-            .order(&order.client_order_id)
+            .recovery_order(&order.client_order_id).expect("canonical account-owner read")
             .unwrap()
             .reserved_quantity,
         0.0
@@ -724,7 +727,7 @@ fn cancel_transport_failure_keeps_intent_and_original_error_until_authoritative_
                 symbol: order.token_id.clone(), side: order.side }, Some(Err(failure)));
         assert_eq!(update.status, OrderStatus::CancelOrderTimeout);
         assert_eq!(update.error.as_deref(), Some(expected_error.as_str()));
-        assert_eq!(trade.shared.account_state.order(&order.client_order_id).unwrap().reserved_quantity, 16.0);
+        assert_eq!(trade.shared.account_state.recovery_order(&order.client_order_id).expect("canonical account-owner read").unwrap().reserved_quantity, 16.0);
     }
     let (transport, requests) = super::super::rtt_probe::probe_http_lane(2);
     trade.shared.bind_recovery_http_transport(transport);
@@ -744,7 +747,7 @@ fn cancel_transport_failure_keeps_intent_and_original_error_until_authoritative_
     let updates = trade.reconcile_orphans_via_owners(&[], &[(order.client_order_id.clone(),order.order_id.clone())], &[]);
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0].status, OrderStatus::Cancelled);
-    assert_eq!(trade.shared.account_state.order(&order.client_order_id).unwrap().reserved_quantity, 0.0);
+    assert_eq!(trade.shared.account_state.recovery_order(&order.client_order_id).expect("canonical account-owner read").unwrap().reserved_quantity, 0.0);
     server.join().unwrap();
     shutdown.request(); shutdown.finish(); trade.shared.join_background_workers();
 }
@@ -761,7 +764,7 @@ fn per_order_recovery_rejects_cross_instance_identity_before_http() {
     let updates = trade.reconcile_orphans_via_owners(&[(sibling.client_order_id.clone(),
         sibling.token_id.clone(), sibling.side, sibling.price, Some(sibling.order_id.clone()))], &[], &[]);
     assert!(updates.is_empty()); assert!(requests.try_recv().is_err());
-    assert_eq!(trade.shared.account_state.order(&sibling.client_order_id).unwrap().reserved_quantity, 16.0);
+    assert_eq!(trade.shared.account_state.recovery_order(&sibling.client_order_id).expect("canonical account-owner read").unwrap().reserved_quantity, 16.0);
     shutdown.request(); shutdown.finish(); trade.shared.join_background_workers();
 }
 
@@ -798,8 +801,8 @@ fn ambiguous_null_placement_backs_off_without_releasing_or_polling_sibling() {
     assert!(trade.shared.placement_reconcile_next_retry_ns.get(&order.client_order_id).unwrap() > now_ns());
     assert!(trade.reconcile_orphans_via_owners(&pending, &[], &[]).is_empty());
     assert!(requests.try_recv().is_err(), "retry before backoff must issue no HTTP work");
-    assert_eq!(trade.shared.account_state.order(&order.client_order_id).unwrap().reserved_quantity, 16.0);
-    assert_eq!(trade.shared.account_state.order(&sibling.client_order_id).unwrap().reserved_cash, 9.28);
+    assert_eq!(trade.shared.account_state.recovery_order(&order.client_order_id).expect("canonical account-owner read").unwrap().reserved_quantity, 16.0);
+    assert_eq!(trade.shared.account_state.recovery_order(&sibling.client_order_id).expect("canonical account-owner read").unwrap().reserved_cash, 9.28);
     shutdown.request();
     shutdown.finish();
     trade.shared.join_background_workers();
@@ -859,7 +862,7 @@ fn live_cancel_absence_never_releases_before_delayed_private_fill() {
             assert_eq!(final_order.filled_quantity, 5.555556);
             assert_eq!(final_order.status, OrderStatus::Cancelled);
             assert_eq!((final_order.reserved_cash, final_order.reserved_quantity), (0.0, 0.0));
-            assert_eq!(trade.shared.account_state.order(&sibling.client_order_id).unwrap(), sibling);
+            assert_eq!(trade.shared.account_state.recovery_order(&sibling.client_order_id).expect("canonical account-owner read").unwrap(), sibling);
             shutdown.request(); shutdown.finish(); trade.shared.join_background_workers();
         }
     }
