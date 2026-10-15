@@ -14809,9 +14809,16 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("account lifecycle owner stalled");
 
-        let order = shared.account_state.order("owner-late-place-ack").unwrap();
+        let order = shared.account_state.recovery_order("owner-late-place-ack")
+            .expect("ordered canonical account read").unwrap();
         assert_eq!(order.status, OrderStatus::Rejected);
         assert_eq!(order.reserved_cash, 0.0);
+        // Reporting is asynchronous even after the execution-lane barrier.
+        let published_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while shared.account_state.instance_snapshot("owner").unwrap().reserved_cash != 0.0 {
+            assert!(std::time::Instant::now() < published_deadline, "reporting projection did not converge");
+            std::thread::yield_now();
+        }
         assert_eq!(
             shared
                 .account_state
