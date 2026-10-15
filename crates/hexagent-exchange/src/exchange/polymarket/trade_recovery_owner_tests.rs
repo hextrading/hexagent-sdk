@@ -588,28 +588,25 @@ fn stale_live_after_cancel_proof_cannot_reopen_or_release_unknown_order() {
             req.reply_for_test(reply, Some((role, slot)));
         }
     });
+    // Drain deferred lifecycle jobs, then use the ordered canonical read.
+    // A published reporting snapshot can lag even this lifecycle barrier.
     for _ in 0..2 {
         let pass = trade.reconcile_runtime_open_orders_with_updates();
-        // Recovery publishes the lifecycle result before the asynchronous
-        // durable-account projection necessarily catches up. Assert that
-        // projection after its existing FIFO barrier, without a live wait.
         trade.shared.flush_execution_state_for_test();
         assert!(pass.updates.is_empty());
         assert_eq!(pass.errors.len(), 1);
         let pending = trade
             .shared
             .account_state
-            .order(&order.client_order_id)
+            .recovery_order(&order.client_order_id)
+            .unwrap()
             .unwrap();
         assert_eq!(pending.status, OrderStatus::Cancelled);
         assert_eq!(pending.reserved_quantity, 16.0);
         assert_eq!(pending.filled_quantity, 0.0);
     }
     let pass = trade.reconcile_runtime_open_orders_with_updates();
-        // Recovery publishes the lifecycle result before the asynchronous
-        // durable-account projection necessarily catches up. Assert that
-        // projection after its existing FIFO barrier, without a live wait.
-        trade.shared.flush_execution_state_for_test();
+    trade.shared.flush_execution_state_for_test();
     assert!(pass.errors.is_empty());
     assert_eq!(pass.updates.len(), 1);
     assert_eq!(pass.updates[0].status, OrderStatus::Cancelled);
@@ -617,7 +614,8 @@ fn stale_live_after_cancel_proof_cannot_reopen_or_release_unknown_order() {
         trade
             .shared
             .account_state
-            .order(&order.client_order_id)
+            .recovery_order(&order.client_order_id)
+            .unwrap()
             .unwrap()
             .reserved_quantity,
         0.0
