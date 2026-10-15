@@ -413,12 +413,6 @@ pub struct PrivateOwnerSpan {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrivateOwnerStages {
-    pub ownership_lookup: PrivateOwnerSpan,
-    pub ownership_cold_fallback: bool,
-    pub turn_started_ns: u64,
-    /// First dequeue to current turn, including prior CPU and cold waits.
-    pub prior_turn_elapsed_ns: u64,
-    pub route_turns: u32,
     pub pre_route: PrivateOwnerSpan,
     pub route_and_construct: PrivateOwnerSpan,
     /// One output construction; nested in route_and_construct for a fanout.
@@ -429,6 +423,13 @@ pub struct PrivateOwnerStages {
     /// Actual current routing worker; zero where unavailable. This differs
     /// from RoutedOrderUpdate.owner, which identifies the destination strategy.
     pub thread_id: u64,
+    // Append only: nested MessagePack records encode fields positionally.
+    pub ownership_lookup: PrivateOwnerSpan,
+    pub ownership_cold_fallback: bool,
+    pub turn_started_ns: u64,
+    /// First dequeue to current turn, including prior CPU and cold waits.
+    pub prior_turn_elapsed_ns: u64,
+    pub route_turns: u32,
 }
 
 /// Monotonic, process-local timestamps carried with one lifecycle update.
@@ -459,6 +460,32 @@ pub struct LifecycleTiming {
 #[cfg(test)]
 mod private_owner_timing_tests {
     use super::*;
+    #[test]
+    fn private_owner_legacy_messagepack_positions_and_nested_lifecycle_are_preserved() {
+        let span = PrivateOwnerSpan { started_ns: 10, done_ns: 20, cpu_ns: Some(7) };
+        let owner = (span, span, span, span, 50_u64, 60_u64);
+        let restored: PrivateOwnerStages = rmp_serde::from_slice(&rmp_serde::to_vec(&owner).unwrap()).unwrap();
+        assert_eq!(restored.pre_route.started_ns, 10);
+        assert_eq!(restored.prepare_delivery.cpu_ns, Some(7));
+        assert_eq!(restored.publish_started_ns, 50);
+        assert_eq!(restored.thread_id, 60);
+        assert_eq!(restored.route_turns, 0);
+        assert_eq!(restored.ownership_lookup.cpu_ns, None);
+        let legacy = (1_u64, 2_u64, 3_u64, 4_u64, 5_u64,
+            super::super::MarketReceipt::default(), 0_u32, 6_u64, owner);
+        let timing: LifecycleTiming = rmp_serde::from_slice(&rmp_serde::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(timing.private_owner.thread_id, 60);
+        assert_eq!(timing.private_ws_received_ns, 1);
+        assert_eq!(timing.strategy_dequeued_ns, 6);
+        let new = PrivateOwnerStages { route_turns: 2, prior_turn_elapsed_ns: 100,
+            ownership_cold_fallback: true, ..restored };
+        let roundtrip: PrivateOwnerStages = rmp_serde::from_slice(&rmp_serde::to_vec(&new).unwrap()).unwrap();
+        assert_eq!(roundtrip.route_turns, 2);
+        assert_eq!(roundtrip.prior_turn_elapsed_ns, 100);
+        assert!(roundtrip.ownership_cold_fallback);
+        assert_eq!(roundtrip.thread_id, 60);
+    }
+
     #[test]
     fn private_owner_old_messages_keep_unknown_cpu_and_receipt() {
         let value=serde_json::json!({"private_ws_received_ns":10,"private_json_parsed_ns":20,
