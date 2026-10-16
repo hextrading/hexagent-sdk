@@ -104,6 +104,14 @@ pub struct HotPathTrace {
     pub identity_probes: u16,
     #[serde(default)]
     pub fast_selection: Option<FastLaneSelection>,
+    /// Append-only wire extension. Zero means immediate receive or unknown.
+    #[serde(default)]
+    pub owner_resumed_mono_ns: u64,
+    /// Owner maintenance preceding this receive; may precede publication.
+    #[serde(default)]
+    pub owner_maintenance_started_mono_ns: u64,
+    #[serde(default)]
+    pub owner_maintenance_completed_mono_ns: u64,
 }
 impl HotPathTrace {
     /// Unknown/replay/clock-domain mismatch remains null, never fake zero.
@@ -143,6 +151,12 @@ mod tests {
         assert_eq!(restored.l2_auth_done_mono_ns, 0);
         assert_eq!(restored.identity_probes, 0);
         assert_eq!(restored.fast_selection, None);
+        assert_eq!(restored.owner_resumed_mono_ns, 0);
+        assert_eq!(restored.owner_maintenance_completed_mono_ns, 0);
+        let current = HotPathTrace { owner_resumed_mono_ns: 11, owner_maintenance_started_mono_ns: 12,
+            owner_maintenance_completed_mono_ns: 13, ..restored };
+        let wire = rmp_serde::to_vec(&current).unwrap();
+        assert_eq!(rmp_serde::from_slice::<HotPathTrace>(&wire).unwrap(), current);
     }
     #[test]
     fn sessions_sequences_and_replay_are_explicit() {

@@ -20,6 +20,9 @@ pub(super) struct HttpPhaseRecord {
     pub slot: usize,
     pub pool_generation: u64,
     pub request_started_ns: u64,
+    pub request_started_mono_ns: u64,
+    pub response_received_mono_ns: u64,
+    pub completed_mono_ns: u64,
     pub response_received_ns: u64,
     pub completed_ns: u64,
     pub status: u16,
@@ -105,6 +108,10 @@ impl HttpPhaseRecord {
             "generation_before": t.connect_generation_before, "generation_after": t.connect_generation_after,
             "peer": t.peer.map(|peer| peer.to_string()), "incomplete_phase": t.incomplete_phase.name(),
         });
+        value["request_started_mono_ns"] = self.request_started_mono_ns.into();
+        value["response_received_mono_ns"] = self.response_received_mono_ns.into();
+        value["completed_mono_ns"] = self.completed_mono_ns.into();
+        value["response_wait_observed"] = (t.io.first_read_mono_ns != 0 && t.io.first_write_mono_ns != 0).into();
         value["clock_domain_ns"] = crate::types::monotonic_clock_domain_ns().into();
         value["connect_worker_queue_ns"] = serde_json::json!(
             (!t.connect_attempted || t.connect_worker_queue_ns != 0).then_some(t.connect_worker_queue_ns));
@@ -144,6 +151,9 @@ mod tests {
             slot: leg as usize,
             pool_generation: 7,
             request_started_ns: 10,
+            request_started_mono_ns: 100,
+            response_received_mono_ns: 200,
+            completed_mono_ns: 250,
             response_received_ns: 20,
             completed_ns: 25,
             status: 200,
@@ -253,6 +263,9 @@ fn benchmark_http_phase_publish() {
                     slot: 0,
                     pool_generation: 7,
                     request_started_ns: 1,
+                    request_started_mono_ns: 1,
+                    response_received_mono_ns: 2,
+                    completed_mono_ns: 3,
                     response_received_ns: 2,
                     completed_ns: 3,
                     status: 200,
@@ -370,6 +383,14 @@ async fn actual_http_phases_keep_identity_status_peer_and_reconnect_generation()
         } else {
             assert_eq!(r.status, 0);
             assert_eq!(r.timings.io.read_bytes, 0);
+        }
+        assert!(r.request_started_mono_ns <= r.response_received_mono_ns);
+        assert!(r.response_received_mono_ns <= r.completed_mono_ns);
+        assert_eq!(r.value("fixture")["response_wait_observed"], index < 3);
+        if index < 3 {
+            assert!(r.request_started_mono_ns <= r.timings.io.first_write_mono_ns);
+            assert!(r.timings.io.first_write_mono_ns <= r.timings.io.first_read_mono_ns);
+            assert!(r.timings.io.first_read_mono_ns <= r.response_received_mono_ns);
         }
         assert_eq!(r.context.runtime_queue_ns, 13);
     }

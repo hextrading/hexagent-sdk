@@ -9,12 +9,89 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Identifies an observation-only timestamp without mutating the source.
+///
+/// # Safety
+/// Some must reference an ordinary, exclusively owned u64 field inside Self
+/// which may accept ANY u64 without invalidating Self or its invariants. It
+/// must not name padding, shared/interior storage, a discriminant, a pointer,
+/// or bytes reinterpreted from another type. The corresponding field remains
+/// at the same offset when Self is moved. None requests no stamp.
+/// copied_prefix_len must include every byte required for a valid owned T,
+/// including its discriminant and ALL active fields. Omitted bytes may only
+/// be inactive enum storage or trailing padding. A shorter prefix requires a
+/// guaranteed representation (e.g. repr(C)); never guess default enum layout.
+/// Selectors run before reservation and may unwind there.
+pub unsafe trait PublicationStamp {
+    fn publication_stamp(&self) -> Option<&u64>;
+    fn copied_prefix_len(&self) -> usize where Self: Sized { std::mem::size_of::<Self>() }
+}
+
 #[repr(align(128))]
 struct Cursor(AtomicUsize);
 
 struct Slot<T> {
     stamp: AtomicUsize,
     value: UnsafeCell<MaybeUninit<T>>,
+}
+
+/// Only the runtime's immediate publication paths may hold this permit.
+#[must_use = "a reserved FIFO slot must be published immediately"]
+pub(crate) struct WriteReservation<'a, T> {
+    slot: &'a Slot<T>,
+    release_stamp: usize,
+}
+
+impl<T> WriteReservation<'_, T> {
+    /// Full-value transfer for types without a compact publication layout.
+    /// No callback or fallible work occurs in the reserved slot.
+    #[inline(always)]
+    pub(crate) fn publish_owned(self, value: T) {
+        // SAFETY: the reservation exclusively owns this uninitialized slot.
+        unsafe { (*self.slot.value.get()).write(value); }
+        self.slot.stamp.store(self.release_stamp, Ordering::Release);
+    }
+
+    /// # Safety
+    /// copied_len/field must come from publication_layout for this exact value.
+    /// After this copy the caller MUST forget its source and immediately call
+    /// release, without fallible work or user code in between. Keeping the
+    /// source borrowed avoids a full T move into this internal helper.
+    #[inline(always)]
+    pub(crate) unsafe fn write_prefix(&self, value: &T, copied_len: usize, field: Option<(usize, u64)>) {
+        // SAFETY: reservation exclusively owns the destination. The audited
+        // prefix includes the tag and ALL active fields. Omitted bytes are
+        // inactive storage/padding, permitted to remain uninitialized.
+        unsafe { std::ptr::copy_nonoverlapping((value as *const T).cast::<u8>(), (*self.slot.value.get()).as_mut_ptr().cast::<u8>(), copied_len); }
+        if let Some((offset, stamp)) = field {
+            unsafe { (*self.slot.value.get()).as_mut_ptr().cast::<u8>().add(offset)
+                .cast::<u64>().write_unaligned(stamp); }
+        }
+    }
+
+    /// # Safety
+    /// write_prefix initialized this reservation and the original owner has
+    /// been forgotten; only the queue may subsequently access/drop the value.
+    #[inline(always)]
+    pub(crate) unsafe fn release(self) {
+        self.slot.stamp.store(self.release_stamp, Ordering::Release);
+    }
+
+}
+
+/// Runs selection and all bounds checks BEFORE reserving any FIFO slot.
+#[inline(always)]
+pub(crate) fn publication_layout<T: PublicationStamp>(value: &T, stamp: Option<u64>) -> (usize, Option<(usize, u64)>) {
+    let copied_len = value.copied_prefix_len();
+    assert!(copied_len <= std::mem::size_of::<T>(), "copied prefix exceeds value");
+    let field = stamp.and_then(|stamp| value.publication_stamp().map(|field| {
+        let offset = (field as *const u64 as usize)
+            .checked_sub(value as *const T as usize).expect("stamp must be inside value");
+        assert!(offset.checked_add(std::mem::size_of::<u64>())
+            .is_some_and(|end| end <= copied_len), "stamp must be inside copied prefix");
+        (offset, stamp)
+    }));
+    (copied_len, field)
 }
 
 pub struct TryQueue<T> {
@@ -96,6 +173,55 @@ impl<T> TryQueue<T> {
     /// no lock, allocation, syscall, retry loop, or peer-completion wait.
     pub fn try_push(&self, value: T) -> Result<(), T> {
         self.push_with(value, || {})
+    }
+
+    /// Move ownership on success; retain the exact message on full/contention.
+    #[inline(always)]
+    pub fn try_push_owned(&self, value: T) -> Result<(), T> {
+        let Some(reservation) = self.try_reserve() else { return Err(value); };
+        reservation.publish_owned(value);
+        Ok(())
+    }
+
+    /// Internal linear operation: successful reservation must immediately be
+    /// published, with no callback, fallible operation, or unwind in between.
+    /// Returning a small permit avoids intermediate Result<large message>
+    /// temporaries in Sender. Abandoning a permit would stall the FIFO head.
+    #[inline(always)]
+    pub(crate) fn try_reserve(&self) -> Option<WriteReservation<'_, T>> {
+        let tail = self.tail.0.load(Ordering::Relaxed);
+        let slot = &self.slots[tail & (self.lap - 1)];
+        if slot.stamp.load(Ordering::Acquire) != tail
+            || self.tail.0.compare_exchange(tail, self.next(tail), Ordering::Relaxed, Ordering::Relaxed).is_err()
+        { return None; }
+        Some(WriteReservation { slot, release_stamp: tail.wrapping_add(1) })
+    }
+
+    /// Transfer directly from a caller-owned slot. On contention/full the
+    /// caller retains Some(T); success leaves None. The small return avoids
+    /// transporting a large error payload through intermediate Result values.
+    #[inline(always)]
+    pub fn try_push_slot(&self, value: &mut Option<T>) -> bool {
+        if value.is_none() { return false; }
+        let tail = self.tail.0.load(Ordering::Relaxed);
+        let slot = &self.slots[tail & (self.lap - 1)];
+        if slot.stamp.load(Ordering::Acquire) != tail
+            || self.tail.0.compare_exchange(tail, self.next(tail), Ordering::Relaxed, Ordering::Relaxed).is_err()
+        { return false; }
+        // SAFETY: the successful CAS exclusively owns the uninitialized
+        // destination; &mut Option<T> exclusively owns the disjoint source.
+        // Move the bytes directly, then overwrite the source with None WITHOUT
+        // dropping T. There is no callback/panic point between these operations
+        // and the release publication. Only the queue may subsequently drop T.
+        // Avoid take()/write(T): large niche-bearing enums otherwise materialize
+        // another full-size temporary even when this function is inlined.
+        unsafe {
+            let source = value.as_mut().unwrap_unchecked() as *mut T;
+            std::ptr::copy_nonoverlapping(source, (*slot.value.get()).as_mut_ptr(), 1);
+            std::ptr::write(value, None);
+        }
+        slot.stamp.store(tail.wrapping_add(1), Ordering::Release);
+        true
     }
 
     #[inline]
@@ -199,8 +325,9 @@ mod tests {
             reserved.wait();
             assert_eq!(q.try_pop(), None);
             assert!(!q.front_ready());
-            let next = q.try_push(2);
-            assert_eq!(next.is_ok(), capacity == 2);
+            let mut next = Some(2);
+            assert_eq!(q.try_push_slot(&mut next), capacity == 2);
+            assert_eq!(next.is_none(), capacity == 2);
             assert_eq!(
                 q.try_pop(),
                 None,
@@ -306,7 +433,9 @@ mod tests {
             slot.stamp.store(start + i, Ordering::Relaxed);
         }
         for value in 0..100 {
-            q.try_push(value).unwrap();
+            let mut pending = Some(value);
+            assert!(q.try_push_slot(&mut pending));
+            assert!(pending.is_none());
             assert_eq!(q.len(), 1);
             assert_eq!(q.try_pop(), Some(value));
             assert!(q.is_empty());
@@ -329,5 +458,161 @@ mod tests {
         drop(q.try_pop());
         drop(q);
         assert_eq!(drops.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn slot_transfer_preserves_large_niche_enum_and_exact_drop_ownership() {
+        struct Owned(Arc<AtomicUsize>);
+        impl Drop for Owned {
+            fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+        }
+        enum Message { Large([u64; 960], Box<Owned>), Small(Box<Owned>) }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let q = TryQueue::new(1);
+        let mut large = Some(Message::Large([42; 960], Box::new(Owned(drops.clone()))));
+        assert!(q.try_push_slot(&mut large));
+        assert!(large.is_none());
+        let mut small = Some(Message::Small(Box::new(Owned(drops.clone()))));
+        assert!(!q.try_push_slot(&mut small));
+        assert!(matches!(&small, Some(Message::Small(owner)) if Arc::ptr_eq(&owner.0, &drops)));
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        match q.try_pop().unwrap() {
+            Message::Large(bytes, owner) => {
+                assert_eq!(bytes, [42; 960]);
+                assert!(Arc::ptr_eq(&owner.0, &drops));
+            }
+            _ => panic!("variant corrupted"),
+        }
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(q.try_push_slot(&mut small));
+        assert!(small.is_none());
+        assert!(!q.try_push_slot(&mut small));
+        drop(q);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        // Zero-sized T also has a valid, aligned transfer destination.
+        let zst = TryQueue::new(1);
+        let mut unit = Some(());
+        assert!(zst.try_push_slot(&mut unit));
+        assert_eq!(unit, None);
+        assert_eq!(zst.try_pop(), Some(()));
+    }
+
+    #[test]
+    fn competing_slot_producers_preserve_fifo_payload_and_single_drop() {
+        struct Message { owner: usize, sequence: usize, drops: Arc<AtomicUsize> }
+        impl Drop for Message {
+            fn drop(&mut self) { self.drops.fetch_add(1, Ordering::Relaxed); }
+        }
+        let q = Arc::new(TryQueue::new(7));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..4).map(|owner| {
+            let (q, drops) = (q.clone(), drops.clone());
+            std::thread::spawn(move || {
+                for sequence in 0..5000 {
+                    let mut pending = Some(Message { owner, sequence, drops: drops.clone() });
+                    while !q.try_push_slot(&mut pending) {
+                        assert_eq!(pending.as_ref().unwrap().sequence, sequence);
+                        std::thread::yield_now();
+                    }
+                    assert!(pending.is_none());
+                }
+            })
+        }).collect();
+        let mut next = [0; 4];
+        for _ in 0..20_000 {
+            let message = loop {
+                if let Some(message) = q.try_pop() { break message; }
+                std::thread::yield_now();
+            };
+            assert_eq!(message.sequence, next[message.owner]);
+            next[message.owner] += 1;
+        }
+        for worker in workers { worker.join().unwrap(); }
+        assert_eq!(next, [5000; 4]);
+        assert_eq!(drops.load(Ordering::Relaxed), 20_000);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn competing_owned_producers_preserve_fifo_and_single_drop() {
+        struct Message { owner: usize, sequence: usize, drops: Arc<AtomicUsize> }
+        impl Drop for Message { fn drop(&mut self) { self.drops.fetch_add(1, Ordering::Relaxed); } }
+        let q = Arc::new(TryQueue::new(7));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..4).map(|owner| {
+            let (q, drops) = (q.clone(), drops.clone());
+            std::thread::spawn(move || {
+                for sequence in 0..5000 {
+                    let mut pending = Message { owner, sequence, drops: drops.clone() };
+                    while let Err(retained) = q.try_push_owned(pending) {
+                        assert_eq!(retained.owner, owner);
+                        assert_eq!(retained.sequence, sequence);
+                        pending = retained;
+                        std::thread::yield_now();
+                    }
+                }
+            })
+        }).collect();
+        let mut next = [0; 4];
+        for _ in 0..20_000 {
+            let message = loop {
+                if let Some(message) = q.try_pop() { break message; }
+                std::thread::yield_now();
+            };
+            assert_eq!(message.sequence, next[message.owner]);
+            next[message.owner] += 1;
+        }
+        for worker in workers { worker.join().unwrap(); }
+        assert_eq!(next, [5000; 4]);
+        assert_eq!(drops.load(Ordering::Relaxed), 20_000);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn owned_large_enum_drop_full_zero_size_and_counter_wrap() {
+        #[derive(Debug)]
+        struct Owned(Arc<AtomicUsize>);
+        impl Drop for Owned { fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); } }
+        #[derive(Debug)]
+        enum Message { Large([u64; 960], Box<Owned>), Small(Box<Owned>) }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let q = TryQueue::new(1);
+        q.try_push_owned(Message::Large([42; 960], Box::new(Owned(drops.clone())))).unwrap();
+        let Err(retained) = q.try_push_owned(Message::Small(Box::new(Owned(drops.clone()))))
+            else { panic!("full must retain exact message"); };
+        assert!(matches!(&retained, Message::Small(owner) if Arc::ptr_eq(&owner.0, &drops)));
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        match q.try_pop().unwrap() {
+            Message::Large(bytes, owner) => {
+                assert_eq!(bytes, [42; 960]);
+                assert!(Arc::ptr_eq(&owner.0, &drops));
+            },
+            _ => panic!("variant corrupted"),
+        }
+        q.try_push_owned(retained).unwrap();
+        drop(q);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        let q = TryQueue::new(3);
+        let start = usize::MAX - (q.lap - 1);
+        q.head.0.store(start, Ordering::Relaxed);
+        q.tail.0.store(start, Ordering::Relaxed);
+        for (i, slot) in q.slots.iter().enumerate() { slot.stamp.store(start + i, Ordering::Relaxed); }
+        for _ in 0..100 {
+            q.try_push_owned(()).unwrap();
+            assert_eq!(q.try_pop(), Some(()));
+            assert!(q.is_empty());
+        }
+    }
+
+    #[test]
+    fn owned_publication_cannot_overtake_unpublished_fifo_head() {
+        let q = TryQueue::new(2);
+        q.push_with(1, || {
+            q.try_push_owned(2).unwrap();
+            assert_eq!(q.try_push_owned(3), Err(3));
+            assert_eq!(q.try_pop(), None);
+        }).unwrap();
+        assert_eq!(q.try_pop(), Some(1));
+        assert_eq!(q.try_pop(), Some(2));
     }
 }

@@ -523,7 +523,16 @@ mod sim_lifecycle_router_tests {
 }
 
 #[derive(Debug)]
+// repr(C) puts the tag before the active payload. Compact publication copies
+// through ALL fields of OwnerPublication; other variants retain a full copy.
+#[repr(C)]
 enum ExecutionDiagnostic {
+    OwnerPublication { account: Arc<str>, role: hexagent_runtime::http1_pool::Role,
+        slot: usize, publication_mono_ns: u64, timing: hexagent_runtime::poll_channel::PublicationTiming },
+    OwnerSlow { account: Arc<str>, role: hexagent_runtime::http1_pool::Role,
+        slot: usize, elapsed_ns: u64, connection: hexagent_runtime::http1_pool::PooledConnectionSnapshot },
+    LaneEvidence { account: Arc<str>, role: hexagent_runtime::http1_pool::Role,
+        slot: usize, observation: LaneObservation, consumed_at_ns: u64, consumed_mono_ns: u64 },
     SignalIngress { owners: usize, depth: usize, control_depth: usize, sampled_high_water: usize },
     ProbeIngress { depth: usize, high_water: usize, rejected: u64, retry: (u64, u64, u64, u64) },
     Admission {
@@ -536,6 +545,7 @@ enum ExecutionDiagnostic {
         no_response_resets: u64,
         cancel_outbox: CancelOutboxSnapshot,
         event_audit_queue: (usize, usize, u64),
+        lane_evidence_dropped: u64,
     },
     PeerFailureReset {
         account: Arc<str>, failure: Option<PeerFailure>, overflow: bool,
@@ -548,6 +558,23 @@ enum ExecutionDiagnostic {
     },
     #[cfg(test)]
     FixedLifecycleOverflow { client_order_id: String },
+}
+
+// SAFETY: repr(C) guarantees the tag precedes the payload. Taking the maximum
+// end of EVERY active field covers tag, padding and all owned subobjects. The
+// exhaustive OwnerPublication pattern makes adding a field a compile error.
+unsafe impl hexagent_runtime::try_queue::PublicationStamp for ExecutionDiagnostic {
+    fn publication_stamp(&self) -> Option<&u64> { None }
+    fn copied_prefix_len(&self) -> usize {
+        match self {
+            Self::OwnerPublication { account, role, slot, publication_mono_ns, timing } => {
+                let base = self as *const Self as usize;
+                macro_rules! end { ($field:expr) => { $field as *const _ as usize - base + std::mem::size_of_val($field) }; }
+                end!(account).max(end!(role)).max(end!(slot)).max(end!(publication_mono_ns)).max(end!(timing))
+            }
+            _ => std::mem::size_of::<Self>(),
+        }
+    }
 }
 
 #[inline]
@@ -579,6 +606,24 @@ fn spawn_execution_diagnostics(
                     Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                 };
                 match diagnostic {
+                    ExecutionDiagnostic::OwnerPublication { account, role, slot, publication_mono_ns, timing } => info!(
+                        "[owner_publication] account={} role={:?} slot={} clock_domain_ns={} publication_mono_ns={} push_started_mono_ns={} push_returned_mono_ns={} notify_returned_mono_ns={} boundary=publication_bracket",
+                        account, role, slot, crate::types::monotonic_clock_domain_ns(), publication_mono_ns,
+                        timing.push_started_mono_ns, timing.push_returned_mono_ns, timing.notify_returned_mono_ns),
+                    ExecutionDiagnostic::OwnerSlow { account, role, slot, elapsed_ns, connection } => warn!(
+                        "[poly_connection_owner_slow] account={} role={:?} slot={} elapsed_ns={} pool_generation={} connect_generation={} peer={:?} selection_authority=router_generation_health",
+                        account, role, slot, elapsed_ns, connection.pool_generation, connection.connect_generation, connection.peer),
+                    ExecutionDiagnostic::LaneEvidence { account, role, slot, observation: o, consumed_at_ns, consumed_mono_ns } => info!(
+                        "[execution_lane_evidence] account={} role={:?} slot={} sequence={} observed_at_ns={} consumed_at_ns={} observed_mono_ns={} consumed_mono_ns={} generation={} quarantined={} busy={} attempt={} business_generation={} outcome={:?} status={} failures={} slow={} no_response={} no_response_generation={} slow_retired={} slow_retired_generation={} clock_domain_ns={} repair_old_generation={} repair_new_generation={} repair_cause={} repair_trigger_attempt={} repair_claimed_mono_ns={} repair_prewarm_started_mono_ns={} repair_ready_mono_ns={} repair_attempts={}",
+                        account, role, slot, o.sequence, o.observed_at_ns, consumed_at_ns, o.observed_mono_ns, consumed_mono_ns, o.health.pool_generation,
+                        o.health.quarantined, o.busy, o.business.map_or(0, |b| b.attempt_id),
+                        o.business.map_or(0, |b| b.pool_generation), o.business.map(|b| b.outcome),
+                        o.business.map_or(0, |b| b.status_code), o.cumulative_failures, o.cumulative_slow,
+                        o.cumulative_no_response, o.no_response_generation, o.cumulative_slow_retired, o.slow_retired_generation, crate::types::monotonic_clock_domain_ns(),
+                        o.repair.map_or(0, |r| r.old_generation), o.repair.map_or(0, |r| r.new_generation),
+                        o.repair.map_or(0, |r| r.cause), o.repair.map_or(0, |r| r.trigger_attempt),
+                        o.repair.map_or(0, |r| r.claimed_mono_ns), o.repair.map_or(0, |r| r.prewarm_started_mono_ns),
+                        o.repair.map_or(0, |r| r.ready_mono_ns), o.repair.map_or(0, |r| r.attempts)),
                     ExecutionDiagnostic::SignalIngress { owners, depth, control_depth, sampled_high_water } => info!(
                         "[execution_signal_ingress] direct=1 owners={} owner_capacity=1024 root_capacity={} control_capacity=8 depth={} control_depth={} sampled_high_water={} sample_interval_ms=1",
                         owners, CHANNEL_CAPACITY, depth, control_depth, sampled_high_water),
@@ -586,8 +631,8 @@ fn spawn_execution_diagnostics(
                         "[execution_probe_ingress] capacity=64 depth={} sampled_high_water={} rejected_before_dispatch={} retried_requests={} retry_exhausted={} disconnected={} enqueue_max_ns={}",
                         depth, high_water, rejected, retry.0, retry.1, retry.2, retry.3,
                     ),
-                    ExecutionDiagnostic::Admission { account, snapshot, paused_total_ns, place_blocked_total_ns, capacity, replaced_snapshots, no_response_resets, cancel_outbox, event_audit_queue } => info!(
-                        "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0 no_response_resets={} cancel_outbox_depth={} cancel_outbox_high_water={} cancel_outbox_oldest_ns={} cancel_coalesced={} cancel_outbox_overflow={} event_audit_depth={} event_audit_sampled_high_water={} event_audit_rejected={} event_audit_capacity=512 place_blocked_total_ms={} reason={} ready_fast={} verified_free={} probation_free={} probation_busy={} eligible_cancel={} ready_mask={} verified_mask={} busy_mask={}",
+                    ExecutionDiagnostic::Admission { account, snapshot, paused_total_ns, place_blocked_total_ns, capacity, replaced_snapshots, no_response_resets, cancel_outbox, event_audit_queue, lane_evidence_dropped } => info!(
+                        "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0 no_response_resets={} cancel_outbox_depth={} cancel_outbox_high_water={} cancel_outbox_oldest_ns={} cancel_coalesced={} cancel_outbox_overflow={} event_audit_depth={} event_audit_sampled_high_water={} event_audit_rejected={} event_audit_capacity=512 place_blocked_total_ms={} reason={} ready_fast={} verified_free={} probation_free={} probation_busy={} eligible_cancel={} ready_mask={} verified_mask={} busy_mask={} observed_at_ns={} blockers={} pause_until_ns={} recovery_successes={} recovery_required={} probe_dispatched_at_ns={} probe_attempt_after={} lane_evidence_dropped={}",
                         account, snapshot.state, snapshot.epoch, snapshot.available_place_slots,
                         paused_total_ns / 1_000_000, replaced_snapshots, no_response_resets,
                         cancel_outbox.depth, cancel_outbox.high_water, cancel_outbox.oldest_ns,
@@ -597,6 +642,9 @@ fn spawn_execution_diagnostics(
                         capacity.ready_fast, capacity.verified_free, capacity.probation_free,
                         capacity.probation_busy, capacity.eligible_cancel,
                         capacity.ready_mask, capacity.verified_mask, capacity.busy_mask,
+                        snapshot.observed_at_ns, capacity.blockers, capacity.pause_until_ns,
+                        capacity.recovery_successes, capacity.recovery_required,
+                        capacity.probe_dispatched_at_ns, capacity.probe_attempt_after, lane_evidence_dropped,
                     ),
                     ExecutionDiagnostic::PeerFailureReset { account, failure, overflow, reset_count, consumed_at_ns } => warn!(
                         "[execution_peer_failure] account={} source={:?} peer={:?} observed_at_ns={} notification_age_us={} queue_capacity={} overflow={} reset_count={} action=retire_old_order_generations",
@@ -620,6 +668,16 @@ fn spawn_execution_diagnostics(
                 }
             }
         })?)
+}
+
+// Shutdown only, after physical owners and the metrics monitor have joined.
+// Metrics own sender clones: retaining them while joining the receiver keeps
+// its channel alive forever even after all business routes are gone.
+fn finish_execution_diagnostics(metrics: Vec<Arc<PolyConnectionLaneMetrics>>,
+    sender: hexagent_runtime::poll_channel::Sender<ExecutionDiagnostic>, handle: thread::JoinHandle<()>) {
+    drop(metrics);
+    drop(sender);
+    let _ = handle.join();
 }
 
 fn spawn_memory_telemetry(shutdown_token: ShutdownToken) -> Result<thread::JoinHandle<()>> {
@@ -12861,11 +12919,9 @@ impl Engine {
                         let wake = (config.os_tune.execution_wakeup && matches!(role, Role::Fast | Role::Cancel))
                             .then(|| Arc::new(hexagent_runtime::wake::Wake::default()));
                         let (tx, rx) = hexagent_runtime::poll_channel::bounded_with_wake::<PolyConnectionCommand>(capacity, wake);
-                        let lane_metrics = Arc::new(PolyConnectionLaneMetrics::new(
-                            &account_id,
-                            role,
-                            slot,
-                        ));
+                        let mut metrics = PolyConnectionLaneMetrics::new(&account_id, role, slot);
+                        metrics.diagnostic = Some(execution_diagnostic_tx.clone());
+                        let lane_metrics = Arc::new(metrics);
                         poly_connection_metrics.push(Arc::clone(&lane_metrics));
                         let binding = (role == Role::Fast).then(||
                             crate::os_tune::reserve_execution_binding("poly-exec", crate::os_tune::ExecutionThreadRole::PolymarketFast));
@@ -13108,7 +13164,7 @@ impl Engine {
                                             0
                                         };
                                         info!(
-                                            "[poly_connection_owner_metric] account={} role={:?} slot={} occupied={} queue_depth={} queue_high_water={} busy_skips={} cooldown_skips={} cooldown_remaining_ms={} slow_requests={} slow_streak={} send_failures={} completed={} current_request_age_ms={} request_age_max_ms={}",
+                                            "[poly_connection_owner_metric] account={} role={:?} slot={} occupied={} queue_depth={} queue_high_water={} busy_skips={} cooldown_skips={} cooldown_remaining_ms={} slow_requests={} slow_streak={} send_failures={} completed={} current_request_age_ms={} request_age_max_ms={} diagnostic_dropped={} diagnostic_capacity={}",
                                             lane.account_id,
                                             lane.role,
                                             lane.slot,
@@ -13126,6 +13182,7 @@ impl Engine {
                                             lane.completed.load(Ordering::Relaxed),
                                             request_age_ms,
                                             lane.request_age_max_ns.load(Ordering::Relaxed) / 1_000_000,
+                                            lane.diagnostic_dropped.load(Ordering::Relaxed), EXECUTION_DIAGNOSTIC_CAPACITY,
                                         );
                                     }
                                     for account in &monitoring_accounts {
@@ -13793,8 +13850,7 @@ impl Engine {
                 }
                 poly_stats_stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 if let Some(h) = poly_stats_handle.take() { let _ = h.join(); }
-                drop(execution_diagnostic_tx);
-                let _ = execution_diagnostic_handle.join();
+                finish_execution_diagnostics(poly_connection_metrics, execution_diagnostic_tx, execution_diagnostic_handle);
                 info!("[Executor] Thread stopped");
             })
             .unwrap()
@@ -14920,6 +14976,9 @@ fn spawn_venue_execution_owner<T: ExchangeTrade + 'static>(
 /// Typed business commands accepted by one physical Polymarket connection
 /// owner.  The owner retains its exact admission slot for its whole lifetime,
 /// so a command never migrates to an arbitrary worker or completion drainer.
+// Explicit tag + payload layout permits copying only the active Place/Cancel
+// prefix. Large cold Signal variants keep the full-copy fallback.
+#[repr(C)]
 enum PolyConnectionCommand {
     RefreshTransport { prewarm_url: Arc<str>, expected_generation: u64, avoid_peer: Option<std::net::IpAddr> },
     /// Existing durable RTT probe HTTP legs use the same capacity and generation
@@ -14967,6 +15026,35 @@ enum PolyConnectionCommand {
         update_tx: ExecutorUpdateSender,
         enqueued_at: std::time::Instant,
     },
+}
+
+// SAFETY: both fields are ordinary observation-only u64s owned inline by the
+// command, valid for every bit pattern. No business/risk invariant uses them.
+// Selection does not mutate the source; the queue stamps its private copy.
+unsafe impl hexagent_runtime::try_queue::PublicationStamp for PolyConnectionCommand {
+    fn publication_stamp(&self) -> Option<&u64> {
+        match self {
+            Self::Place { order, .. } => Some(&order.hot_path.owner_published_mono_ns),
+            Self::Cancel { cancel_trigger, .. } => Some(&cancel_trigger.hot_path.owner_published_mono_ns),
+            _ => None,
+        }
+    }
+    fn copied_prefix_len(&self) -> usize {
+        let base = self as *const Self as usize;
+        macro_rules! end { ($field:expr) => { $field as *const _ as usize - base + std::mem::size_of_val($field) }; }
+        // SAFETY: repr(C) tag precedes fields. Include every whole field, not
+        // just its live subfields; exhaustive patterns reject added fields.
+        match self {
+            Self::Place { expected_generation, instance_id, order, stale_ms, update_tx, enqueued_at } =>
+                end!(expected_generation).max(end!(instance_id)).max(end!(order))
+                    .max(end!(stale_ms)).max(end!(update_tx)).max(end!(enqueued_at)),
+            Self::Cancel { cancel_trigger, instance_id, exchange, client_order_id, timestamp_ns, update_tx, enqueued_at } =>
+                end!(cancel_trigger).max(end!(instance_id)).max(end!(exchange))
+                    .max(end!(client_order_id)).max(end!(timestamp_ns)).max(end!(update_tx)).max(end!(enqueued_at)),
+            _ => std::mem::size_of::<Self>(),
+        }
+    }
+
 }
 
 /// Exact identity, never a hash-only match. Oversize identities take the
@@ -15040,9 +15128,10 @@ enum PolyTypedCompletion {
 /// while this flag is set can only create cross-order head-of-line blocking.
 /// The sender claims the slot before enqueue and the owner releases it only
 /// after the response handler completes.
-#[derive(Debug)]
 struct PolyConnectionLaneMetrics {
     account_id: Arc<str>,
+    diagnostic: Option<hexagent_runtime::poll_channel::Sender<ExecutionDiagnostic>>,
+    diagnostic_dropped: AtomicU64,
     role: hexagent_runtime::http1_pool::Role,
     slot: usize,
     occupied: AtomicBool,
@@ -15057,9 +15146,8 @@ struct PolyConnectionLaneMetrics {
     send_failures: AtomicU64,
     completed: AtomicU64,
     request_age_max_ns: AtomicU64,
-    /// A slow physical socket is temporarily removed from ordinary RR
-    /// selection. Cancel remains lossless: this lane is still a last-resort
-    /// fallback when every healthy owner is occupied.
+    /// Cold Reconcile compatibility only. Fast/Cancel never use this timer;
+    /// their generation-aware preference is exclusively router-owned.
     cooldown_until_ns: AtomicU64,
     slow_streak: AtomicU64,
     slow_requests: AtomicU64,
@@ -15070,6 +15158,8 @@ impl PolyConnectionLaneMetrics {
     fn new(account_id: &str, role: hexagent_runtime::http1_pool::Role, slot: usize) -> Self {
         Self {
             account_id: Arc::from(account_id),
+            diagnostic: None,
+            diagnostic_dropped: AtomicU64::new(0),
             role,
             slot,
             occupied: AtomicBool::new(false),
@@ -15094,35 +15184,24 @@ impl PolyConnectionLaneMetrics {
         connection: hexagent_runtime::http1_pool::PooledConnectionSnapshot,
     ) {
         const SLOW: Duration = Duration::from_millis(500);
-        const HEALTHY_RESET: Duration = Duration::from_millis(100);
         if elapsed >= SLOW {
-            let streak = self.slow_streak.fetch_add(1, Ordering::AcqRel) + 1;
-            let shift = streak.saturating_sub(1).min(4) as u32;
-            // Fast eligibility is generation-aware and router-owned. Do not
-            // report a timer quarantine that the new Fast path does not use.
-            let cooldown_secs = if self.role == hexagent_runtime::http1_pool::Role::Fast {
-                0
-            } else {
-                (2_u64 << shift).min(30)
-            };
-            let until = now_ns().saturating_add(cooldown_secs * 1_000_000_000);
-            self.cooldown_until_ns.fetch_max(until, Ordering::AcqRel);
-            let slow_requests = self.slow_requests.fetch_add(1, Ordering::Relaxed) + 1;
-            warn!(
-                "[poly_connection_owner_slow] account={} role={:?} slot={} elapsed_ms={} slow_streak={} slow_requests={} cooldown_ms={} pool_generation={} connect_generation={} peer={:?} cardinality_unchanged=true",
-                self.account_id,
-                self.role,
-                self.slot,
-                elapsed.as_millis(),
-                streak,
-                slow_requests,
-                cooldown_secs * 1_000,
-                connection.pool_generation,
-                connection.connect_generation,
-                connection.peer,
-            );
-        } else if elapsed <= HEALTHY_RESET {
-            self.slow_streak.store(0, Ordering::Release);
+            let streak = self.slow_streak.fetch_add(1, Ordering::Relaxed) + 1;
+            self.slow_requests.fetch_add(1, Ordering::Relaxed);
+            // Only the cold Reconcile compatibility route retains its old
+            // elapsed-command timer. Fast and Cancel use router generation health.
+            if self.role == hexagent_runtime::http1_pool::Role::Reconcile {
+                let seconds = (2_u64 << streak.saturating_sub(1).min(4)).min(30);
+                self.cooldown_until_ns.store(now_ns().saturating_add(seconds * 1_000_000_000), Ordering::Release);
+            }
+            if let Some(sender) = &self.diagnostic {
+                if sender.try_send(ExecutionDiagnostic::OwnerSlow {
+                    account: Arc::clone(&self.account_id), role: self.role, slot: self.slot,
+                    elapsed_ns: elapsed.as_nanos().min(u64::MAX as u128) as u64, connection }).is_err() {
+                    self.diagnostic_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        } else if elapsed <= Duration::from_millis(100) {
+            self.slow_streak.store(0, Ordering::Relaxed);
             self.cooldown_until_ns.store(0, Ordering::Release);
         }
         let enqueued_ns = self.enqueued_ns.swap(0, Ordering::AcqRel);
@@ -15168,7 +15247,7 @@ impl PolyConnectionLane {
 
     fn try_send(
         &self,
-        mut command: PolyConnectionCommand,
+        command: PolyConnectionCommand,
     ) -> Result<(), crossbeam_channel::TrySendError<PolyConnectionCommand>> {
         if self
             .metrics
@@ -15183,14 +15262,25 @@ impl PolyConnectionLane {
         self.metrics.cancel_reply_pending.store(
             matches!(command, PolyConnectionCommand::Cancel { .. }), Ordering::Release);
         let prepares = matches!(&command, PolyConnectionCommand::Place { .. });
-        if let Some(trace) = command.hot_path_mut() { trace.owner_published_mono_ns = hexagent_types::types::monotonic_now_ns(); }
+        let has_trace = matches!(&command, PolyConnectionCommand::Place { .. } | PolyConnectionCommand::Cancel { .. });
         self.metrics.queue_depth.store(1, Ordering::Release);
-        match self.tx.try_send(command) {
-            Ok(()) => {
+        let sent = self.tx.try_send_stamped(command);
+        match sent {
+            Ok(timing) => {
                 if prepares { if let Some(route) = &self.preparation { route.issued(); } }
-                self.metrics
-                    .queue_high_water
-                    .fetch_max(1, Ordering::Relaxed);
+                if has_trace {
+                    let publication_mono_ns = timing.push_started_mono_ns;
+                    if let Some(sender) = &self.metrics.diagnostic {
+                        if sender.try_send_owned(ExecutionDiagnostic::OwnerPublication {
+                            account: Arc::clone(&self.metrics.account_id), role: self.metrics.role,
+                            slot: self.metrics.slot, publication_mono_ns, timing }).is_err() {
+                            self.metrics.diagnostic_dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                // occupied admits at most one command; this gauge only ever
+                // transitions 0 -> 1. No read/modify/write is needed per send.
+                self.metrics.queue_high_water.store(1, Ordering::Relaxed);
                 Ok(())
             }
             Err(error) => {
@@ -15258,6 +15348,8 @@ struct PolyAccountConnectionRoutes {
     health: Option<AccountExecutionAdmission>,
     health_account: Arc<str>,
     health_diagnostic: Option<hexagent_runtime::poll_channel::Sender<ExecutionDiagnostic>>,
+    // Dispatcher sole writer; exported by the existing background diagnostic owner.
+    lane_evidence_dropped: u64,
     paused_since_ns: Option<u64>,
     paused_total_ns: u64,
     // Dispatcher-owned total includes zero-capacity Degraded/Recovering too.
@@ -15314,6 +15406,7 @@ impl Default for PolyAccountConnectionRoutes {
             health: None,
             health_account: Arc::from(""),
             health_diagnostic: None,
+            lane_evidence_dropped: 0,
             paused_since_ns: None,
             paused_total_ns: 0,
             place_blocked_since_ns: None,
@@ -15369,7 +15462,17 @@ impl PolyAccountConnectionRoutes {
             match receiver.try_recv() {
                 Ok(observation) => {
                     let resets = health.no_response_resets();
-                    health.observe(*role, *slot, observation, now_ns());
+                    let consumed_at_ns = now_ns();
+                    if health.evidence_changed(*role, *slot, &observation) {
+                        if let Some(sender) = &self.health_diagnostic {
+                            if sender.try_send(ExecutionDiagnostic::LaneEvidence {
+                                account: Arc::clone(&self.health_account), role: *role, slot: *slot,
+                                observation, consumed_at_ns, consumed_mono_ns: crate::types::monotonic_now_ns() }).is_err() {
+                                self.lane_evidence_dropped = self.lane_evidence_dropped.saturating_add(1);
+                            }
+                        }
+                    }
+                    health.observe(*role, *slot, observation, consumed_at_ns);
                     if health.no_response_resets() != resets {
                         if let Some(peer) = observation.no_response_peer.filter(|_|
                             self.last_peer_failure.is_none_or(|old|
@@ -15495,6 +15598,7 @@ impl PolyAccountConnectionRoutes {
             if let Some(sender) = &self.health_diagnostic {
                 try_submit_execution_diagnostic(sender, ExecutionDiagnostic::Admission {
                     account: Arc::clone(&self.health_account), snapshot,
+                    lane_evidence_dropped: self.lane_evidence_dropped,
                     no_response_resets: health.no_response_resets(),
                     event_audit_queue: (self.event_audit.as_ref().map_or(0, |tx| tx.len()),
                         self.event_audit_high_water, self.event_audit_rejected),
@@ -15682,74 +15786,79 @@ fn try_send_poly_owner(
         }
         selection.minimum_pending = (best != u64::MAX).then_some(best);
     }
-    for offset in 0..lanes.len() {
-        let index = (start + offset) % lanes.len();
-        if matches!(&command, PolyConnectionCommand::ProbeHttp { request, .. }
-            if request.excluded_slot == Some(lanes[index].metrics.slot)) {
-            continue;
-        }
-        if role == hexagent_runtime::http1_pool::Role::Fast
-            && health.as_mut().is_some_and(|health| !health.lane_place_allowed(lanes[index].metrics.slot, now))
-        {
-            continue;
-        }
-        // Production Fast admission follows generation-aware health. The old
-        // elapsed-command cooldown is retained only for non-Fast fallback lanes
-        // and legacy unit fixtures; it cannot prolong a repaired Fast socket.
-        if !(role == hexagent_runtime::http1_pool::Role::Fast && health.is_some())
-            && lanes[index]
-            .metrics
-            .cooldown_until_ns
-            .load(Ordering::Acquire)
-            > now
-        {
-            lanes[index]
+    let passes = if role == hexagent_runtime::http1_pool::Role::Cancel && health.is_some() { 3 } else { 1 };
+    for rank in 0..passes {
+        for offset in 0..lanes.len() {
+            let index = (start + offset) % lanes.len();
+            if role == hexagent_runtime::http1_pool::Role::Cancel
+                && health.as_ref().is_some_and(|h| h.cancel_lane_rank(lanes[index].metrics.slot, now) != rank) {
+                continue;
+            }
+            if matches!(&command, PolyConnectionCommand::ProbeHttp { request, .. }
+                if request.excluded_slot == Some(lanes[index].metrics.slot)) {
+                continue;
+            }
+            if role == hexagent_runtime::http1_pool::Role::Fast
+                && health.as_mut().is_some_and(|health| !health.lane_place_allowed(lanes[index].metrics.slot, now))
+            {
+                continue;
+            }
+            // Fast/Cancel health has one generation-aware router authority.
+            if role == hexagent_runtime::http1_pool::Role::Reconcile
+                && lanes[index]
                 .metrics
-                .cooldown_skips
-                .fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        match &mut command {
-            PolyConnectionCommand::Place { expected_generation, .. }
-            | PolyConnectionCommand::ProbeHttp { expected_generation, .. } if role == hexagent_runtime::http1_pool::Role::Fast => {
-                *expected_generation = health.as_ref().and_then(|health| health.lane_generation(lanes[index].metrics.slot));
+                .cooldown_until_ns
+                .load(Ordering::Acquire)
+                > now
+            {
+                lanes[index]
+                    .metrics
+                    .cooldown_skips
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
             }
-            _ => {}
-        }
-        if role == hexagent_runtime::http1_pool::Role::Fast {
-            if let PolyConnectionCommand::Place { order, .. } = &mut command {
-                order.hot_path.fast_selection = lanes[index].preparation.as_ref().map(|route| {
-                    selection.core = route.core() as u32;
-                    selection.selected_pending = route.pending_on_core();
-                    selection
-                });
-            }
-        }
-        match lanes[index].try_send(command) {
-            Ok(()) => {
-                *maintenance_pending = true;
-                *rr = index.wrapping_add(1);
-                if role == hexagent_runtime::http1_pool::Role::Cancel {
-                    cancel_lane_keys[index] = cancel_key;
+            match &mut command {
+                PolyConnectionCommand::Place { expected_generation, .. }
+                | PolyConnectionCommand::ProbeHttp { expected_generation, .. } if role == hexagent_runtime::http1_pool::Role::Fast => {
+                    *expected_generation = health.as_ref().and_then(|health| health.lane_generation(lanes[index].metrics.slot));
                 }
-                if role == hexagent_runtime::http1_pool::Role::Fast {
-                    if let Some(health) = health.as_mut() {
-                        health.place_dispatched(lanes[index].metrics.slot, now_ns());
+                _ => {}
+            }
+            if role == hexagent_runtime::http1_pool::Role::Fast {
+                if let PolyConnectionCommand::Place { order, .. } = &mut command {
+                    order.hot_path.fast_selection = lanes[index].preparation.as_ref().map(|route| {
+                        selection.core = route.core() as u32;
+                        selection.selected_pending = route.pending_on_core();
+                        selection
+                    });
+                }
+            }
+            match lanes[index].try_send(command) {
+                Ok(()) => {
+                    *maintenance_pending = true;
+                    *rr = index.wrapping_add(1);
+                    if role == hexagent_runtime::http1_pool::Role::Cancel {
+                        cancel_lane_keys[index] = cancel_key;
                     }
+                    if role == hexagent_runtime::http1_pool::Role::Fast {
+                        if let Some(health) = health.as_mut() {
+                            health.place_dispatched(lanes[index].metrics.slot, now_ns());
+                        }
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                Err(crossbeam_channel::TrySendError::Full(returned)) => command = returned,
+                Err(crossbeam_channel::TrySendError::Disconnected(returned)) => command = returned,
             }
-            Err(crossbeam_channel::TrySendError::Full(returned)) => command = returned,
-            Err(crossbeam_channel::TrySendError::Disconnected(returned)) => command = returned,
         }
     }
-    // Cancel/reconcile work is lossless. A cooling lane remains a bounded
+    // Reconcile work is lossless. A cooling lane remains a bounded
     // last resort when every healthy connection is occupied; no request is
     // dropped and no extra socket is created. Fast/place never falls through
     // to a known-slow generation.
     if matches!(
         role,
-        hexagent_runtime::http1_pool::Role::Cancel | hexagent_runtime::http1_pool::Role::Reconcile
+        hexagent_runtime::http1_pool::Role::Reconcile
     ) {
         for offset in 0..lanes.len() {
             let index = (start + offset) % lanes.len();
@@ -15968,40 +16077,51 @@ fn run_poly_connection_owner(
         Duration::from_millis(1)
     };
     loop {
+        let maintenance_started = hexagent_types::types::monotonic_now_ns();
         // The socket driver publishes retirement even while no business is in
         // flight. Repair on the existing runtime before the next quote needs
         // TLS; generation fencing and quarantine remain the admission authority.
         if matches!(role, Role::Fast | Role::Cancel) && permit.instrumented_transport_closed()
             && !permit.health_snapshot().quarantined
         {
-            permit.current_pooled_client().note_instrumented_transport_failure(prewarm_url.to_string());
+            permit.current_pooled_client().note_instrumented_transport_failure_with_cause(prewarm_url.to_string(),
+                hexagent_runtime::http1_pool::TransportRepairCause::IdleSocketClosed, 0);
         }
         if let Some(publisher) = health_publisher.as_mut() {
             let business = permit.business_outcome();
             let (failures, slow) = permit.business_outcome_totals();
             let (cumulative_no_response, no_response_generation) = permit.business_no_response_evidence();
+            let (cumulative_slow_retired, slow_retired_generation) = permit.business_slow_retirement_evidence();
             observation_sequence += 1;
             publisher.publish(LaneObservation {
-                sequence: observation_sequence,
+                observed_mono_ns: crate::types::monotonic_now_ns(),
+                repair: permit.transport_repair_snapshot(), sequence: observation_sequence,
                 observed_at_ns: now_ns(),
                 health: permit.health_snapshot(),
                 business,
                 busy: lane_metrics.occupied.load(Ordering::Acquire),
                 cumulative_failures: failures,
                 cumulative_slow: slow,
-                cumulative_no_response, no_response_generation,
+                cumulative_no_response, cumulative_slow_retired, slow_retired_generation, no_response_generation,
                 no_response_peer: permit.business_no_response_peer(),
             });
         }
         // Twelve Cancel owners share a core with a lower-priority dispatcher.
         // A 10 us idle poll saturated that core in the Linux FIFO probe; 50 us
         // leaves publication time for the producer while bounding pickup delay.
-        let mut command = match rx.recv_timeout_with_poll(HEARTBEAT, idle_poll) {
+        let maintenance_completed = hexagent_types::types::monotonic_now_ns();
+        let mut resumed_mono_ns = 0;
+        let mut command = match rx.recv_timeout_observed(HEARTBEAT, idle_poll, &mut resumed_mono_ns) {
             Ok(command) => command,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
-        if let Some(trace) = command.hot_path_mut() { trace.owner_dequeued_mono_ns = hexagent_types::types::monotonic_now_ns(); }
+        if let Some(trace) = command.hot_path_mut() {
+            trace.owner_dequeued_mono_ns = hexagent_types::types::monotonic_now_ns();
+            trace.owner_resumed_mono_ns = resumed_mono_ns;
+            trace.owner_maintenance_started_mono_ns = maintenance_started;
+            trace.owner_maintenance_completed_mono_ns = maintenance_completed;
+        }
         let mut preparation_guard = if matches!(&command, PolyConnectionCommand::Place { .. }) {
             preparation_completion.as_mut().map(|completion| completion.guard())
         } else { None };
@@ -19424,6 +19544,70 @@ mod market_router_tests {
     }
 
     #[test]
+    fn compact_hot_commands_preserve_all_fields_and_cold_full_copy() {
+        use hexagent_runtime::try_queue::PublicationStamp;
+        let (tx, rx) = hexagent_runtime::poll_channel::bounded(1);
+        let (updates, _updates_rx) = bounded(1);
+        let update_tx = ExecutorUpdateSender { owner: 42, tx: updates.into() };
+        let enqueued_at = Instant::now();
+        let order = order_req("compact-order", "compact-instance");
+        let mut expected = order.clone();
+        let place = PolyConnectionCommand::Place { expected_generation: Some(73), instance_id: "compact-instance".into(),
+            order, stale_ms: 987, update_tx: update_tx.clone(), enqueued_at };
+        println!("copied_prefix place={} whole={}", place.copied_prefix_len(), std::mem::size_of::<PolyConnectionCommand>());
+        assert!(place.copied_prefix_len() < 1024);
+        let timing = tx.try_send_stamped(place).ok().unwrap();
+        let PolyConnectionCommand::Place { expected_generation, instance_id, order, stale_ms, update_tx: received, enqueued_at: at } = rx.try_recv().unwrap()
+            else { panic!("place variant lost"); };
+        expected.hot_path.owner_published_mono_ns = timing.push_started_mono_ns;
+        assert_eq!(format!("{order:?}"), format!("{expected:?}"));
+        assert_eq!((expected_generation, instance_id.as_str(), stale_ms, received.owner, at), (Some(73), "compact-instance", 987, 42, enqueued_at));
+        let cancel_trigger = CancelTrigger { exchange_ns: 731, local_ns: 987, ..Default::default() };
+        let mut expected = cancel_trigger;
+        let cancel = PolyConnectionCommand::Cancel { cancel_trigger, instance_id: "cancel-instance".into(), exchange: Exchange::Polymarket,
+            client_order_id: "cancel-order".into(), timestamp_ns: 567, update_tx: update_tx.clone(), enqueued_at };
+        println!("copied_prefix cancel={} whole={}", cancel.copied_prefix_len(), std::mem::size_of::<PolyConnectionCommand>());
+        assert!(cancel.copied_prefix_len() < 1024);
+        let timing = tx.try_send_stamped(cancel).ok().unwrap();
+        let PolyConnectionCommand::Cancel { cancel_trigger, instance_id, exchange, client_order_id, timestamp_ns, update_tx: received, enqueued_at: at } = rx.try_recv().unwrap()
+            else { panic!("cancel variant lost"); };
+        expected.hot_path.owner_published_mono_ns = timing.push_started_mono_ns;
+        assert_eq!(format!("{cancel_trigger:?}"), format!("{expected:?}"));
+        assert_eq!((instance_id.as_str(), exchange, client_order_id.as_str(), timestamp_ns, received.owner, at),
+            ("cancel-instance", Exchange::Polymarket, "cancel-order", 567, 42, enqueued_at));
+        let cold = PolyConnectionCommand::SafetyCancel { signal: Signal::PolymarketCancelAllOrders {
+            reason: "test-safety".into(), market: None, asset_ids: vec!["asset".into()], instance_id: "safety-instance".into() }, update_tx, enqueued_at };
+        assert_eq!(cold.copied_prefix_len(), std::mem::size_of::<PolyConnectionCommand>());
+        tx.try_send_stamped(cold).ok().unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), PolyConnectionCommand::SafetyCancel {
+            signal: Signal::PolymarketCancelAllOrders { reason, market, asset_ids, instance_id }, update_tx, enqueued_at: at
+        } if instance_id == "safety-instance" && reason == "test-safety" && market.is_none() && asset_ids == ["asset"] && update_tx.owner == 42 && at == enqueued_at));
+    }
+
+    #[test]
+    fn compact_publication_diagnostic_preserves_identity_timing_and_full_fallback() {
+        use hexagent_runtime::try_queue::PublicationStamp;
+        let (tx, rx) = hexagent_runtime::poll_channel::bounded(1);
+        let account: Arc<str> = Arc::from("compact-account");
+        for _iteration in 0..1000 {
+            let cold = ExecutionDiagnostic::OwnerSlow { account: account.clone(), role: hexagent_runtime::http1_pool::Role::Cancel,
+                slot: 17, elapsed_ns: 999, connection: Default::default() };
+            assert_eq!(cold.copied_prefix_len(), std::mem::size_of::<ExecutionDiagnostic>());
+            tx.try_send_owned(cold).ok().unwrap();
+            assert!(matches!(rx.try_recv().unwrap(), ExecutionDiagnostic::OwnerSlow { account: a, slot: 17, elapsed_ns: 999, .. } if Arc::ptr_eq(&a, &account)));
+            let timing = hexagent_runtime::poll_channel::PublicationTiming { push_started_mono_ns: 12, push_returned_mono_ns: 23, notify_returned_mono_ns: 45 };
+            let record = ExecutionDiagnostic::OwnerPublication { account: account.clone(), role: hexagent_runtime::http1_pool::Role::Cancel,
+                slot: 19, publication_mono_ns: 12, timing };
+            if _iteration == 0 { println!("copied_prefix diagnostic={} whole={}", record.copied_prefix_len(), std::mem::size_of::<ExecutionDiagnostic>()); }
+            assert!(record.copied_prefix_len() < 128);
+            tx.try_send_owned(record).ok().unwrap();
+            assert!(matches!(rx.try_recv().unwrap(), ExecutionDiagnostic::OwnerPublication { account: a, role: hexagent_runtime::http1_pool::Role::Cancel,
+                slot: 19, publication_mono_ns: 12, timing: got } if Arc::ptr_eq(&a, &account) && got == timing));
+            assert_eq!(Arc::strong_count(&account), 1);
+        }
+    }
+
+    #[test]
     fn hexmarket_single_cancel_returns_to_the_physical_order_owner() {
         let mut order = order_req("hex-coid-1", "instance-0");
         order.exchange = Exchange::Hexmarket;
@@ -19853,10 +20037,10 @@ mod market_router_tests {
         let mut health = AccountExecutionAdmission::new(1, 1, now);
         for role in [Role::Fast, Role::Cancel] {
             health.observe(role, 0, LaneObservation {
-                sequence: 1, observed_at_ns: now,
+                observed_mono_ns: 0, repair: None, sequence: 1, observed_at_ns: now,
                 health: PermitHealthSnapshot { pool_generation: 7, quarantined: false },
                 business: None, busy: false, cumulative_failures: 0, cumulative_slow: 0,
-                cumulative_no_response: 0, no_response_generation: 0, no_response_peer: None,
+                cumulative_no_response: 0, cumulative_slow_retired: 0, slow_retired_generation: 0, no_response_generation: 0, no_response_peer: None,
             }, now);
         }
         assert!(health.can_place(now));
@@ -19917,10 +20101,10 @@ mod market_router_tests {
         let now = now_ns();
         for role in [Role::Fast, Role::Cancel] {
             routes.health.as_mut().unwrap().observe(role, 0, LaneObservation {
-                sequence: 2, observed_at_ns: now,
+                observed_mono_ns: 0, repair: None, sequence: 2, observed_at_ns: now,
                 health: PermitHealthSnapshot { pool_generation: 8, quarantined: false },
                 business: None, busy: false, cumulative_failures: 0, cumulative_slow: 0,
-                cumulative_no_response: 0, no_response_generation: 0, no_response_peer: None,
+                cumulative_no_response: 0, cumulative_slow_retired: 0, slow_retired_generation: 0, no_response_generation: 0, no_response_peer: None,
             }, now);
         }
         sender.publish(failure);
@@ -20026,10 +20210,10 @@ mod market_router_tests {
         let now = now_ns();
         let mut health = AccountExecutionAdmission::new(1, 1, now);
         let mut observation = LaneObservation {
-            sequence: 1, observed_at_ns: now,
+            observed_mono_ns: 0, repair: None, sequence: 1, observed_at_ns: now,
             health: PermitHealthSnapshot { pool_generation: 7, quarantined: false },
             business: None, busy: false, cumulative_failures: 0, cumulative_slow: 0,
-            cumulative_no_response: 0, no_response_generation: 0, no_response_peer: None,
+            cumulative_no_response: 0, cumulative_slow_retired: 0, slow_retired_generation: 0, no_response_generation: 0, no_response_peer: None,
         };
         health.observe(Role::Fast, 0, observation, now);
         health.observe(Role::Cancel, 0, observation, now);
@@ -20182,10 +20366,10 @@ mod market_router_tests {
         let mut health = AccountExecutionAdmission::new(2, 1, now);
         for (role, slot) in [(Role::Fast, 0), (Role::Fast, 1), (Role::Cancel, 0)] {
             health.observe(role, slot, LaneObservation {
-                sequence: 1, observed_at_ns: now,
+                observed_mono_ns: 0, repair: None, sequence: 1, observed_at_ns: now,
                 health: PermitHealthSnapshot { pool_generation: 7, quarantined: false },
                 business: None, busy: false, cumulative_failures: 0, cumulative_slow: 0,
-                cumulative_no_response: 0, no_response_generation: 0, no_response_peer: None,
+                cumulative_no_response: 0, cumulative_slow_retired: 0, slow_retired_generation: 0, no_response_generation: 0, no_response_peer: None,
             }, now);
         }
         let mut routes = PolyAccountConnectionRoutes {
@@ -20514,7 +20698,7 @@ mod market_router_tests {
     }
 
     #[test]
-    fn cancel_owner_cools_slow_slot_without_dropping_lossless_fallback() {
+    fn cancel_owner_generation_health_precedes_rr_and_preserves_lossless_fallback() {
         let (slow_tx, slow_rx) = hexagent_runtime::poll_channel::bounded(1);
         let (healthy_tx, healthy_rx) = hexagent_runtime::poll_channel::bounded(1);
         let (raw_update_tx, _update_rx) = bounded(4);
@@ -20537,6 +20721,21 @@ mod market_router_tests {
             ],
             ..Default::default()
         };
+        let now = now_ns();
+        let mut health = AccountExecutionAdmission::new(0, 3, now);
+        for slot in 1..3 {
+            health.observe(hexagent_runtime::http1_pool::Role::Cancel, slot, LaneObservation {
+                observed_mono_ns: 0, repair: None, sequence: 1, observed_at_ns: now,
+                health: hexagent_runtime::http1_pool::PermitHealthSnapshot { pool_generation: 2, quarantined: slot == 1 },
+                business: Some(hexagent_runtime::http1_pool::BusinessHttpOutcomeSnapshot {
+                    attempt_id: slot as u64, pool_generation: 2, elapsed_ns: 10,
+                    outcome: hexagent_runtime::http1_pool::BusinessHttpOutcome::Healthy, status_code: 200 }),
+                busy: false, cumulative_failures: 0, cumulative_slow: 0,
+                cumulative_no_response: 0, cumulative_slow_retired: 0, slow_retired_generation: 0, no_response_generation: 0, no_response_peer: None,
+            }, now);
+        }
+        routes.health = Some(health);
+        routes.next_health_refresh_mono_ns = u64::MAX;
         routes.cancel[0]
             .metrics
             .cooldown_until_ns
@@ -20581,7 +20780,7 @@ mod market_router_tests {
                 .metrics
                 .cooldown_skips
                 .load(Ordering::Relaxed)
-                >= 2
+                == 0
         );
         assert_eq!(
             routes.cancel[0]
@@ -21481,3 +21680,7 @@ mod market_router_tests {
 #[cfg(test)]
 #[path = "cancel_coalescing_tests.rs"]
 mod cancel_coalescing_tests;
+
+#[cfg(test)]
+#[path = "owner_handoff_benchmark.rs"]
+mod owner_handoff_benchmark;

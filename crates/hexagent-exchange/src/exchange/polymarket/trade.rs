@@ -3008,10 +3008,12 @@ fn business_http_outcome(
         }
         _ => false,
     };
-    if !responsive {
+    if matches!(reply, Err(HttpErr::Timeout | HttpErr::Transport(_))) {
+        BusinessHttpOutcome::TransportUncertain
+    } else if !responsive {
         BusinessHttpOutcome::Failure
     } else if elapsed_ns >= super::network_incident::HTTP_SLOW_SUCCESS_THRESHOLD.as_nanos() as u64 {
-        BusinessHttpOutcome::Slow
+        BusinessHttpOutcome::SlowResponded
     } else {
         BusinessHttpOutcome::Healthy
     }
@@ -3030,8 +3032,11 @@ fn publish_business_http_outcome(
     if method == reqwest::Method::DELETE
         || (method == reqwest::Method::POST && matches!(path, "/order" | "/orders"))
     {
-        let outcome = business_http_outcome(reply, elapsed_ns);
-        if business_http_retirement_required(client.role(), outcome) {
+        let outcome = if status_code == 0 {
+            crate::http1_pool::BusinessHttpOutcome::TransportUncertain
+        } else { business_http_outcome(reply, elapsed_ns) };
+        let retire_slow = client.record_business_outcome(attempt_id, elapsed_ns, outcome, status_code);
+        if retire_slow {
             super::network_incident::note_http_slow_success(
                 client.role(),
                 client.slot(),
@@ -3040,20 +3045,10 @@ fn publish_business_http_outcome(
             // Use the same real-HTTP classification as the admission owner.
             // Slow business 4xx responses also retire their measured socket;
             // otherwise the owner could exclude a generation that never repairs.
-            client.note_instrumented_transport_failure(instrumented_prewarm_url(url));
+            client.note_instrumented_transport_failure_with_cause(instrumented_prewarm_url(url),
+                crate::http1_pool::TransportRepairCause::RepeatedSlowResponse, attempt_id);
         }
-        client.record_business_outcome(attempt_id, elapsed_ns, outcome, status_code);
     }
-}
-
-fn business_http_retirement_required(
-    role: crate::http1_pool::Role,
-    outcome: crate::http1_pool::BusinessHttpOutcome,
-) -> bool {
-    matches!(
-        role,
-        crate::http1_pool::Role::Fast | crate::http1_pool::Role::Cancel
-    ) && outcome == crate::http1_pool::BusinessHttpOutcome::Slow
 }
 
 async fn execute_http_on(
@@ -3068,6 +3063,7 @@ async fn execute_http_on(
     context: HttpPhaseContext,
 ) -> HttpReply {
     let request_started_ns = now_ns();
+    let request_started_mono_ns = crate::types::monotonic_now_ns();
     debug_assert_ne!(attempt_id, 0, "every HTTP dispatch requires an attempt ID");
     // Lazily derived — only the error branches need it, and parsing the
     // URL eagerly cost a full `Url::parse` + allocs on every request.
@@ -3102,6 +3098,7 @@ async fn execute_http_on(
         Ok(response) => response,
         Err(error) => {
             let response_received_ns = now_ns();
+            let response_received_mono_ns = crate::types::monotonic_now_ns();
             let timings = error.timings;
             let elapsed_ns = error.timings.total_ns;
             let attempted =
@@ -3109,7 +3106,8 @@ async fn execute_http_on(
                     crate::instrumented_http1::InstrumentedHttp1ErrorKind::InvalidRequest
                     | crate::instrumented_http1::InstrumentedHttp1ErrorKind::QueueTimeout);
             if attempted {
-                client.note_instrumented_transport_failure(instrumented_prewarm_url(url.as_ref()));
+                client.note_instrumented_transport_failure_with_cause(instrumented_prewarm_url(url.as_ref()),
+                    crate::http1_pool::TransportRepairCause::TransportUncertain, attempt_id);
             }
             let reply = Err(match error.kind {
                 crate::instrumented_http1::InstrumentedHttp1ErrorKind::Timeout => HttpErr::Timeout,
@@ -3143,6 +3141,9 @@ async fn execute_http_on(
                 slot: client.slot(),
                 pool_generation: client.pool_generation(),
                 request_started_ns,
+                request_started_mono_ns,
+                response_received_mono_ns,
+                completed_mono_ns: crate::types::monotonic_now_ns(),
                 response_received_ns,
                 completed_ns: now_ns(),
                 status: 0,
@@ -3163,6 +3164,7 @@ async fn execute_http_on(
         }
     };
     let response_received_ns = now_ns();
+    let response_received_mono_ns = crate::types::monotonic_now_ns();
     let timings = response.timings;
     client.note_transport_success();
     let elapsed_ns = response.timings.total_ns;
@@ -3198,6 +3200,9 @@ async fn execute_http_on(
         slot: client.slot(),
                 pool_generation: client.pool_generation(),
         request_started_ns,
+        request_started_mono_ns,
+        response_received_mono_ns,
+        completed_mono_ns: crate::types::monotonic_now_ns(),
         response_received_ns,
         completed_ns: now_ns(),
         status: status.as_u16(),
@@ -14510,11 +14515,11 @@ mod tests {
             super::super::network_incident::HTTP_SLOW_SUCCESS_THRESHOLD.as_nanos() as u64;
         let success = Ok(serde_json::json!({"success": true}));
         assert_eq!(business_http_outcome(&success, threshold - 1), Healthy);
-        assert_eq!(business_http_outcome(&success, threshold), Slow);
+        assert_eq!(business_http_outcome(&success, threshold), SlowResponded);
         for code in [400, 404, 409, 422] {
             let rejection = Err(HttpErr::Status(code, "business rejection".into()));
             assert_eq!(business_http_outcome(&rejection, 1), Healthy);
-            assert_eq!(business_http_outcome(&rejection, threshold), Slow);
+            assert_eq!(business_http_outcome(&rejection, threshold), SlowResponded);
         }
         for code in [301, 401, 403, 408, 425, 429, 500, 502, 503, 504] {
             assert_eq!(
@@ -14535,33 +14540,24 @@ mod tests {
             HttpErr::InvalidResponse("invalid json".into()),
             HttpErr::Other("failed".into()),
         ] {
-            assert_eq!(business_http_outcome(&Err(error), 1), Failure);
+            let expected = if matches!(error, HttpErr::Timeout | HttpErr::Transport(_)) { TransportUncertain } else { Failure };
+            assert_eq!(business_http_outcome(&Err(error), 1), expected);
         }
     }
 
     #[test]
-    fn slow_business_rejections_retire_exact_order_generation_but_queries_do_not() {
-        use crate::http1_pool::{BusinessHttpOutcome, Role};
+    fn complete_slow_business_rejections_are_distinct_from_service_failure() {
+        use crate::http1_pool::BusinessHttpOutcome;
         let slow_ns = super::super::network_incident::HTTP_SLOW_SUCCESS_THRESHOLD.as_nanos() as u64;
         for code in [400, 404, 409, 422] {
             let response = Err(HttpErr::Status(code, "business rejection".into()));
             let outcome = business_http_outcome(&response, slow_ns);
-            assert_eq!(outcome, BusinessHttpOutcome::Slow);
-            for role in [Role::Fast, Role::Cancel] {
-                assert!(business_http_retirement_required(role, outcome));
-            }
-            for role in [Role::Query, Role::Reconcile, Role::GapReplay] {
-                assert!(!business_http_retirement_required(role, outcome));
-            }
+            assert_eq!(outcome, BusinessHttpOutcome::SlowResponded);
         }
         for code in [401, 403, 408, 425, 429, 503] {
             let response = Err(HttpErr::Status(code, "unavailable".into()));
             let outcome = business_http_outcome(&response, slow_ns);
             assert_eq!(outcome, BusinessHttpOutcome::Failure);
-            assert!(
-                !business_http_retirement_required(Role::Fast, outcome),
-                "service pressure must reduce admission without a socket replacement storm"
-            );
         }
     }
 
