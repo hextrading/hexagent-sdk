@@ -858,6 +858,7 @@ struct Slot {
 
 #[derive(Clone)]
 struct ConnectionHealth {
+    attempt_trace: Arc<AttemptTraceSlot>,
     last_activity_ns: Arc<AtomicU64>,
     role: Role,
     slot: usize,
@@ -1036,10 +1037,12 @@ impl ConnectionHealth {
 
     async fn repair_instrumented(self, prewarm_url: String, failures: usize, avoid_peer: Option<IpAddr>) {
         let mut owner = self;
+        owner.attempt_trace.repair.prewarm_started.store(hexagent_types::types::monotonic_now_ns(), Ordering::SeqCst);
         let mut delay = Duration::from_millis(100);
         let mut attempt = 0_u64;
         while owner.is_current() {
             attempt += 1;
+            owner.attempt_trace.repair.attempts.store(attempt, Ordering::SeqCst);
             // Prefer other DNS peers for three bounded attempts. If every
             // alternative is unreachable, return to ordinary DNS ordering
             // instead of stranding the entire account in quarantine forever.
@@ -1073,6 +1076,8 @@ impl ConnectionHealth {
                     // Quarantine grants exclusive replacement ownership.
                     if let Some(generation) = owner.install_instrumented_replacement(candidate) {
                         owner.generation_at_pick = generation;
+                        owner.attempt_trace.repair.new_generation.store(generation, Ordering::SeqCst);
+                        owner.attempt_trace.repair.ready.store(hexagent_types::types::monotonic_now_ns(), Ordering::SeqCst);
                         owner.release_quarantine();
                         log::info!("[http1_pool] role={:?} slot={} replacement_generation={} connect_generation={} prewarm_attempts={} prior_failures={} avoided_peer={:?} peer={:?} ready=true", owner.role, owner.slot, generation, connect_generation, attempt, failures, preferred_avoid_peer, peer);
                     }
@@ -1144,7 +1149,68 @@ impl AttemptPeer {
     }
 }
 
+/// Advisory repair stages. Sole writer is the successful quarantine claimant
+/// and then its repair task; readers consume a copied, generation-tagged value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransportRepairSnapshot {
+    pub old_generation: u64,
+    pub new_generation: u64,
+    pub trigger_attempt: u64,
+    pub cause: u64,
+    pub claimed_mono_ns: u64,
+    pub prewarm_started_mono_ns: u64,
+    pub ready_mono_ns: u64,
+    pub attempts: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(u64)]
+pub enum TransportRepairCause {
+    Unspecified = 0,
+    TransportUncertain = 1,
+    RepeatedSlowResponse = 2,
+    AccountReset = 3,
+    IdleSocketClosed = 4,
+}
+
+#[derive(Default)]
+struct TransportRepairTrace {
+    old_generation: AtomicU64, new_generation: AtomicU64, trigger_attempt: AtomicU64,
+    cause: AtomicU64, claimed: AtomicU64, prewarm_started: AtomicU64,
+    ready: AtomicU64, attempts: AtomicU64,
+}
+impl TransportRepairTrace {
+    fn begin(&self, generation: u64, attempt: u64, cause: TransportRepairCause) {
+        self.claimed.store(0, Ordering::SeqCst);
+        self.old_generation.store(generation, Ordering::SeqCst);
+        self.new_generation.store(0, Ordering::SeqCst);
+        self.trigger_attempt.store(attempt, Ordering::SeqCst);
+        self.cause.store(cause as u64, Ordering::SeqCst);
+        self.prewarm_started.store(0, Ordering::SeqCst);
+        self.ready.store(0, Ordering::SeqCst);
+        self.attempts.store(0, Ordering::SeqCst);
+        self.claimed.store(hexagent_types::types::monotonic_now_ns(), Ordering::SeqCst);
+    }
+    fn snapshot(&self) -> Option<TransportRepairSnapshot> {
+        let claimed = self.claimed.load(Ordering::SeqCst);
+        if claimed == 0 { return None; }
+        let ready = self.ready.load(Ordering::SeqCst);
+        let snapshot = TransportRepairSnapshot {
+            old_generation: self.old_generation.load(Ordering::SeqCst),
+            new_generation: self.new_generation.load(Ordering::SeqCst),
+            trigger_attempt: self.trigger_attempt.load(Ordering::SeqCst),
+            cause: self.cause.load(Ordering::SeqCst), claimed_mono_ns: claimed,
+            prewarm_started_mono_ns: self.prewarm_started.load(Ordering::SeqCst),
+            ready_mono_ns: ready,
+            attempts: self.attempts.load(Ordering::SeqCst),
+        };
+        (self.claimed.load(Ordering::SeqCst) == claimed
+            && self.ready.load(Ordering::SeqCst) == ready).then_some(snapshot)
+    }
+}
+
 struct AttemptTraceSlot {
+    repair: TransportRepairTrace,
     role: Role,
     slot: usize,
     attempt_id: AtomicU64,
@@ -1162,7 +1228,13 @@ struct AttemptTraceSlot {
     business_outcome_status: AtomicU64,
     business_failures: AtomicU64,
     business_slow: AtomicU64,
+    // Sole writer is the exclusive permit's serialized HTTP actor. These never
+    // authorize risk; atomics share the slot's existing publication storage.
+    slow_streak_generation: AtomicU64,
+    slow_response_streak: AtomicU64,
     business_no_response: AtomicU64,
+    business_slow_retired: AtomicU64,
+    business_slow_retired_generation: AtomicU64,
     business_no_response_generation: AtomicU64,
     business_no_response_peer: AttemptPeer,
 }
@@ -1170,6 +1242,7 @@ struct AttemptTraceSlot {
 impl AttemptTraceSlot {
     fn new(role: Role, slot: usize) -> Self {
         Self {
+            repair: TransportRepairTrace::default(),
             role,
             slot,
             attempt_id: AtomicU64::new(0),
@@ -1184,7 +1257,11 @@ impl AttemptTraceSlot {
             business_outcome_status: AtomicU64::new(0),
             business_failures: AtomicU64::new(0),
             business_slow: AtomicU64::new(0),
+            slow_streak_generation: AtomicU64::new(0),
+            slow_response_streak: AtomicU64::new(0),
             business_no_response: AtomicU64::new(0),
+            business_slow_retired: AtomicU64::new(0),
+            business_slow_retired_generation: AtomicU64::new(0),
             business_no_response_generation: AtomicU64::new(0),
             business_no_response_peer: AttemptPeer::default(),
         }
@@ -1206,8 +1283,10 @@ impl AttemptTraceSlot {
         }
         let outcome = match encoded >> 16 {
             1 => BusinessHttpOutcome::Healthy,
-            2 => BusinessHttpOutcome::Slow,
+            2 => BusinessHttpOutcome::SlowResponded,
             3 => BusinessHttpOutcome::Failure,
+            4 => BusinessHttpOutcome::TransportUncertain,
+            5 => BusinessHttpOutcome::SlowRetired,
             _ => return None,
         };
         Some(BusinessHttpOutcomeSnapshot {
@@ -1227,8 +1306,13 @@ impl AttemptTraceSlot {
 #[repr(u8)]
 pub enum BusinessHttpOutcome {
     Healthy = 1,
-    Slow = 2,
+    /// Complete responsive result; one slow result downgrades, not retires.
+    SlowResponded = 2,
     Failure = 3,
+    /// Attempted request without a complete response. Unknown-order rules stay intact.
+    TransportUncertain = 4,
+    /// Second consecutive slow response on the same pool generation.
+    SlowRetired = 5,
 }
 
 /// One completed request on the permit's exact logical pool generation.
@@ -1413,13 +1497,14 @@ impl PooledClient {
     /// attempt, never for preflight rejection, GET probes or the final combined
     /// outcome of a primary request plus an alternate-connection hedge.
     /// Storage is preallocated and private to this exclusive admission slot.
+    /// Returns true exactly when this new result requires slow-generation retirement.
     pub fn record_business_outcome(
         &self,
         attempt_id: u64,
         elapsed_ns: u64,
         outcome: BusinessHttpOutcome,
         status_code: u16,
-    ) {
+    ) -> bool {
         if !self.exclusive_admission
             || !matches!(self.role(), Role::Fast | Role::Cancel)
             || attempt_id == 0
@@ -1429,8 +1514,20 @@ impl PooledClient {
                     .business_attempt_id
                     .load(Ordering::SeqCst)
         {
-            return;
+            return false;
         }
+        let generation = self.health.generation_at_pick;
+        let prior_generation = self.attempt_trace.slow_streak_generation.load(Ordering::Relaxed);
+        let prior_streak = self.attempt_trace.slow_response_streak.load(Ordering::Relaxed);
+        let streak = if outcome == BusinessHttpOutcome::SlowResponded {
+            if prior_generation == generation { prior_streak.saturating_add(1) } else { 1 }
+        } else { 0 };
+        self.attempt_trace.slow_streak_generation.store(generation, Ordering::Relaxed);
+        self.attempt_trace.slow_response_streak.store(streak, Ordering::Relaxed);
+        // Conservative initial policy: one probation request, retire after two
+        // consecutive slow responses; a new generation starts with no evidence.
+        let retire = streak >= 2 || outcome == BusinessHttpOutcome::SlowRetired;
+        let outcome = if retire { BusinessHttpOutcome::SlowRetired } else { outcome };
         self.attempt_trace
             .business_attempt_id
             .store(0, Ordering::SeqCst);
@@ -1445,7 +1542,7 @@ impl PooledClient {
             Ordering::SeqCst,
         );
         match outcome {
-            BusinessHttpOutcome::Failure => {
+            BusinessHttpOutcome::Failure | BusinessHttpOutcome::TransportUncertain => {
                 if status_code == 0 {
                     self.attempt_trace.business_no_response_generation
                         .store(self.health.generation_at_pick, Ordering::SeqCst);
@@ -1457,16 +1554,21 @@ impl PooledClient {
                     .business_failures
                     .fetch_add(1, Ordering::SeqCst);
             }
-            BusinessHttpOutcome::Slow => {
+            BusinessHttpOutcome::SlowResponded | BusinessHttpOutcome::SlowRetired => {
                 self.attempt_trace
                     .business_slow
                     .fetch_add(1, Ordering::SeqCst);
             }
             BusinessHttpOutcome::Healthy => {}
         }
+        if outcome == BusinessHttpOutcome::SlowRetired {
+            self.attempt_trace.business_slow_retired_generation.fetch_max(generation, Ordering::SeqCst);
+            self.attempt_trace.business_slow_retired.fetch_add(1, Ordering::SeqCst);
+        }
         self.attempt_trace
             .business_attempt_id
             .store(attempt_id, Ordering::SeqCst);
+        retire
     }
 
     /// Record a transport failure. On the second consecutive failure this
@@ -1489,25 +1591,31 @@ impl PooledClient {
     /// slot. A single transport failure already identifies the affected
     /// generation; the account's connection owner decides placement capacity.
     pub fn note_instrumented_transport_failure(&self, prewarm_url: String) -> bool {
-        self.note_instrumented_transport_failure_avoiding(
-            prewarm_url, self.instrumented.connection_snapshot().peer.map(|peer| peer.ip()),
-        )
+        self.note_instrumented_transport_failure_with_cause(prewarm_url, TransportRepairCause::Unspecified, 0)
     }
 
-    /// Account-local recovery may supply the failed sibling's exact peer.
-    /// Selection affects only background DNS/connect, never order finality.
-    pub fn note_instrumented_transport_failure_avoiding(
-        &self, prewarm_url: String, avoid_peer: Option<IpAddr>,
-    ) -> bool {
-        let Some(failures) = self.health.claim_instrumented_rebuild() else {
-            return false;
-        };
+    pub fn note_instrumented_transport_failure_with_cause(&self, prewarm_url: String,
+        cause: TransportRepairCause, trigger_attempt: u64) -> bool {
+        self.retire_instrumented(prewarm_url,
+            self.instrumented.connection_snapshot().peer.map(|peer| peer.ip()), cause, trigger_attempt)
+    }
+
+    pub fn note_instrumented_transport_failure_avoiding(&self, prewarm_url: String,
+        avoid_peer: Option<IpAddr>) -> bool {
+        self.retire_instrumented(prewarm_url, avoid_peer, TransportRepairCause::AccountReset, 0)
+    }
+
+    fn retire_instrumented(&self, prewarm_url: String, avoid_peer: Option<IpAddr>,
+        cause: TransportRepairCause, trigger_attempt: u64) -> bool {
+        let Some(failures) = self.health.claim_instrumented_rebuild() else { return false; };
+        self.health.attempt_trace.repair.begin(self.pool_generation(), trigger_attempt, cause);
         let health = self.health.clone();
         crate::async_rt::order_handle().spawn(async move {
             health.repair_instrumented(prewarm_url, failures, avoid_peer).await;
         });
         true
     }
+
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1564,6 +1672,15 @@ impl Permit {
     /// generations. Consume after an owner command completes, before starting
     /// another: one cancel sweep can perform multiple HTTP attempts, so its
     /// last successful response must not hide an earlier adverse result.
+    pub fn transport_repair_snapshot(&self) -> Option<TransportRepairSnapshot> {
+        self.attempt_trace.repair.snapshot()
+    }
+
+    pub fn business_slow_retirement_evidence(&self) -> (u64, u64) {
+        (self.attempt_trace.business_slow_retired.load(Ordering::SeqCst),
+         self.attempt_trace.business_slow_retired_generation.load(Ordering::SeqCst))
+    }
+
     pub fn business_outcome_totals(&self) -> (u64, u64) {
         (
             self.attempt_trace.business_failures.load(Ordering::SeqCst),
@@ -1606,6 +1723,7 @@ impl Permit {
 
     fn health(&self, generation_at_pick: u64) -> ConnectionHealth {
         ConnectionHealth {
+            attempt_trace: Arc::clone(&self.attempt_trace),
             last_activity_ns: self.last_activity_ns.clone(),
             role: self.role,
             slot: self.slot,
@@ -1893,6 +2011,7 @@ impl RolePool {
             client: state.client.load_full(),
             instrumented: state.instrumented.load_full(),
             health: ConnectionHealth {
+                attempt_trace: Arc::clone(&state.attempt_trace),
                 last_activity_ns: state.last_activity_ns.clone(),
                 role: self.role,
                 slot,
@@ -2350,6 +2469,79 @@ mod repair_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn repair_stage_receipt_is_generation_fenced_and_get_never_verifies_business() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        crate::async_rt::init().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/time", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096]; let mut used = 0;
+            while !buf[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf[used..]).await.unwrap(); assert!(n > 0); used += n;
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+        });
+        let pool = RolePool::new(1, Duration::from_secs(2), Role::Fast).unwrap();
+        let permit = pool.try_acquire().unwrap();
+        let health = permit.health(permit.generation());
+        let failures = health.claim_instrumented_rebuild().unwrap();
+        health.attempt_trace.repair.begin(0, 77, TransportRepairCause::RepeatedSlowResponse);
+        let claimed = permit.transport_repair_snapshot().unwrap();
+        assert_eq!(claimed.ready_mono_ns, 0);
+        health.clone().repair_instrumented(url, failures, None).await;
+        server.await.unwrap();
+        let done = permit.transport_repair_snapshot().unwrap();
+        assert_eq!((done.old_generation, done.new_generation, done.trigger_attempt), (0, 1, 77));
+        assert_eq!(done.cause, TransportRepairCause::RepeatedSlowResponse as u64);
+        assert!(done.claimed_mono_ns <= done.prewarm_started_mono_ns);
+        assert!(done.prewarm_started_mono_ns <= done.ready_mono_ns);
+        assert_eq!(done.attempts, 1);
+        assert!(!permit.health_snapshot().quarantined);
+        assert!(permit.business_outcome().is_none(), "GET readiness is not POST/DELETE proof");
+        assert!(health.claim_instrumented_rebuild().is_none(), "old generation cannot launch another repair");
+        assert_eq!(permit.transport_repair_snapshot(), Some(done));
+    }
+
+    #[test]
+    fn query_outcomes_do_not_accumulate_order_slow_streaks() {
+        let pool = RolePool::new(1, Duration::from_secs(2), Role::Query).unwrap();
+        let permit = pool.try_acquire().unwrap(); let client = permit.pooled_client();
+        for _ in 0..4 {
+            assert!(!client.record_business_outcome(client.allocate_attempt_id(), 900_000_000,
+                BusinessHttpOutcome::SlowResponded, 200));
+        }
+        assert_eq!(permit.business_outcome_totals(), (0, 0));
+        assert_eq!(permit.business_slow_retirement_evidence(), (0, 0));
+    }
+
+
+    #[test]
+    fn slow_response_streak_is_generation_fenced_duplicate_safe_and_account_local() {
+        let a = account(1); let b = account(1);
+        let permit = a.fast.try_acquire().unwrap(); let other = b.fast.try_acquire().unwrap();
+        let client = permit.pooled_client();
+        let first = client.allocate_attempt_id();
+        assert!(!client.record_business_outcome(first, 600_000_000, BusinessHttpOutcome::SlowResponded, 200));
+        assert_eq!(permit.business_outcome().unwrap().outcome, BusinessHttpOutcome::SlowResponded);
+        assert!(!client.record_business_outcome(first, 600_000_000, BusinessHttpOutcome::SlowResponded, 200));
+        assert!(client.record_business_outcome(client.allocate_attempt_id(), 600_000_000, BusinessHttpOutcome::SlowResponded, 422));
+        assert_eq!(permit.business_outcome().unwrap().outcome, BusinessHttpOutcome::SlowRetired);
+        assert_eq!(permit.business_outcome_totals(), (0, 2));
+        assert_eq!(permit.business_no_response_evidence(), (0, 0));
+        assert_eq!(other.business_outcome_totals(), (0, 0));
+        let health = permit.health(permit.generation());
+        health.clone().install_replacement(health.build_replacement().unwrap(), 1);
+        let replacement = permit.current_pooled_client();
+        assert!(!replacement.record_business_outcome(replacement.allocate_attempt_id(), 600_000_000, BusinessHttpOutcome::SlowResponded, 200));
+        assert!(!replacement.record_business_outcome(replacement.allocate_attempt_id(), 50_000_000, BusinessHttpOutcome::Healthy, 200));
+        assert!(!replacement.record_business_outcome(replacement.allocate_attempt_id(), 600_000_000, BusinessHttpOutcome::SlowResponded, 200));
+        replacement.record_business_outcome(replacement.allocate_attempt_id(), 2_000_000_000, BusinessHttpOutcome::TransportUncertain, 0);
+        assert_eq!(permit.business_no_response_evidence(), (1, replacement.pool_generation()));
+        assert_eq!(permit.business_outcome().unwrap().outcome, BusinessHttpOutcome::TransportUncertain);
+    }
+
 
     #[test]
     fn completion_peer_evidence_preserves_ipv4_ipv6_and_slot_isolation() {
@@ -2667,7 +2859,7 @@ mod tests {
         );
         assert_eq!(permit.business_outcome_totals(), (1, 0));
         let slow = client.allocate_attempt_id();
-        client.record_business_outcome(slow, 500_000_000, BusinessHttpOutcome::Slow, 200);
+        client.record_business_outcome(slow, 500_000_000, BusinessHttpOutcome::SlowResponded, 200);
         client.record_business_outcome(
             client.allocate_attempt_id(),
             40,

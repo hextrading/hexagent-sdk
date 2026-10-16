@@ -44,19 +44,25 @@ impl Default for AdmissionConfig {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LaneObservation {
     pub sequence: u64,
+    pub repair: Option<hexagent_runtime::http1_pool::TransportRepairSnapshot>,
     pub observed_at_ns: u64,
+    pub observed_mono_ns: u64,
     pub health: PermitHealthSnapshot,
     pub business: Option<BusinessHttpOutcomeSnapshot>,
     pub busy: bool,
     pub cumulative_failures: u64,
     pub cumulative_slow: u64,
     pub cumulative_no_response: u64,
+    pub cumulative_slow_retired: u64,
+    pub slow_retired_generation: u64,
     pub no_response_generation: u64,
     pub no_response_peer: Option<IpAddr>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct LaneState {
+    // Compact diagnostic change key; full repair payload stays in the message.
+    repair_key: (u64, u64, u64),
     sequence: u64,
     observed_at_ns: u64,
     generation: u64,
@@ -67,6 +73,7 @@ struct LaneState {
     cumulative_failures: u64,
     cumulative_slow: u64,
     cumulative_no_response: u64,
+    cumulative_slow_retired: u64,
     retired_generation: Option<u64>,
     verified: bool,
     delivery_fault: bool,
@@ -117,6 +124,14 @@ pub(crate) struct AdmissionCapacityDetail {
     pub verified_mask: u64,
     pub busy_mask: u64,
     pub reason: &'static str,
+    /// Overlapping blockers: 1 no Fast, 2 no cancel, 4 backoff, 8 old/busy Fast,
+    /// 16 probe in flight, 32 recovery evidence incomplete. Diagnostic only.
+    pub blockers: u8,
+    pub pause_until_ns: u64,
+    pub recovery_successes: u8,
+    pub recovery_required: bool,
+    pub probe_dispatched_at_ns: u64,
+    pub probe_attempt_after: u64,
 }
 
 /// Sole writer: the existing account execution router, never a strategy thread.
@@ -257,6 +272,9 @@ impl AccountExecutionAdmission {
             || observation.observed_at_ns < previous.observed_at_ns
             || observation.cumulative_failures < previous.cumulative_failures
             || observation.cumulative_slow < previous.cumulative_slow
+            || observation.cumulative_slow_retired < previous.cumulative_slow_retired
+            || observation.cumulative_slow_retired > observation.cumulative_slow
+            || (observation.cumulative_slow_retired > 0 && observation.slow_retired_generation > observation.health.pool_generation)
             || observation.cumulative_no_response < previous.cumulative_no_response
             || observation.cumulative_no_response > observation.cumulative_failures
             || (observation.cumulative_no_response > 0
@@ -276,9 +294,9 @@ impl AccountExecutionAdmission {
             outcome.outcome == BusinessHttpOutcome::Healthy && outcome.elapsed_ns < SLOW_HTTP_NS
         });
         let failure = observation.cumulative_failures > previous.cumulative_failures
-            || business.is_some_and(|outcome| outcome.outcome == BusinessHttpOutcome::Failure);
+            || business.is_some_and(|outcome| matches!(outcome.outcome, BusinessHttpOutcome::Failure | BusinessHttpOutcome::TransportUncertain));
         let business_slow = business.is_some_and(|outcome| {
-            outcome.outcome == BusinessHttpOutcome::Slow
+            matches!(outcome.outcome, BusinessHttpOutcome::SlowResponded | BusinessHttpOutcome::SlowRetired)
                 || (outcome.outcome == BusinessHttpOutcome::Healthy
                     && outcome.elapsed_ns >= SLOW_HTTP_NS)
         });
@@ -294,6 +312,7 @@ impl AccountExecutionAdmission {
         if observation.health.pool_generation != lane.generation {
             lane.verified = false;
         }
+        lane.repair_key = observation.repair.map_or((0, 0, 0), |r| (r.claimed_mono_ns, r.ready_mono_ns, r.attempts));
         lane.sequence = observation.sequence;
         lane.observed_at_ns = observation.observed_at_ns;
         lane.generation = observation.health.pool_generation;
@@ -301,6 +320,7 @@ impl AccountExecutionAdmission {
         lane.cumulative_failures = observation.cumulative_failures;
         lane.cumulative_slow = observation.cumulative_slow;
         lane.cumulative_no_response = observation.cumulative_no_response;
+        lane.cumulative_slow_retired = observation.cumulative_slow_retired;
         lane.delivery_fault = false;
         if let Some(outcome) = observation.business {
             lane.business_attempt = lane.business_attempt.max(outcome.attempt_id);
@@ -337,9 +357,11 @@ impl AccountExecutionAdmission {
             lane.failure_streak = 0;
             lane.failure_eligible_after_ns = 0;
         }
-        if business_slow || (slow && lane.generation == previous.generation) {
-            // A warmup/fast response on the same generation cannot resurrect a
-            // socket retired for a slow business result.
+        if business.is_some_and(|outcome| outcome.outcome == BusinessHttpOutcome::SlowRetired)
+            || (observation.cumulative_slow_retired > previous.cumulative_slow_retired
+                && observation.slow_retired_generation == lane.generation) {
+            // Repeated slow responses retire the exact generation. A single
+            // completed slow response remains a bounded probation candidate.
             lane.retired_generation = Some(lane.generation);
         } else if healthy && !failure && !slow && lane.ready() {
             lane.verified = true;
@@ -543,10 +565,24 @@ impl AccountExecutionAdmission {
             })
     }
 
-    /// Compact diagnostic copy. The router is the sole writer; formatting and
-    /// export run on the existing background diagnostic owner.
+    /// No formatting/allocation in the router. Emit only changed evidence.
+    pub(crate) fn evidence_changed(&self, role: Role, slot: usize, o: &LaneObservation) -> bool {
+        self.lane(role, slot).is_some_and(|old| o.sequence > old.sequence && (
+            old.repair_key != o.repair.map_or((0, 0, 0), |r| (r.claimed_mono_ns, r.ready_mono_ns, r.attempts))
+            || old.generation != o.health.pool_generation || old.quarantined != o.health.quarantined
+            || old.busy != o.busy || old.business_attempt < o.business.map_or(0, |b| b.attempt_id)
+            || old.cumulative_failures != o.cumulative_failures || old.cumulative_slow != o.cumulative_slow
+            || old.cumulative_no_response != o.cumulative_no_response
+            || old.cumulative_slow_retired != o.cumulative_slow_retired))
+    }
+
+    /// Compact diagnostic copy; formatting/export run on the background owner.
     pub(crate) fn capacity_detail(&self, now_ns: u64) -> AdmissionCapacityDetail {
-        let mut detail = AdmissionCapacityDetail::default();
+        let mut detail = AdmissionCapacityDetail { pause_until_ns: self.pause_until_ns,
+            recovery_successes: self.recovery_successes, recovery_required: self.recovery_required,
+            probe_dispatched_at_ns: self.probe.map_or(0, |p| p.dispatched_at_ns),
+            probe_attempt_after: self.probe.map_or(0, |p| p.after_attempt),
+            ..Default::default() };
         for (slot, lane) in self.fast.iter().enumerate() {
             let ready = lane.fresh(now_ns, self.config.stale_after_ns) && lane.ready();
             detail.ready_fast += u16::from(ready);
@@ -564,6 +600,12 @@ impl AccountExecutionAdmission {
             !lane.reserved_cancel && lane.fresh(now_ns, self.config.stale_after_ns)
                 && lane.cancel_probe_eligible(now_ns)
         }).count().min(u16::MAX as usize) as u16;
+        detail.blockers = u8::from(detail.ready_fast == 0)
+            | (u8::from(detail.eligible_cancel == 0) << 1)
+            | (u8::from(now_ns < self.pause_until_ns) << 2)
+            | (u8::from(self.fast.iter().any(|l| l.busy)) << 3)
+            | (u8::from(self.probe.is_some()) << 4)
+            | (u8::from(self.recovery_required) << 5);
         detail.reason = if self.admission.allows_place() { "open" }
             else if detail.ready_fast == 0 { "no_ready_fast" }
             else if detail.eligible_cancel == 0 { "no_ordinary_cancel" }
@@ -571,6 +613,17 @@ impl AccountExecutionAdmission {
             else if self.recovery_required { "recovery_inflight" }
             else { "eligible_capacity_inflight" };
         detail
+    }
+
+    /// Router-owned cancel preference. Always preserve a bounded physical-lane
+    /// fallback (rank 2); this is routing preference, never order/risk authority.
+    /// A new GET-prewarmed generation is probation, not verified business health.
+    pub(crate) fn cancel_lane_rank(&self, slot: usize, now_ns: u64) -> u8 {
+        match self.cancel.get(slot) {
+            Some(lane) if lane.fresh(now_ns, self.config.stale_after_ns) && lane.cancel_ready() && lane.verified => 0,
+            Some(lane) if lane.fresh(now_ns, self.config.stale_after_ns) && lane.cancel_probe_eligible(now_ns) => 1,
+            _ => 2,
+        }
     }
 
     pub(crate) fn lane_generation(&self, slot: usize) -> Option<u64> {
@@ -674,6 +727,74 @@ impl AccountExecutionAdmission {
 mod tests {
     use super::*;
 
+    #[test]
+    fn one_slow_response_uses_one_probation_without_losing_verified_capacity() {
+        let mut h = Harness::healthy(4, 2);
+        h.outcome(Role::Fast, 0, BusinessHttpOutcome::SlowResponded);
+        h.outcome(Role::Fast, 1, BusinessHttpOutcome::SlowResponded);
+        assert_eq!(h.state.current().state, ExecutionAdmissionState::Degraded);
+        assert_eq!(h.state.current().available_place_slots, 3);
+        assert_eq!(h.state.retired_generation(Role::Fast, 0), None);
+        assert_eq!(h.state.no_response_resets(), 0);
+        assert!(!h.state.take_transport_reset());
+        h.state.place_dispatched(0, h.now);
+        assert!(!h.state.lane_place_allowed(1, h.now));
+        assert!(h.state.lane_place_allowed(2, h.now));
+        assert_eq!(h.state.current().available_place_slots, 2);
+        h.outcome(Role::Fast, 0, BusinessHttpOutcome::Healthy);
+        assert!(h.state.fast[0].verified, "same-generation real response heals soft probation");
+        h.outcome(Role::Fast, 1, BusinessHttpOutcome::SlowRetired);
+        assert!(!h.state.lane_place_allowed(1, h.now));
+        h.outcome(Role::Fast, 1, BusinessHttpOutcome::Healthy);
+        assert!(!h.state.lane_place_allowed(1, h.now), "retired generation cannot be resurrected");
+    }
+
+    #[test]
+    fn cancel_generation_preferences_do_not_turn_get_or_old_results_into_business_health() {
+        let mut h = Harness::healthy(4, 3);
+        h.outcome(Role::Cancel, 1, BusinessHttpOutcome::Healthy);
+        assert_eq!(h.state.cancel_lane_rank(1, h.now), 0);
+        h.outcome(Role::Cancel, 1, BusinessHttpOutcome::SlowResponded);
+        assert_eq!(h.state.cancel_lane_rank(1, h.now), 2);
+        h.now += 250_000_001;
+        assert_eq!(h.state.cancel_lane_rank(1, h.now), 1);
+        h.emit(Role::Cancel, 1, |o| o.health.pool_generation += 1);
+        assert_eq!(h.state.cancel_lane_rank(1, h.now), 1, "GET is probation only");
+        h.emit(Role::Cancel, 1, |o| {
+            o.business = Some(BusinessHttpOutcomeSnapshot { attempt_id: 1000, pool_generation: 1,
+                elapsed_ns: 1, outcome: BusinessHttpOutcome::Healthy, status_code: 200 });
+        });
+        assert_eq!(h.state.cancel_lane_rank(1, h.now), 1, "old generation cannot heal");
+        h.attempt = 1000;
+        h.outcome(Role::Cancel, 1, BusinessHttpOutcome::Healthy);
+        assert_eq!(h.state.cancel_lane_rank(1, h.now), 0);
+        let old = h.cancel[1];
+        h.state.observe(Role::Cancel, 1, old, h.now);
+        assert_eq!(h.state.cancel_lane_rank(1, h.now), 0, "duplicate is inert");
+        h.now += h.state.config.stale_after_ns + 1;
+        assert_eq!(h.state.cancel_lane_rank(1, h.now), 2, "expired lease is fallback only");
+    }
+
+    #[test]
+    fn unknown_transport_still_retires_account_and_blocks_behind_old_inflight() {
+        let mut h = Harness::healthy(4, 2);
+        h.state.place_dispatched(0, h.now);
+        h.emit(Role::Cancel, 0, |o| { o.cumulative_failures += 1;
+            o.cumulative_no_response += 1; o.no_response_generation = 1; });
+        assert!(h.state.take_transport_reset());
+        assert_eq!(h.state.current().available_place_slots, 0);
+        h.now += 250_000_001;
+        for i in 0..4 { h.emit(Role::Fast, i, |o| {
+            o.health.pool_generation += 1; o.busy = i == 0; }); }
+        for i in 0..2 { h.emit(Role::Cancel, i, |o| o.health.pool_generation += 1); }
+        assert_eq!(h.state.current().available_place_slots, 0);
+        let detail = h.state.capacity_detail(h.now);
+        assert_ne!(detail.blockers & 8, 0);
+        assert!(detail.recovery_required);
+        assert_eq!(detail.recovery_successes, 0);
+    }
+
+
     struct Harness {
         state: AccountExecutionAdmission,
         fast: Vec<LaneObservation>,
@@ -686,7 +807,7 @@ mod tests {
         fn new(fast: usize, cancel: usize) -> Self {
             let now = 10_000;
             let observation = LaneObservation {
-                sequence: 0,
+                observed_mono_ns: 0, repair: None, sequence: 0,
                 observed_at_ns: now,
                 health: PermitHealthSnapshot {
                     pool_generation: 1,
@@ -696,7 +817,7 @@ mod tests {
                 busy: false,
                 cumulative_failures: 0,
                 cumulative_slow: 0,
-                cumulative_no_response: 0,
+                cumulative_no_response: 0, cumulative_slow_retired: 0, slow_retired_generation: 0,
                 no_response_generation: 0, no_response_peer: None,
             };
             let mut harness = Self {
@@ -734,14 +855,18 @@ mod tests {
             self.emit(role, slot, |observation| {
                 match outcome {
                     BusinessHttpOutcome::Healthy => {}
-                    BusinessHttpOutcome::Slow => observation.cumulative_slow += 1,
-                    BusinessHttpOutcome::Failure => observation.cumulative_failures += 1,
+                    BusinessHttpOutcome::SlowResponded | BusinessHttpOutcome::SlowRetired => observation.cumulative_slow += 1,
+                    BusinessHttpOutcome::Failure | BusinessHttpOutcome::TransportUncertain => observation.cumulative_failures += 1,
+                }
+                if outcome == BusinessHttpOutcome::SlowRetired {
+                    observation.cumulative_slow_retired += 1;
+                    observation.slow_retired_generation = observation.health.pool_generation;
                 }
                 observation.busy = false;
                 observation.business = Some(BusinessHttpOutcomeSnapshot {
                     attempt_id: attempt,
                     pool_generation: observation.health.pool_generation,
-                    elapsed_ns: if outcome == BusinessHttpOutcome::Slow {
+                    elapsed_ns: if matches!(outcome, BusinessHttpOutcome::SlowResponded | BusinessHttpOutcome::SlowRetired) {
                         SLOW_HTTP_NS
                     } else {
                         40_000_000
@@ -943,7 +1068,7 @@ mod tests {
     fn http_status_failure_and_slow_success_do_not_request_account_reset() {
         let mut account = Harness::healthy(4, 2);
         account.outcome(Role::Fast, 0, BusinessHttpOutcome::Failure);
-        account.outcome(Role::Fast, 1, BusinessHttpOutcome::Slow);
+        account.outcome(Role::Fast, 1, BusinessHttpOutcome::SlowRetired);
         assert!(!account.state.take_transport_reset());
         assert_eq!(account.state.retired_generation(Role::Fast, 2), None);
     }
@@ -951,7 +1076,7 @@ mod tests {
     #[test]
     fn slow_success_retires_exact_generation_without_pausing_other_capacity() {
         let mut harness = Harness::healthy(4, 2);
-        harness.outcome(Role::Fast, 0, BusinessHttpOutcome::Slow);
+        harness.outcome(Role::Fast, 0, BusinessHttpOutcome::SlowRetired);
         assert_eq!(
             harness.state.current().state,
             ExecutionAdmissionState::Degraded
@@ -981,8 +1106,8 @@ mod tests {
     #[test]
     fn two_slow_lanes_keep_spare_capacity_instead_of_starting_a_five_second_gate() {
         let mut harness = Harness::healthy(6, 2);
-        harness.outcome(Role::Fast, 0, BusinessHttpOutcome::Slow);
-        harness.outcome(Role::Fast, 1, BusinessHttpOutcome::Slow);
+        harness.outcome(Role::Fast, 0, BusinessHttpOutcome::SlowRetired);
+        harness.outcome(Role::Fast, 1, BusinessHttpOutcome::SlowRetired);
         assert_eq!(harness.state.pause_until_ns, 0);
         assert_eq!(
             harness.state.current().state,
@@ -1035,8 +1160,8 @@ mod tests {
     fn repaired_probation_does_not_block_verified_idle_siblings() {
         let mut account = Harness::healthy(4, 2);
         let mut sibling = Harness::healthy(4, 2);
-        account.outcome(Role::Fast, 0, BusinessHttpOutcome::Slow);
-        account.outcome(Role::Fast, 1, BusinessHttpOutcome::Slow);
+        account.outcome(Role::Fast, 0, BusinessHttpOutcome::SlowRetired);
+        account.outcome(Role::Fast, 1, BusinessHttpOutcome::SlowRetired);
         account.emit(Role::Fast, 0, |o| o.health.pool_generation += 1);
         account.emit(Role::Fast, 1, |o| o.health.pool_generation += 1);
         assert_eq!(account.state.current().available_place_slots, 3);
@@ -1049,7 +1174,7 @@ mod tests {
         assert_eq!(account.state.current().available_place_slots, 1);
         // Completing a slow verified lane used to shrink the whole budget
         // and leave the spare idle lane unusable behind the probation request.
-        account.outcome(Role::Fast, 2, BusinessHttpOutcome::Slow);
+        account.outcome(Role::Fast, 2, BusinessHttpOutcome::SlowRetired);
         assert_eq!(account.state.current().available_place_slots, 1);
         assert!(account.state.lane_place_allowed(3, account.now));
         assert_eq!(sibling.state.refresh(sibling.now).available_place_slots, 4);
@@ -1117,7 +1242,7 @@ mod tests {
 
     #[test]
     fn failed_cancel_timer_only_allows_probes_real_cancel_evidence_releases_full_capacity() {
-        for outcome in [BusinessHttpOutcome::Failure, BusinessHttpOutcome::Slow] {
+        for outcome in [BusinessHttpOutcome::Failure, BusinessHttpOutcome::SlowRetired] {
             let mut harness = Harness::healthy(2, 1);
             // HTTP 503 need not quarantine a socket, but the only ordinary cancel
             // route still cannot justify admitting additional exposure.
@@ -1284,6 +1409,8 @@ mod tests {
         harness.emit(Role::Fast, 0, |observation| {
             observation.sequence += 20;
             observation.cumulative_slow += 1;
+            observation.cumulative_slow_retired += 1;
+            observation.slow_retired_generation = observation.health.pool_generation;
             // The latest result can be fast even though an earlier replaced
             // observation retired this same generation.
             observation.business.as_mut().unwrap().attempt_id += 100;

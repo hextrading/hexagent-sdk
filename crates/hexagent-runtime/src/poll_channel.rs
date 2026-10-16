@@ -51,6 +51,19 @@ pub struct Sender<T>(Arc<Shared<T>>);
 /// Intentionally not Clone: one owner consumes and mutates downstream state.
 pub struct Receiver<T>(Arc<Shared<T>>);
 
+/// Local observation bounds, not a timestamp written back into a transferred
+/// message. A consumer may dequeue before either returned timestamp. Join by
+/// the caller's immutable publication identity; never clamp that ordering away.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PublicationTiming {
+    pub push_started_mono_ns: u64,
+    pub push_returned_mono_ns: u64,
+    pub notify_returned_mono_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotSendError { Full, Disconnected, Empty }
+
 pub fn bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     bounded_with_wake(capacity, None)
 }
@@ -115,6 +128,86 @@ impl<T> Sender<T> {
         self.0.queue.try_push(value).map_err(TrySendError::Full)?;
         if let Some(wake) = self.0.wake.get() { wake.notify(); }
         Ok(())
+    }
+
+    /// Owned, inlined publication for large records on latency-sensitive
+    /// lanes. Same capacity, failure ownership and notification as try_send.
+    #[inline(always)]
+    pub fn try_send_owned(&self, value: T) -> Result<(), TrySendError<T>>
+    where T: crate::try_queue::PublicationStamp {
+        if !self.0.receiver_alive.load(Ordering::Acquire) {
+            return Err(TrySendError::Disconnected(value));
+        }
+        let (copied_len, field) = crate::try_queue::publication_layout(&value, None);
+        let Some(reservation) = self.0.queue.try_reserve() else {
+            return Err(TrySendError::Full(value));
+        };
+        // SAFETY: prefix was validated for this exact value before CAS.
+        unsafe { reservation.write_prefix(&value, copied_len, field); }
+        std::mem::forget(value);
+        // SAFETY: destination is initialized and the source owner is gone.
+        unsafe { reservation.release(); }
+        if let Some(wake) = self.0.wake.get() { wake.notify(); }
+        Ok(())
+    }
+
+    /// Owned publication with complete phase timing. Only the active prefix
+    /// is copied for explicitly audited message layouts; all fields and all
+    /// three clocks remain. Capacity failure retains the unchanged message.
+    #[inline(always)]
+    pub fn try_send_stamped(&self, value: T) -> Result<PublicationTiming, TrySendError<T>>
+    where T: crate::try_queue::PublicationStamp {
+        if !self.0.receiver_alive.load(Ordering::Acquire) {
+            return Err(TrySendError::Disconnected(value));
+        }
+        let push_started_mono_ns = hexagent_types::types::monotonic_now_ns();
+        let (copied_len, field) = crate::try_queue::publication_layout(&value, Some(push_started_mono_ns));
+        let Some(reservation) = self.0.queue.try_reserve() else {
+            return Err(TrySendError::Full(value));
+        };
+        // SAFETY: field describes this exact value, selected before CAS.
+        // No fallible work or user code occurs before release publication.
+        unsafe { reservation.write_prefix(&value, copied_len, field); }
+        std::mem::forget(value);
+        // SAFETY: destination is initialized and the source owner is gone.
+        unsafe { reservation.release(); }
+        let push_returned_mono_ns = hexagent_types::types::monotonic_now_ns();
+        if let Some(wake) = self.0.wake.get() { wake.notify(); }
+        Ok(PublicationTiming { push_started_mono_ns, push_returned_mono_ns,
+            notify_returned_mono_ns: hexagent_types::types::monotonic_now_ns() })
+    }
+
+    /// Diagnostic variant for physical order owners only. The actual release
+    /// publication lies inside the push bracket. No allocation or extra queue.
+    pub fn try_send_observed(&self, value: T) -> Result<PublicationTiming, TrySendError<T>> {
+        if !self.0.receiver_alive.load(Ordering::Acquire) {
+            return Err(TrySendError::Disconnected(value));
+        }
+        let push_started_mono_ns = hexagent_types::types::monotonic_now_ns();
+        self.0.queue.try_push(value).map_err(TrySendError::Full)?;
+        let push_returned_mono_ns = hexagent_types::types::monotonic_now_ns();
+        if let Some(wake) = self.0.wake.get() { wake.notify(); }
+        Ok(PublicationTiming { push_started_mono_ns, push_returned_mono_ns,
+            notify_returned_mono_ns: hexagent_types::types::monotonic_now_ns() })
+    }
+
+    /// Stamp before transferring ownership, then publish directly from the
+    /// caller's slot. All failures retain the value. The queue release lies
+    /// inside [push_started, push_returned], including the stamp callback.
+    /// This avoids a large Result<T> temporary and lets the command reuse the
+    /// same start clock as the independently published observation sidecar.
+    #[inline(always)]
+    pub fn try_send_observed_slot(&self, value: &mut Option<T>,
+        stamp: impl FnOnce(&mut T, u64)) -> Result<PublicationTiming, SlotSendError> {
+        if !self.0.receiver_alive.load(Ordering::Acquire) { return Err(SlotSendError::Disconnected); }
+        let Some(message) = value.as_mut() else { return Err(SlotSendError::Empty); };
+        let push_started_mono_ns = hexagent_types::types::monotonic_now_ns();
+        stamp(message, push_started_mono_ns);
+        if !self.0.queue.try_push_slot(value) { return Err(SlotSendError::Full); }
+        let push_returned_mono_ns = hexagent_types::types::monotonic_now_ns();
+        if let Some(wake) = self.0.wake.get() { wake.notify(); }
+        Ok(PublicationTiming { push_started_mono_ns, push_returned_mono_ns,
+            notify_returned_mono_ns: hexagent_types::types::monotonic_now_ns() })
     }
 
     /// Bounded cold recovery wait. Retains the exact message on timeout/close.
@@ -194,6 +287,19 @@ impl<T> Receiver<T> {
     /// Co-located FIFO owners need an explicit polling budget so their idle
     /// wakeups leave lower-priority producers runnable on the same CPU.
     pub fn recv_timeout_with_poll(&self, timeout: Duration, poll: Duration) -> Result<T, crossbeam_channel::RecvTimeoutError> {
+        self.recv_timeout_impl::<false>(timeout, poll, &mut 0)
+    }
+
+    /// Last return from a park/sleep in this receive, zero for an immediate
+    /// pickup. This is userspace resume, not kernel runnable or packet arrival.
+    pub fn recv_timeout_observed(&self, timeout: Duration, poll: Duration,
+        resumed_mono_ns: &mut u64) -> Result<T, crossbeam_channel::RecvTimeoutError> {
+        self.recv_timeout_impl::<true>(timeout, poll, resumed_mono_ns)
+    }
+
+    fn recv_timeout_impl<const OBSERVE: bool>(&self, timeout: Duration, poll: Duration,
+        resumed_mono_ns: &mut u64) -> Result<T, crossbeam_channel::RecvTimeoutError> {
+        *resumed_mono_ns = 0;
         assert!(!poll.is_zero(), "owner polling must yield the CPU");
         let started = std::time::Instant::now();
         loop {
@@ -218,6 +324,7 @@ impl<T> Receiver<T> {
                 }
                 self.wait_for_wake(remaining);
             } else { std::thread::sleep(remaining.min(poll)); }
+            if OBSERVE { *resumed_mono_ns = hexagent_types::types::monotonic_now_ns(); }
         }
     }
 
@@ -261,6 +368,235 @@ impl<T> Drop for Receiver<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // SAFETY: element zero is an owned inline u64 with no value invariant.
+    unsafe impl crate::try_queue::PublicationStamp for [u64; 1024] {
+        fn publication_stamp(&self) -> Option<&u64> { Some(&self[0]) }
+    }
+
+    #[test]
+    fn compact_prefix_reuses_large_slots_without_losing_owned_fields_or_drops() {
+        #[derive(Debug)]
+        struct Owned(Arc<AtomicUsize>);
+        impl Drop for Owned { fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); } }
+        #[repr(C)]
+        #[derive(Debug)]
+        enum Message { Large([u64; 960], Box<Owned>), Small { name: String, stamp: u64, owner: Box<Owned> } }
+        // SAFETY: repr(C) tag precedes the payload. Small includes the entire
+        // prefix through every active field; Large uses the full representation.
+        unsafe impl crate::try_queue::PublicationStamp for Message {
+            fn publication_stamp(&self) -> Option<&u64> { match self { Self::Small { stamp, .. } => Some(stamp), _ => None } }
+            fn copied_prefix_len(&self) -> usize {
+                match self {
+                    Self::Small { name, stamp, owner } => {
+                        let base = self as *const Self as usize;
+                        let end = |address: usize, size| address - base + size;
+                        end(name as *const _ as usize, std::mem::size_of_val(name))
+                            .max(end(stamp as *const _ as usize, 8))
+                            .max(end(owner as *const _ as usize, std::mem::size_of_val(owner)))
+                    },
+                    _ => std::mem::size_of::<Self>(),
+                }
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = bounded(1);
+        for sequence in 0..1000 {
+            tx.try_send_stamped(Message::Large([sequence; 960], Box::new(Owned(drops.clone())))).unwrap();
+            let small = Message::Small { name: format!("owner-{sequence}"), stamp: 0, owner: Box::new(Owned(drops.clone())) };
+            let Err(TrySendError::Full(small)) = tx.try_send_stamped(small) else { panic!("full retains owner"); };
+            match rx.try_recv().unwrap() {
+                Message::Large(bytes, owner) => { assert_eq!(bytes, [sequence; 960]); assert!(Arc::ptr_eq(&owner.0, &drops)); },
+                _ => panic!("large variant lost"),
+            }
+            let timing = tx.try_send_stamped(small).unwrap();
+            match rx.try_recv().unwrap() {
+                Message::Small { name, stamp, owner } => {
+                    assert_eq!(name, format!("owner-{sequence}"));
+                    assert_eq!(stamp, timing.push_started_mono_ns);
+                    assert!(Arc::ptr_eq(&owner.0, &drops));
+                },
+                _ => panic!("compact variant lost"),
+            }
+        }
+        assert_eq!(drops.load(Ordering::Relaxed), 2000);
+    }
+
+    #[test]
+    fn stamped_owned_publication_retains_large_message_on_full_and_disconnect() {
+        let (tx, rx) = bounded(1);
+        let timing = tx.try_send_stamped([7_u64; 1024]).unwrap();
+        assert_eq!(tx.try_send_stamped([9; 1024]), Err(TrySendError::Full([9; 1024])));
+        assert_eq!(tx.try_send_owned([11; 1024]), Err(TrySendError::Full([11; 1024])));
+        let value = rx.try_recv().unwrap();
+        assert_eq!(value[0], timing.push_started_mono_ns);
+        assert_eq!(&value[1..], &[7; 1023]);
+        assert!(timing.push_started_mono_ns <= timing.push_returned_mono_ns);
+        assert!(timing.push_returned_mono_ns <= timing.notify_returned_mono_ns);
+        tx.try_send_owned([13; 1024]).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), [13; 1024]);
+        drop(rx);
+        assert_eq!(tx.try_send_stamped([9; 1024]), Err(TrySendError::Disconnected([9; 1024])));
+        assert_eq!(tx.try_send_owned([11; 1024]), Err(TrySendError::Disconnected([11; 1024])));
+    }
+
+    #[test]
+    fn owned_stamp_panic_drops_once_without_reserving_fifo_head() {
+        #[derive(Debug)]
+        struct Message(Arc<AtomicUsize>, bool, u64);
+        impl Drop for Message { fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); } }
+        // SAFETY: ordinary owned timestamp with no value invariant.
+        unsafe impl crate::try_queue::PublicationStamp for Message {
+            fn publication_stamp(&self) -> Option<&u64> {
+                assert!(!self.1, "selector unwind"); Some(&self.2)
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = bounded(1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = tx.try_send_stamped(Message(drops.clone(), true, 0));
+        }));
+        assert!(result.is_err());
+        assert!(rx.is_empty());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        tx.try_send_stamped(Message(drops.clone(), false, 0)).unwrap();
+        drop(rx.try_recv().unwrap());
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn stamped_owned_wake_delivery_preserves_order_and_single_drop() {
+        #[derive(Debug)]
+        struct Message { sequence: usize, stamp: u64, dropped: Arc<AtomicUsize> }
+        impl Drop for Message { fn drop(&mut self) { self.dropped.fetch_add(1, Ordering::Relaxed); } }
+        // SAFETY: ordinary owned timestamp with no value invariant.
+        unsafe impl crate::try_queue::PublicationStamp for Message {
+            fn publication_stamp(&self) -> Option<&u64> { Some(&self.stamp) }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = bounded_with_wake(1, Some(Arc::new(crate::wake::Wake::default())));
+        let counts = dropped.clone();
+        let producer = std::thread::spawn(move || {
+            for sequence in 0..5000 {
+                let mut pending = Message { sequence, stamp: 0, dropped: counts.clone() };
+                loop { match tx.try_send_stamped(pending) {
+                    Ok(_) => break,
+                    Err(TrySendError::Full(retained)) => {
+                        assert_eq!(retained.sequence, sequence);
+                        pending = retained;
+                        std::thread::yield_now();
+                    },
+                    _ => panic!("receiver remains connected"),
+                }}
+            }
+        });
+        for sequence in 0..5000 {
+            let message = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(message.sequence, sequence);
+            assert!(message.stamp > 0 && message.stamp <= hexagent_types::types::monotonic_now_ns());
+        }
+        producer.join().unwrap();
+        assert_eq!(dropped.load(Ordering::Relaxed), 5000);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn observed_slot_retains_large_payload_on_full_empty_and_disconnect() {
+        let (tx, rx) = bounded(1);
+        let mut pending = Some([7_u64; 1024]);
+        let timing = tx.try_send_observed_slot(&mut pending, |v, now| v[0] = now).unwrap();
+        assert!(pending.is_none());
+        pending = Some([8; 1024]);
+        assert_eq!(tx.try_send_observed_slot(&mut pending, |_, _| {}), Err(SlotSendError::Full));
+        assert_eq!(pending.as_ref().unwrap()[1023], 8);
+        let received = rx.try_recv().unwrap();
+        assert_eq!(received[0], timing.push_started_mono_ns);
+        assert_eq!(received[1023], 7);
+        assert!(timing.push_started_mono_ns <= timing.push_returned_mono_ns);
+        assert!(timing.push_returned_mono_ns <= timing.notify_returned_mono_ns);
+        assert_eq!(tx.try_send_observed_slot(&mut None, |_, _| {}), Err(SlotSendError::Empty));
+        drop(rx);
+        assert_eq!(tx.try_send_observed_slot(&mut pending, |_, _| panic!("must not stamp disconnected")), Err(SlotSendError::Disconnected));
+        assert_eq!(pending.unwrap()[1023], 8);
+    }
+
+    #[test]
+    fn observed_slot_stamps_before_transfer_and_drops_each_message_once() {
+        struct Message { sequence: usize, stamp: u64, dropped: Arc<AtomicUsize> }
+        impl Drop for Message { fn drop(&mut self) { self.dropped.fetch_add(1, Ordering::Relaxed); } }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = bounded_with_wake(1, Some(Arc::new(crate::wake::Wake::default())));
+        let counts = Arc::clone(&dropped);
+        let producer = std::thread::spawn(move || {
+            for sequence in 0..5000 {
+                let mut pending = Some(Message { sequence, stamp: 0, dropped: Arc::clone(&counts) });
+                loop { match tx.try_send_observed_slot(&mut pending, |m, now| m.stamp = now) {
+                    Ok(_) => { assert!(pending.is_none()); break; },
+                    Err(SlotSendError::Full) => { assert_eq!(pending.as_ref().unwrap().sequence, sequence); std::thread::yield_now(); },
+                    _ => panic!("receiver remains connected"),
+                }}
+            }
+        });
+        for sequence in 0..5000 {
+            let value = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(value.sequence, sequence);
+            assert!(value.stamp > 0 && value.stamp <= hexagent_types::types::monotonic_now_ns());
+        }
+        producer.join().unwrap();
+        assert_eq!(dropped.load(Ordering::Relaxed), 5000);
+    }
+
+    #[test]
+    fn observed_slot_callback_panic_cannot_reserve_an_unpublished_head() {
+        let (tx, rx) = bounded(1);
+        let mut pending = Some(9);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = tx.try_send_observed_slot(&mut pending, |_, _| panic!("fixture"));
+        })).is_err());
+        assert_eq!(pending, Some(9));
+        assert!(rx.is_empty());
+        tx.try_send_observed_slot(&mut pending, |_, _| {}).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), 9);
+    }
+
+    #[test]
+    fn observed_publication_retains_overflow_value_and_disconnect_semantics() {
+        let (tx, rx) = bounded_with_wake(1, Some(Arc::new(crate::wake::Wake::default())));
+        let timing = tx.try_send_observed(41).unwrap();
+        assert!(timing.push_started_mono_ns > 0);
+        assert!(timing.push_started_mono_ns <= timing.push_returned_mono_ns);
+        assert!(timing.push_returned_mono_ns <= timing.notify_returned_mono_ns);
+        assert!(matches!(tx.try_send_observed(42), Err(TrySendError::Full(42))));
+        let mut resumed = 123;
+        assert_eq!(rx.recv_timeout_observed(Duration::from_millis(10), IDLE_POLL, &mut resumed).unwrap(), 41);
+        assert_eq!(resumed, 0, "an immediate receive did not resume from a park");
+        tx.try_send_observed(42).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), 42);
+        drop(rx);
+        assert!(matches!(tx.try_send_observed(43), Err(TrySendError::Disconnected(43))));
+    }
+
+    #[test]
+    fn observed_wake_ordering_is_lossless_under_repeated_handoffs() {
+        let (tx, rx) = bounded_with_wake(1, Some(Arc::new(crate::wake::Wake::default())));
+        let producer = std::thread::spawn(move || {
+            for i in 0..5000 {
+                let mut value = i;
+                loop { match tx.try_send_observed(value) {
+                    Ok(_) => break,
+                    Err(TrySendError::Full(v)) => { value = v; std::thread::yield_now(); },
+                    Err(_) => panic!("receiver disconnected"),
+                }}
+            }
+        });
+        for i in 0..5000 {
+            let mut resumed = 0;
+            assert_eq!(rx.recv_timeout_observed(Duration::from_secs(1), IDLE_POLL, &mut resumed).unwrap(), i);
+            assert!(resumed <= hexagent_types::types::monotonic_now_ns());
+        }
+        producer.join().unwrap();
+        assert!(rx.is_empty());
+    }
+
     use std::sync::Barrier;
 
     #[test]
