@@ -109,6 +109,13 @@ impl HttpPhaseRecord {
             "peer": t.peer.map(|peer| peer.to_string()), "incomplete_phase": t.incomplete_phase.name(),
         });
         value["request_started_mono_ns"] = self.request_started_mono_ns.into();
+        if t.response_trace.status != 0 {
+            value["response_status_code"] = t.response_trace.status.into();
+            value["cf_ray"] = t.response_trace.cf_ray.as_str().into();
+            value["request_id"] = t.response_trace.request_id.as_str().into();
+            value["cf_ray_truncated"] = t.response_trace.cf_ray.truncated.into();
+            value["request_id_truncated"] = t.response_trace.request_id.truncated.into();
+        }
         value["response_received_mono_ns"] = self.response_received_mono_ns.into();
         value["completed_mono_ns"] = self.completed_mono_ns.into();
         value["response_wait_observed"] = (t.io.first_read_mono_ns != 0 && t.io.first_write_mono_ns != 0).into();
@@ -225,7 +232,7 @@ mod tests {
         );
         assert_eq!(request_kind(None, "query"), "query");
         // Fixed I/O observations; no owned buffer or heap growth.
-        assert!(std::mem::size_of::<HttpPhaseRecord>() <= 352);
+        assert!(std::mem::size_of::<HttpPhaseRecord>() <= 512);
     }
 }
 
@@ -298,7 +305,7 @@ async fn actual_http_phases_keep_identity_status_peer_and_reconnect_generation()
     let server = tokio::spawn(async move {
         for (status, body) in [
             ("200 OK", "{}"),
-            ("503 Service Unavailable", "{}"),
+            ("403 Forbidden", "{}"),
             ("200 OK", "not-json"),
             ("", ""), // Request received; connection lost before any response.
         ] {
@@ -315,7 +322,7 @@ async fn actual_http_phases_keep_identity_status_peer_and_reconnect_generation()
             }
             if status.is_empty() { continue; }
             let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\ncf-ray: region-ray-DUB\r\nx-request-id: region-request\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             stream.write_all(response.as_bytes()).await.unwrap();
@@ -392,6 +399,12 @@ async fn actual_http_phases_keep_identity_status_peer_and_reconnect_generation()
             assert!(r.timings.io.first_write_mono_ns <= r.timings.io.first_read_mono_ns);
             assert!(r.timings.io.first_read_mono_ns <= r.response_received_mono_ns);
         }
+        if index == 1 {
+            let json=r.value("fixture");
+            assert_eq!(json["response_status_code"],403);
+            assert_eq!(json["cf_ray"],"region-ray-DUB");
+            assert_eq!(json["request_id"],"region-request");
+        } else { assert_eq!(r.timings.response_trace.status,0); }
         assert_eq!(r.context.runtime_queue_ns, 13);
     }
     server.await.unwrap();
