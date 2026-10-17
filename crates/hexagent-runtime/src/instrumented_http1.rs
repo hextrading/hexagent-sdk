@@ -357,6 +357,7 @@ pub(crate) enum KeepWarmOutcome {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Http1PhaseTimings {
+    pub response_trace: crate::http_response_trace::HttpResponseTrace,
     pub io: Http1IoTimings,
     pub connect_attempted: bool,
     pub connect_generation_before: u64,
@@ -614,6 +615,7 @@ impl InstrumentedHttp1Client {
         let started = Instant::now();
         let _io_guard = self.trace.io.begin();
         let headers_completed_ns = AtomicU64::new(0);
+        let mut response_trace = crate::http_response_trace::HttpResponseTrace::default();
         self.trace.phase.store(PHASE_TTFB, Ordering::Release);
         let operation = async {
             let headers_started = Instant::now();
@@ -636,6 +638,7 @@ impl InstrumentedHttp1Client {
             }
             self.trace.phase.store(PHASE_BODY, Ordering::Release);
             let status = response.status();
+            response_trace = crate::http_response_trace::HttpResponseTrace::capture(status.as_u16(), response.headers());
             let body_started = Instant::now();
             let body = response
                 .into_body()
@@ -646,7 +649,7 @@ impl InstrumentedHttp1Client {
             let body_ns = duration_ns(body_started.elapsed());
             Ok::<_, (InstrumentedHttp1ErrorKind, String)>((status, body, headers_ns, body_ns))
         };
-        match tokio::time::timeout_at(deadline, operation).await {
+        let mut result = match tokio::time::timeout_at(deadline, operation).await {
             Ok(Ok((status, body, headers_ns, body_ns))) => {
                 let timings = self.snapshot(
                     attempts_before,
@@ -707,7 +710,13 @@ impl InstrumentedHttp1Client {
                     ),
                 })
             }
+        };
+        // Preserve header evidence even if a 403 body subsequently times out.
+        match &mut result {
+            Ok(response) => response.timings.response_trace = response_trace,
+            Err(error) => error.timings.response_trace = response_trace,
         }
+        result
     }
 
     /// Published by the driver on stream retirement. Unknown/unconnected is
@@ -773,6 +782,7 @@ impl InstrumentedHttp1Client {
             (0, 0, 0, 0)
         };
         Http1PhaseTimings {
+            response_trace: Default::default(),
             io: self.trace.io.snapshot(if matches!(incomplete_phase, Http1IncompletePhase::None | Http1IncompletePhase::Body) { headers_ns } else { 0 }),
             connect_attempted,
             connect_generation_before: generation_before,
@@ -1115,6 +1125,26 @@ mod tests {
         assert_eq!(response.body, Bytes::from_static(b"ok"));
         #[cfg(target_os = "linux")]
         assert!(t.io.tcp_sampled, "successful loopback request needs both TCP_INFO samples");
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forbidden_headers_survive_body_timeout() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move {
+            let (mut stream,_)=listener.accept().await.unwrap();
+            let mut request=[0;2048];stream.read(&mut request).await.unwrap();
+            stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 100\r\ncf-ray: timeout-ray\r\nx-request-id: timeout-request\r\n\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let client=InstrumentedHttp1Client::new(Duration::from_secs(1)).unwrap();
+        let error=client.request(reqwest::Method::GET,&format!("http://{addr}/"),
+            reqwest::header::HeaderMap::new(),Bytes::new(),Duration::from_millis(100)).await.unwrap_err();
+        assert_eq!(error.kind,InstrumentedHttp1ErrorKind::Timeout);
+        assert_eq!(error.timings.response_trace.status,403);
+        assert_eq!(error.timings.response_trace.cf_ray.as_str(),"timeout-ray");
+        assert_eq!(error.timings.response_trace.request_id.as_str(),"timeout-request");
         server.await.unwrap();
     }
 

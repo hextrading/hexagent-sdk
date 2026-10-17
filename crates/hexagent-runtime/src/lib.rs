@@ -16,6 +16,7 @@ pub mod cold_rpc_jobs;
 pub mod cold_connect_submit;
 pub mod http1_pool;
 pub mod instrumented_http1;
+pub mod http_response_trace;
 pub mod latency;
 pub mod latency_record;
 pub mod owner_queue_probe;
