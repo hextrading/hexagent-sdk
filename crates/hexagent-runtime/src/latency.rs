@@ -610,6 +610,17 @@ fn snapshot_and_reset() -> Vec<(&'static str, StageSnapshot)> {
         .collect()
 }
 
+/// Offline fixture only. Call after measured work, while owners are still
+/// alive, with no periodic dumper. Reuses existing bins: no additional clocks
+/// or synchronization on measured threads. Includes warmup and uses the same
+/// logarithmic bucket upper bounds as the production diagnostic dumper.
+#[cfg(feature = "offline-latency-snapshot")]
+pub fn offline_snapshot_and_reset() -> Vec<(&'static str, u64, u64, Vec<u64>)> {
+    snapshot_and_reset().into_iter()
+        .map(|(stage, snapshot)| (stage, snapshot.count, snapshot.max, snapshot.bins))
+        .collect()
+}
+
 fn value_at_quantile(snapshot: &StageSnapshot, quantile: f64) -> u64 {
     if snapshot.count == 0 {
         return 0;

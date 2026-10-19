@@ -593,6 +593,10 @@ impl InstrumentedHttp1Client {
         headers: reqwest::header::HeaderMap, body: Bytes,
         deadline: tokio::time::Instant, slot_wait_ns: u64,
     ) -> Result<InstrumentedHttp1Response, InstrumentedHttp1Error> {
+        #[cfg(feature = "offline-delivery-probe")]
+        let offline_key = crate::offline_delivery_probe::body_key(&body);
+        #[cfg(feature = "offline-delivery-probe")]
+        if let Some(key) = offline_key { crate::offline_delivery_probe::point_id(crate::offline_delivery_probe::Phase::HttpStart, key); }
         let attempts_before = self.trace.attempts.load(Ordering::Acquire);
         let generation_before = self.trace.generation.load(Ordering::Acquire);
         let request = match Request::builder()
@@ -614,16 +618,28 @@ impl InstrumentedHttp1Client {
         };
         let started = Instant::now();
         let _io_guard = self.trace.io.begin();
+        #[cfg(feature = "offline-delivery-probe")]
+        self.trace.io.offline_key.store(offline_key.map_or(0, |k| k + 1), Ordering::Relaxed);
         let headers_completed_ns = AtomicU64::new(0);
         let mut response_trace = crate::http_response_trace::HttpResponseTrace::default();
         self.trace.phase.store(PHASE_TTFB, Ordering::Release);
         let operation = async {
             let headers_started = Instant::now();
-            let response = self
-                .client
-                .request(request)
-                .await
-                .map_err(|error| {
+            let response = self.client.request(request);
+            #[cfg(feature = "offline-delivery-probe")]
+            let response = async {
+                let mut response = std::pin::pin!(response);
+                std::future::poll_fn(|cx| {
+                    let span = offline_key.and_then(|key| crate::offline_delivery_probe::Span::begin_id(crate::offline_delivery_probe::Phase::HttpPoll, key));
+                    let result = response.as_mut().poll(cx);
+                    if let Some(span) = span {
+                        span.finish_at(hexagent_types::types::monotonic_now_ns(), u8::from(result.is_ready()), None,
+                            self.trace.io.first_write_mono.load(Ordering::Acquire));
+                    }
+                    result
+                }).await
+            };
+            let response = response.await.map_err(|error| {
                     let kind = if error.is_connect() {
                         InstrumentedHttp1ErrorKind::Connect
                     } else {

@@ -24,10 +24,17 @@ pub struct Receiver<T, M> {
 }
 impl<T, M> Pool<T, M> {
     pub fn new(capacity: usize, metadata: impl Fn() -> M, disconnected: fn() -> T) -> Self {
+        Self::with_wake(capacity, metadata, disconnected, None)
+    }
+    /// Startup-only: all slots on one reactor may share its single-consumer
+    /// wake. Endpoint/metadata lifetime still prevents generation reuse.
+    pub fn with_wake(capacity: usize, metadata: impl Fn() -> M, disconnected: fn() -> T,
+        wake: Option<Arc<crate::wake::Wake>>) -> Self {
         Self {
             slots: (0..capacity)
                 .map(|_| {
-                    let (tx, rx) = crate::poll_channel::bounded_with_wake(1, Some(Arc::new(crate::wake::Wake::default())));
+                    let (tx, rx) = crate::poll_channel::bounded_with_wake(1,
+                        Some(wake.clone().unwrap_or_else(|| Arc::new(crate::wake::Wake::default()))));
                     Arc::new(Slot {
                         tx,
                         rx,
@@ -80,6 +87,9 @@ impl<T, M> Drop for Sender<T, M> {
     }
 }
 impl<T, M> Receiver<T, M> {
+    pub fn try_recv(&self) -> Result<T, crossbeam_channel::TryRecvError> {
+        self.slot.rx.try_recv()
+    }
     pub fn recv(&self) -> Result<T, RecvError> {
         self.slot.rx.recv()
     }
@@ -90,6 +100,26 @@ impl<T, M> Receiver<T, M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reactor_poll_keeps_slow_and_abandoned_slots_independent() {
+        let wake = Arc::new(crate::wake::Wake::default());
+        let mut pool = Pool::with_wake(2, || (), || -1, Some(wake.clone()));
+        let (slow, slow_rx, sm) = pool.checkout(|_| {}).unwrap();
+        let (fast, fast_rx, fm) = pool.checkout(|_| {}).unwrap();
+        assert!(matches!(slow_rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+        wake.arm();
+        fast.try_send(7).unwrap();
+        wake.wait(std::time::Duration::from_millis(1));
+        assert_eq!(fast_rx.try_recv().unwrap(), 7);
+        assert!(fast_rx.try_recv().is_err());
+        assert!(pool.checkout(|_| {}).is_none());
+        drop(slow);
+        assert_eq!(slow_rx.try_recv().unwrap(), -1);
+        drop((slow_rx, fast_rx, sm, fm));
+        let (tx, rx, _) = pool.checkout(|_| {}).unwrap();
+        tx.try_send(8).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), 8);
+    }
     #[test]
     fn lifecycle_is_lossless_and_no_reuse_while_any_generation_reader_remains() {
         let mut pool = Pool::new(1, || 7, || -1);

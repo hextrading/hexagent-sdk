@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "hexagent-sdk: the engine runtime — drives strategies in live / paper / backtest."
 
+[features]
+# Offline fixture only; never enabled by live binaries.
+offline-http-reactor-bench = ["hexagent-exchange/offline-http-reactor-bench", "hexagent-runtime/offline-latency-snapshot", "hexagent-runtime/offline-delivery-probe"]
+
 [dependencies]
 hexagent-types = { path = "../hexagent-types" }
 hexagent-config = { path = "../hexagent-config" }

@@ -43,6 +43,16 @@ pub struct OsTuneConfig {
     /// Wake idle execution/connection owners after queue publication (Linux futex).
     #[serde(default)]
     pub execution_wakeup: bool,
+    /// Experimental bounded normal-cancel reactor. Zero preserves one owner
+    /// thread per slot. 1..=4 bounds successful actor transitions per turn;
+    /// safety and blocking compatibility work keep dedicated workers.
+    #[serde(default)]
+    pub cancel_reactor_batch: usize,
+    /// Explicit candidate: consolidate only ordinary-priority cold connect,
+    /// private cold, recorder and background workers on the cold-connect core.
+    /// Requires strict validation; never permits overlap with trading roles.
+    #[serde(default)]
+    pub consolidate_cold_workers: bool,
     /// Allow ordinary-priority background threads to share only the
     /// `execution_core`. This is an explicit production escape hatch for
     /// hosts whose system/IRQ cores must be kept completely free of bot
@@ -111,9 +121,17 @@ pub struct OsTuneConfig {
     pub allow_cancel_on_execution_core: bool,
     /// Consolidate cancel/completion and cold work beside the strategy router,
     /// freeing a dedicated dispatcher CPU. Requires event wakeups and router
-    /// priority above cancel/completion; Fast/signing never shares this CPU.
+    /// priority above cancel/completion unless the explicit execution-first
+    /// variant below is enabled; Fast/signing never shares this CPU.
     #[serde(default)]
     pub allow_execution_aux_on_router_core: bool,
+    /// Explicit safety/execution-first variant of router-core sharing. Cancel
+    /// and completion both run exactly one FIFO level above the router, with
+    /// wakeups, strict topology validation, and disjoint dispatcher/Fast cores.
+    /// This removes router-priority starvation but charges their CPU work to
+    /// router wall time; validate both owner and router latency before rollout.
+    #[serde(default)]
+    pub prioritize_execution_aux_on_router_core: bool,
     /// Shared-account id -> dedicated private event application core.  These
     /// lifecycle owners apply authenticated order/trade updates to their
     /// account-local state. Keeping them off the ingress and housekeeping
@@ -190,6 +208,8 @@ impl Default for OsTuneConfig {
             enable_pin: true,
             enable_fifo: true,
             execution_wakeup: false,
+            cancel_reactor_batch: 0,
+            consolidate_cold_workers: false,
             strict_core_isolation: false,
             allow_background_on_execution_core: false,
             allow_strategy_router_on_execution_core: false,
@@ -206,6 +226,7 @@ impl Default for OsTuneConfig {
             allow_private_cold_on_background_core: false,
             allow_cancel_on_execution_core: false,
             allow_execution_aux_on_router_core: false,
+            prioritize_execution_aux_on_router_core: false,
             private_apply_cores: HashMap::new(),
             private_cold_cores: HashMap::new(),
             execution_core: None,

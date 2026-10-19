@@ -941,6 +941,7 @@ impl ConnectionHealth {
             self.release_quarantine();
             return None;
         }
+        self.attempt_trace.health_notification.notify();
         Some(failures)
     }
 
@@ -981,6 +982,7 @@ impl ConnectionHealth {
 
     fn release_quarantine(&self) {
         self.quarantined.store(false, Ordering::Release);
+        self.attempt_trace.health_notification.notify();
         publish_slot_token(
             self.slot,
             &self.busy,
@@ -1210,6 +1212,8 @@ impl TransportRepairTrace {
 }
 
 struct AttemptTraceSlot {
+    // Existing physical owner consumes this hint and rereads generation/health.
+    health_notification: crate::wake::StateNotification,
     repair: TransportRepairTrace,
     role: Role,
     slot: usize,
@@ -1242,6 +1246,7 @@ struct AttemptTraceSlot {
 impl AttemptTraceSlot {
     fn new(role: Role, slot: usize) -> Self {
         Self {
+            health_notification: crate::wake::StateNotification::default(),
             repair: TransportRepairTrace::default(),
             role,
             slot,
@@ -1649,6 +1654,14 @@ pub struct Permit {
 }
 
 impl Permit {
+    /// Startup-only physical owner binding; notification cannot grant admission.
+    pub fn bind_owner_health_wake(&self, wake: Arc<crate::wake::Wake>) {
+        self.attempt_trace.health_notification.bind(wake);
+    }
+    pub fn take_owner_health_notification(&self) -> bool {
+        self.attempt_trace.health_notification.take_pending()
+    }
+
     /// The reserved client — dispatch the request on this.
     pub fn client(&self) -> &Arc<reqwest::Client> {
         &self.client
@@ -3134,6 +3147,32 @@ mod tests {
             !Arc::ptr_eq(&original, repaired.client()),
             "the repaired slot must own a fresh reqwest connection pool",
         );
+    }
+
+    #[test]
+    fn repair_notification_is_slot_local_and_never_business_recovery() {
+        let pool=RolePool::new(2,Duration::from_secs(2),Role::Cancel).unwrap();
+        let permit=pool.try_acquire().unwrap();let other=pool.try_acquire().unwrap();
+        let wake=Arc::new(crate::wake::Wake::default());permit.bind_owner_health_wake(wake);
+        let mut health=permit.health(permit.generation());
+        assert!(!permit.take_owner_health_notification());
+        health.claim_rebuild(1,Duration::ZERO).unwrap();
+        assert!(permit.take_owner_health_notification());assert!(permit.health_snapshot().quarantined);
+        let candidate=Arc::new(crate::instrumented_http1::InstrumentedHttp1Client::new(Duration::from_secs(2)).unwrap());
+        let generation=health.install_instrumented_replacement(candidate).unwrap();
+        assert!(permit.health_snapshot().quarantined); // install alone cannot open the lane
+        health.generation_at_pick=generation;
+        health.release_quarantine();
+        assert!(permit.take_owner_health_notification());assert!(!permit.take_owner_health_notification());
+        assert!(!other.take_owner_health_notification());
+        assert_eq!(permit.health_snapshot().pool_generation,1);
+        assert!(!permit.health_snapshot().quarantined);
+        assert!(permit.business_outcome().is_none(),"prewarm is not a healthy business probe");
+        let stale=permit.health(0);
+        let replacement=Arc::new(crate::instrumented_http1::InstrumentedHttp1Client::new(Duration::from_secs(2)).unwrap());
+        assert!(stale.install_instrumented_replacement(replacement).is_none());
+        assert!(!permit.take_owner_health_notification());
+        assert_eq!(permit.health_snapshot().pool_generation,1);
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub use hexagent_config::config;
 
 pub mod async_rt;
 pub mod background_jobs;
+pub mod bounded_reactor;
 pub mod cold_rpc_jobs;
 pub mod cold_connect_submit;
 pub mod http1_pool;
@@ -33,3 +34,6 @@ pub mod try_queue;
 
 pub mod reply_slots;
 pub mod root_owner;
+
+#[cfg(feature = "offline-delivery-probe")]
+pub mod offline_delivery_probe;
