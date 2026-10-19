@@ -128,7 +128,10 @@ pub struct CorePlan {
     pub allow_private_cold_on_background_core: bool,
     pub allow_cancel_on_execution_core: bool,
     pub allow_execution_aux_on_router_core: bool,
+    pub prioritize_execution_aux_on_router_core: bool,
     pub execution_wakeup: bool,
+    pub cancel_reactor_batch: usize,
+    pub consolidate_cold_workers: bool,
     /// Per-account private order/trade application cores.
     pub private_apply_cores: HashMap<String, usize>,
     /// Per-account cold ledger/lifecycle cores. These stay SCHED_OTHER and
@@ -176,7 +179,10 @@ impl CorePlan {
             allow_private_cold_on_background_core: false,
             allow_cancel_on_execution_core: false,
             allow_execution_aux_on_router_core: false,
+            prioritize_execution_aux_on_router_core: false,
             execution_wakeup: false,
+            cancel_reactor_batch: 0,
+            consolidate_cold_workers: false,
             private_apply_cores: HashMap::new(),
             private_cold_cores: HashMap::new(),
             execution: DEFAULT_EXECUTION_CORE,
@@ -234,7 +240,10 @@ impl CorePlan {
             allow_private_cold_on_background_core: cfg.allow_private_cold_on_background_core,
             allow_cancel_on_execution_core: cfg.allow_cancel_on_execution_core,
             allow_execution_aux_on_router_core: cfg.allow_execution_aux_on_router_core,
+            prioritize_execution_aux_on_router_core: cfg.prioritize_execution_aux_on_router_core,
             execution_wakeup: cfg.execution_wakeup,
+            cancel_reactor_batch: cfg.cancel_reactor_batch,
+            consolidate_cold_workers: cfg.consolidate_cold_workers,
             private_apply_cores: cfg.private_apply_cores.clone(),
             private_cold_cores: cfg.private_cold_cores.clone(),
             execution: cfg.execution_core.unwrap_or(DEFAULT_EXECUTION_CORE),
@@ -360,7 +369,21 @@ impl CorePlan {
     /// core with each other (for example Coinbase + Chainlink); worker pools
     /// may intentionally contain many threads per configured pool core.
     fn validate_strategy_isolation(&self, instance_ids: &[String]) -> Result<(), String> {
+        if self.cancel_reactor_batch > 4 || (self.cancel_reactor_batch > 0 &&
+            (!self.strict_core_isolation || !self.execution_wakeup || self.poly_cancel_cores.is_empty())) {
+            return Err("cancel reactor requires strict isolation, wakeups, explicit cancel cores and batch 1..=4".into());
+        }
+        if self.consolidate_cold_workers && (!self.strict_core_isolation
+            || self.cold_connect.is_none()
+            || self.background_cores.as_slice() != [self.cold_connect.unwrap_or(usize::MAX)]
+            || self.recorder_core != self.cold_connect
+            || self.private_cold_cores.values().any(|core| Some(*core) != self.cold_connect)) {
+            return Err("cold consolidation requires strict isolation and recorder/background/private cold on the explicit cold-connect core".into());
+        }
         if !self.strict_core_isolation {
+            if self.prioritize_execution_aux_on_router_core {
+                return Err("execution-first router sharing requires strict_core_isolation".into());
+            }
             return Ok(());
         }
         if !self.enable_pin {
@@ -384,11 +407,24 @@ impl CorePlan {
                 "strict_core_isolation requires at least two distinct Polymarket dispatch/completion cores".into(),
             );
         }
+        // Keep the legacy router-first policy unless explicitly opted in.
+        // Both lanes move in priority together; otherwise completion inherits
+        // the original starvation and apparent owner improvement is misleading.
+        if self.prioritize_execution_aux_on_router_core && (
+            !self.allow_execution_aux_on_router_core
+            || self.fifo_strategy == 0 || self.fifo_strategy >= 99
+            || self.fifo_cancel != self.fifo_strategy.saturating_add(1)
+            || self.fifo_completion != self.fifo_cancel
+            || self.poly_cancel_cores.as_slice() != [self.strategy]
+            || self.poly_completion_cores.as_slice() != [self.strategy]) {
+            return Err("execution-first router sharing requires router sharing, both auxiliary lanes on router, and equal cancel/completion priority exactly one above router".into());
+        }
         if self.allow_execution_aux_on_router_core && (
             self.strategy == self.execution || !self.execution_wakeup
-            || self.fifo_strategy <= self.fifo_cancel || self.fifo_strategy <= self.fifo_completion
+            || (!self.prioritize_execution_aux_on_router_core &&
+                (self.fifo_strategy <= self.fifo_cancel || self.fifo_strategy <= self.fifo_completion))
             || self.poly_exec_cores.contains(&self.strategy)) {
-            return Err("execution auxiliary sharing requires a separate dispatcher, wakeups, router priority above cancel/completion, and disjoint Fast cores".into());
+            return Err("execution auxiliary sharing requires a separate dispatcher, wakeups, a validated router/auxiliary priority policy, and disjoint Fast cores".into());
         }
         let dispatch_cores: HashSet<_> = self
             .poly_exec_cores
@@ -516,6 +552,10 @@ impl CorePlan {
             let background_cold = self.allow_private_cold_on_background_core
                 && self.background_cores.contains(&cold_core)
                 && (cold_core != self.execution || self.allow_background_on_execution_core);
+            if self.consolidate_cold_workers && Some(cold_core) == self.cold_connect {
+                cold_cores.insert(cold_core);
+                continue;
+            }
             if background_cold && (cold_core == self.execution || (self.allow_execution_aux_on_router_core && cold_core == self.strategy)) {
                 cold_cores.insert(cold_core);
                 continue;
@@ -620,7 +660,10 @@ impl CorePlan {
         latency_cores.extend(poly_cores);
         latency_cores.extend(hex_cores);
         if let Some(core) = self.recorder_core {
-            if latency_cores.contains(&core) || self.background_cores.contains(&core) {
+            let explicit_cold = self.consolidate_cold_workers
+                && Some(core) == self.cold_connect
+                && exclusive.get(&core).is_some_and(|role| role == "cold_connect");
+            if !explicit_cold && (latency_cores.contains(&core) || self.background_cores.contains(&core)) {
                 return Err(format!(
                     "recorder core {} overlaps another worker/background role", core
                 ));
@@ -628,6 +671,8 @@ impl CorePlan {
         }
         for &core in &self.background_cores {
             if latency_cores.contains(&core) {
+                if self.consolidate_cold_workers && Some(core) == self.cold_connect
+                    && exclusive.get(&core).is_some_and(|role| role == "cold_connect") { continue; }
                 if self.allow_private_cold_on_background_core
                     && exclusive.get(&core).is_some_and(|role| role.starts_with("private_account_cold:"))
                 {
@@ -717,6 +762,8 @@ pub fn init_from_config(cfg: &OsTuneConfig) {
     info!("[os_tune] archive recorder_core={:?} policy=SCHED_OTHER fallback=background", plan.recorder_core);
     info!("[os_tune] execution_wakeup={} auxiliary_router_sharing={} dispatcher_core={} router_core={}",
         plan.execution_wakeup, plan.allow_execution_aux_on_router_core, plan.execution, plan.strategy);
+    info!("[os_tune] prioritize_execution_aux_on_router_core={} router_priority={} cancel_priority={} completion_priority={}",
+        plan.prioritize_execution_aux_on_router_core, plan.fifo_strategy, plan.fifo_cancel, plan.fifo_completion);
     let _ = CORE_PLAN.set(plan);
 }
 
@@ -756,7 +803,8 @@ pub fn validate_configured_topology(
 }
 
 /// Fail-fast validation for production live/paper per-instance topology.
-/// No-op unless `[os_tune].strict_core_isolation = true`.
+/// No-op unless strict isolation is enabled or an execution-first opt-in
+/// must be rejected for lacking strict isolation.
 /// Call after [`init_from_config`] and before spawning runtime/feed threads.
 pub fn validate_strategy_isolation(instance_ids: &[String]) -> Result<(), String> {
     let p = plan();
@@ -1499,6 +1547,31 @@ mod tests {
         isolated.allow_execution_aux_on_router_core = true;
         isolated.execution_wakeup = true;
         assert!(CorePlan::from_config(&isolated).validate_strategy_isolation(&enabled).is_ok());
+        let mut priority = isolated.clone();
+        priority.prioritize_execution_aux_on_router_core = true;
+        priority.fifo_cancel = Some(61);
+        priority.fifo_completion = Some(61);
+        assert!(CorePlan::from_config(&priority).validate_strategy_isolation(&enabled).is_ok());
+        for case in 0..14 {
+            let mut bad = priority.clone();
+            match case {
+                0 => bad.execution_wakeup = false,
+                1 => bad.allow_execution_aux_on_router_core = false,
+                2 => bad.prioritize_execution_aux_on_router_core = false,
+                3 => bad.fifo_cancel = Some(60),
+                4 => bad.fifo_completion = Some(55),
+                5 => { bad.fifo_cancel = Some(62); bad.fifo_completion = Some(62); },
+                6 => bad.poly_cancel_cores = vec![15],
+                7 => bad.poly_completion_cores = vec![15],
+                8 => bad.poly_exec_cores.push(4),
+                9 => bad.execution_core = Some(4),
+                10 => bad.strict_core_isolation = false,
+                11 => { bad.private_owner_cores.insert("hex001".into(), 4); },
+                12 => { bad.fifo_strategy = Some(99); bad.fifo_cancel = Some(99); bad.fifo_completion = Some(99); },
+                _ => { bad.fifo_strategy = Some(0); bad.fifo_cancel = Some(1); bad.fifo_completion = Some(1); },
+            }
+            assert!(CorePlan::from_config(&bad).validate_strategy_isolation(&enabled).is_err(), "execution-first case {case}");
+        }
         for case in 0..7 {
             let mut bad = isolated.clone();
             match case {

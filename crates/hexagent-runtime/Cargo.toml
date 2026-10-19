@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "hexagent-sdk: low-level runtime utilities — OS tuning, async runtime helper, latency instrumentation + record/replay."
 
+[features]
+# Offline post-run export of existing bins; no new hot-path instrumentation.
+offline-latency-snapshot = []
+offline-delivery-probe = []
+
 [dependencies]
 hexagent-types = { path = "../hexagent-types" }
 hexagent-config = { path = "../hexagent-config" }

@@ -72,6 +72,10 @@ pub(super) struct Command {
 }
 impl Command {
     pub async fn run(self) {
+        #[cfg(feature = "offline-http-reactor-bench")]
+        if let Some(key) = hexagent_runtime::offline_delivery_probe::body_key(&self.body_a) {
+            hexagent_runtime::offline_delivery_probe::point_id(hexagent_runtime::offline_delivery_probe::Phase::HttpDequeue, key);
+        }
         let Self {
             context,
             client,
@@ -168,6 +172,10 @@ impl Command {
 }
 impl Dispatch {
     pub fn send(&self, command: Command) {
+        #[cfg(feature = "offline-http-reactor-bench")]
+        if let Some(key) = hexagent_runtime::offline_delivery_probe::body_key(&command.body_a) {
+            hexagent_runtime::offline_delivery_probe::point_id(hexagent_runtime::offline_delivery_probe::Phase::HttpSubmit, key);
+        }
         if let Err(error) = self.lane.0.try_send(command) {
             error.into_inner().reject();
         }

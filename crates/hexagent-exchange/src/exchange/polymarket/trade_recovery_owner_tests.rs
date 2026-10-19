@@ -867,3 +867,25 @@ fn live_cancel_absence_never_releases_before_delayed_private_fill() {
         }
     }
 }
+
+#[test]
+fn reactor_cancel_readiness_retains_unknown_and_transport_outcomes_exactly_once() {
+    fn pending(rx: Option<HttpReplyReceiver>) -> ReactorPendingCancel {
+        PendingCancel { cancel_trigger: CancelTrigger::default(),
+            ctx: CancelCtx { local_oid: None, order_slot: OrderSlot::UNASSIGNED,
+                symbol: String::new(), side: Side::Buy }, rx, timing: None, attempt: None }.into_reactor()
+    }
+    let (slow_tx, slow_rx)=crossbeam_channel::bounded(1);
+    let (fast_tx, fast_rx)=crossbeam_channel::bounded(1);
+    let mut slow=pending(Some(HttpReplyReceiver::Dedicated(slow_rx)));
+    let mut fast=pending(Some(HttpReplyReceiver::Dedicated(fast_rx)));
+    let start=slow.completion_started_ns;
+    assert!(!slow.try_ready());
+    fast_tx.send(Ok(serde_json::Value::Null)).unwrap();
+    assert!(fast.try_ready());assert!(fast.try_ready());
+    assert!(matches!(fast.ready_reply.take(),Some(Ok(serde_json::Value::Null))));
+    assert!(!slow.try_ready());assert_eq!(slow.completion_started_ns,start);
+    drop(slow_tx);assert!(slow.try_ready());
+    assert!(matches!(slow.ready_reply,Some(Err(HttpErr::Transport(_)))));
+    assert!(pending(None).try_ready()); // original no-order-ID path remains distinct
+}

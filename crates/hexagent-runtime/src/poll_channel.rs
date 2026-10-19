@@ -177,6 +177,31 @@ impl<T> Sender<T> {
             notify_returned_mono_ns: hexagent_types::types::monotonic_now_ns() })
     }
 
+    /// Transfer from a caller-owned pending slot without a large by-value
+    /// argument/Result temporary. Full/disconnect leaves every field unchanged.
+    /// Success clears the source before release, preserving single ownership.
+    #[inline(always)]
+    pub fn try_send_stamped_slot(&self, value: &mut Option<T>) -> Result<PublicationTiming, SlotSendError>
+    where T: crate::try_queue::PublicationStamp {
+        if !self.0.receiver_alive.load(Ordering::Acquire) { return Err(SlotSendError::Disconnected); }
+        let message = value.as_ref().ok_or(SlotSendError::Empty)?;
+        let push_started_mono_ns = hexagent_types::types::monotonic_now_ns();
+        let (copied_len, field) = crate::try_queue::publication_layout(message, Some(push_started_mono_ns));
+        let reservation = self.0.queue.try_reserve().ok_or(SlotSendError::Full)?;
+        // SAFETY: validated complete active prefix; unique reservation and
+        // non-overlapping source. No fallible operation after reservation.
+        unsafe {
+            reservation.write_prefix(message, copied_len, field);
+            // Do not drop the original: its ownership now belongs to the slot.
+            std::ptr::write(value, None);
+            reservation.release();
+        }
+        let push_returned_mono_ns = hexagent_types::types::monotonic_now_ns();
+        if let Some(wake) = self.0.wake.get() { wake.notify(); }
+        Ok(PublicationTiming { push_started_mono_ns, push_returned_mono_ns,
+            notify_returned_mono_ns: hexagent_types::types::monotonic_now_ns() })
+    }
+
     /// Diagnostic variant for physical order owners only. The actual release
     /// publication lies inside the push bracket. No allocation or extra queue.
     pub fn try_send_observed(&self, value: T) -> Result<PublicationTiming, TrySendError<T>> {
@@ -268,11 +293,36 @@ impl<T> Receiver<T> {
     }
     /// Cold owners/tests only. Wait without spinning on an unpublished slot.
     pub fn recv(&self) -> Result<T, crossbeam_channel::RecvError> {
+        // There is no caller deadline on recv. Reusing recv_timeout used to
+        // read Instant on every 10us portable poll (and on immediate pickups).
+        // Keep identical arm/recheck/wait and disconnect semantics, without
+        // manufacturing a deadline which can never be returned to the caller.
+        #[cfg(feature = "offline-delivery-probe")]
+        let mut offline_loop = crate::offline_delivery_probe::ReceiveLoop::begin();
         loop {
-            match self.recv_timeout(Duration::from_secs(60)) {
+            #[cfg(feature = "offline-delivery-probe")]
+            offline_loop.check();
+            match self.try_recv() {
                 Ok(value) => return Ok(value),
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Err(crossbeam_channel::RecvError),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(TryRecvError::Disconnected) => return Err(crossbeam_channel::RecvError),
+                Err(TryRecvError::Empty) => {}
+            }
+            if self.has_wake() {
+                self.arm_wake();
+                match self.try_recv() {
+                    Ok(value) => { self.cancel_wake(); return Ok(value); }
+                    Err(TryRecvError::Disconnected) => {
+                        self.cancel_wake(); return Err(crossbeam_channel::RecvError);
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+                #[cfg(feature = "offline-delivery-probe")]
+                offline_loop.wait();
+                self.wait_for_wake(Duration::from_secs(60));
+            } else {
+                #[cfg(feature = "offline-delivery-probe")]
+                offline_loop.wait();
+                std::thread::sleep(IDLE_POLL);
             }
         }
     }
@@ -287,22 +337,35 @@ impl<T> Receiver<T> {
     /// Co-located FIFO owners need an explicit polling budget so their idle
     /// wakeups leave lower-priority producers runnable on the same CPU.
     pub fn recv_timeout_with_poll(&self, timeout: Duration, poll: Duration) -> Result<T, crossbeam_channel::RecvTimeoutError> {
-        self.recv_timeout_impl::<false>(timeout, poll, &mut 0)
+        self.recv_timeout_impl::<false>(timeout, poll, &mut 0, || false)
     }
 
     /// Last return from a park/sleep in this receive, zero for an immediate
     /// pickup. This is userspace resume, not kernel runnable or packet arrival.
     pub fn recv_timeout_observed(&self, timeout: Duration, poll: Duration,
         resumed_mono_ns: &mut u64) -> Result<T, crossbeam_channel::RecvTimeoutError> {
-        self.recv_timeout_impl::<true>(timeout, poll, resumed_mono_ns)
+        self.recv_timeout_impl::<true>(timeout, poll, resumed_mono_ns, || false)
+    }
+
+    /// Return Timeout early for a coalesced control-state notification so the
+    /// owner can refresh health. The predicate must consume a durable pending
+    /// bit; wake alone is only a hint. Business queue ownership/order is unchanged.
+    pub fn recv_timeout_observed_interruptible(&self, timeout: Duration, poll: Duration,
+        resumed_mono_ns: &mut u64, interrupted: impl FnMut() -> bool) -> Result<T, crossbeam_channel::RecvTimeoutError> {
+        self.recv_timeout_impl::<true>(timeout, poll, resumed_mono_ns, interrupted)
     }
 
     fn recv_timeout_impl<const OBSERVE: bool>(&self, timeout: Duration, poll: Duration,
-        resumed_mono_ns: &mut u64) -> Result<T, crossbeam_channel::RecvTimeoutError> {
+        resumed_mono_ns: &mut u64, mut interrupted: impl FnMut() -> bool) -> Result<T, crossbeam_channel::RecvTimeoutError> {
+        #[cfg(feature = "offline-delivery-probe")]
+        let mut offline_loop = crate::offline_delivery_probe::ReceiveLoop::begin();
         *resumed_mono_ns = 0;
         assert!(!poll.is_zero(), "owner polling must yield the CPU");
         let started = std::time::Instant::now();
         loop {
+            #[cfg(feature = "offline-delivery-probe")]
+            offline_loop.check();
+            if interrupted() { return Err(crossbeam_channel::RecvTimeoutError::Timeout); }
             match self.try_recv() {
                 Ok(value) => return Ok(value),
                 Err(TryRecvError::Disconnected) => return Err(crossbeam_channel::RecvTimeoutError::Disconnected),
@@ -314,6 +377,10 @@ impl<T> Receiver<T> {
             }
             if self.0.wake.get().is_some() {
                 self.arm_wake();
+                if interrupted() {
+                    self.cancel_wake();
+                    return Err(crossbeam_channel::RecvTimeoutError::Timeout);
+                }
                 match self.try_recv() {
                     Ok(value) => { self.cancel_wake(); return Ok(value); }
                     Err(TryRecvError::Disconnected) => {
@@ -322,8 +389,14 @@ impl<T> Receiver<T> {
                     }
                     Err(TryRecvError::Empty) => {}
                 }
+                #[cfg(feature = "offline-delivery-probe")]
+                offline_loop.wait();
                 self.wait_for_wake(remaining);
-            } else { std::thread::sleep(remaining.min(poll)); }
+            } else {
+                #[cfg(feature = "offline-delivery-probe")]
+                offline_loop.wait();
+                std::thread::sleep(remaining.min(poll));
+            }
             if OBSERVE { *resumed_mono_ns = hexagent_types::types::monotonic_now_ns(); }
         }
     }
@@ -371,6 +444,23 @@ mod tests {
     // SAFETY: element zero is an owned inline u64 with no value invariant.
     unsafe impl crate::try_queue::PublicationStamp for [u64; 1024] {
         fn publication_stamp(&self) -> Option<&u64> { Some(&self[0]) }
+    }
+
+    #[test]
+    fn untimed_receive_delayed_publication_and_last_sender_close_drain_exactly_once() {
+        for use_wake in [false, true] {
+            let (tx, rx) = bounded_with_wake(2, use_wake.then(|| Arc::new(crate::wake::Wake::default())));
+            let (ready, started) = std::sync::mpsc::sync_channel(1);
+            let join = std::thread::spawn(move || {
+                ready.send(()).unwrap();
+                for expected in 0..128 { assert_eq!(rx.recv().unwrap(), expected); }
+                assert!(rx.recv().is_err());
+            });
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+            for sequence in 0..128 { tx.send(sequence).unwrap(); }
+            drop(tx); join.join().unwrap();
+        }
     }
 
     #[test]
@@ -895,5 +985,99 @@ mod wake_lane_tests {
         });
         for id in 0..10_000 { assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), id); }
         producer.join().unwrap(); assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
+    }
+}
+
+#[cfg(test)]
+mod owner_notification_tests {
+    use super::*;
+    use crate::wake::{StateNotification, Wake};
+    use std::sync::atomic::AtomicU64;
+
+    struct Owned { stamp: u64, sequence: u64, drops: Arc<AtomicUsize>, payload: [u8; 4096] }
+    impl Drop for Owned { fn drop(&mut self) { self.drops.fetch_add(1, Ordering::Relaxed); } }
+    // SAFETY: the default prefix includes the entire initialized value; stamp
+    // is an ordinary inline observation field valid for every u64.
+    unsafe impl crate::try_queue::PublicationStamp for Owned {
+        fn publication_stamp(&self) -> Option<&u64> { Some(&self.stamp) }
+    }
+    #[test]
+    fn stamped_pending_retains_failure_and_drops_exactly_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = bounded(1);
+        let mut first = Some(Owned { stamp: 7, sequence: 1, drops: drops.clone(), payload: [13;4096] });
+        let timing = tx.try_send_stamped_slot(&mut first).unwrap();
+        assert!(first.is_none());
+        let mut second = Some(Owned { stamp: 9, sequence: 2, drops: drops.clone(), payload: [17;4096] });
+        assert_eq!(tx.try_send_stamped_slot(&mut second), Err(SlotSendError::Full));
+        assert_eq!(second.as_ref().unwrap().stamp,9);
+        let got=rx.try_recv().ok().unwrap();
+        assert_eq!((got.sequence,got.stamp),(1,timing.push_started_mono_ns));
+        assert_eq!(got.payload,[13;4096]); drop(got);
+        assert_eq!(tx.try_send_stamped_slot(&mut first),Err(SlotSendError::Empty));
+        drop(rx);
+        assert_eq!(tx.try_send_stamped_slot(&mut second),Err(SlotSendError::Disconnected));
+        assert_eq!((second.as_ref().unwrap().sequence,second.as_ref().unwrap().stamp),(2,9));
+        drop(second); assert_eq!(drops.load(Ordering::Relaxed),2);
+    }
+    #[test]
+    fn stamped_pending_multiple_producers_preserve_order_and_identity() {
+        let drops=Arc::new(AtomicUsize::new(0)); let (tx,rx)=bounded(4);
+        let threads:Vec<_>=(0..4).map(|id| {let tx=tx.clone();let drops=drops.clone();std::thread::spawn(move || {
+            for sequence in 0..500 { let mut pending=Some(Owned {stamp:0,sequence: id*500+sequence,drops:drops.clone(),payload:[id as u8;4096]});
+                while tx.try_send_stamped_slot(&mut pending).is_err() { std::thread::yield_now(); }
+                assert!(pending.is_none());
+            }
+        })}).collect(); drop(tx);
+        let mut expected=[0;4];
+        for _ in 0..2000 {let value=rx.recv().unwrap();let id=(value.sequence/500) as usize;
+            assert_eq!(value.sequence%500,expected[id]); expected[id]+=1;
+            assert_eq!(value.payload,[id as u8;4096]);assert_ne!(value.stamp,0);
+        }
+        for t in threads { t.join().unwrap(); }
+        assert_eq!(expected,[500;4]);assert_eq!(drops.load(Ordering::Relaxed),2000);
+    }
+    #[test]
+    fn state_hint_before_arm_and_during_recheck_is_not_lost() {
+        for during_recheck in [false,true] {
+            let wake=Arc::new(Wake::default());let hint=StateNotification::default();hint.bind(wake.clone());
+            let (_tx,rx)=bounded_with_wake::<u64>(1,Some(wake));
+            if !during_recheck {hint.notify();}
+            let mut calls=0;
+            let result=rx.recv_timeout_observed_interruptible(Duration::from_secs(5),IDLE_POLL,&mut 0,||{
+                calls+=1; if during_recheck && calls==2 {hint.notify();}
+                hint.take_pending()
+            });
+            assert_eq!(result,Err(crossbeam_channel::RecvTimeoutError::Timeout));
+            assert_eq!(calls,if during_recheck {2}else{1});assert!(!hint.take_pending());
+        }
+    }
+    #[test]
+    fn state_hint_interrupts_park_without_command_and_is_owner_local() {
+        let wake=Arc::new(Wake::default());let hint=Arc::new(StateNotification::default());hint.bind(wake.clone());
+        let other=StateNotification::default();let state=Arc::new(AtomicU64::new(0));
+        let (_tx,rx)=bounded_with_wake::<u64>(1,Some(wake));
+        let (ready_tx,ready_rx)=crossbeam_channel::bounded(1);let (done_tx,done_rx)=crossbeam_channel::bounded(1);
+        let h=hint.clone();let observed=state.clone();
+        let worker=std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();let mut resumed=0;
+            let result=rx.recv_timeout_observed_interruptible(Duration::from_secs(5),IDLE_POLL,&mut resumed,||h.take_pending());
+            assert!(matches!(result,Err(crossbeam_channel::RecvTimeoutError::Timeout)));
+            done_tx.send(observed.load(Ordering::Acquire)).unwrap();
+        });
+        ready_rx.recv().unwrap(); std::thread::sleep(Duration::from_millis(10));
+        state.store(42,Ordering::Release);for _ in 0..1000 {hint.notify();}
+        assert!(!other.take_pending());assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),42);
+        worker.join().unwrap();
+        // Coalesced duplicates may remain after consumption, but cannot grow a queue.
+        hint.take_pending();assert!(!hint.take_pending());
+    }
+    #[test]
+    fn interrupt_preserves_queued_business_and_disconnect() {
+        let wake=Arc::new(Wake::default());let hint=StateNotification::default();hint.bind(wake.clone());
+        let (tx,rx)=bounded_with_wake(2,Some(wake));tx.try_send(11).unwrap();tx.try_send(12).unwrap();hint.notify();
+        assert!(matches!(rx.recv_timeout_observed_interruptible(Duration::from_secs(1),IDLE_POLL,&mut 0,||hint.take_pending()),Err(crossbeam_channel::RecvTimeoutError::Timeout)));
+        assert_eq!(rx.try_recv(),Ok(11));assert_eq!(rx.try_recv(),Ok(12));drop(tx);
+        assert!(matches!(rx.recv_timeout_observed_interruptible(Duration::from_secs(1),IDLE_POLL,&mut 0,||hint.take_pending()),Err(crossbeam_channel::RecvTimeoutError::Disconnected)));
     }
 }

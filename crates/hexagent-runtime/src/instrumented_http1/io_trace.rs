@@ -27,10 +27,12 @@ pub struct Http1IoTimings {
 }
 
 pub(super) struct IoTrace {
+    #[cfg(feature = "offline-delivery-probe")]
+    pub(super) offline_key: AtomicU64,
     origin: Instant,
     active_start: AtomicU64,
     first_write: AtomicU64,
-    first_write_mono: AtomicU64,
+    pub(super) first_write_mono: AtomicU64,
     first_read_mono: AtomicU64,
     last_write: AtomicU64,
     first_read: AtomicU64,
@@ -47,6 +49,8 @@ pub(super) struct IoTrace {
 impl Default for IoTrace {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "offline-delivery-probe")]
+            offline_key: AtomicU64::new(0),
             origin: Instant::now(),
             active_start: AtomicU64::new(0),
             first_write: AtomicU64::new(0),
@@ -73,6 +77,8 @@ impl IoTrace {
 
     pub(super) fn begin(&self) -> IoGuard<'_> {
         self.active_start.store(0, Ordering::Release);
+        #[cfg(feature = "offline-delivery-probe")]
+        self.offline_key.store(0, Ordering::Relaxed);
         for value in [
             &self.first_write,
             &self.first_write_mono,
@@ -260,10 +266,16 @@ impl<T: Write + Unpin> Write for TimedIo<T> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        #[cfg(feature = "offline-delivery-probe")]
+        let offline_span = self.trace.io.offline_key.load(Ordering::Relaxed).checked_sub(1)
+            .and_then(|key| crate::offline_delivery_probe::Span::begin_id(crate::offline_delivery_probe::Phase::HttpWritePoll, key));
         let result = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(bytes)) = result {
             self.wrote(bytes);
         }
+        #[cfg(feature = "offline-delivery-probe")]
+        if let Some(span) = offline_span { span.finish_at(hexagent_types::types::monotonic_now_ns(), u8::from(result.is_ready()), None,
+            self.trace.io.first_write_mono.load(Ordering::Acquire)); }
         result
     }
     fn poll_write_vectored(
@@ -271,10 +283,16 @@ impl<T: Write + Unpin> Write for TimedIo<T> {
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
+        #[cfg(feature = "offline-delivery-probe")]
+        let offline_span = self.trace.io.offline_key.load(Ordering::Relaxed).checked_sub(1)
+            .and_then(|key| crate::offline_delivery_probe::Span::begin_id(crate::offline_delivery_probe::Phase::HttpWritePoll, key));
         let result = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
         if let Poll::Ready(Ok(bytes)) = result {
             self.wrote(bytes);
         }
+        #[cfg(feature = "offline-delivery-probe")]
+        if let Some(span) = offline_span { span.finish_at(hexagent_types::types::monotonic_now_ns(), u8::from(result.is_ready()), None,
+            self.trace.io.first_write_mono.load(Ordering::Acquire)); }
         result
     }
     fn is_write_vectored(&self) -> bool {

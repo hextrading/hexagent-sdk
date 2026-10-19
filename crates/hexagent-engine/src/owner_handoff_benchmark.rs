@@ -13,9 +13,9 @@ fn benchmark_http_owner_handoff() {
             1,
             Some(Arc::new(hexagent_runtime::wake::Wake::default())),
         );
-        let (diagnostic, diagnostics) = hexagent_runtime::poll_channel::bounded(512);
+        let (diagnostic, diagnostics) = hexagent_runtime::poll_channel::bounded::<OwnerPublication>(512);
         let mut metrics = PolyConnectionLaneMetrics::new("bench", Role::Cancel, 1);
-        metrics.diagnostic = Some(diagnostic); // includes real telemetry publication
+        metrics.publication = Some(diagnostic); // includes real telemetry publication
         let metrics = Arc::new(metrics);
         let lane = PolyConnectionLane {
             tx,
@@ -67,7 +67,8 @@ fn benchmark_http_owner_handoff() {
                 enqueued_at: Instant::now(),
             };
             let began = Instant::now();
-            assert!(lane.try_send(command).is_ok());
+            let mut pending = Some(command); // included in the same full-send timing boundary
+            assert!(lane.try_send_slot(&mut pending).is_ok());
             let sent = began.elapsed().as_nanos() as u64;
             let elapsed = if let Some(rx) = &local_rx {
                 let mut command = rx.try_recv().unwrap();
@@ -598,19 +599,92 @@ fn benchmark_owner_observation_ablation() {
 #[test]
 fn diagnostics_shutdown_releases_metrics_sender_clones_before_join() {
     let (tx, rx) = hexagent_runtime::poll_channel::bounded(8);
-    let handle = spawn_execution_diagnostics(rx).unwrap();
+    let (publications, published) = hexagent_runtime::poll_channel::bounded(8);
+    let handle = spawn_execution_diagnostics(rx, published).unwrap();
     let mut metrics =
         PolyConnectionLaneMetrics::new("fixture", hexagent_runtime::http1_pool::Role::Cancel, 1);
     metrics.diagnostic = Some(tx.clone());
+    metrics.publication = Some(publications.clone());
     let (done_tx, done_rx) = bounded(1);
     let shutdown = thread::spawn(move || {
-        finish_execution_diagnostics(vec![Arc::new(metrics)], tx, handle);
+        finish_execution_diagnostics(vec![Arc::new(metrics)], tx, publications, handle);
         done_tx.send(()).unwrap();
     });
     done_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("diagnostic worker must observe disconnect");
     shutdown.join().unwrap();
+}
+
+#[test]
+fn owned_publication_keeps_fifo_fields_and_exact_arc_ownership() {
+    use hexagent_runtime::http1_pool::Role;
+    let account: Arc<str> = Arc::from("fixture");
+    let (tx, rx) = hexagent_runtime::poll_channel::bounded(2);
+    for slot in 1..=2 {
+        tx.try_send_owned(OwnerPublication {
+            account: account.clone(), role: Role::Cancel, slot,
+            timing: hexagent_runtime::poll_channel::PublicationTiming {
+                push_started_mono_ns: slot as u64 * 10,
+                push_returned_mono_ns: slot as u64 * 10 + 1,
+                notify_returned_mono_ns: slot as u64 * 10 + 2,
+            },
+        }).unwrap();
+    }
+    assert_eq!(Arc::strong_count(&account), 3);
+    for slot in 1..=2 {
+        let p = rx.try_recv().unwrap();
+        assert!(Arc::ptr_eq(&p.account, &account));
+        assert_eq!((p.role, p.slot), (Role::Cancel, slot));
+        assert_eq!(p.timing.push_started_mono_ns, slot as u64 * 10);
+        assert_eq!(p.timing.push_returned_mono_ns, slot as u64 * 10 + 1);
+        assert_eq!(p.timing.notify_returned_mono_ns, slot as u64 * 10 + 2);
+    }
+    assert_eq!(Arc::strong_count(&account), 1);
+    assert!(rx.try_recv().is_err());
+    drop(rx);
+    let retained = tx.try_send_owned(OwnerPublication {
+        account: account.clone(), role: Role::Fast, slot: 9,
+        timing: hexagent_runtime::poll_channel::PublicationTiming::default(),
+    }).unwrap_err().into_inner();
+    assert_eq!(retained.slot, 9);
+    assert_eq!(Arc::strong_count(&account), 2);
+    drop(retained);
+    assert_eq!(Arc::strong_count(&account), 1);
+}
+
+#[test]
+fn publication_lane_full_preserves_command_and_separates_health_evidence() {
+    use hexagent_runtime::http1_pool::Role;
+    let (pub_tx, pub_rx) = hexagent_runtime::poll_channel::bounded(1);
+    let (diag_tx, diag_rx) = hexagent_runtime::poll_channel::bounded(1);
+    assert!(std::mem::size_of::<OwnerPublication>() <= 64);
+    let timing = hexagent_runtime::poll_channel::PublicationTiming {
+        push_started_mono_ns: 11, push_returned_mono_ns: 22, notify_returned_mono_ns: 33,
+    };
+    pub_tx.try_send(OwnerPublication { account: Arc::from("prior"), role: Role::Fast,
+        slot: 7, timing }).unwrap();
+    let mut metrics = PolyConnectionLaneMetrics::new("next", Role::Cancel, 2);
+    metrics.publication = Some(pub_tx);
+    metrics.diagnostic = Some(diag_tx);
+    let metrics = Arc::new(metrics);
+    let (tx, rx) = hexagent_runtime::poll_channel::bounded(1);
+    let lane = PolyConnectionLane { tx, metrics: metrics.clone(), preparation: None };
+    let (updates, _rx) = bounded(1);
+    lane.try_send(PolyConnectionCommand::Cancel { cancel_trigger: Default::default(),
+        instance_id: "instance".into(), exchange: Exchange::Polymarket,
+        client_order_id: "order".into(), timestamp_ns: 1,
+        update_tx: ExecutorUpdateSender { owner: 7, tx: updates.into() },
+        enqueued_at: Instant::now() }).unwrap();
+    assert_eq!(metrics.diagnostic_dropped.load(Ordering::Relaxed), 1);
+    assert!(matches!(rx.try_recv().unwrap(), PolyConnectionCommand::Cancel { client_order_id, .. } if client_order_id == "order"));
+    metrics.release(Duration::from_millis(600), Default::default());
+    assert!(!metrics.occupied.load(Ordering::Acquire));
+    assert!(matches!(diag_rx.try_recv().unwrap(), ExecutionDiagnostic::OwnerSlow { slot: 2, .. }));
+    let record = pub_rx.try_recv().unwrap();
+    assert_eq!((record.account.as_ref(), record.role, record.slot, record.timing), ("prior", Role::Fast, 7, timing));
+    assert_eq!(metrics.diagnostic_dropped.load(Ordering::Relaxed), 1);
+    assert!(pub_rx.try_recv().is_err());
 }
 
 #[test]
@@ -732,4 +806,303 @@ fn owner_payload_layout_probe() {
         std::mem::size_of::<CancelTrigger>(), std::mem::size_of::<Signal>(),
         std::mem::size_of::<ProbeHttpRequest>(), std::mem::size_of::<ExecutionDiagnostic>(),
         std::mem::size_of::<hexagent_runtime::poll_channel::PublicationTiming>());
+}
+
+// Frozen starting implementation for same-binary ownership-transfer ablation.
+impl PolyConnectionLane {
+    fn legacy_burst_try_send(
+        &self,
+        command: PolyConnectionCommand,
+    ) -> Result<(), crossbeam_channel::TrySendError<PolyConnectionCommand>> {
+        if self
+            .metrics
+            .occupied
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.metrics.busy_skips.fetch_add(1, Ordering::Relaxed);
+            return Err(crossbeam_channel::TrySendError::Full(command));
+        }
+        self.metrics.enqueued_ns.store(now_ns(), Ordering::Release);
+        self.metrics.cancel_reply_pending.store(
+            matches!(command, PolyConnectionCommand::Cancel { .. }), Ordering::Release);
+        let prepares = matches!(&command, PolyConnectionCommand::Place { .. });
+        let has_trace = matches!(&command, PolyConnectionCommand::Place { .. } | PolyConnectionCommand::Cancel { .. });
+        self.metrics.queue_depth.store(1, Ordering::Release);
+        let sent = self.tx.try_send_stamped(command);
+        match sent {
+            Ok(timing) => {
+                if prepares { if let Some(route) = &self.preparation { route.issued(); } }
+                if has_trace {
+                    let publication_mono_ns = timing.push_started_mono_ns;
+                    if let Some(sender) = &self.metrics.diagnostic {
+                        if sender.try_send_owned(ExecutionDiagnostic::OwnerPublication {
+                            account: Arc::clone(&self.metrics.account_id), role: self.metrics.role,
+                            slot: self.metrics.slot, publication_mono_ns, timing }).is_err() {
+                            self.metrics.diagnostic_dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                // occupied admits at most one command; this gauge only ever
+                // transitions 0 -> 1. No read/modify/write is needed per send.
+                self.metrics.queue_high_water.store(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                self.metrics.cancel_reply_pending.store(false, Ordering::Release);
+                self.metrics.send_failures.fetch_add(1, Ordering::Relaxed);
+                self.metrics.enqueued_ns.store(0, Ordering::Release);
+                self.metrics.queue_depth.store(0, Ordering::Release);
+                self.metrics.occupied.store(false, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+}
+fn legacy_burst_route(
+    routes: &mut PolyAccountConnectionRoutes,
+    role: hexagent_runtime::http1_pool::Role,
+    mut command: PolyConnectionCommand,
+) -> Result<(), PolyConnectionCommand> {
+    // Production initializes these alongside the lanes before dispatch starts.
+    #[cfg(test)]
+    routes.cancel_lane_keys.resize(routes.cancel.len(), None);
+    let cancel_key = command.cancel_key();
+    let now = now_ns();
+    routes.refresh_health_if_needed(now);
+    let now = now_ns();
+    let PolyAccountConnectionRoutes { fast, cancel, reconcile, fast_rr, cancel_rr,
+        reconcile_rr, health, cancel_lane_keys, maintenance_pending, .. } = routes;
+    let (lanes, rr) = match role {
+        hexagent_runtime::http1_pool::Role::Fast => (&*fast, fast_rr),
+        hexagent_runtime::http1_pool::Role::Cancel => (&*cancel, cancel_rr),
+        hexagent_runtime::http1_pool::Role::Reconcile => (&*reconcile, reconcile_rr),
+        _ => return Err(command),
+    };
+    if lanes.is_empty() {
+        return Err(command);
+    }
+    let mut start = *rr % lanes.len();
+    let mut selection = crate::types::FastLaneSelection::default();
+    if role == hexagent_runtime::http1_pool::Role::Fast {
+        if let Some(route) = lanes.first().and_then(|lane| lane.preparation.as_ref()) { route.refresh(); }
+        // Rank only healthy idle candidates. Equal CPU load retains RR fairness.
+        let mut best = u64::MAX;
+        for offset in 0..lanes.len() {
+            let index = (*rr + offset) % lanes.len();
+            let lane = &lanes[index];
+            if lane.metrics.occupied.load(Ordering::Acquire) {
+                selection.busy_lanes = selection.busy_lanes.saturating_add(1);
+                continue;
+            }
+            if health.as_mut().is_some_and(|health| !health.lane_place_allowed(lane.metrics.slot, now)) {
+                selection.unhealthy_lanes = selection.unhealthy_lanes.saturating_add(1);
+                continue;
+            }
+            selection.eligible_lanes = selection.eligible_lanes.saturating_add(1);
+            let score = lane.preparation.as_ref().map_or(0, |route| route.pending_on_core());
+            if score < best { best = score; start = index; }
+        }
+        selection.minimum_pending = (best != u64::MAX).then_some(best);
+    }
+    let passes = if role == hexagent_runtime::http1_pool::Role::Cancel && health.is_some() { 3 } else { 1 };
+    for rank in 0..passes {
+        for offset in 0..lanes.len() {
+            let index = (start + offset) % lanes.len();
+            if role == hexagent_runtime::http1_pool::Role::Cancel
+                && health.as_ref().is_some_and(|h| h.cancel_lane_rank(lanes[index].metrics.slot, now) != rank) {
+                continue;
+            }
+            if matches!(&command, PolyConnectionCommand::ProbeHttp { request, .. }
+                if request.excluded_slot == Some(lanes[index].metrics.slot)) {
+                continue;
+            }
+            if role == hexagent_runtime::http1_pool::Role::Fast
+                && health.as_mut().is_some_and(|health| !health.lane_place_allowed(lanes[index].metrics.slot, now))
+            {
+                continue;
+            }
+            // Fast/Cancel health has one generation-aware router authority.
+            if role == hexagent_runtime::http1_pool::Role::Reconcile
+                && lanes[index]
+                .metrics
+                .cooldown_until_ns
+                .load(Ordering::Acquire)
+                > now
+            {
+                lanes[index]
+                    .metrics
+                    .cooldown_skips
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            match &mut command {
+                PolyConnectionCommand::Place { expected_generation, .. }
+                | PolyConnectionCommand::ProbeHttp { expected_generation, .. } if role == hexagent_runtime::http1_pool::Role::Fast => {
+                    *expected_generation = health.as_ref().and_then(|health| health.lane_generation(lanes[index].metrics.slot));
+                }
+                _ => {}
+            }
+            if role == hexagent_runtime::http1_pool::Role::Fast {
+                if let PolyConnectionCommand::Place { order, .. } = &mut command {
+                    order.hot_path.fast_selection = lanes[index].preparation.as_ref().map(|route| {
+                        selection.core = route.core() as u32;
+                        selection.selected_pending = route.pending_on_core();
+                        selection
+                    });
+                }
+            }
+            match lanes[index].legacy_burst_try_send(command) {
+                Ok(()) => {
+                    *maintenance_pending = true;
+                    *rr = index.wrapping_add(1);
+                    if role == hexagent_runtime::http1_pool::Role::Cancel {
+                        cancel_lane_keys[index] = cancel_key;
+                    }
+                    if role == hexagent_runtime::http1_pool::Role::Fast {
+                        if let Some(health) = health.as_mut() {
+                            health.place_dispatched(lanes[index].metrics.slot, now_ns());
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(crossbeam_channel::TrySendError::Full(returned)) => command = returned,
+                Err(crossbeam_channel::TrySendError::Disconnected(returned)) => command = returned,
+            }
+        }
+    }
+    // Reconcile work is lossless. A cooling lane remains a bounded
+    // last resort when every healthy connection is occupied; no request is
+    // dropped and no extra socket is created. Fast/place never falls through
+    // to a known-slow generation.
+    if matches!(
+        role,
+        hexagent_runtime::http1_pool::Role::Reconcile
+    ) {
+        for offset in 0..lanes.len() {
+            let index = (start + offset) % lanes.len();
+        if matches!(&command, PolyConnectionCommand::ProbeHttp { request, .. }
+            if request.excluded_slot == Some(lanes[index].metrics.slot)) {
+            continue;
+        }
+            if lanes[index]
+                .metrics
+                .cooldown_until_ns
+                .load(Ordering::Acquire)
+                <= now
+            {
+                continue;
+            }
+            match lanes[index].legacy_burst_try_send(command) {
+                Ok(()) => {
+                    *rr = index.wrapping_add(1);
+                    if role == hexagent_runtime::http1_pool::Role::Cancel {
+                        cancel_lane_keys[index] = cancel_key;
+                    }
+                    return Ok(());
+                }
+                Err(crossbeam_channel::TrySendError::Full(returned)) => command = returned,
+                Err(crossbeam_channel::TrySendError::Disconnected(returned)) => command = returned,
+            }
+        }
+    }
+    Err(command)
+}
+
+/// Full routing/command/diagnostic publication through real production types.
+/// Fixed-size 4/6-command bursts; no exchange, no fixture construction in send.
+#[test]
+#[ignore = "offline complete routing boundary and multi-owner burst comparison"]
+fn benchmark_owner_burst() {
+    use hexagent_runtime::http1_pool::Role;
+    use std::io::Write;
+    let n:usize=std::env::var("HEX_BURST_N").unwrap_or("10000".into()).parse().unwrap();
+    let legacy=std::env::var("HEX_BURST_LEGACY").ok().as_deref()==Some("1");
+    const WARM:usize=1000;
+    for count in [4usize,6] {
+        let mut routes=PolyAccountConnectionRoutes::default();
+        let (diagnostic,diagnostics)=hexagent_runtime::poll_channel::bounded(1024);
+        let (done,completed)=bounded(count);let mut workers=Vec::new();let mut all_metrics=Vec::new();
+        for slot in 0..count {
+            let(tx,rx)=hexagent_runtime::poll_channel::bounded_with_wake(1,Some(Arc::new(hexagent_runtime::wake::Wake::default())));
+            let mut metrics=PolyConnectionLaneMetrics::new("burst",Role::Cancel,slot);metrics.diagnostic=Some(diagnostic.clone());let metrics=Arc::new(metrics);
+            all_metrics.push(metrics.clone());routes.cancel.push(PolyConnectionLane{tx,metrics:metrics.clone(),preparation:None});
+            let done=done.clone();workers.push(thread::spawn(move|| {
+                for _ in 0..n+WARM {let mut resume=0;
+                    let mut command=rx.recv_timeout_observed(Duration::from_secs(5),Duration::from_micros(50),&mut resume).unwrap();
+                    let end=crate::types::monotonic_now_ns();let trace=command.hot_path_mut().unwrap();let published=trace.owner_published_mono_ns;
+                    metrics.release_for_test();done.send((slot,end,published,resume)).unwrap();
+                }
+            }));
+        }
+        routes.cancel_lane_keys.resize(count,None);
+        let(updates,_updates_rx)=bounded(1);let update_tx=ExecutorUpdateSender{owner:1,tx:updates.into()};
+        let mut rows=Vec::with_capacity(n*count);let mut start=vec![0;count];let mut sends=vec![0;count];let mut received=vec![(0,0,0);count];let mut times=vec![hexagent_runtime::poll_channel::PublicationTiming::default();count];let mut diag_hwm=0;let mut diag_count=0;
+        for sequence in 0..n+WARM {
+            for slot in 0..count {
+                let command=PolyConnectionCommand::Cancel {cancel_trigger:Default::default(),instance_id:"burst".into(),exchange:Exchange::Polymarket,client_order_id:format!("burst-{slot}"),timestamp_ns:1,update_tx:update_tx.clone(),enqueued_at:std::time::Instant::now()};
+                start[slot]=crate::types::monotonic_now_ns();let began=std::time::Instant::now();
+                assert!(if legacy { legacy_burst_route(&mut routes,Role::Cancel,command) } else { try_send_poly_owner(&mut routes,Role::Cancel,command) }.is_ok());
+                sends[slot]=began.elapsed().as_nanos() as u64;
+            }
+            for _ in 0..count {let(slot,end,published,resume)=completed.recv_timeout(Duration::from_secs(5)).unwrap();received[slot]=(end,published,resume);}
+            diag_hwm=diag_hwm.max(diagnostics.len());
+            for _ in 0..count {let record=diagnostics.try_recv().unwrap();if let ExecutionDiagnostic::OwnerPublication{slot,publication_mono_ns,timing,..}=record {assert_eq!(publication_mono_ns,received[slot].1);times[slot]=timing;diag_count+=1;}else{panic!("unexpected diagnostic");}}
+            if sequence>=WARM {for slot in 0..count {let(end,published,resume)=received[slot];let t=times[slot];rows.push((sends[slot],end-start[slot],end-published,t.push_returned_mono_ns-t.push_started_mono_ns,t.notify_returned_mono_ns-t.push_returned_mono_ns,if resume>0{Some(resume as i128-t.notify_returned_mono_ns as i128)}else{None}));}}
+        }
+        for w in workers {w.join().unwrap();}
+        let prefix=std::env::var("HEX_HTTP_BENCH_OUT").unwrap();let mut f=std::io::BufWriter::new(std::fs::File::create(format!("{prefix}-burst{count}.csv")).unwrap());writeln!(f,"route_send_ns,route_start_to_dequeue_ns,publication_to_dequeue_ns,push_ns,notify_ns,notify_to_resume_ns").unwrap();
+        for(a,b,c,d,e,f1)in rows{writeln!(f,"{a},{b},{c},{d},{e},{}",f1.map(|x|x.to_string()).unwrap_or_default()).unwrap();}
+        for m in all_metrics {assert_eq!(m.queue_high_water.load(Ordering::Relaxed),1);assert_eq!(m.send_failures.load(Ordering::Relaxed),0);assert_eq!(m.diagnostic_dropped.load(Ordering::Relaxed),0);}
+        println!("burst lanes={count} n={} hwm=1 overflow=0 diagnostic_hwm={diag_hwm} diagnostic_records={diag_count} diagnostic_dropped=0",n*count);
+    }
+}
+
+#[test]
+fn account_completion_preserves_fifo_full_retry_disconnect_and_account_isolation() {
+    let (a, ar) = account_completion_channel(1);
+    let (b, br) = account_completion_channel(1);
+    let update = |owner, id: &str| RoutedOrderUpdate {
+        owner, update: exec_rejected_cancel(id.into(), Exchange::Polymarket),
+        timing: LifecycleTiming::default(),
+    };
+    a.try_send(update(7, "first")).unwrap();
+    let retained = match a.try_send(update(7, "second")) {
+        Err(crossbeam_channel::TrySendError::Full(value)) => value,
+        _ => panic!("full must retain exact lifecycle"),
+    };
+    b.try_send(update(9, "first")).unwrap();
+    assert_eq!(br.recv().unwrap().owner, 9);
+    let first=ar.recv().unwrap();
+    assert_eq!((first.owner,first.update.client_order_id.as_str()),(7,"first"));
+    a.try_send(retained).unwrap();drop(a);
+    let second=ar.recv().unwrap();
+    assert_eq!((second.owner,second.update.client_order_id.as_str()),(7,"second"));
+    assert!(matches!(ar.try_recv(),Err(crossbeam_channel::TryRecvError::Disconnected)));
+    drop(br);
+    match b.try_send(update(9,"late")) {
+        Err(crossbeam_channel::TrySendError::Disconnected(value)) => {
+            assert_eq!(value.owner,9);assert_eq!(value.update.client_order_id,"late");
+        }, _ => panic!("disconnect must return ownership"),
+    }
+}
+
+#[test]
+fn account_completion_wakes_consumer_and_drains_before_disconnect() {
+    let (tx,rx)=account_completion_channel(2);
+    let (ready,started)=std::sync::mpsc::sync_channel(1);
+    let (done,finished)=std::sync::mpsc::sync_channel(1);
+    let worker=thread::spawn(move || {
+        ready.send(()).unwrap();
+        let mut ids=Vec::new();
+        while let Ok(value)=rx.recv() {ids.push((value.owner,value.update.client_order_id));}
+        done.send(ids).unwrap();
+    });
+    started.recv().unwrap();thread::sleep(Duration::from_millis(10));
+    for id in ["one","two"] {tx.send(RoutedOrderUpdate {owner:7,
+        update:exec_rejected_cancel(id.into(),Exchange::Polymarket),timing:LifecycleTiming::default()}).unwrap();}
+    drop(tx);
+    assert_eq!(finished.recv_timeout(Duration::from_secs(2)).unwrap(),vec![(7,"one".into()),(7,"two".into())]);
+    worker.join().unwrap();
 }

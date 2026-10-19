@@ -2256,6 +2256,9 @@ pub(crate) enum HttpReplyReceiver {
     Reused(hexagent_runtime::reply_slots::Receiver<HttpReply, HttpCompletionTiming>),
 }
 impl HttpReplyReceiver {
+    pub(crate) fn try_recv(&self) -> Result<HttpReply, crossbeam_channel::TryRecvError> {
+        match self { Self::Dedicated(rx) => rx.try_recv(), Self::Reused(rx) => rx.try_recv() }
+    }
     pub(crate) fn recv(&self) -> Result<HttpReply, crossbeam_channel::RecvError> {
         match self { Self::Dedicated(rx) => rx.recv(), Self::Reused(rx) => rx.recv() }
     }
@@ -5260,6 +5263,9 @@ impl SharedState {
         status: OrderStatus,
         error: Option<&str>,
     ) {
+        #[cfg(feature = "offline-http-reactor-bench")]
+        let audit_probe = hexagent_runtime::offline_delivery_probe::Span::begin(
+            hexagent_runtime::offline_delivery_probe::Phase::Audit, exchange_order_id);
         let Some(attempt) = attempt.snapshot() else {
             log::error!(
                 "[order_attempt] admission trace slot reused before completion kind={} coid={}",
@@ -5293,7 +5299,13 @@ impl SharedState {
             completed_ns,
             enqueued_ns: now_ns(),
         };
-        if let Err(error) = self.attempt_audit_tx.try_send(AuditJob::Attempt(job)) {
+        #[cfg(feature = "offline-http-reactor-bench")]
+        let queue_probe = hexagent_runtime::offline_delivery_probe::Span::begin(
+            hexagent_runtime::offline_delivery_probe::Phase::AuditEnqueue, exchange_order_id);
+        let queued = self.attempt_audit_tx.try_send(AuditJob::Attempt(job));
+        #[cfg(feature = "offline-http-reactor-bench")]
+        if let Some(probe) = queue_probe { probe.finish(u8::from(queued.is_err())); }
+        if let Err(error) = queued {
             // This is an audit/measurement loss, not an account mutation.
             // Keep the order completion lane non-blocking and make the loss
             // operationally loud instead of delaying StrategyAccount apply.
@@ -5304,6 +5316,8 @@ impl SharedState {
                 error,
             );
         }
+        #[cfg(feature = "offline-http-reactor-bench")]
+        if let Some(probe) = audit_probe { probe.finish(0); }
     }
 
     fn enqueue_lifecycle_trace(&self, job: LifecycleTraceJob) {
@@ -5791,6 +5805,22 @@ impl SharedState {
             .oid_to_coid
             .get(&normalize_order_id(exchange_order_id))
             .cloned()
+    }
+
+    /// Offline setup only: seed the same asynchronous identity projection used
+    /// by order recovery. Call before the measured wave, never on a quote path.
+    #[cfg(feature = "offline-http-reactor-bench")]
+    pub fn offline_unified_private_owner(&self) -> bool { self.unified_private_owner }
+
+    #[cfg(feature = "offline-http-reactor-bench")]
+    pub fn offline_seed_cancel(&self, coid: &str, oid: &str) {
+        assert!(self.clob_base_url.starts_with("http://127.0.0.1:"));
+        self.install_runtime_order_id(coid, oid, "offline-token", None).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while self.lookup_coid(oid).as_deref() != Some(coid) {
+            assert!(std::time::Instant::now() < deadline, "offline identity owner stalled");
+            std::thread::sleep(Duration::from_micros(50));
+        }
     }
 
     pub(crate) fn lookup_private_order_ownership(&self, order_id: &str) -> Option<PrivateOrderOwnership> {
@@ -6943,6 +6973,36 @@ pub struct PendingCancel {
     attempt: Option<crate::http1_pool::AttemptTraceHandle>,
 }
 
+/// Reactor-local cache. Keep it out of PendingCancel so the default per-slot
+/// completion message keeps its original layout and has no reactor-only fields.
+pub struct ReactorPendingCancel {
+    pending: PendingCancel,
+    ready_reply: Option<HttpReply>,
+    completion_started_ns: u64,
+}
+
+impl PendingCancel {
+    pub fn into_reactor(self) -> ReactorPendingCancel {
+        ReactorPendingCancel { pending: self, ready_reply: None, completion_started_ns: now_ns() }
+    }
+}
+
+impl ReactorPendingCancel {
+    /// A readiness check, not a business result. Empty/slow HTTP stays pending;
+    /// disconnected senders use the same transport failure as blocking complete.
+    pub fn try_ready(&mut self) -> bool {
+        if self.ready_reply.is_some() || self.pending.rx.is_none() { return true; }
+        match self.pending.rx.as_ref().unwrap().try_recv() {
+            Ok(reply) => self.ready_reply = Some(reply),
+            Err(crossbeam_channel::TryRecvError::Empty) => return false,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.ready_reply = Some(Err(HttpErr::Transport("async reply dropped".to_string())));
+            }
+        }
+        true
+    }
+}
+
 struct PreparedSubmit {
     hot_path: crate::types::HotPathTrace,
     local_oid: String,
@@ -6978,6 +7038,7 @@ pub struct PolymarketTrade {
     gen_ns_hint: u64,
     /// Connection-owner local; initialized before signals can reach this worker.
     reply_slots: ReplyPool,
+    reactor_spare_reply_slots: Option<ReplyPool>,
     http_dispatch: Option<persistent_http::Dispatch>,
 }
 
@@ -7510,6 +7571,7 @@ impl PolymarketTrade {
             instance_id: String::new(),
             gen_ns_hint: 0,
             reply_slots: new_reply_pool(),
+            reactor_spare_reply_slots: None,
             http_dispatch: None,
         })
     }
@@ -7675,6 +7737,7 @@ impl PolymarketTrade {
             instance_id: instance_id.to_string(),
             gen_ns_hint: 0,
             reply_slots: new_reply_pool(),
+            reactor_spare_reply_slots: None,
             http_dispatch: None,
         }
     }
@@ -7688,6 +7751,23 @@ impl PolymarketTrade {
         });
     }
 
+    /// Startup-only, before this route is exposed to any execution command.
+    /// Reply and command publications wake the same sole reactor consumer.
+    pub fn bind_cancel_reactor_wake(&mut self, wake: Arc<hexagent_runtime::wake::Wake>) {
+        assert!(self.reactor_spare_reply_slots.is_none(), "bind reactor once at startup");
+        let shared = ReplyPool::with_wake(2, HttpCompletionTiming::default,
+            || Err(HttpErr::Transport("async reply dropped".to_string())), Some(wake));
+        self.reactor_spare_reply_slots = Some(std::mem::replace(&mut self.reply_slots, shared));
+    }
+
+    /// Ownership-transfer boundary only, with no in-flight request on this
+    /// physical slot. Cold blocking control uses its private, startup-allocated
+    /// wake; it must never arm the reactor's single-consumer futex word.
+    pub fn swap_cancel_control_reply_slots(&mut self) {
+        std::mem::swap(&mut self.reply_slots,
+            self.reactor_spare_reply_slots.as_mut().expect("reactor binding required"));
+    }
+
     /// Fresh connection-worker completion slots. A live Fast/Cancel worker
     /// must bind its own persistent lane before receiving execution commands;
     /// cold compatibility callers retain the legacy async dispatch bridge.
@@ -7698,6 +7778,7 @@ impl PolymarketTrade {
             instance_id: self.instance_id.clone(),
             gen_ns_hint: self.gen_ns_hint,
             reply_slots: new_reply_pool(),
+            reactor_spare_reply_slots: None,
             http_dispatch: None,
         }
     }
@@ -11873,18 +11954,37 @@ impl PolymarketTrade {
         client_order_id: &str,
         pending: PendingCancel,
     ) -> OrderUpdate {
-        let PendingCancel {
-            cancel_trigger,
-            ctx,
-            rx,
-            timing,
-            attempt,
-        } = pending;
         let completion_started_ns = now_ns();
-        let reply = rx.map(|rx| {
+        let mut pending = pending;
+        let reply = pending.rx.take().map(|rx| {
             rx.recv()
                 .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())))
         });
+        self.finish_cancel(exchange, client_order_id, pending, reply, completion_started_ns)
+    }
+
+    /// Consume an already observed reply without waiting for the transport.
+    /// Uses the same risk handler, audit, and timing boundaries as the old path.
+    pub fn complete_reactor_cancel(
+        &mut self,
+        exchange: Exchange,
+        client_order_id: &str,
+        pending: ReactorPendingCancel,
+    ) -> OrderUpdate {
+        let ReactorPendingCancel { pending, ready_reply, completion_started_ns } = pending;
+        assert!(ready_reply.is_some() || pending.rx.is_none(), "complete only a ready reactor reply");
+        self.finish_cancel(exchange, client_order_id, pending, ready_reply, completion_started_ns)
+    }
+
+    fn finish_cancel(
+        &mut self,
+        exchange: Exchange,
+        client_order_id: &str,
+        pending: PendingCancel,
+        reply: Option<HttpReply>,
+        completion_started_ns: u64,
+    ) -> OrderUpdate {
+        let PendingCancel { cancel_trigger, ctx, rx: _rx, timing, attempt } = pending;
         let response_received_ns = now_ns();
         if reply.is_some() {
             crate::latency::record_ns(

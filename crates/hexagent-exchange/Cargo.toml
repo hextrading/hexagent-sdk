@@ -5,6 +5,7 @@ edition = "2021"
 description = "hexagent-sdk: exchange adapters (market-data + execution traits), backtest sim (v2), market-data record/replay, and the cross-venue index price."
 
 [features]
+offline-http-reactor-bench = ["hexagent-runtime/offline-delivery-probe"]
 # Only selects the allocator in the offline libtest binary, never a consumer.
 offline-private-owner-mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
