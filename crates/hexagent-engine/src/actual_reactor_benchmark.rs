@@ -83,11 +83,38 @@ impl log::Log for FormatSink {
     fn flush(&self) {}
 }
 
+// accept() inherits O_NONBLOCK on macOS. The synchronous HTTP peer must
+// block between requests; otherwise WouldBlock retries consume an entire core
+// per connection and confound every measured scheduling/HTTP stage.
+fn configure_peer(stream: &TcpStream) {
+    stream.set_nonblocking(false).unwrap();
+    stream.set_nodelay(true).unwrap();
+    stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+}
+
+#[test]
+fn accepted_http_peer_clears_inherited_nonblocking() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (peer, _) = listener.accept().unwrap();
+    // Force the inherited state on every Unix host, including Linux where
+    // accept normally clears it. Check the cloned descriptor used by BufReader.
+    peer.set_nonblocking(true).unwrap();
+    configure_peer(&peer);
+    let mut input = peer.try_clone().unwrap();
+    let started = std::time::Instant::now();
+    let error = input.read(&mut [0u8; 1]).unwrap_err();
+    assert!(matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+    assert!(started.elapsed() >= Duration::from_millis(50),
+        "empty read must wait for the configured timeout instead of spinning");
+    assert!(peer.nodelay().unwrap());
+    assert_eq!(input.read_timeout().unwrap(), Some(Duration::from_millis(100)));
+}
+
 fn serve(mut stream: TcpStream, stopped: Arc<AtomicBool>, core: usize,
          replies: Arc<AtomicU64>, delay_us: u64) {
     role("off-http-peer", core, 0);
-    stream.set_nodelay(true).unwrap();
-    stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    configure_peer(&stream);
     let mut input = std::io::BufReader::new(stream.try_clone().unwrap());
     while !stopped.load(Ordering::Acquire) {
         let mut line = String::new();
