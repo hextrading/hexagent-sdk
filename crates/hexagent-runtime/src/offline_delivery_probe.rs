@@ -8,7 +8,8 @@ use std::cell::RefCell;
 pub enum Phase { Audit = 1, AuditEnqueue = 2, HandlerReturn = 3,
     Publish = 4, Receive = 5, Fast = 6, FullSend = 7, Diagnostic = 8,
     Router = 9, CommandPublication = 10, HttpPoll = 11, HttpWritePoll = 12,
-    HttpStart = 13, HttpSubmit = 14, HttpDequeue = 15, ReceiveLoop = 16 }
+    HttpStart = 13, HttpSubmit = 14, HttpDequeue = 15, ReceiveLoop = 16,
+    HyperTaskPoll = 17, HttpReadPoll = 18 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Record {

@@ -2,6 +2,50 @@
 use super::*;
 
 #[test]
+fn physical_fast_wait_wakes_for_health_and_preserves_command_fifo_and_disconnect() {
+    use hexagent_runtime::{http1_pool::Role, poll_channel, wake::StateNotification};
+    let wake = Arc::new(physical_owner_wake(Role::Fast));
+    let hint = Arc::new(StateNotification::default());
+    hint.bind(wake.clone());
+    let (tx, rx) = poll_channel::bounded_with_wake(1, Some(wake));
+    let (started, start) = bounded(1);
+    let (done, receive) = bounded(1);
+    let h = hint.clone();
+    let worker = thread::spawn(move || {
+        started.send(()).unwrap();
+        assert!(matches!(rx.recv_timeout_observed_interruptible(
+            Duration::from_secs(5), Duration::from_micros(50), &mut 0, || h.take_pending()),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)));
+        done.send(u64::MAX).unwrap();
+        for expected in 0..64 {
+            let value = loop {
+                match rx.recv_timeout_observed_interruptible(
+                    Duration::from_secs(2), Duration::from_micros(50), &mut 0, || h.take_pending()) {
+                    Ok(value) => break value,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(error) => panic!("early disconnect: {error}"),
+                }
+            };
+            assert_eq!(value, expected);
+            done.send(value).unwrap();
+        }
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(2)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)));
+    });
+    start.recv().unwrap();
+    thread::sleep(Duration::from_millis(10));
+    hint.notify();
+    assert_eq!(receive.recv_timeout(Duration::from_secs(1)).unwrap(), u64::MAX);
+    for value in 0..64 {
+        hint.notify();
+        tx.try_send(value).unwrap();
+        assert_eq!(receive.recv_timeout(Duration::from_secs(1)).unwrap(), value);
+    }
+    drop(tx);
+    worker.join().unwrap();
+}
+
+#[test]
 #[ignore = "release offline owner handoff A/B; writes raw samples only when requested"]
 fn benchmark_http_owner_handoff() {
     use hexagent_runtime::http1_pool::Role;
@@ -165,6 +209,69 @@ fn full_diagnostic_lane_does_not_block_command_or_keep_cancel_occupied() {
     assert!(!metrics.occupied.load(Ordering::Acquire));
     assert_eq!(metrics.cooldown_until_ns.load(Ordering::Relaxed), 0);
     assert_eq!(diagnostics.len(), 1);
+}
+
+#[test]
+fn dedicated_slow_overflow_preserves_release_and_separates_publication_loss() {
+    use hexagent_runtime::http1_pool::Role;
+    let (tx, readers) = bounded(1);
+    let registry = owner_diagnostics::Registry { tx, ready: Arc::new(AtomicBool::new(false)) };
+    let mut metrics = PolyConnectionLaneMetrics::new("fixture", Role::Fast, 1);
+    metrics.register_slow_diagnostic(&registry);
+    let reader = readers.recv().unwrap();
+    for _ in 0..=owner_diagnostics::CAPACITY {
+        metrics.occupied.store(true, Ordering::Release);
+        metrics.cancel_reply_pending.store(true, Ordering::Release);
+        metrics.release(Duration::from_millis(501), Default::default());
+        assert!(!metrics.occupied.load(Ordering::Acquire));
+        assert!(!metrics.cancel_reply_pending.load(Ordering::Acquire));
+        assert_eq!(metrics.cooldown_until_ns.load(Ordering::Relaxed), 0);
+    }
+    assert_eq!(metrics.diagnostic_dropped.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.publication_dropped.load(Ordering::Relaxed), 0);
+    assert_eq!(metrics.slow_diagnostic.as_ref().unwrap().stats().full, 1);
+    drop(reader);
+    metrics.release(Duration::from_millis(501), Default::default());
+    assert_eq!(metrics.slow_diagnostic.as_ref().unwrap().stats().disconnected, 1);
+    assert_eq!(metrics.diagnostic_dropped.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn coalesced_slow_hint_drains_all_owners_while_ordinary_channels_stay_open() {
+    use hexagent_runtime::http1_pool::Role;
+    use hexagent_runtime::poll_channel;
+    let (diagnostic, diagnostic_rx) = poll_channel::bounded(16);
+    let (publication, publication_rx) = poll_channel::bounded(16);
+    let (worker, registry) = spawn_execution_diagnostics(diagnostic_rx, publication_rx).unwrap();
+    let mut metrics = Vec::new();
+    let mut writers = Vec::new();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    for slot in 0..8 {
+        let mut m = PolyConnectionLaneMetrics::new("coalesced", Role::Fast, slot);
+        m.register_slow_diagnostic(&registry);
+        let m = Arc::new(m);
+        metrics.push(m.clone());
+        let barrier = barrier.clone();
+        writers.push(thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..owner_diagnostics::CAPACITY {
+                m.release(Duration::from_millis(501), Default::default());
+                thread::yield_now();
+            }
+        }));
+    }
+    drop(registry);
+    for h in writers { h.join().unwrap(); }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while metrics.iter().any(|m| m.slow_diagnostic.as_ref().unwrap().stats().depth != 0) {
+        assert!(Instant::now() < deadline, "coalescing must not strand records until shutdown");
+        thread::sleep(Duration::from_millis(1));
+    }
+    for m in &metrics {
+        assert_eq!(m.slow_requests.load(Ordering::Relaxed), owner_diagnostics::CAPACITY as u64);
+        assert_eq!(m.diagnostic_dropped.load(Ordering::Relaxed), 0);
+    }
+    finish_execution_diagnostics(metrics, diagnostic, publication, worker);
 }
 
 #[test]
@@ -600,11 +707,14 @@ fn benchmark_owner_observation_ablation() {
 fn diagnostics_shutdown_releases_metrics_sender_clones_before_join() {
     let (tx, rx) = hexagent_runtime::poll_channel::bounded(8);
     let (publications, published) = hexagent_runtime::poll_channel::bounded(8);
-    let handle = spawn_execution_diagnostics(rx, published).unwrap();
+    let (handle, registration) = spawn_execution_diagnostics(rx, published).unwrap();
     let mut metrics =
         PolyConnectionLaneMetrics::new("fixture", hexagent_runtime::http1_pool::Role::Cancel, 1);
     metrics.diagnostic = Some(tx.clone());
     metrics.publication = Some(publications.clone());
+    metrics.register_slow_diagnostic(&registration);
+    metrics.release(Duration::from_millis(501), Default::default());
+    drop(registration);
     let (done_tx, done_rx) = bounded(1);
     let shutdown = thread::spawn(move || {
         finish_execution_diagnostics(vec![Arc::new(metrics)], tx, publications, handle);

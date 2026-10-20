@@ -186,14 +186,14 @@ fn actual_http_reactor() {
     let shared = seed.shared_state();
     assert_eq!(shared.offline_unified_private_owner(), !legacy_private);
     hexagent_runtime::async_rt::block_on_order_runtime(async move {
-        delivery_probe::prepare(300, (waves + WARM) * LANES * 24, probing);
+        delivery_probe::prepare(300, (waves + WARM) * LANES * 64, probing);
     });
     http1_pool::init_account_pools(&HashMap::from([("offline".into(), vec!["a".into(), "b".into()])])).unwrap();
     let config: Config = toml::from_str("[general]\nmode='live'").unwrap();
     let states = HashMap::from([("a".to_string(), shared.clone())]);
     let (diag_tx, diag_rx) = poll_channel::bounded(EXECUTION_DIAGNOSTIC_CAPACITY);
     let (pub_tx, pub_rx) = poll_channel::bounded(EXECUTION_DIAGNOSTIC_CAPACITY);
-    let diagnostics = spawn_execution_diagnostics(diag_rx, pub_rx).unwrap();
+    let (diagnostics, slow_registration) = spawn_execution_diagnostics(diag_rx, pub_rx).unwrap();
     let (updates, received) = account_completion_channel(LANES);
     let completion_backend = received.backend();
     let completion_wait = received.wait_kind();
@@ -207,7 +207,8 @@ fn actual_http_reactor() {
         let permit = http1_pool::take_account_execution_slot("offline", Role::Cancel, slot + 1).unwrap();
         let (tx, rx) = poll_channel::bounded_with_wake(1, Some(wake.clone()));
         let mut m = PolyConnectionLaneMetrics::new("offline", Role::Cancel, slot+1);
-        m.diagnostic = Some(diag_tx.clone()); m.publication = Some(pub_tx.clone()); let m = Arc::new(m);
+        m.diagnostic = Some(diag_tx.clone()); m.publication = Some(pub_tx.clone());
+        m.register_slow_diagnostic(&slow_registration); let m = Arc::new(m);
         lanes.push(PolyConnectionLane{tx,metrics:m.clone(),preparation:None}); metrics.push(m.clone());
         let (publisher, consumer) = snapshot_lane(); health.push(consumer);
         let mut router = LiveRouter::new_with_poly_map(&config, &states);
@@ -223,6 +224,7 @@ fn actual_http_reactor() {
             owners.push(Owner::new(router,permit,rx,m,Some(publisher),u,wake,binding,format!("off-control-{slot}")));
         }
     }
+    drop(slow_registration);
     if budget != 0 { handles.push(thread::spawn(move || { role("off-reactor",owner_core,55);
         delivery_probe::prepare(100, (waves+WARM)*LANES*6, probing);
         run(owners,reactor_wake,budget); delivery_probe::take() })); }
@@ -237,11 +239,24 @@ fn actual_http_reactor() {
         } delivery_probe::take() });
     let (fast_done, fast_received) = bounded(LANES);
     let mut fast_txs=Vec::new(); let mut fast_handles=Vec::new();
-    for core in fast_cores {
-        let (tx,rx)=poll_channel::bounded_with_wake::<u64>(LANES/2,Some(Arc::new(Wake::default())));fast_txs.push(tx);
+    let fast_wait = physical_owner_wake(Role::Fast).offline_wait_kind();
+    for slot in 0..LANES {
+        let core = fast_cores[slot % 2];
+        let wake = Arc::new(physical_owner_wake(Role::Fast));
+        let hint = hexagent_runtime::wake::StateNotification::default();
+        hint.bind(wake.clone());
+        let (tx,rx)=poll_channel::bounded_with_wake::<u64>(1,Some(wake));fast_txs.push(tx);
         let done=fast_done.clone();fast_handles.push(thread::spawn(move || { role("off-fast",core,50);
-            delivery_probe::prepare(200+core as u16,(waves+WARM)*8,probing);
-            while let Ok(start)=rx.recv() { let began=ns();let probe=Span::begin_at(Phase::Fast,start,began);
+            delivery_probe::prepare(200+slot as u16,(waves+WARM)*24,probing);
+            loop {
+                let mut resumed = 0;
+                let start = match rx.recv_timeout_observed_interruptible(
+                    HEARTBEAT, Duration::from_micros(50), &mut resumed, || hint.take_pending()) {
+                    Ok(start) => start,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                };
+                let began=ns();let probe=Span::begin_at(Phase::Fast,start,began);
                 burn_cpu(60);let end=ns();if let Some(p)=probe {p.finish_at(end,0,None,0);}
                 done.send((start,began,end)).unwrap(); }
             delivery_probe::take()
@@ -279,7 +294,7 @@ fn actual_http_reactor() {
         if Instant::now() < deadline { thread::sleep(deadline-Instant::now()); } else if wave>0 {missed+=1;}
         deadline = Instant::now()+Duration::from_millis(5);
         let input=ns();router_tx.publish(input);
-        let fast_start=ns();for slot in 0..LANES {fast_txs[slot%2].try_send(fast_start).unwrap();}
+        let fast_start=ns();for tx in &fast_txs {tx.try_send(fast_start).unwrap();}
         let mut send_times=[(0,0);LANES];
         for slot in 0..LANES {
             let mut command=Some(PolyConnectionCommand::Cancel { cancel_trigger:Default::default(),instance_id:"a".into(),exchange:Exchange::Polymarket,
@@ -336,5 +351,5 @@ fn actual_http_reactor() {
     let mut f=std::io::BufWriter::new(std::fs::File::create(format!("{out}-health.csv")).unwrap());
     writeln!(f,"wave,slot,sequence,observed,consumed,generation,quarantined").unwrap();
     for(a,b,c,d,e,f1,g) in health_rows{writeln!(f,"{a},{b},{c},{d},{e},{f1},{g}").unwrap();}
-    std::fs::write(format!("{out}.json"),serde_json::to_vec_pretty(&serde_json::json!({"reactor_wait":reactor_wait,"completion_wait":completion_wait,"control_wait":control_wait,"private_owner_mode":if legacy_private {"compatibility"} else {"unified"},"completion_receive":"production-recv","router_ingress":if legacy_router {"legacy-crossbeam"} else {"LiveSignalIngress"},"delivery_probe":probing,"probe_dropped":probe_dropped,"completion_backend":completion_backend,"waves":waves,"idle_every":idle_every,"idle_heartbeats":idle_heartbeats,"warmup":WARM,"lanes":LANES,"batch":budget,"cores":cores,"router_us":router_us,"http_delay_us":delay_us,"completed":completed,"http_replies":replies.load(Ordering::Relaxed),"command_capacity":1,"command_hwm":1,"command_overflow":failures,"diagnostic_capacity":EXECUTION_DIAGNOSTIC_CAPACITY,"diagnostic_hwm":diag_hwm,"diagnostic_dropped":dropped,"lifecycle_capacity":LANES,"lifecycle_sampled_hwm":update_hwm,"missed_periods":missed,"formatted_bytes":FORMATTED.load(Ordering::Relaxed),"fast_work":"synthetic 60us thread CPU, three commands per core per wave","transport":"actual loopback TCP HTTP/1.1, no TLS/venue/network RTT"})).unwrap()).unwrap();
+    std::fs::write(format!("{out}.json"),serde_json::to_vec_pretty(&serde_json::json!({"fast_wait":fast_wait,"reactor_wait":reactor_wait,"completion_wait":completion_wait,"control_wait":control_wait,"private_owner_mode":if legacy_private {"compatibility"} else {"unified"},"completion_receive":"production-recv","router_ingress":if legacy_router {"legacy-crossbeam"} else {"LiveSignalIngress"},"delivery_probe":probing,"probe_dropped":probe_dropped,"completion_backend":completion_backend,"waves":waves,"idle_every":idle_every,"idle_heartbeats":idle_heartbeats,"warmup":WARM,"lanes":LANES,"batch":budget,"cores":cores,"router_us":router_us,"http_delay_us":delay_us,"completed":completed,"http_replies":replies.load(Ordering::Relaxed),"command_capacity":1,"command_hwm":1,"command_overflow":failures,"diagnostic_capacity":EXECUTION_DIAGNOSTIC_CAPACITY,"diagnostic_hwm":diag_hwm,"diagnostic_dropped":dropped,"lifecycle_capacity":LANES,"lifecycle_sampled_hwm":update_hwm,"missed_periods":missed,"formatted_bytes":FORMATTED.load(Ordering::Relaxed),"fixture_version":2,"fast_receive":"production-interruptible-100ms","fast_work":"synthetic 60us thread CPU, six physical owners, three owners per core","transport":"actual loopback TCP HTTP/1.1, no TLS/venue/network RTT"})).unwrap()).unwrap();
 }
