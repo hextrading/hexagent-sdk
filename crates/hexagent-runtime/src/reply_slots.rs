@@ -220,7 +220,7 @@ mod control_benchmark {
         fn now() -> u64 { hexagent_types::types::monotonic_now_ns() }
         fn report(mode: &str, stage: &str, samples: &mut [u64]) {
             samples.sort_unstable(); let n = samples.len();
-            eprintln!("control_wait mode={mode} stage={stage} n={n} median_ns={} p99_ns={} p999_ns={} max_ns={} capacity=1 high_water=1 overflow=0",
+            eprintln!("control_wait mode={mode} stage={stage} n={n} median_ns={} p99_ns={} p999_ns={} max_ns={} capacity=2 per_slot_high_water=1 overflow=0",
                 samples[n/2], samples[(n*99).div_ceil(100)-1], samples[(n*999).div_ceil(1000)-1], samples[n-1]);
         }
         for turn in 0..4 {
@@ -238,7 +238,9 @@ mod control_benchmark {
                         tx.try_send(now()).unwrap();
                     }
                 });
-                let mut pool = Pool::with_wake(1, || (), || 0, Some(wake));
+                // Match the production two-slot pool. A consumed reply does
+                // not prove the producer endpoint's final Arc drop has run.
+                let mut pool = Pool::with_wake(2, || (), || 0, Some(wake));
                 let mut health_samples = Vec::with_capacity(N);
                 let mut reply_samples = Vec::with_capacity(N);
                 for i in 0..N+100 {
