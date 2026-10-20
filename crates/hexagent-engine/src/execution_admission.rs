@@ -1157,6 +1157,29 @@ mod tests {
     }
 
     #[test]
+    fn repaired_health_while_old_completion_is_busy_cannot_admit_or_clear_recovery() {
+        let mut h = Harness::healthy(1, 1);
+        h.state.place_dispatched(0, h.now);
+        h.emit(Role::Fast, 0, |o| {
+            o.busy = true;
+            o.health.pool_generation += 1;
+            o.health.quarantined = false;
+        });
+        assert_eq!(h.state.current().available_place_slots, 0);
+        assert!(!h.state.lane_place_allowed(0, h.now));
+        // Replay of the same health snapshot cannot release the old request.
+        h.state.observe(Role::Fast, 0, h.fast[0], h.now);
+        assert_eq!(h.state.current().available_place_slots, 0);
+        h.emit(Role::Cancel, 0, |o| {
+            o.busy = true;
+            o.health.pool_generation += 1;
+            o.health.quarantined = false;
+        });
+        assert_eq!(h.state.current().available_place_slots, 0);
+        assert!(!h.state.lane_place_allowed(0, h.now));
+    }
+
+    #[test]
     fn repaired_probation_does_not_block_verified_idle_siblings() {
         let mut account = Harness::healthy(4, 2);
         let mut sibling = Harness::healthy(4, 2);

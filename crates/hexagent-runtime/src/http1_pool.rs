@@ -1080,6 +1080,7 @@ impl ConnectionHealth {
                         owner.generation_at_pick = generation;
                         owner.attempt_trace.repair.new_generation.store(generation, Ordering::SeqCst);
                         owner.attempt_trace.repair.ready.store(hexagent_types::types::monotonic_now_ns(), Ordering::SeqCst);
+                        owner.attempt_trace.repair.notified.store(hexagent_types::types::monotonic_now_ns(), Ordering::SeqCst);
                         owner.release_quarantine();
                         log::info!("[http1_pool] role={:?} slot={} replacement_generation={} connect_generation={} prewarm_attempts={} prior_failures={} avoided_peer={:?} peer={:?} ready=true", owner.role, owner.slot, generation, connect_generation, attempt, failures, preferred_avoid_peer, peer);
                     }
@@ -1162,6 +1163,11 @@ pub struct TransportRepairSnapshot {
     pub claimed_mono_ns: u64,
     pub prewarm_started_mono_ns: u64,
     pub ready_mono_ns: u64,
+    /// Start of quarantine release and durable owner notification, not a kernel wake timestamp.
+    pub notified_mono_ns: u64,
+    /// Filled by the physical owner in its copied observation, never the repair task.
+    pub owner_observed_mono_ns: u64,
+    pub owner_observed_busy: bool,
     pub attempts: u64,
 }
 
@@ -1179,7 +1185,7 @@ pub enum TransportRepairCause {
 struct TransportRepairTrace {
     old_generation: AtomicU64, new_generation: AtomicU64, trigger_attempt: AtomicU64,
     cause: AtomicU64, claimed: AtomicU64, prewarm_started: AtomicU64,
-    ready: AtomicU64, attempts: AtomicU64,
+    ready: AtomicU64, notified: AtomicU64, attempts: AtomicU64,
 }
 impl TransportRepairTrace {
     fn begin(&self, generation: u64, attempt: u64, cause: TransportRepairCause) {
@@ -1190,6 +1196,7 @@ impl TransportRepairTrace {
         self.cause.store(cause as u64, Ordering::SeqCst);
         self.prewarm_started.store(0, Ordering::SeqCst);
         self.ready.store(0, Ordering::SeqCst);
+        self.notified.store(0, Ordering::SeqCst);
         self.attempts.store(0, Ordering::SeqCst);
         self.claimed.store(hexagent_types::types::monotonic_now_ns(), Ordering::SeqCst);
     }
@@ -1204,6 +1211,8 @@ impl TransportRepairTrace {
             cause: self.cause.load(Ordering::SeqCst), claimed_mono_ns: claimed,
             prewarm_started_mono_ns: self.prewarm_started.load(Ordering::SeqCst),
             ready_mono_ns: ready,
+            notified_mono_ns: self.notified.load(Ordering::SeqCst),
+            owner_observed_mono_ns: 0, owner_observed_busy: false,
             attempts: self.attempts.load(Ordering::SeqCst),
         };
         (self.claimed.load(Ordering::SeqCst) == claimed

@@ -93,6 +93,9 @@ impl<T, M> Receiver<T, M> {
     pub fn recv(&self) -> Result<T, RecvError> {
         self.slot.rx.recv()
     }
+    pub fn recv_with_control(&self, control: impl FnMut()) -> Result<T, RecvError> {
+        self.slot.rx.recv_with_control(control)
+    }
     pub fn recv_timeout(&self, timeout: std::time::Duration) -> Result<T, RecvTimeoutError> {
         self.slot.rx.recv_timeout(timeout)
     }
@@ -100,6 +103,49 @@ impl<T, M> Receiver<T, M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_notification_is_observed_before_old_reply_without_releasing_ownership() {
+        let wake = Arc::new(crate::wake::Wake::event());
+        let health = Arc::new(crate::wake::StateNotification::default());
+        health.bind(wake.clone());
+        let mut pool = Pool::with_wake(1, || (), || -1, Some(wake));
+        let (tx, rx, metadata) = pool.checkout(|_| {}).unwrap();
+        let (seen_tx, seen_rx) = crossbeam_channel::bounded(1);
+        let h = health.clone();
+        let owner = std::thread::spawn(move || {
+            rx.recv_with_control(|| {
+                if h.take_pending() { seen_tx.try_send(()).unwrap(); }
+            }).unwrap()
+        });
+        health.notify();
+        seen_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert!(pool.checkout(|_| {}).is_none(), "health never releases old business slot");
+        tx.try_send(42).unwrap();
+        assert_eq!(owner.join().unwrap(), 42);
+        drop(metadata);
+        let (abandoned, rx, _) = pool.checkout(|_| {}).unwrap();
+        drop(abandoned);
+        assert_eq!(rx.recv_with_control(|| panic!("immediate reply needs no control work")).unwrap(), -1);
+    }
+    #[test]
+    fn shared_wake_control_does_not_lose_reply_or_duplicate_callback() {
+        for _ in 0..128 {
+            let wake = Arc::new(crate::wake::Wake::event());
+            let health = Arc::new(crate::wake::StateNotification::default());
+            health.bind(wake.clone());
+            let mut pool = Pool::with_wake(1, || (), || -1, Some(wake));
+            let (tx, rx, _) = pool.checkout(|_| {}).unwrap();
+            let h = health.clone();
+            let producer = std::thread::spawn(move || { h.notify(); tx.try_send(7).unwrap(); });
+            let mut observed = 0;
+            assert_eq!(rx.recv_with_control(|| { if health.take_pending() { observed += 1; } }).unwrap(), 7);
+            producer.join().unwrap();
+            observed += u32::from(health.take_pending());
+            assert_eq!(observed, 1);
+            assert!(rx.try_recv().is_err());
+        }
+    }
     #[test]
     fn reactor_poll_keeps_slow_and_abandoned_slots_independent() {
         let wake = Arc::new(crate::wake::Wake::default());
@@ -160,5 +206,63 @@ mod tests {
         bt.try_send(2).unwrap();
         assert_eq!(br.recv().unwrap(), 2);
         assert_eq!(ar.recv().unwrap(), 1);
+    }
+}
+
+#[cfg(test)]
+mod control_benchmark {
+    use super::*;
+    use std::{sync::atomic::{AtomicU64, Ordering}, time::Duration};
+    #[test]
+    #[ignore = "focused release: controlled old reply delay, shared completion/health wake"]
+    fn pending_reply_health_latency() {
+        const N: usize = 1200;
+        fn now() -> u64 { hexagent_types::types::monotonic_now_ns() }
+        fn report(mode: &str, stage: &str, samples: &mut [u64]) {
+            samples.sort_unstable(); let n = samples.len();
+            eprintln!("control_wait mode={mode} stage={stage} n={n} median_ns={} p99_ns={} p999_ns={} max_ns={} capacity=1 high_water=1 overflow=0",
+                samples[n/2], samples[(n*99).div_ceil(100)-1], samples[(n*999).div_ceil(1000)-1], samples[n-1]);
+        }
+        for turn in 0..4 {
+            for enabled in if turn % 2 == 0 { [false, true] } else { [true, false] } {
+                let wake = Arc::new(crate::wake::Wake::event());
+                let health = Arc::new(crate::wake::StateNotification::default());
+                health.bind(wake.clone());
+                let ready = Arc::new(AtomicU64::new(0));
+                let (dispatch_tx, dispatch_rx) = crossbeam_channel::bounded::<Sender<u64, ()>>(1);
+                let h = health.clone(); let r = ready.clone();
+                let producer = std::thread::spawn(move || {
+                    while let Ok(tx) = dispatch_rx.recv() {
+                        r.store(now(), Ordering::Release); h.notify();
+                        std::thread::sleep(Duration::from_millis(1));
+                        tx.try_send(now()).unwrap();
+                    }
+                });
+                let mut pool = Pool::with_wake(1, || (), || 0, Some(wake));
+                let mut health_samples = Vec::with_capacity(N);
+                let mut reply_samples = Vec::with_capacity(N);
+                for i in 0..N+100 {
+                    let (tx, rx, _meta) = pool.checkout(|_| {}).unwrap();
+                    dispatch_tx.send(tx).unwrap();
+                    let mut observed = 0;
+                    let mut control = || {
+                        if health.take_pending() { observed = now(); }
+                    };
+                    let reply_ready = if enabled { rx.recv_with_control(&mut control).unwrap() }
+                        else { rx.recv().unwrap() };
+                    let completed = now();
+                    control();
+                    assert_ne!(observed, 0); assert_ne!(reply_ready, 0);
+                    if i >= 100 {
+                        health_samples.push(observed-ready.load(Ordering::Acquire));
+                        reply_samples.push(completed-reply_ready);
+                    }
+                }
+                drop(dispatch_tx); producer.join().unwrap();
+                let mode = if enabled { "interruptible" } else { "completion_only" };
+                report(mode, "ready_to_owner_observe", &mut health_samples);
+                report(mode, "reply_publish_to_consume", &mut reply_samples);
+            }
+        }
     }
 }

@@ -30,9 +30,50 @@ pub(super) struct HttpPhaseRecord {
     pub timings: crate::instrumented_http1::Http1PhaseTimings,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TcpFailureRecord {
+    pub context: HttpPhaseContext,
+    pub attempt_id: u64,
+    pub role: crate::http1_pool::Role,
+    pub slot: usize,
+    pub pool_generation: u64,
+    pub request_started_ns: u64,
+    pub completed_ns: u64,
+    pub first_write_mono_ns: u64,
+    pub failure: crate::instrumented_http1::TcpFailureInfo,
+}
+impl TcpFailureRecord {
+    pub fn value(&self, account: &str) -> serde_json::Value {
+        let failure = self.failure;
+        let sampled = failure.status == crate::instrumented_http1::TcpFailureStatus::Sampled;
+        serde_json::json!({
+            "kind": "http_failure_tcp", "account": account, "attempt_id": self.attempt_id,
+            "root_attempt_id": self.context.root_attempt_id, "leg": self.context.leg,
+            "role": format!("{:?}", self.role), "slot": self.slot, "pool_generation": self.pool_generation,
+            "request_kind": self.context.kind, "request_started_ns": self.request_started_ns,
+            "completed_ns": self.completed_ns, "first_write_mono_ns": self.first_write_mono_ns,
+            "clock_domain_ns": crate::types::monotonic_clock_domain_ns(),
+            "tcp_failure": {
+                "status": failure.status.as_str(), "boundary": failure.boundary.as_str(),
+                "generation": failure.generation, "sampled_mono_ns": failure.sampled_mono_ns,
+                "baseline_sampled": failure.baseline_sampled, "errno": failure.errno,
+                "returned_len": failure.returned_len,
+                "rtt_us": sampled.then_some(failure.rtt_us), "rttvar_us": sampled.then_some(failure.rttvar_us),
+                "total_retrans": sampled.then_some(failure.total_retrans),
+                "unacked": sampled.then_some(failure.unacked), "lost": sampled.then_some(failure.lost),
+                "retrans": sampled.then_some(failure.retrans), "rto_us": sampled.then_some(failure.rto_us),
+                "state": sampled.then_some(failure.state), "backoff": sampled.then_some(failure.backoff),
+                "probes": sampled.then_some(failure.probes),
+                "retrans_delta": (sampled && failure.baseline_sampled).then_some(failure.retrans_delta)
+            }
+        })
+    }
+}
+
 pub(super) struct HttpPhaseAudit {
     tx: crossbeam_channel::Sender<AuditJob>,
     dropped: AtomicU64,
+    failure_dropped: AtomicU64,
     high_water: AtomicU64,
 }
 
@@ -41,6 +82,7 @@ impl HttpPhaseAudit {
         Self {
             tx,
             dropped: AtomicU64::new(0),
+            failure_dropped: AtomicU64::new(0),
             high_water: AtomicU64::new(0),
         }
     }
@@ -60,6 +102,14 @@ impl HttpPhaseAudit {
         }
     }
 
+    pub fn publish_failure(&self, record: TcpFailureRecord) {
+        self.high_water.fetch_max(self.tx.len().saturating_add(1)
+            .min(EXECUTION_AUDIT_QUEUE_CAPACITY) as u64, Ordering::Relaxed);
+        if self.tx.try_send(AuditJob::HttpFailureTcp(record)).is_err() {
+            self.failure_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn write_metrics(
         &self,
         recorder: &mut OrderAttemptRecorder,
@@ -74,6 +124,7 @@ impl HttpPhaseAudit {
             "queue_depth": self.tx.len(),
             "queue_high_water": self.high_water.load(Ordering::Relaxed),
             "phase_dropped": self.dropped.load(Ordering::Relaxed),
+            "failure_tcp_dropped": self.failure_dropped.load(Ordering::Relaxed),
         }))
     }
 }
@@ -109,6 +160,8 @@ impl HttpPhaseRecord {
             "peer": t.peer.map(|peer| peer.to_string()), "incomplete_phase": t.incomplete_phase.name(),
         });
         value["request_started_mono_ns"] = self.request_started_mono_ns.into();
+        // Failure-only schema: null is unavailable, never an invented zero
+        // retransmission count. The original first-read sample remains intact.
         if t.response_trace.status != 0 {
             value["response_status_code"] = t.response_trace.status.into();
             value["cf_ray"] = t.response_trace.cf_ray.as_str().into();
@@ -171,6 +224,33 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+    #[test]
+    fn failure_socket_evidence_distinguishes_missing_and_zero_retransmissions() {
+        use crate::instrumented_http1::{TcpFailureInfo, TcpFailureStatus, TcpFailureBoundary};
+        let mut r = TcpFailureRecord {
+            context: record(7, 7, 0).context, attempt_id: 7, role: crate::http1_pool::Role::Cancel,
+            slot: 0, pool_generation: 3, request_started_ns: 10, completed_ns: 20, first_write_mono_ns: 100,
+            failure: TcpFailureInfo { status: TcpFailureStatus::SocketRetired,
+                boundary: TcpFailureBoundary::Timeout, generation: 9, ..Default::default() },
+        };
+        let v = r.value("a");
+        assert!(v["tcp_failure"]["rtt_us"].is_null());
+        assert!(v["tcp_failure"]["retrans_delta"].is_null());
+        r.failure.status = TcpFailureStatus::Sampled;
+        assert!(r.value("a")["tcp_failure"]["retrans_delta"].is_null());
+        r.failure.baseline_sampled = true;
+        let v = r.value("a");
+        assert_eq!(v["tcp_failure"]["retrans_delta"], 0);
+        assert_eq!(v["tcp_failure"]["generation"], 9);
+        assert!(std::mem::size_of::<TcpFailureRecord>() <= 192);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let sink = HttpPhaseAudit::new(tx);
+        sink.publish_failure(r); sink.publish_failure(r);
+        assert_eq!(sink.failure_dropped.load(Ordering::Relaxed), 1);
+        let AuditJob::HttpFailureTcp(delivered) = rx.try_recv().unwrap() else { panic!() };
+        assert_eq!(delivered.attempt_id, 7);
+        assert_eq!(sink.dropped.load(Ordering::Relaxed), 0);
     }
     #[test]
     fn wire_boundaries_share_the_receipt_domain_and_absent_writes_are_null() {
@@ -406,6 +486,17 @@ async fn actual_http_phases_keep_identity_status_peer_and_reconnect_generation()
             assert_eq!(json["request_id"],"region-request");
         } else { assert_eq!(r.timings.response_trace.status,0); }
         assert_eq!(r.context.runtime_queue_ns, 13);
+        if index == 3 {
+            let AuditJob::HttpFailureTcp(tcp) = rx.try_recv().unwrap() else { panic!("missing terminal TCP evidence") };
+            assert_eq!(tcp.attempt_id, r.attempt_id);
+            assert_eq!(tcp.pool_generation, r.pool_generation);
+            assert_eq!(tcp.request_started_ns, r.request_started_ns);
+            assert_eq!(tcp.first_write_mono_ns, r.timings.io.first_write_mono_ns);
+            #[cfg(target_os = "linux")]
+            assert_eq!(tcp.failure.status, crate::instrumented_http1::TcpFailureStatus::Sampled);
+            #[cfg(not(target_os = "linux"))]
+            assert_eq!(tcp.failure.status, crate::instrumented_http1::TcpFailureStatus::Unsupported);
+        }
     }
     server.await.unwrap();
     assert!(rx.is_empty());

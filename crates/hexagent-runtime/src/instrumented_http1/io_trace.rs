@@ -44,6 +44,7 @@ pub(super) struct IoTrace {
     tcp_rttvar_us: AtomicU32,
     tcp_retrans_before: AtomicU32,
     tcp_retrans_after: AtomicU32,
+    write_generation: AtomicU64,
 }
 
 impl Default for IoTrace {
@@ -66,6 +67,7 @@ impl Default for IoTrace {
             tcp_rttvar_us: AtomicU32::new(0),
             tcp_retrans_before: AtomicU32::new(0),
             tcp_retrans_after: AtomicU32::new(0),
+            write_generation: AtomicU64::new(0),
         }
     }
 }
@@ -88,6 +90,7 @@ impl IoTrace {
             &self.written,
             &self.read,
             &self.flush,
+            &self.write_generation,
         ] {
             value.store(0, Ordering::Relaxed);
         }
@@ -141,6 +144,17 @@ impl IoTrace {
             },
         }
     }
+
+    fn baseline(&self) -> Option<u32> {
+        (self.tcp_sampled.load(Ordering::Acquire) & 1 != 0)
+            .then(|| self.tcp_retrans_before.load(Ordering::Relaxed))
+    }
+
+    pub(super) fn failure_info(&self, probe: &tcp_failure::FailureProbe,
+        boundary: TcpFailureBoundary) -> TcpFailureInfo {
+        probe.capture(self.active_start.load(Ordering::Acquire),
+            self.write_generation.load(Ordering::Acquire), self.baseline(), boundary)
+    }
 }
 
 pub(super) struct IoGuard<'a>(&'a IoTrace);
@@ -176,6 +190,7 @@ impl<T> TimedIo<T> {
                 .is_ok()
             {
                 io.first_write_mono.store(hexagent_types::types::monotonic_now_ns(), Ordering::Release);
+                io.write_generation.store(self.generation, Ordering::Release);
                 self.sample_tcp(true);
             }
             io.last_write.store(now, Ordering::Release);
@@ -219,6 +234,10 @@ impl<T> TimedIo<T> {
 
 impl<T> Drop for TimedIo<T> {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.trace.failure_probe.retiring(self.socket_fd, self.generation,
+            self.trace.io.active_start.load(Ordering::Acquire),
+            self.trace.io.write_generation.load(Ordering::Acquire), self.trace.io.baseline());
         // A retiring old socket must not invalidate a newer connection. This
         // per-client monotone watermark crosses to readers as a compact value.
         self.trace.closed_generation.fetch_max(self.generation, Ordering::Release);

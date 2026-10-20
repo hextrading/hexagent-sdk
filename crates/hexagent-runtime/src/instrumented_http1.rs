@@ -92,10 +92,13 @@ async fn observe_cold_connect<F: Future>(future: F, registration: tokio::runtime
 mod io_trace;
 pub use io_trace::Http1IoTimings;
 use io_trace::{IoTrace, TimedIo};
+mod tcp_failure;
+pub use tcp_failure::{TcpFailureBoundary, TcpFailureInfo, TcpFailureStatus};
 
 #[derive(Default)]
 struct ConnectTrace {
     io: IoTrace,
+    failure_probe: tcp_failure::FailureProbe,
     attempts: AtomicU64,
     generation: AtomicU64,
     closed_generation: AtomicU64,
@@ -306,6 +309,8 @@ impl Service<Uri> for TimedTlsConnector {
                         hyper_rustls::MaybeHttpsStream::Https(io) => io.inner().get_ref().0.inner().inner().as_raw_fd(),
                     }
                 };
+                #[cfg(target_os = "linux")]
+                trace.failure_probe.install(socket_fd, generation);
                 TimedIo { inner, trace, generation, flush_pending: false,
                     #[cfg(target_os = "linux")]
                     socket_fd,
@@ -482,6 +487,8 @@ pub struct InstrumentedHttp1Error {
     pub kind: InstrumentedHttp1ErrorKind,
     pub message: String,
     pub timings: Http1PhaseTimings,
+    /// Failure-only allocation; successful phase messages retain their original size.
+    pub tcp_failure: Option<Box<TcpFailureInfo>>,
 }
 
 // Cold error path only. Display on hyper-util drops the cause (e.g. reset,
@@ -582,6 +589,7 @@ impl InstrumentedHttp1Client {
         let _request_guard = match tokio::time::timeout_at(deadline, self.request_gate.acquire()).await {
             Ok(guard) => guard.expect("instrumented HTTP/1 request gate is never closed"),
             Err(_) => return Err(InstrumentedHttp1Error {
+                    tcp_failure: None,
                 kind: InstrumentedHttp1ErrorKind::QueueTimeout,
                 message: format!("HTTP/1 slot wait exceeded {}ms; request not sent", timeout.as_millis()),
                 // Do not read the active request's connect trace or retire its
@@ -642,6 +650,7 @@ impl InstrumentedHttp1Client {
             }
             Err(error) => {
                 return Err(InstrumentedHttp1Error {
+                    tcp_failure: None,
                     kind: InstrumentedHttp1ErrorKind::InvalidRequest,
                     message: error.to_string(),
                     timings: Http1PhaseTimings::default(),
@@ -717,7 +726,10 @@ impl InstrumentedHttp1Client {
             Ok(Err((kind, message))) => {
                 let total_ns = duration_ns(started.elapsed());
                 let headers_ns = headers_completed_ns.load(Ordering::Acquire);
+                let terminal = self.trace.io.failure_info(&self.trace.failure_probe,
+                    TcpFailureBoundary::TransportError);
                 Err(InstrumentedHttp1Error {
+                    tcp_failure: Some(Box::new(terminal)),
                     kind,
                     message,
                     timings: self.snapshot(
@@ -739,7 +751,10 @@ impl InstrumentedHttp1Client {
             Err(_) => {
                 let total_ns = duration_ns(started.elapsed());
                 let headers_ns = headers_completed_ns.load(Ordering::Acquire);
+                let terminal = self.trace.io.failure_info(&self.trace.failure_probe,
+                    TcpFailureBoundary::Timeout);
                 Err(InstrumentedHttp1Error {
+                    tcp_failure: Some(Box::new(terminal)),
                     kind: InstrumentedHttp1ErrorKind::Timeout,
                     message: "HTTP/1.1 request deadline exceeded".to_owned(),
                     timings: self.snapshot(
@@ -912,6 +927,8 @@ mod tests {
             reqwest::header::HeaderMap::new(), Bytes::new(), Duration::from_secs(1))
             .await.unwrap_err();
         assert_eq!(error.kind, InstrumentedHttp1ErrorKind::Connect);
+        #[cfg(target_os = "linux")]
+        assert_eq!(error.tcp_failure.as_ref().unwrap().status, TcpFailureStatus::NoWrite);
         assert_eq!(error.timings.incomplete_phase, Http1IncompletePhase::Tls);
         assert_eq!(error.timings.connect_generation_after, 0);
         assert_eq!(error.timings.io.written_bytes, 0);
@@ -1214,6 +1231,11 @@ mod tests {
             Duration::from_secs(1)).await.unwrap_err();
         server.await.unwrap();
         assert_eq!(error.kind, InstrumentedHttp1ErrorKind::Transport);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(error.tcp_failure.as_ref().unwrap().status, TcpFailureStatus::Sampled);
+            assert_eq!(error.tcp_failure.as_ref().unwrap().generation, 1);
+        }
         assert!(error.message.contains(": "), "underlying cause is retained: {}", error.message);
         // Listener is now gone; the connector can prove this second request
         // never reached an HTTP connection. No inferred elapsed-time cutoff.
@@ -1423,6 +1445,19 @@ mod tests {
         assert!(error.timings.total_ns >= 20_000_000);
         assert!(error.timings.ttfb_ns > 0);
         assert!(error.timings.ttfb_ns <= error.timings.total_ns);
+        let failure = error.tcp_failure.as_ref().unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(failure.status, TcpFailureStatus::Sampled);
+            assert!(failure.baseline_sampled);
+            assert_eq!(failure.generation, 1);
+            assert!(failure.sampled_mono_ns >= error.timings.io.first_write_mono_ns);
+            assert_eq!(failure.retrans_delta, 0);
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(failure.status, TcpFailureStatus::Unsupported);
+        assert!(matches!(failure.boundary, TcpFailureBoundary::Timeout | TcpFailureBoundary::DriverDrop));
+        assert!(!error.timings.io.tcp_sampled, "first-read evidence stays absent");
         server.await.unwrap();
     }
 
