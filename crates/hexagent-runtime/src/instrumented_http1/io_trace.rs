@@ -147,6 +147,8 @@ pub(super) struct IoGuard<'a>(&'a IoTrace);
 impl Drop for IoGuard<'_> {
     fn drop(&mut self) {
         self.0.active_start.store(0, Ordering::Release);
+        #[cfg(feature = "offline-delivery-probe")]
+        self.0.offline_key.store(0, Ordering::Relaxed);
     }
 }
 
@@ -235,6 +237,10 @@ impl<T: Read + Unpin> Read for TimedIo<T> {
         cx: &mut Context<'_>,
         mut buf: ReadBufCursor<'_>,
     ) -> Poll<io::Result<()>> {
+        #[cfg(feature = "offline-delivery-probe")]
+        let offline_span = self.trace.io.offline_key.load(Ordering::Relaxed).checked_sub(1)
+            .and_then(|key| crate::offline_delivery_probe::Span::begin_id(
+                crate::offline_delivery_probe::Phase::HttpReadPoll, key));
         // Reborrow only the unfilled region. Read's contract guarantees the
         // inner reader initializes every byte it marks filled; propagate that
         // exact prefix to the original cursor even on a partial/error read.
@@ -255,6 +261,11 @@ impl<T: Read + Unpin> Read for TimedIo<T> {
                 self.sample_tcp(false);
             }
             io.read.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+        #[cfg(feature = "offline-delivery-probe")]
+        if let Some(span) = offline_span {
+            span.finish_at(hexagent_types::types::monotonic_now_ns(),
+                u8::from(result.is_ready()), None, bytes as u64);
         }
         result
     }

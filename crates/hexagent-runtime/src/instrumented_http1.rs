@@ -317,6 +317,35 @@ impl Service<Uri> for TimedTlsConnector {
 
 type H1Client = Client<TimedTlsConnector, Full<Bytes>>;
 
+// Offline only: observe Hyper's separately scheduled futures as well as the
+// request future. A pending interval is not proof of kernel runnable delay:
+// the task may be awaiting I/O. No executor wrapper in production builds.
+#[cfg(feature = "offline-delivery-probe")]
+#[derive(Clone)]
+struct OfflineExecutor(Arc<ConnectTrace>);
+#[cfg(feature = "offline-delivery-probe")]
+impl<F> hyper::rt::Executor<F> for OfflineExecutor
+where F: Future + Send + 'static, F::Output: Send + 'static {
+    fn execute(&self, future: F) {
+        let trace = self.0.clone();
+        tokio::spawn(async move {
+            let mut future = std::pin::pin!(future);
+            std::future::poll_fn(|cx| {
+                let span = trace.io.offline_key.load(Ordering::Relaxed).checked_sub(1)
+                    .and_then(|key| crate::offline_delivery_probe::Span::begin_id(
+                        crate::offline_delivery_probe::Phase::HyperTaskPoll, key));
+                let result = future.as_mut().poll(cx);
+                if let Some(span) = span {
+                    span.finish_at(hexagent_types::types::monotonic_now_ns(),
+                        u8::from(result.is_ready()), None,
+                        trace.io.first_write_mono.load(Ordering::Acquire));
+                }
+                result
+            }).await
+        });
+    }
+}
+
 #[derive(Clone)]
 pub struct InstrumentedHttp1Client {
     client: H1Client,
@@ -514,7 +543,10 @@ impl InstrumentedHttp1Client {
             trace: Arc::clone(&trace),
             connect_timeout,
         };
+        #[cfg(not(feature = "offline-delivery-probe"))]
         let mut builder = Client::builder(TokioExecutor::new());
+        #[cfg(feature = "offline-delivery-probe")]
+        let mut builder = Client::builder(OfflineExecutor(trace.clone()));
         // Never let the generic client replay an order internally. A stale
         // pooled socket returns Transport and enters the external place gate;
         // only the explicitly idempotent cancel path may hedge.

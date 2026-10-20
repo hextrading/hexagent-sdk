@@ -613,18 +613,48 @@ fn try_submit_execution_diagnostic(
     }
 }
 
+#[path = "owner_diagnostics.rs"]
+mod owner_diagnostics;
+
 fn spawn_execution_diagnostics(
     receiver: hexagent_runtime::poll_channel::Receiver<ExecutionDiagnostic>,
     publications: hexagent_runtime::poll_channel::Receiver<OwnerPublication>,
-) -> Result<thread::JoinHandle<()>> {
-    Ok(thread::Builder::new()
+) -> Result<(thread::JoinHandle<()>, owner_diagnostics::Registry)> {
+    // Registration is startup-only. It may wait for this background worker;
+    // no business/diagnostic hot producer uses this channel.
+    let (registration, registered) = bounded::<owner_diagnostics::Lane>(64);
+    let ready = Arc::new(AtomicBool::new(false));
+    let registry = owner_diagnostics::Registry { tx: registration, ready: ready.clone() };
+    let handle = thread::Builder::new()
         .name("execution-diagnostics".into())
         .spawn(move || {
             crate::os_tune::pin_background("execution-diagnostics");
             let mut records_open = true;
             let mut publications_open = true;
+            let mut registration_open = true;
+            let mut slow_lanes = Vec::<owner_diagnostics::Lane>::new();
+            let mut slow_backlog = false;
             loop {
                 let mut progressed = false;
+                if registration_open {
+                    match registered.try_recv() {
+                        Ok(lane) => { slow_lanes.push(lane); slow_backlog = true; progressed = true; }
+                        Err(crossbeam_channel::TryRecvError::Empty) => {}
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => registration_open = false,
+                    }
+                }
+                // Clear the hint BEFORE scanning. Concurrent publications set
+                // it again; a successful read keeps a bounded next turn queued.
+                // Closed ordinary lanes force a final drain/disconnect scan:
+                // dropping an idle publisher does not need a hot wake counter.
+                if slow_backlog || ready.load(Ordering::Acquire) || (!records_open && !publications_open) {
+                    ready.swap(false, Ordering::AcqRel);
+                    slow_backlog = false;
+                    slow_lanes.retain(|lane| match lane.log_one() {
+                        Ok(received) => { progressed |= received; slow_backlog |= received; true }
+                        Err(_) => false,
+                    });
+                }
                 // Interleave lanes: a publication flood cannot hide recovery
                 // evidence, and neither producer ever waits for this consumer.
                 match publications.try_recv() {
@@ -636,7 +666,7 @@ fn spawn_execution_diagnostics(
                     Ok(diagnostic) => diagnostic,
                     Err(error) => {
                         if matches!(error, crossbeam_channel::TryRecvError::Disconnected) { records_open = false; }
-                        if !records_open && !publications_open { break; }
+                        if !records_open && !publications_open && !registration_open && slow_lanes.is_empty() { break; }
                         if !progressed { thread::sleep(Duration::from_millis(10)); }
                         continue;
                     }
@@ -703,7 +733,8 @@ fn spawn_execution_diagnostics(
                     }
                 }
             }
-        })?)
+        })?;
+    Ok((handle, registry))
 }
 
 // Shutdown only, after physical owners and the metrics monitor have joined.
@@ -3068,6 +3099,18 @@ impl AccountCompletionReceiver {
         match self { Self::Compatibility(rx) => rx.len(), Self::Poll(rx) => rx.len() }
     }
 }
+fn physical_owner_wake(role: hexagent_runtime::http1_pool::Role) -> hexagent_runtime::wake::Wake {
+    // Linux's existing futex path is unchanged. On Darwin, six idle Fast
+    // owners otherwise perform 10us fallback polls despite a 100ms deadline.
+    // Use the already-tested atomic address wait for these dedicated owners;
+    // older macOS automatically retains the portable fallback.
+    if cfg!(target_os = "macos") && role == hexagent_runtime::http1_pool::Role::Fast {
+        hexagent_runtime::wake::Wake::event()
+    } else {
+        hexagent_runtime::wake::Wake::default()
+    }
+}
+
 fn account_completion_channel(capacity: usize) -> (ExecutionUpdateTx, AccountCompletionReceiver) {
     // Offline ablation retains the exact old queue on the same binary. No
     // production configuration/escape hatch can change lossless delivery.
@@ -3078,7 +3121,8 @@ fn account_completion_channel(capacity: usize) -> (ExecutionUpdateTx, AccountCom
     }
     // Keep hot publication on the existing platform policy. Native Darwin
     // event wakeups reduced receive CPU but raised full-send P99 in matched
-    // runs; only the idle cold-control workers retain event waits by default.
+    // runs. Dedicated Fast owners select their wait separately above; this
+    // completion lane retains its existing publication policy.
     let wake = hexagent_runtime::wake::Wake::default();
     #[cfg(all(test, feature = "offline-http-reactor-bench"))]
     let wake = if std::env::var("HEX_ACTUAL_COMPLETION_EVENT").as_deref() == Ok("1") {
@@ -12750,7 +12794,7 @@ impl Engine {
                     hexagent_runtime::poll_channel::bounded::<ExecutionDiagnostic>(EXECUTION_DIAGNOSTIC_CAPACITY);
                 let (execution_publication_tx, execution_publication_rx) =
                     hexagent_runtime::poll_channel::bounded::<OwnerPublication>(EXECUTION_DIAGNOSTIC_CAPACITY);
-                let execution_diagnostic_handle =
+                let (execution_diagnostic_handle, slow_registration) =
                     spawn_execution_diagnostics(execution_diagnostic_rx, execution_publication_rx)
                         .expect("spawn execution diagnostics");
                 let hex_cfg = config.exchanges.iter().find(|e| e.name == "hexmarket");
@@ -13047,12 +13091,13 @@ impl Engine {
                             Some(group.1.clone())
                         } else {
                             (config.os_tune.execution_wakeup && matches!(role, Role::Fast | Role::Cancel))
-                                .then(|| Arc::new(hexagent_runtime::wake::Wake::default()))
+                                .then(|| Arc::new(physical_owner_wake(role)))
                         };
                         let (tx, rx) = hexagent_runtime::poll_channel::bounded_with_wake::<PolyConnectionCommand>(capacity, wake);
                         let mut metrics = PolyConnectionLaneMetrics::new(&account_id, role, slot);
                         metrics.diagnostic = Some(execution_diagnostic_tx.clone());
                         metrics.publication = Some(execution_publication_tx.clone());
+                        metrics.register_slow_diagnostic(&slow_registration);
                         let lane_metrics = Arc::new(metrics);
                         poly_connection_metrics.push(Arc::clone(&lane_metrics));
                         let binding = (role == Role::Fast).then(||
@@ -13312,8 +13357,9 @@ impl Engine {
                                         } else {
                                             0
                                         };
+                                        let slow = lane.slow_diagnostic.as_ref().map_or_else(Default::default, |p| p.stats());
                                         info!(
-                                            "[poly_connection_owner_metric] account={} role={:?} slot={} occupied={} queue_depth={} queue_high_water={} busy_skips={} cooldown_skips={} cooldown_remaining_ms={} slow_requests={} slow_streak={} send_failures={} completed={} current_request_age_ms={} request_age_max_ms={} diagnostic_dropped={} diagnostic_capacity={} publication_capacity={} publication_depth={}",
+                                            "[poly_connection_owner_metric] account={} role={:?} slot={} occupied={} queue_depth={} queue_high_water={} busy_skips={} cooldown_skips={} cooldown_remaining_ms={} slow_requests={} slow_streak={} send_failures={} completed={} current_request_age_ms={} request_age_max_ms={} diagnostic_dropped={} diagnostic_capacity={} publication_capacity={} publication_depth={} publication_dropped={} slow_diagnostic_capacity={} slow_diagnostic_depth={} slow_diagnostic_high_water={} slow_diagnostic_full={} slow_diagnostic_disconnected={}",
                                             lane.account_id,
                                             lane.role,
                                             lane.slot,
@@ -13333,6 +13379,8 @@ impl Engine {
                                             lane.request_age_max_ns.load(Ordering::Relaxed) / 1_000_000,
                                             lane.diagnostic_dropped.load(Ordering::Relaxed), EXECUTION_DIAGNOSTIC_CAPACITY,
                                             EXECUTION_DIAGNOSTIC_CAPACITY, lane.publication.as_ref().map_or(0, |tx| tx.len()),
+                                            lane.publication_dropped.load(Ordering::Relaxed), owner_diagnostics::CAPACITY,
+                                            slow.depth, slow.high_water, slow.full, slow.disconnected,
                                         );
                                     }
                                     for account in &monitoring_accounts {
@@ -13553,6 +13601,7 @@ impl Engine {
                     Duration::from_secs(30), std::time::Instant::now(),
                 );
 
+                drop(slow_registration); // immutable lane set after startup
                 let mut maintenance_timer = hexagent_runtime::owner_timer::OwnerTimer::new(
                     Duration::from_millis(1), std::time::Instant::now(),
                 );
@@ -15278,11 +15327,19 @@ enum PolyTypedCompletion {
 /// while this flag is set can only create cross-order head-of-line blocking.
 /// The sender claims the slot before enqueue and the owner releases it only
 /// after the response handler completes.
+// Each physical lane owns a separate cache-aligned allocation. In particular
+// cold diagnostics fields must not place two owners' hot counters on one line;
+// Arc's refcount header is also kept off the metrics' first cache line.
+#[repr(align(64))]
 struct PolyConnectionLaneMetrics {
     account_id: Arc<str>,
     diagnostic: Option<hexagent_runtime::poll_channel::Sender<ExecutionDiagnostic>>,
     publication: Option<hexagent_runtime::poll_channel::Sender<OwnerPublication>>,
+    // Startup allocation; keep cold queue/counters out of the hot occupancy
+    // struct. Only slow completions and the existing monitor dereference it.
+    slow_diagnostic: Option<Box<owner_diagnostics::Publisher>>,
     diagnostic_dropped: AtomicU64,
+    publication_dropped: AtomicU64,
     role: hexagent_runtime::http1_pool::Role,
     slot: usize,
     occupied: AtomicBool,
@@ -15311,7 +15368,9 @@ impl PolyConnectionLaneMetrics {
             account_id: Arc::from(account_id),
             diagnostic: None,
             publication: None,
+            slow_diagnostic: None,
             diagnostic_dropped: AtomicU64::new(0),
+            publication_dropped: AtomicU64::new(0),
             role,
             slot,
             occupied: AtomicBool::new(false),
@@ -15330,6 +15389,13 @@ impl PolyConnectionLaneMetrics {
         }
     }
 
+    fn register_slow_diagnostic(&mut self, registry: &owner_diagnostics::Registry) {
+        assert!(self.slow_diagnostic.is_none(), "one diagnostic publisher per owner");
+        let (publisher, lane) = owner_diagnostics::channel_with_ready(self.account_id.clone(), self.role, self.slot, registry.ready.clone());
+        registry.tx.send(lane).unwrap_or_else(|_| panic!("diagnostic worker stopped during startup"));
+        self.slow_diagnostic = Some(Box::new(publisher));
+    }
+
     fn release(
         &self,
         elapsed: Duration,
@@ -15345,7 +15411,11 @@ impl PolyConnectionLaneMetrics {
                 let seconds = (2_u64 << streak.saturating_sub(1).min(4)).min(30);
                 self.cooldown_until_ns.store(now_ns().saturating_add(seconds * 1_000_000_000), Ordering::Release);
             }
-            if let Some(sender) = &self.diagnostic {
+            if let Some(publisher) = &self.slow_diagnostic {
+                if !publisher.publish(elapsed.as_nanos().min(u64::MAX as u128) as u64, connection) {
+                    self.diagnostic_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            } else if let Some(sender) = &self.diagnostic {
                 if sender.try_send(ExecutionDiagnostic::OwnerSlow {
                     account: Arc::clone(&self.account_id), role: self.role, slot: self.slot,
                     elapsed_ns: elapsed.as_nanos().min(u64::MAX as u128) as u64, connection }).is_err() {
@@ -15387,6 +15457,7 @@ fn publish_legacy_owner_diagnostic(metrics: &PolyConnectionLaneMetrics,
             account: Arc::clone(&metrics.account_id), role: metrics.role,
             slot: metrics.slot, publication_mono_ns: timing.push_started_mono_ns, timing }).is_err() {
             metrics.diagnostic_dropped.fetch_add(1, Ordering::Relaxed);
+            metrics.publication_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -15456,6 +15527,7 @@ impl PolyConnectionLane {
                         if sender.try_send_owned(OwnerPublication { account: Arc::clone(&self.metrics.account_id),
                             role: self.metrics.role, slot: self.metrics.slot, timing }).is_err() {
                             self.metrics.diagnostic_dropped.fetch_add(1, Ordering::Relaxed);
+                            self.metrics.publication_dropped.fetch_add(1, Ordering::Relaxed);
                         }
                     } else {
                         publish_legacy_owner_diagnostic(&self.metrics, timing);
