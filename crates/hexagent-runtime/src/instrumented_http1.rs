@@ -482,13 +482,17 @@ pub enum InstrumentedHttp1ErrorKind {
     InvalidRequest,
 }
 
+/// Error payload is allocated only on failure. Keep the successful HTTP Result
+/// and async return frames independent of terminal diagnostic growth.
+pub type InstrumentedHttp1Error = Box<InstrumentedHttp1ErrorDetails>;
+
 #[derive(Debug)]
-pub struct InstrumentedHttp1Error {
+pub struct InstrumentedHttp1ErrorDetails {
     pub kind: InstrumentedHttp1ErrorKind,
     pub message: String,
     pub timings: Http1PhaseTimings,
-    /// Failure-only allocation; successful phase messages retain their original size.
-    pub tcp_failure: Option<Box<TcpFailureInfo>>,
+    /// Inline inside the failure-only allocation; no second allocation.
+    pub tcp_failure: Option<TcpFailureInfo>,
 }
 
 // Cold error path only. Display on hyper-util drops the cause (e.g. reset,
@@ -588,7 +592,7 @@ impl InstrumentedHttp1Client {
         let deadline = tokio::time::Instant::now() + timeout;
         let _request_guard = match tokio::time::timeout_at(deadline, self.request_gate.acquire()).await {
             Ok(guard) => guard.expect("instrumented HTTP/1 request gate is never closed"),
-            Err(_) => return Err(InstrumentedHttp1Error {
+            Err(_) => return Err(Box::new(InstrumentedHttp1ErrorDetails {
                     tcp_failure: None,
                 kind: InstrumentedHttp1ErrorKind::QueueTimeout,
                 message: format!("HTTP/1 slot wait exceeded {}ms; request not sent", timeout.as_millis()),
@@ -599,7 +603,7 @@ impl InstrumentedHttp1Client {
                     incomplete_phase: Http1IncompletePhase::SlotWait,
                     ..Http1PhaseTimings::default()
                 },
-            }),
+            })),
         };
         let slot_wait_ns = duration_ns(gate_started.elapsed());
         self.request_on_gate(method, url, headers, body, deadline, slot_wait_ns).await
@@ -649,12 +653,12 @@ impl InstrumentedHttp1Client {
                 request
             }
             Err(error) => {
-                return Err(InstrumentedHttp1Error {
+                return Err(Box::new(InstrumentedHttp1ErrorDetails {
                     tcp_failure: None,
                     kind: InstrumentedHttp1ErrorKind::InvalidRequest,
                     message: error.to_string(),
                     timings: Http1PhaseTimings::default(),
-                })
+                }))
             }
         };
         let started = Instant::now();
@@ -728,8 +732,8 @@ impl InstrumentedHttp1Client {
                 let headers_ns = headers_completed_ns.load(Ordering::Acquire);
                 let terminal = self.trace.io.failure_info(&self.trace.failure_probe,
                     TcpFailureBoundary::TransportError);
-                Err(InstrumentedHttp1Error {
-                    tcp_failure: Some(Box::new(terminal)),
+                Err(Box::new(InstrumentedHttp1ErrorDetails {
+                    tcp_failure: Some(terminal),
                     kind,
                     message,
                     timings: self.snapshot(
@@ -746,15 +750,15 @@ impl InstrumentedHttp1Client {
                         slot_wait_ns,
                         self.incomplete_phase(headers_ns),
                     ),
-                })
+                }))
             }
             Err(_) => {
                 let total_ns = duration_ns(started.elapsed());
                 let headers_ns = headers_completed_ns.load(Ordering::Acquire);
                 let terminal = self.trace.io.failure_info(&self.trace.failure_probe,
                     TcpFailureBoundary::Timeout);
-                Err(InstrumentedHttp1Error {
-                    tcp_failure: Some(Box::new(terminal)),
+                Err(Box::new(InstrumentedHttp1ErrorDetails {
+                    tcp_failure: Some(terminal),
                     kind: InstrumentedHttp1ErrorKind::Timeout,
                     message: "HTTP/1.1 request deadline exceeded".to_owned(),
                     timings: self.snapshot(
@@ -771,7 +775,7 @@ impl InstrumentedHttp1Client {
                         slot_wait_ns,
                         self.incomplete_phase(headers_ns),
                     ),
-                })
+                }))
             }
         };
         // Preserve header evidence even if a 403 body subsequently times out.
@@ -875,6 +879,15 @@ fn duration_ns(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_diagnostics_do_not_expand_success_return_layout() {
+        use super::{InstrumentedHttp1Error, InstrumentedHttp1Response};
+        assert_eq!(std::mem::size_of::<InstrumentedHttp1Error>(),
+            std::mem::size_of::<usize>());
+        assert_eq!(std::mem::size_of::<Result<InstrumentedHttp1Response, InstrumentedHttp1Error>>(),
+            std::mem::size_of::<InstrumentedHttp1Response>());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn cold_connect_runs_off_reactor_and_cancellation_drops_pending_work() {
         let reactor = std::thread::current().id();

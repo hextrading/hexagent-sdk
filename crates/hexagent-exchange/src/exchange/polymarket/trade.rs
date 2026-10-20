@@ -3176,7 +3176,7 @@ async fn execute_http_on(
                     context, attempt_id, role: client.role(), slot: client.slot(),
                     pool_generation: client.pool_generation(), request_started_ns,
                     completed_ns: now_ns(), first_write_mono_ns: timings.io.first_write_mono_ns,
-                    failure: *failure,
+                    failure,
                 });
             }
             return reply;
