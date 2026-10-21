@@ -15178,7 +15178,9 @@ fn spawn_venue_execution_owner<T: ExchangeTrade + 'static>(
 /// owner.  The owner retains its exact admission slot for its whole lifetime,
 /// so a command never migrates to an arbitrary worker or completion drainer.
 // Explicit tag + payload layout permits copying only the active Place/Cancel
-// prefix. Large cold Signal variants keep the full-copy fallback.
+// prefix. Cold controls own boxed Signals so their batch capacity cannot inflate
+// every hot receiver/result stack frame. Normal place/cancel/batch routes stay
+// inline and allocate no box; boxing occurs only after cold-control selection.
 #[repr(C)]
 enum PolyConnectionCommand {
     RefreshTransport { prewarm_url: Arc<str>, expected_generation: u64, avoid_peer: Option<std::net::IpAddr> },
@@ -15214,7 +15216,7 @@ enum PolyConnectionCommand {
     /// the connection slot reserved for the safety lane and never waits
     /// behind ordinary order-specific cancellation or completion work.
     SafetyCancel {
-        signal: Signal,
+        signal: Box<Signal>,
         update_tx: ExecutorUpdateSender,
         enqueued_at: std::time::Instant,
     },
@@ -15222,7 +15224,7 @@ enum PolyConnectionCommand {
     /// a role actor, while the venue adapter is migrated to accept an exact
     /// owner client for every batch variant.
     Fallback {
-        signal: Signal,
+        signal: Box<Signal>,
         stale_ms: u64,
         update_tx: ExecutorUpdateSender,
         enqueued_at: std::time::Instant,
@@ -16294,7 +16296,7 @@ fn run_poly_event_audit_owner(
         crate::latency::record_ns("polymarket.event_audit.owner_queue",
             enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         let started = crate::latency::Instant::now();
-        let result = match &signal {
+        let result = match signal.as_ref() {
             Signal::RetainPolymarketEventAudit { condition_id, asset_ids, instance_id } =>
                 router.poly_route_mut(instance_id).and_then(|route|
                     route.retain_event_audit(condition_id, asset_ids)),
@@ -16470,11 +16472,13 @@ fn run_poly_connection_owner(
     use hexagent_runtime::http1_pool::Role;
     crate::latency::prepare_polymarket_order_stages();
     crate::latency::prepare_thread_stages(&["polymarket.order.owner_preflight"]);
-    if let Some(wake) = rx.wake_handle() {
-        permit.bind_owner_health_wake(wake.clone());
-        for route in router.poly_routes.values_mut() { route.bind_private_owner_wake(wake.clone()); }
-        if let Some(route) = router.polymarket.as_mut() { route.bind_private_owner_wake(wake); }
-    }
+    // Even a configured polling command inbox needs an explicit completion
+    // wake: pending HTTP must observe repair hints without waiting for a reply.
+    let completion_wake = rx.wake_handle().unwrap_or_else(|| Arc::new(hexagent_runtime::wake::Wake::default()));
+    permit.bind_owner_health_wake(completion_wake.clone());
+    for route in router.poly_routes.values_mut() { route.bind_private_owner_wake(completion_wake.clone()); }
+    if let Some(route) = router.polymarket.as_mut() { route.bind_private_owner_wake(completion_wake.clone()); }
+    let mut cold_completions = crate::exchange::polymarket::trade::OwnerHttpCompletions::new(Some(completion_wake));
     let mut observation_sequence = OwnerHealthObservation::default();
     // Only Fast/Cancel need sub-millisecond idle pickup. Six background
     // Reconcile owners at 50 us consumed 28% of the live shared core during
@@ -16550,7 +16554,10 @@ fn run_poly_connection_owner(
                 {
                     request.reject_not_sent("probe admission changed before dispatch");
                 } else {
-                    request.execute_on(permit.current_pooled_client());
+                    request.execute_on_with_control(permit.current_pooled_client(), &mut cold_completions,
+                        &mut || { if permit.take_owner_health_notification() {
+                            publish_poly_owner_health(&permit, &lane_metrics, &mut health_publisher, &mut observation_sequence);
+                        } });
                 }
             }
             PolyConnectionCommand::Place {
@@ -16717,7 +16724,10 @@ fn run_poly_connection_owner(
                     "polymarket.safety_cancel.connection_owner_queue",
                     enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 );
-                for update in execute_safety_cancel_signal(&mut router, signal, &permit) {
+                for update in execute_safety_cancel_signal_with_control(&mut router, *signal, &permit,
+                    &mut cold_completions, &mut || { if permit.take_owner_health_notification() {
+                        publish_poly_owner_health(&permit, &lane_metrics, &mut health_publisher, &mut observation_sequence);
+                    } }) {
                     if send_executor_update(&update_tx, update).is_err() {
                         break;
                     }
@@ -16733,7 +16743,7 @@ fn run_poly_connection_owner(
                     "polymarket.control.connection_owner_queue",
                     enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 );
-                for update in execute_fallback_signal(&mut router, signal, stale_ms) {
+                for update in execute_fallback_signal(&mut router, *signal, stale_ms) {
                     if send_executor_update(&update_tx, update).is_err() {
                         break;
                     }
@@ -16799,11 +16809,10 @@ fn control_lane_rejected(signal: &Signal, detail: impl Into<String>) -> OrderUpd
     }
 }
 
-fn execute_safety_cancel_signal(
-    executor: &mut LiveRouter,
-    signal: Signal,
+fn execute_safety_cancel_signal_with_control(executor: &mut LiveRouter, signal: Signal,
     permit: &hexagent_runtime::http1_pool::Permit,
-) -> Vec<OrderUpdate> {
+    completions: &mut crate::exchange::polymarket::trade::OwnerHttpCompletions,
+    control: &mut dyn FnMut()) -> Vec<OrderUpdate> {
     let instance_id = extract_instance_id(&signal);
     match signal {
         Signal::CancelAll {
@@ -16811,11 +16820,11 @@ fn execute_safety_cancel_signal(
             ..
         } => match executor.poly_route_mut(&instance_id) {
             Ok(route) if instance_id.is_empty() => {
-                route.cancel_all_orders_on(permit);
+                route.cancel_all_orders_on_with_control(permit, completions, control);
                 Vec::new()
             }
             Ok(route) => route
-                .cancel_instance_orders_on(permit)
+                .cancel_instance_orders_on_with_control(permit, control)
                 .unwrap_or_else(|error| {
                     vec![safety_cancel_uncertain(
                         &Signal::CancelAll {
@@ -16860,11 +16869,13 @@ fn execute_safety_cancel_signal(
             match market {
                 Some(condition_id) => {
                     let routine = is_routine_expiry_cancel(&reason, true);
-                    let result = route.cancel_market_orders_until_final_on(
+                    let result = route.cancel_market_orders_until_final_on_with_control(
                         &condition_id,
                         &asset_ids,
                         routine,
                         permit,
+                        completions,
+                        control,
                     );
                     let mut updates = result.updates;
                     let (status, error) = if result.confirmed {
@@ -16903,11 +16914,11 @@ fn execute_safety_cancel_signal(
                     updates
                 }
                 None if instance_id.is_empty() => {
-                    route.cancel_all_orders_on(permit);
+                    route.cancel_all_orders_on_with_control(permit, completions, control);
                     Vec::new()
                 }
                 None => route
-                    .cancel_instance_orders_on(permit)
+                    .cancel_instance_orders_on_with_control(permit, control)
                     .unwrap_or_else(|error| {
                         vec![safety_cancel_uncertain(
                             &Signal::PolymarketCancelAllOrders {
@@ -17330,7 +17341,7 @@ fn dispatch_poly_signal_to_connection_owner(
             ..
         } => {
             let command = PolyConnectionCommand::SafetyCancel {
-                signal: safety,
+                signal: Box::new(safety),
                 update_tx: update_tx.clone(),
                 enqueued_at: std::time::Instant::now(),
             };
@@ -17349,7 +17360,7 @@ fn dispatch_poly_signal_to_connection_owner(
         audit @ (Signal::RetainPolymarketEventAudit { .. }
             | Signal::RetirePolymarketEventAudit { .. }) => {
             let command = PolyConnectionCommand::Fallback {
-                signal: audit, stale_ms, update_tx: update_tx.clone(),
+                signal: Box::new(audit), stale_ms, update_tx: update_tx.clone(),
                 enqueued_at: std::time::Instant::now(),
             };
             let result = match routes.event_audit.as_ref() {
@@ -17369,7 +17380,7 @@ fn dispatch_poly_signal_to_connection_owner(
         }
         control => {
             let command = PolyConnectionCommand::Fallback {
-                signal: control,
+                signal: Box::new(control),
                 stale_ms,
                 update_tx: update_tx.clone(),
                 enqueued_at: std::time::Instant::now(),
@@ -19987,13 +19998,16 @@ mod market_router_tests {
         assert_eq!(format!("{cancel_trigger:?}"), format!("{expected:?}"));
         assert_eq!((instance_id.as_str(), exchange, client_order_id.as_str(), timestamp_ns, received.owner, at),
             ("cancel-instance", Exchange::Polymarket, "cancel-order", 567, 42, enqueued_at));
-        let cold = PolyConnectionCommand::SafetyCancel { signal: Signal::PolymarketCancelAllOrders {
-            reason: "test-safety".into(), market: None, asset_ids: vec!["asset".into()], instance_id: "safety-instance".into() }, update_tx, enqueued_at };
+        let cold = PolyConnectionCommand::SafetyCancel { signal: Box::new(Signal::PolymarketCancelAllOrders {
+            reason: "test-safety".into(), market: None, asset_ids: vec!["asset".into()], instance_id: "safety-instance".into() }), update_tx, enqueued_at };
         assert_eq!(cold.copied_prefix_len(), std::mem::size_of::<PolyConnectionCommand>());
         tx.try_send_stamped(cold).ok().unwrap();
-        assert!(matches!(rx.try_recv().unwrap(), PolyConnectionCommand::SafetyCancel {
-            signal: Signal::PolymarketCancelAllOrders { reason, market, asset_ids, instance_id }, update_tx, enqueued_at: at
-        } if instance_id == "safety-instance" && reason == "test-safety" && market.is_none() && asset_ids == ["asset"] && update_tx.owner == 42 && at == enqueued_at));
+        let PolyConnectionCommand::SafetyCancel { signal, update_tx, enqueued_at: at } = rx.try_recv().unwrap()
+            else { panic!("cold command lost"); };
+        assert!(matches!(*signal, Signal::PolymarketCancelAllOrders { reason, market, asset_ids, instance_id }
+            if instance_id == "safety-instance" && reason == "test-safety" && market.is_none() && asset_ids == ["asset"]));
+        assert_eq!((update_tx.owner, at), (42, enqueued_at));
+        assert!(std::mem::size_of::<PolyConnectionCommand>() <= 1024, "cold Signal must not inflate hot envelopes");
     }
 
     #[test]
@@ -20847,7 +20861,7 @@ mod market_router_tests {
         };
         assert!(fast_tx
             .try_send(PolyConnectionCommand::Fallback {
-                signal: Signal::Exit,
+                signal: Box::new(Signal::Exit),
                 stale_ms: 0,
                 update_tx: update_tx.clone(),
                 enqueued_at: std::time::Instant::now(),
@@ -21248,10 +21262,8 @@ mod market_router_tests {
         assert!(cancel_rx.try_recv().is_err());
         assert!(matches!(
             safety_rx.try_recv().unwrap(),
-            PolyConnectionCommand::SafetyCancel {
-                signal: Signal::PolymarketCancelAllOrders { instance_id, .. },
-                ..
-            } if instance_id == "zhu-03"
+            PolyConnectionCommand::SafetyCancel { signal, .. }
+                if matches!(signal.as_ref(), Signal::PolymarketCancelAllOrders { instance_id, .. } if instance_id == "zhu-03")
         ));
         assert!(update_rx.try_recv().is_err());
     }
@@ -21274,24 +21286,24 @@ mod market_router_tests {
         };
         safety_tx
             .try_send(PolyConnectionCommand::SafetyCancel {
-                signal: Signal::PolymarketCancelAllOrders {
+                signal: Box::new(Signal::PolymarketCancelAllOrders {
                     reason: "occupied".into(),
                     market: None,
                     asset_ids: Vec::new(),
                     instance_id: "zhu-03".into(),
-                },
+                }),
                 update_tx: update_tx.clone(),
                 enqueued_at: std::time::Instant::now(),
             })
             .unwrap();
         for index in 0..POLY_SAFETY_CANCEL_OUTBOX_CAPACITY {
             let command = PolyConnectionCommand::SafetyCancel {
-                signal: Signal::PolymarketCancelAllOrders {
+                signal: Box::new(Signal::PolymarketCancelAllOrders {
                     reason: index.to_string(),
                     market: None,
                     asset_ids: Vec::new(),
                     instance_id: "zhu-03".into(),
-                },
+                }),
                 update_tx: update_tx.clone(),
                 enqueued_at: std::time::Instant::now(),
             };
@@ -21334,7 +21346,7 @@ mod market_router_tests {
         };
         // No Fast or Reconcile slot exists. The Cancel lane is occupied too.
         assert!(try_send_poly_owner(&mut routes, Role::Cancel, PolyConnectionCommand::Fallback {
-            signal: Signal::Exit, stale_ms: 0, update_tx: update_tx.clone(),
+            signal: Box::new(Signal::Exit), stale_ms: 0, update_tx: update_tx.clone(),
             enqueued_at: Instant::now(),
         }).is_ok());
         for retain in [true, false, true, true] {
@@ -21352,7 +21364,7 @@ mod market_router_tests {
                 audit_rx.try_recv().unwrap() else { panic!("wrong command"); };
             assert_eq!(routed.owner, 11);
             assert_eq!(extract_instance_id(&signal), "zhu-03");
-            assert_eq!(matches!(signal, Signal::RetainPolymarketEventAudit { .. }), retain);
+            assert_eq!(matches!(*signal, Signal::RetainPolymarketEventAudit { .. }), retain);
         }
         assert!(update_rx.is_empty());
         assert_eq!(cancel_rx.len(), 1);
@@ -21406,7 +21418,7 @@ mod market_router_tests {
             for _ in 0..EVENTS {
                 let signal = Signal::RetainPolymarketEventAudit { condition_id: "event".into(),
                     asset_ids: vec!["up".into(), "down".into()], instance_id: "instance".into() };
-                let command = PolyConnectionCommand::Fallback { signal, stale_ms: 150,
+                let command = PolyConnectionCommand::Fallback { signal: Box::new(signal), stale_ms: 150,
                     update_tx: update_tx.clone(), enqueued_at: Instant::now() };
                 let started = Instant::now();
                 if cold_lane {
@@ -21438,7 +21450,7 @@ mod market_router_tests {
         };
         for _ in 0..POLY_EVENT_AUDIT_CAPACITY {
             let command = PolyConnectionCommand::Fallback {
-                signal: Signal::Exit,
+                signal: Box::new(Signal::Exit),
                 stale_ms: 0,
                 update_tx: update_tx.clone(),
                 enqueued_at: std::time::Instant::now(),
@@ -21503,7 +21515,7 @@ mod market_router_tests {
         };
         cancel_tx
             .try_send(PolyConnectionCommand::Fallback {
-                signal: Signal::Exit,
+                signal: Box::new(Signal::Exit),
                 stale_ms: 0,
                 update_tx: update_tx.clone(),
                 enqueued_at: std::time::Instant::now(),

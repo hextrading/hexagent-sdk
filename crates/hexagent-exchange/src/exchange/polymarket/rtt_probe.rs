@@ -285,6 +285,13 @@ impl ProbeHttpRequest {
     /// a stale cold intent or role mismatch is proven not_sent. The owner
     /// publishes the normal business outcome observation after this returns.
     pub fn execute_on(self, client: crate::http1_pool::PooledClient) {
+        self.execute_on_with_control(client, &mut super::trade::OwnerHttpCompletions::new(None), &mut || {});
+    }
+
+    /// Physical-owner control service remains live throughout recovery/probe
+    /// HTTP waits. Exact role/slot admission and one-shot POST semantics remain.
+    pub fn execute_on_with_control(self, client: crate::http1_pool::PooledClient,
+        completions: &mut super::trade::OwnerHttpCompletions, control: &mut dyn FnMut()) {
         if client.role() != self.role || self.excluded_slot == Some(client.slot()) {
             self.reject_not_sent("probe physical connection identity mismatch");
             return;
@@ -300,12 +307,16 @@ impl ProbeHttpRequest {
             }
         }
         let location = Some((client.role(), client.slot()));
-        let reply = self.shared.http_call_sync_on_rec(
+        let reply = self.shared.http_call_on_with_control(
             client,
             self.method,
             &self.path,
             &self.body,
             self.record_kind,
+            if self.record_kind.is_some() { super::trade::HttpCommandOrigin::Probe }
+                else { super::trade::HttpCommandOrigin::Recovery },
+            completions,
+            control,
         );
         // The sole cold consumer may have timed out. A lost reply is ambiguous
         // there and keeps the durable orphan; never retry a POST here.
@@ -1286,6 +1297,93 @@ mod tests {
         ));
         shutdown.finish();
         shared.join_background_workers();
+    }
+
+    #[test]
+    fn recovery_http_observes_repaired_generation_before_old_response() {
+        const CHILD: &str = "HEX_RECOVERY_HEALTH_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "exchange::polymarket::rtt_probe::tests::recovery_http_observes_repaired_generation_before_old_response", "--nocapture"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success()); return;
+        }
+        use std::io::{BufRead, Read, Write};
+        use crate::http1_pool::{self, Role};
+        crate::async_rt::init().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (sent, received) = crossbeam_channel::bounded(1);
+        let (release, wait) = crossbeam_channel::bounded(1);
+        let server = std::thread::spawn(move || {
+            let mut peers = Vec::new();
+            for ordinal in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let sent = sent.clone(); let wait = wait.clone();
+                peers.push(std::thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new(); let mut size = 0;
+                    reader.read_line(&mut line).unwrap();
+                    assert!(line.starts_with(if ordinal == 0 { "DELETE /order " } else { "GET /time " }));
+                    loop {
+                        line.clear(); reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" { break; }
+                        if let Some((key, value)) = line.split_once(':') {
+                            if key.eq_ignore_ascii_case("content-length") { size = value.trim().parse().unwrap(); }
+                        }
+                    }
+                    let mut body = vec![0; size]; reader.read_exact(&mut body).unwrap();
+                    if ordinal == 0 { sent.send(()).unwrap(); wait.recv_timeout(Duration::from_secs(5)).unwrap(); }
+                    let body = if ordinal == 0 { r#"{"canceled":["orphan-oid"],"not_canceled":{}}"# } else { "1" };
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}", body.len(), body).unwrap();
+                    stream.flush().unwrap();
+                    if ordinal == 1 { std::thread::sleep(Duration::from_millis(250)); }
+                }));
+            }
+            for peer in peers { peer.join().unwrap(); }
+        });
+        let shutdown = hexagent_runtime::shutdown::ShutdownToken::new();
+        let trade = PolymarketTrade::new_with_pool_for_startup_query_repair_and_shutdown(
+            "offline", "c2VjcmV0", "offline", "0x0000000000000000000000000000000000000000000000000000000000000001",
+            false, 1000, super::super::signer::SignatureType::Eoa, super::super::trade::ClobVersion::V2,
+            "", &url, true, "recovery-health", "", super::super::trade::GapReplayConfig::default(), None, shutdown.clone()).unwrap();
+        http1_pool::init_account_pools(&std::collections::HashMap::from([("recovery-health".into(), vec!["owner".into()])])).unwrap();
+        let permit = http1_pool::take_account_execution_slot("recovery-health", Role::Cancel, 1).unwrap();
+        let client = permit.current_pooled_client();
+        let wake = Arc::new(hexagent_runtime::wake::Wake::event());
+        permit.bind_owner_health_wake(wake.clone());
+        let mut completions = super::super::trade::OwnerHttpCompletions::new(Some(wake));
+        let shared = trade.shared_state();
+        let (reply, response) = crossbeam_channel::bounded(1);
+        let request = ProbeHttpRequest { instance_id: "owner".into(), role: Role::Cancel,
+            enqueued_at: Instant::now(), excluded_slot: None, shared: shared.clone(),
+            method: "DELETE", path: "/order".into(), body: r#"{"orderID":"orphan-oid"}"#.into(), record_kind: None, reply };
+        let (observed, seen) = crossbeam_channel::bounded(4);
+        let owner = std::thread::spawn(move || {
+            request.execute_on_with_control(permit.current_pooled_client(), &mut completions, &mut || {
+                if permit.take_owner_health_notification() {
+                    let h = permit.health_snapshot();
+                    if h.pool_generation > 0 && !h.quarantined {
+                        let _ = observed.try_send(h.pool_generation);
+                    }
+                }
+            });
+        });
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        client.note_instrumented_transport_failure_with_cause(format!("{url}/time"),
+            http1_pool::TransportRepairCause::IdleSocketClosed, 0);
+        let repaired = seen.recv_timeout(Duration::from_secs(1));
+        let still_pending = response.try_recv().is_err();
+        release.send(()).unwrap(); // always release old HTTP even on regression
+        owner.join().unwrap(); server.join().unwrap();
+        assert!(repaired.is_ok(), "repair health blocked behind old recovery HTTP: {repaired:?}");
+        assert!(still_pending, "health must not fabricate an old request completion");
+        let result = response.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(result.location, Some((Role::Cancel, 1)));
+        assert_eq!(result.reply.unwrap()["canceled"][0], "orphan-oid");
+        assert!(response.try_recv().is_err(), "one reply per request");
+        shutdown.finish(); shared.join_background_workers();
     }
 
     #[test]
