@@ -133,7 +133,7 @@ impl Owner {
                                 enqueued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                             );
                             for update in
-                                execute_fallback_signal(&mut context.router, signal, stale_ms)
+                                execute_fallback_signal(&mut context.router, *signal, stale_ms)
                             {
                                 if send_executor_update(&update_tx, update).is_err() {
                                     break;
@@ -612,12 +612,12 @@ mod tests {
         // the other's LiveRouter/permit. An unknown route never performs HTTP.
         senders[0]
             .try_send(PolyConnectionCommand::Fallback {
-                signal: Signal::PolymarketCancelAllOrders {
+                signal: Box::new(Signal::PolymarketCancelAllOrders {
                     reason: "test".into(),
                     market: None,
                     asset_ids: vec![],
                     instance_id: "unknown".into(),
-                },
+                }),
                 stale_ms: 0,
                 update_tx: ExecutorUpdateSender {
                     owner: 7,

@@ -57,6 +57,7 @@ pub(super) struct Command {
     pub headers: super::super::auth::AuthHeaders,
     pub tx_a: HttpReplySender,
     pub timing_a: Arc<HttpCompletionTiming>,
+    pub origin: http_phase_audit::HttpCommandOrigin,
     pub phase_kind: &'static str,
     pub rec_kind: Option<crate::latency_record::RequestKind>,
     pub stage: &'static str,
@@ -88,6 +89,7 @@ impl Command {
             tx_a,
             timing_a,
             phase_kind,
+            origin,
             rec_kind,
             stage,
             runtime_queue_stage,
@@ -123,6 +125,7 @@ impl Command {
             body_a,
             &phase_audit,
             HttpPhaseContext {
+                origin,
                 root_attempt_id: attempt_id,
                 leg: 0,
                 kind: phase_kind,

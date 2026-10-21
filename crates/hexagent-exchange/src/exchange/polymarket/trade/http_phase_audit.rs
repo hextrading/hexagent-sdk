@@ -4,10 +4,21 @@
 //! lifecycle lane. Overflow drops only telemetry and increments a counter.
 use super::*;
 
+/// Compact source identity; serialization occurs only on the audit worker.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HttpCommandOrigin { Order, Recovery, Probe, Safety, Compatibility }
+impl HttpCommandOrigin {
+    fn as_str(self) -> &'static str {
+        match self { Self::Order => "order", Self::Recovery => "recovery", Self::Probe => "probe",
+            Self::Safety => "safety", Self::Compatibility => "compatibility" }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct HttpPhaseContext {
     pub root_attempt_id: u64,
     pub leg: u8,
+    pub origin: HttpCommandOrigin,
     pub kind: &'static str,
     pub runtime_queue_ns: u64,
 }
@@ -50,7 +61,7 @@ impl TcpFailureRecord {
             "kind": "http_failure_tcp", "account": account, "attempt_id": self.attempt_id,
             "root_attempt_id": self.context.root_attempt_id, "leg": self.context.leg,
             "role": format!("{:?}", self.role), "slot": self.slot, "pool_generation": self.pool_generation,
-            "request_kind": self.context.kind, "request_started_ns": self.request_started_ns,
+            "request_kind": self.context.kind, "command_origin": self.context.origin.as_str(), "request_started_ns": self.request_started_ns,
             "completed_ns": self.completed_ns, "first_write_mono_ns": self.first_write_mono_ns,
             "clock_domain_ns": crate::types::monotonic_clock_domain_ns(),
             "tcp_failure": {
@@ -159,6 +170,7 @@ impl HttpPhaseRecord {
             "generation_before": t.connect_generation_before, "generation_after": t.connect_generation_after,
             "peer": t.peer.map(|peer| peer.to_string()), "incomplete_phase": t.incomplete_phase.name(),
         });
+        value["command_origin"] = self.context.origin.as_str().into();
         value["request_started_mono_ns"] = self.request_started_mono_ns.into();
         // Failure-only schema: null is unavailable, never an invented zero
         // retransmission count. The original first-read sample remains intact.
@@ -198,9 +210,26 @@ pub(super) fn request_kind(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn command_origin_is_independent_of_request_kind_and_hedge_identity() {
+        for (origin, label) in [(HttpCommandOrigin::Order, "order"), (HttpCommandOrigin::Recovery, "recovery"),
+            (HttpCommandOrigin::Probe, "probe"), (HttpCommandOrigin::Safety, "safety"),
+            (HttpCommandOrigin::Compatibility, "compatibility")] {
+            let mut row = record(2, 1, 1);
+            row.context.origin = origin;
+            let value = row.value("owner");
+            assert_eq!(value["command_origin"], label);
+            assert_eq!(value["request_kind"], "cancel");
+            assert_eq!(value["root_attempt_id"], 1);
+            assert_eq!(value["attempt_id"], 2);
+            assert_eq!(value["leg"], 1);
+        }
+    }
+
     fn record(id: u64, root: u64, leg: u8) -> HttpPhaseRecord {
         HttpPhaseRecord {
             context: HttpPhaseContext {
+                origin: HttpCommandOrigin::Order,
                 root_attempt_id: root,
                 leg,
                 kind: "cancel",
@@ -340,6 +369,7 @@ fn benchmark_http_phase_publish() {
                 let cloned = Arc::clone(&sink);
                 cloned.publish(HttpPhaseRecord {
                     context: HttpPhaseContext {
+                origin: HttpCommandOrigin::Order,
                         root_attempt_id: i as u64,
                         leg: 0,
                         kind: "place",
@@ -437,6 +467,7 @@ async fn actual_http_phases_keep_identity_status_peer_and_reconnect_generation()
             Bytes::new(),
             &sink,
             HttpPhaseContext {
+                origin: HttpCommandOrigin::Order,
                 root_attempt_id: attempt_id,
                 leg: 0,
                 kind: "query",

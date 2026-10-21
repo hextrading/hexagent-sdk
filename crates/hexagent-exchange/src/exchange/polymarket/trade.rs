@@ -2247,6 +2247,41 @@ fn new_reply_pool() -> ReplyPool {
     ReplyPool::new(2, HttpCompletionTiming::default,
         || Err(HttpErr::Transport("async reply dropped".to_string())))
 }
+pub(crate) use http_phase_audit::HttpCommandOrigin;
+
+/// Startup-allocated cold HTTP completions for one physical connection owner.
+/// The control callback observes transport health only; returning from it never
+/// releases the occupied command, replies, or unknown-order reservations.
+/// Two slots tolerate a producer retaining its timing metadata after delivery.
+/// Exhaustion is proven not-sent and never falls back to a blocking receiver.
+pub struct OwnerHttpCompletions {
+    replies: ReplyPool,
+    wake: Option<Arc<hexagent_runtime::wake::Wake>>,
+}
+impl OwnerHttpCompletions {
+    pub fn new(wake: Option<Arc<hexagent_runtime::wake::Wake>>) -> Self {
+        Self { replies: ReplyPool::with_wake(2, HttpCompletionTiming::default,
+            || Err(HttpErr::Transport("async reply dropped".to_string())), wake.clone()), wake }
+    }
+
+    // Existing cold retry delay, now interruptible by transport notifications.
+    // The deadline is unchanged; notifications never trigger an early retry.
+    fn delay(&self, duration: Duration, control: &mut dyn FnMut()) {
+        let deadline = std::time::Instant::now() + duration;
+        loop {
+            if let Some(wake) = &self.wake { wake.arm(); }
+            control();
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                if let Some(wake) = &self.wake { wake.cancel(); }
+                return;
+            }
+            if let Some(wake) = &self.wake { wake.wait(remaining); }
+            else { std::thread::sleep(remaining.min(Duration::from_millis(1))); }
+        }
+    }
+}
+
 fn reset_reply_timing(timing: &HttpCompletionTiming) {
     timing.response_ready_ns.store(0, Ordering::Relaxed);
     timing.reply_enqueued_ns.store(0, Ordering::Relaxed);
@@ -6727,6 +6762,7 @@ impl SharedState {
                     body_owned,
                     &phase_audit,
                     HttpPhaseContext {
+                        origin: http_phase_audit::HttpCommandOrigin::Compatibility,
                         root_attempt_id: attempt_id,
                         leg: 0,
                         kind: phase_kind,
@@ -6825,7 +6861,7 @@ impl SharedState {
         HttpReplyReceiver,
         Arc<HttpCompletionTiming>,
     ) {
-        self.http_call_async_on_completion(client, attempt_id, method, path, body, rec_kind_override, None, None, None)
+        self.http_call_async_on_completion(client, attempt_id, method, path, body, rec_kind_override, None, None, None, http_phase_audit::HttpCommandOrigin::Compatibility)
     }
 
     fn http_call_async_on_completion(
@@ -6834,6 +6870,7 @@ impl SharedState {
         rec_kind_override: Option<crate::latency_record::RequestKind>, completion: Option<PooledReply>,
         mut hot_path: Option<&mut crate::types::HotPathTrace>,
         dispatch: Option<&persistent_http::Dispatch>,
+        origin: http_phase_audit::HttpCommandOrigin,
     ) -> (HttpReplyReceiver, Arc<HttpCompletionTiming>) {
         let (reply_tx, reply_rx, timing) = if let Some((tx, rx, timing)) = completion {
             (HttpReplySender::Reused(tx), HttpReplyReceiver::Reused(rx), timing)
@@ -6890,7 +6927,7 @@ impl SharedState {
                 .then(|| (client.clone(), self.execution_peer_failure.sender()));
             let command = persistent_http::Command {
                 context, client, attempt_id, method_a, path_a, body_a, url_a, headers,
-                tx_a, timing_a, phase_kind, rec_kind, stage, runtime_queue_stage, network_stage,
+                tx_a, timing_a, phase_kind, origin, rec_kind, stage, runtime_queue_stage, network_stage,
                 reply_enqueue_stage, t_start, enqueued_at, peer_failure_observer,
             };
             if let Some(dispatch) = dispatch { dispatch.send(command); }
@@ -6926,29 +6963,24 @@ impl SharedState {
             .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())))
     }
 
-    /// Cold probe traffic dispatched by the engine onto an exact physical
-    /// owner. Override the single CSV record's kind rather than recording the
-    /// same synthetic request again as ordinary strategy order traffic.
-    pub(crate) fn http_call_sync_on_rec(
+    pub(crate) fn http_call_on_with_control(
         &self,
         client: crate::http1_pool::PooledClient,
         method: &str,
         path: &str,
         body: &str,
-        rec_kind_override: Option<crate::latency_record::RequestKind>,
+        rec_kind: Option<crate::latency_record::RequestKind>,
+        origin: http_phase_audit::HttpCommandOrigin,
+        completions: &mut OwnerHttpCompletions,
+        control: &mut dyn FnMut(),
     ) -> HttpReply {
+        let completion = completions.replies.checkout(reset_reply_timing)
+            .ok_or_else(|| HttpErr::NotSent("owner HTTP completion unavailable".to_string()))?;
         let attempt_id = client.allocate_attempt_id();
-        self.http_call_async_on_timed_bytes_rec(
-            client,
-            attempt_id,
-            method,
-            path,
-            Bytes::copy_from_slice(body.as_bytes()),
-            rec_kind_override,
-        )
-        .0
-        .recv()
-        .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())))
+        self.http_call_async_on_completion(client, attempt_id, method, path,
+            Bytes::copy_from_slice(body.as_bytes()), rec_kind, Some(completion), None, None, origin)
+            .0.recv_with_control(control)
+            .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())))
     }
 
     /// [`http_call_sync`] with a latency-CSV kind override — see
@@ -9191,16 +9223,22 @@ impl PolymarketTrade {
 
     /// Cancel ALL open orders on the CLOB (DELETE /cancel-all, no body).
     pub fn cancel_all_orders(&self) {
-        self.cancel_all_orders_inner(None);
+        self.cancel_all_orders_inner(None, None);
     }
 
     /// Physical-owner variant used by the independent safety-cancel lane.
     /// Every request stays on the connection reserved by `permit`.
     pub fn cancel_all_orders_on(&self, permit: &crate::http1_pool::Permit) {
-        self.cancel_all_orders_inner(Some(permit));
+        self.cancel_all_orders_inner(Some(permit), None);
     }
 
-    fn cancel_all_orders_inner(&self, permit: Option<&crate::http1_pool::Permit>) {
+    pub fn cancel_all_orders_on_with_control(&self, permit: &crate::http1_pool::Permit,
+        completions: &mut OwnerHttpCompletions, control: &mut dyn FnMut()) {
+        self.cancel_all_orders_inner(Some(permit), Some((completions, control)));
+    }
+
+    fn cancel_all_orders_inner(&self, permit: Option<&crate::http1_pool::Permit>,
+        mut control: Option<(&mut OwnerHttpCompletions, &mut dyn FnMut())>) {
         let tracked: Vec<(String, String)> = {
             let execution = self.shared.execution_snapshot();
             let coids: Vec<String> = execution.open_orders.keys().cloned().collect();
@@ -9211,6 +9249,11 @@ impl PolymarketTrade {
                 .collect()
         };
         let res = match permit {
+            Some(permit) if control.is_some() => {
+                let (completions, callback) = control.as_mut().unwrap();
+                self.shared.http_call_on_with_control(permit.current_pooled_client(), "DELETE",
+                    "/cancel-all", "", None, http_phase_audit::HttpCommandOrigin::Safety, completions, &mut **callback)
+            }
             Some(permit) => self.shared.http_call_sync_on(
                 permit.current_pooled_client(),
                 "DELETE",
@@ -9433,6 +9476,11 @@ impl PolymarketTrade {
         &mut self,
         permit: &crate::http1_pool::Permit,
     ) -> Result<Vec<OrderUpdate>> {
+        self.cancel_instance_orders_on_with_control(permit, &mut || {})
+    }
+
+    pub fn cancel_instance_orders_on_with_control(&mut self, permit: &crate::http1_pool::Permit,
+        control: &mut dyn FnMut()) -> Result<Vec<OrderUpdate>> {
         if self.instance_id.is_empty() {
             return Err(anyhow!(
                 "instance-scoped cancel requires a non-empty instance_id"
@@ -9443,8 +9491,9 @@ impl PolymarketTrade {
         drop(execution);
         let mut updates = Vec::with_capacity(coids.len());
         for client_order_id in coids {
-            let pending = self.cancel_fire(&client_order_id, permit.current_pooled_client());
-            updates.push(self.complete_cancel(Exchange::Polymarket, &client_order_id, pending));
+            let pending = self.cancel_fire_with_origin(&client_order_id, permit.current_pooled_client(),
+                CancelTrigger::default(), HttpCommandOrigin::Safety);
+            updates.push(self.complete_cancel_with_control(Exchange::Polymarket, &client_order_id, pending, &mut *control));
         }
         Ok(updates)
     }
@@ -9477,6 +9526,7 @@ impl PolymarketTrade {
             asset_ids,
             allow_expired_market_terminalization,
             None,
+            None,
         )
     }
 
@@ -9493,7 +9543,16 @@ impl PolymarketTrade {
             asset_ids,
             allow_expired_market_terminalization,
             Some(permit),
+            None,
         )
+    }
+
+    pub fn cancel_market_orders_until_final_on_with_control(&self,
+        market_condition_id: &str, asset_ids: &[String], allow_expired_market_terminalization: bool,
+        permit: &crate::http1_pool::Permit, completions: &mut OwnerHttpCompletions,
+        control: &mut dyn FnMut()) -> MarketCancelFinality {
+        self.cancel_market_orders_until_final_inner(market_condition_id, asset_ids,
+            allow_expired_market_terminalization, Some(permit), Some((completions, control)))
     }
 
     fn cancel_market_orders_until_final_inner(
@@ -9502,6 +9561,7 @@ impl PolymarketTrade {
         asset_ids: &[String],
         allow_expired_market_terminalization: bool,
         permit: Option<&crate::http1_pool::Permit>,
+        mut control: Option<(&mut OwnerHttpCompletions, &mut dyn FnMut())>,
     ) -> MarketCancelFinality {
         let tokens: HashSet<String> = asset_ids
             .iter()
@@ -9582,7 +9642,9 @@ impl PolymarketTrade {
         let mut retired_market_evidence_streak = 0usize;
         for (attempt_idx, delay_ms) in retry_delays_ms.into_iter().enumerate() {
             if delay_ms > 0 {
-                std::thread::sleep(Duration::from_millis(delay_ms));
+                if let Some((completions, callback)) = control.as_mut() {
+                    completions.delay(Duration::from_millis(delay_ms), &mut **callback);
+                } else { std::thread::sleep(Duration::from_millis(delay_ms)); }
             }
             let mut remote_clean = true;
             let mut remote_details = Vec::new();
@@ -9595,6 +9657,11 @@ impl PolymarketTrade {
                 })
                 .to_string();
                 let reply = match permit {
+                    Some(permit) if control.is_some() => {
+                        let (completions, callback) = control.as_mut().unwrap();
+                        self.shared.http_call_on_with_control(permit.current_pooled_client(), "DELETE",
+                            "/cancel-market-orders", &body, None, http_phase_audit::HttpCommandOrigin::Safety, completions, &mut **callback)
+                    }
                     Some(permit) => self.shared.http_call_sync_on(
                         permit.current_pooled_client(),
                         "DELETE",
@@ -11804,7 +11871,7 @@ impl PolymarketTrade {
             attempt.attempt_id(),
             "POST",
             "/order",
-            prepared.body, None, Some(completion), Some(&mut prepared.hot_path), self.http_dispatch.as_ref(),
+            prepared.body, None, Some(completion), Some(&mut prepared.hot_path), self.http_dispatch.as_ref(), http_phase_audit::HttpCommandOrigin::Order,
         );
         let http_submitted_mono_ns = crate::types::monotonic_now_ns();
         let dispatched_ns = now_ns();
@@ -11910,8 +11977,14 @@ impl PolymarketTrade {
         &mut self,
         client_order_id: &str,
         client: crate::http1_pool::PooledClient,
-        mut cancel_trigger: CancelTrigger,
+        cancel_trigger: CancelTrigger,
     ) -> PendingCancel {
+        self.cancel_fire_with_origin(client_order_id, client, cancel_trigger, HttpCommandOrigin::Order)
+    }
+
+    fn cancel_fire_with_origin(&mut self, client_order_id: &str,
+        client: crate::http1_pool::PooledClient, mut cancel_trigger: CancelTrigger,
+        origin: HttpCommandOrigin) -> PendingCancel {
         cancel_trigger.hot_path.clock_domain_ns = crate::types::monotonic_clock_domain_ns();
         cancel_trigger.hot_path.prep_mono_ns = crate::types::monotonic_now_ns();
         let signal_ns = self.gen_ns_hint;
@@ -11937,7 +12010,7 @@ impl PolymarketTrade {
                     attempt.attempt_id(),
                     "DELETE",
                     "/order",
-                    body_bytes, None, completion, Some(&mut cancel_trigger.hot_path), self.http_dispatch.as_ref(),
+                    body_bytes, None, completion, Some(&mut cancel_trigger.hot_path), self.http_dispatch.as_ref(), origin,
                 );
                 (Some(rx), Some(timing), Some(attempt))
             }
@@ -14644,6 +14717,26 @@ mod expired_recovery_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cold_retry_health_notification_does_not_shorten_retry_delay() {
+        let wake = std::sync::Arc::new(hexagent_runtime::wake::Wake::event());
+        let notification = std::sync::Arc::new(hexagent_runtime::wake::StateNotification::default());
+        notification.bind(wake.clone());
+        let completions = super::OwnerHttpCompletions::new(Some(wake));
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let h = notification.clone();
+        let worker = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            completions.delay(std::time::Duration::from_millis(100), &mut || {
+                if h.take_pending() { tx.try_send(()).unwrap(); }
+            });
+            start.elapsed()
+        });
+        notification.notify();
+        rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(worker.join().unwrap() >= std::time::Duration::from_millis(100));
+    }
+
     use super::*;
 
     #[test]
