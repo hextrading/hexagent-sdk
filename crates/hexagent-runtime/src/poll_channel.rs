@@ -293,6 +293,13 @@ impl<T> Receiver<T> {
     }
     /// Cold owners/tests only. Wait without spinning on an unpublished slot.
     pub fn recv(&self) -> Result<T, crossbeam_channel::RecvError> {
+        self.recv_with_control(|| {})
+    }
+
+    /// Service durable owner-local control hints while preserving the pending
+    /// business reply. The control publisher must share this receiver wake.
+    /// No deadline clock or periodic completion polling is introduced.
+    pub fn recv_with_control(&self, mut control: impl FnMut()) -> Result<T, crossbeam_channel::RecvError> {
         // There is no caller deadline on recv. Reusing recv_timeout used to
         // read Instant on every 10us portable poll (and on immediate pickups).
         // Keep identical arm/recheck/wait and disconnect semantics, without
@@ -309,6 +316,11 @@ impl<T> Receiver<T> {
             }
             if self.has_wake() {
                 self.arm_wake();
+                // One check after arming covers both an already pending hint
+                // and a racing publisher. Checking before arming as well only
+                // rereads the producer's cache line on every completion wait.
+                // A later hint clears the armed word, so wait cannot miss it.
+                control();
                 match self.try_recv() {
                     Ok(value) => { self.cancel_wake(); return Ok(value); }
                     Err(TryRecvError::Disconnected) => {
@@ -320,6 +332,7 @@ impl<T> Receiver<T> {
                 offline_loop.wait();
                 self.wait_for_wake(Duration::from_secs(60));
             } else {
+                control();
                 #[cfg(feature = "offline-delivery-probe")]
                 offline_loop.wait();
                 std::thread::sleep(IDLE_POLL);

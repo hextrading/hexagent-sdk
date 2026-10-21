@@ -2262,6 +2262,13 @@ impl HttpReplyReceiver {
     pub(crate) fn recv(&self) -> Result<HttpReply, crossbeam_channel::RecvError> {
         match self { Self::Dedicated(rx) => rx.recv(), Self::Reused(rx) => rx.recv() }
     }
+    fn recv_with_control(&self, control: impl FnMut()) -> Result<HttpReply, crossbeam_channel::RecvError> {
+        match self {
+            // Only cold compatibility callers use dedicated replies.
+            Self::Dedicated(rx) => rx.recv(),
+            Self::Reused(rx) => rx.recv_with_control(control),
+        }
+    }
 }
 enum HttpReplySender {
     Dedicated(crossbeam_channel::Sender<HttpReply>),
@@ -2368,6 +2375,7 @@ enum LifecycleTraceJob {
 #[derive(Debug)]
 enum AuditJob {
     HttpPhase(HttpPhaseRecord),
+    HttpFailureTcp(http_phase_audit::TcpFailureRecord),
     Attempt(AttemptAuditJob),
     Lifecycle(LifecycleTraceJob),
     PrivateDiagnostic(PrivateDiagnosticJob),
@@ -3163,6 +3171,14 @@ async fn execute_http_on(
                 },
                 timings,
             });
+            if let Some(failure) = error.tcp_failure {
+                audit.publish_failure(http_phase_audit::TcpFailureRecord {
+                    context, attempt_id, role: client.role(), slot: client.slot(),
+                    pool_generation: client.pool_generation(), request_started_ns,
+                    completed_ns: now_ns(), first_write_mono_ns: timings.io.first_write_mono_ns,
+                    failure,
+                });
+            }
             return reply;
         }
     };
@@ -5342,6 +5358,11 @@ impl SharedState {
                     structured_recorder.write_record(&job.value(self.account_state.account_id()))
                 {
                     log::error!("[http_phase_audit] write failed: {error}");
+                }
+            }
+            AuditJob::HttpFailureTcp(job) => {
+                if let Err(error) = structured_recorder.write_record(&job.value(self.account_state.account_id())) {
+                    log::error!("[http_failure_tcp] write failed: {error}");
                 }
             }
             AuditJob::Attempt(job) => self.write_attempt_audit(structured_recorder, job),
@@ -7749,6 +7770,13 @@ impl PolymarketTrade {
         self.http_dispatch = Some(persistent_http::Dispatch {
             lane, context: persistent_http::Context::new(&self.shared, &self.instance_id),
         });
+    }
+
+    /// Bind the sole private owner completion consumer at startup. Health and
+    /// reply notifications share a wake; no new worker or completion polling.
+    pub fn bind_private_owner_wake(&mut self, wake: Arc<hexagent_runtime::wake::Wake>) {
+        self.reply_slots = ReplyPool::with_wake(2, HttpCompletionTiming::default,
+            || Err(HttpErr::Transport("async reply dropped".to_string())), Some(wake));
     }
 
     /// Startup-only, before this route is exposed to any execution command.
@@ -11814,6 +11842,11 @@ impl PolymarketTrade {
     /// Complete a fired place: block on its reply, then run the normal reply
     /// handler (open_orders / coid bookkeeping, balance-error trigger).
     pub fn complete_submit(&mut self, order: &OrderRequest, pending: PendingSubmit) -> OrderUpdate {
+        self.complete_submit_with_control(order, pending, || {})
+    }
+
+    pub fn complete_submit_with_control(&mut self, order: &OrderRequest, pending: PendingSubmit,
+        control: impl FnMut()) -> OrderUpdate {
         let PendingSubmit {
             hot_path,
             local_oid,
@@ -11823,7 +11856,7 @@ impl PolymarketTrade {
         } = pending;
         let completion_started_ns = now_ns();
         let reply = rx
-            .recv()
+            .recv_with_control(control)
             .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())));
         let response_received_ns = now_ns();
         crate::latency::record_ns(
@@ -11954,10 +11987,15 @@ impl PolymarketTrade {
         client_order_id: &str,
         pending: PendingCancel,
     ) -> OrderUpdate {
+        self.complete_cancel_with_control(exchange, client_order_id, pending, || {})
+    }
+
+    pub fn complete_cancel_with_control(&mut self, exchange: Exchange, client_order_id: &str,
+        pending: PendingCancel, control: impl FnMut()) -> OrderUpdate {
         let completion_started_ns = now_ns();
         let mut pending = pending;
         let reply = pending.rx.take().map(|rx| {
-            rx.recv()
+            rx.recv_with_control(control)
                 .unwrap_or_else(|_| Err(HttpErr::Transport("async reply dropped".to_string())))
         });
         self.finish_cancel(exchange, client_order_id, pending, reply, completion_started_ns)

@@ -680,7 +680,7 @@ fn spawn_execution_diagnostics(
                         "[poly_connection_owner_slow] account={} role={:?} slot={} elapsed_ns={} pool_generation={} connect_generation={} peer={:?} selection_authority=router_generation_health",
                         account, role, slot, elapsed_ns, connection.pool_generation, connection.connect_generation, connection.peer),
                     ExecutionDiagnostic::LaneEvidence { account, role, slot, observation: o, consumed_at_ns, consumed_mono_ns } => info!(
-                        "[execution_lane_evidence] account={} role={:?} slot={} sequence={} observed_at_ns={} consumed_at_ns={} observed_mono_ns={} consumed_mono_ns={} generation={} quarantined={} busy={} attempt={} business_generation={} outcome={:?} status={} failures={} slow={} no_response={} no_response_generation={} slow_retired={} slow_retired_generation={} clock_domain_ns={} repair_old_generation={} repair_new_generation={} repair_cause={} repair_trigger_attempt={} repair_claimed_mono_ns={} repair_prewarm_started_mono_ns={} repair_ready_mono_ns={} repair_attempts={}",
+                        "[execution_lane_evidence] account={} role={:?} slot={} sequence={} observed_at_ns={} consumed_at_ns={} observed_mono_ns={} consumed_mono_ns={} generation={} quarantined={} busy={} attempt={} business_generation={} outcome={:?} status={} failures={} slow={} no_response={} no_response_generation={} slow_retired={} slow_retired_generation={} clock_domain_ns={} repair_old_generation={} repair_new_generation={} repair_cause={} repair_trigger_attempt={} repair_claimed_mono_ns={} repair_prewarm_started_mono_ns={} repair_ready_mono_ns={} repair_attempts={} repair_notify_mono_ns={} repair_owner_observed_mono_ns={} repair_owner_observed_busy={}",
                         account, role, slot, o.sequence, o.observed_at_ns, consumed_at_ns, o.observed_mono_ns, consumed_mono_ns, o.health.pool_generation,
                         o.health.quarantined, o.busy, o.business.map_or(0, |b| b.attempt_id),
                         o.business.map_or(0, |b| b.pool_generation), o.business.map(|b| b.outcome),
@@ -689,7 +689,9 @@ fn spawn_execution_diagnostics(
                         o.repair.map_or(0, |r| r.old_generation), o.repair.map_or(0, |r| r.new_generation),
                         o.repair.map_or(0, |r| r.cause), o.repair.map_or(0, |r| r.trigger_attempt),
                         o.repair.map_or(0, |r| r.claimed_mono_ns), o.repair.map_or(0, |r| r.prewarm_started_mono_ns),
-                        o.repair.map_or(0, |r| r.ready_mono_ns), o.repair.map_or(0, |r| r.attempts)),
+                        o.repair.map_or(0, |r| r.ready_mono_ns), o.repair.map_or(0, |r| r.attempts),
+                        o.repair.map_or(0, |r| r.notified_mono_ns), o.repair.map_or(0, |r| r.owner_observed_mono_ns),
+                        o.repair.is_some_and(|r| r.owner_observed_busy)),
                     ExecutionDiagnostic::SignalIngress { owners, depth, control_depth, sampled_high_water } => info!(
                         "[execution_signal_ingress] direct=1 owners={} owner_capacity=1024 root_capacity={} control_capacity=8 depth={} control_depth={} sampled_high_water={} sample_interval_ms=1",
                         owners, CHANNEL_CAPACITY, depth, control_depth, sampled_high_water),
@@ -16189,7 +16191,7 @@ fn send_poly_owner_lossless(
 }
 
 fn finish_poly_typed_completion(router: &mut LiveRouter, completion: PolyTypedCompletion,
-    lane_metrics: &PolyConnectionLaneMetrics) {
+    lane_metrics: &PolyConnectionLaneMetrics, control: impl FnMut()) {
     match completion {
         PolyTypedCompletion::Place {
             instance_id,
@@ -16198,7 +16200,7 @@ fn finish_poly_typed_completion(router: &mut LiveRouter, completion: PolyTypedCo
             update_tx,
         } => {
             let update = match router.poly_route_mut(&instance_id) {
-                Ok(route) => route.complete_submit(&order, pending),
+                Ok(route) => route.complete_submit_with_control(&order, pending, control),
                 Err(error) => {
                     error!("[Executor] Polymarket place completion route error: {error}");
                     exec_rejected_place(&order)
@@ -16214,7 +16216,7 @@ fn finish_poly_typed_completion(router: &mut LiveRouter, completion: PolyTypedCo
             update_tx,
         } => {
             let update = match router.poly_route_mut(&instance_id) {
-                Ok(route) => route.complete_cancel(exchange, &client_order_id, pending),
+                Ok(route) => route.complete_cancel_with_control(exchange, &client_order_id, pending, control),
                 Err(error) => {
                     error!("[Executor] Polymarket cancel completion route error: {error}");
                     exec_rejected_cancel(client_order_id, exchange)
@@ -16313,6 +16315,148 @@ fn run_poly_event_audit_owner(
 #[path = "cancel_reactor.rs"]
 mod cancel_reactor;
 
+/// Sole-writer owner cache. The permit's cumulative business fields are only
+/// consistent after exclusive completion; a health interrupt must not read them
+/// while the HTTP producer is publishing a new outcome.
+#[derive(Clone, Copy, Default)]
+struct CompletedOwnerBusiness {
+    outcome: Option<hexagent_runtime::http1_pool::BusinessHttpOutcomeSnapshot>,
+    failures: u64,
+    slow: u64,
+    no_response: u64,
+    no_response_generation: u64,
+    slow_retired: u64,
+    slow_retired_generation: u64,
+    no_response_peer: Option<std::net::IpAddr>,
+}
+impl CompletedOwnerBusiness {
+    fn capture(permit: &hexagent_runtime::http1_pool::Permit) -> Self {
+        let outcome = permit.business_outcome();
+        let (failures, slow) = permit.business_outcome_totals();
+        let (no_response, no_response_generation) = permit.business_no_response_evidence();
+        let (slow_retired, slow_retired_generation) = permit.business_slow_retirement_evidence();
+        Self { outcome, failures, slow, no_response, no_response_generation,
+            slow_retired, slow_retired_generation, no_response_peer: permit.business_no_response_peer() }
+    }
+}
+
+#[derive(Default)]
+struct OwnerHealthObservation {
+    completed_business: CompletedOwnerBusiness,
+    sequence: u64,
+    ready_key: (u64, u64),
+    first_ready_observed_ns: u64,
+    first_ready_busy: bool,
+}
+impl OwnerHealthObservation {
+    fn observe(&mut self, mut repair: Option<hexagent_runtime::http1_pool::TransportRepairSnapshot>,
+        now: u64, busy: bool) -> Option<hexagent_runtime::http1_pool::TransportRepairSnapshot> {
+        if let Some(r) = repair.as_mut().filter(|r| r.ready_mono_ns != 0) {
+            let key = (r.claimed_mono_ns, r.ready_mono_ns);
+            if self.ready_key != key {
+                self.ready_key = key;
+                self.first_ready_observed_ns = now;
+                self.first_ready_busy = busy;
+            }
+            r.owner_observed_mono_ns = self.first_ready_observed_ns;
+            r.owner_observed_busy = self.first_ready_busy;
+        }
+        repair
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn ready_observation_retains_first_busy_time_across_coalescing_and_fences_repair_epoch() {
+    use hexagent_runtime::http1_pool::TransportRepairSnapshot;
+    let mut observer = OwnerHealthObservation::default();
+    let repair = Some(TransportRepairSnapshot { claimed_mono_ns: 1, ready_mono_ns: 10, ..Default::default() });
+    let first = observer.observe(repair, 12, true).unwrap();
+    assert_eq!(first.owner_observed_mono_ns, 12);
+    assert!(first.owner_observed_busy);
+    let later = observer.observe(repair, 300_000_000, false).unwrap();
+    assert_eq!(later.owner_observed_mono_ns, 12);
+    assert!(later.owner_observed_busy);
+    let next = observer.observe(Some(TransportRepairSnapshot { claimed_mono_ns: 20, ready_mono_ns: 30,
+        ..Default::default() }), 31, false).unwrap();
+    assert_eq!(next.owner_observed_mono_ns, 31);
+    assert!(!next.owner_observed_busy);
+}
+
+#[cfg(test)]
+#[test]
+fn health_interrupt_uses_only_completed_business_evidence() {
+    const CHILD: &str = "HEXBOT_TEST_COMPLETED_HEALTH_CACHE";
+    if std::env::var_os(CHILD).is_none() {
+        // Pool registries are process-startup state; isolate this fixture from
+        // unrelated tests rather than resetting a process-global live registry.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "engine::health_interrupt_uses_only_completed_business_evidence", "--nocapture"])
+            .env(CHILD, "1").status().unwrap();
+        assert!(status.success()); return;
+    }
+    use hexagent_runtime::http1_pool::{self, Role, BusinessHttpOutcome};
+    crate::async_rt::init().unwrap();
+    http1_pool::init_account_pools(&HashMap::from([("health-cache".into(), vec!["owner".into()])])).unwrap();
+    let permit = http1_pool::take_account_execution_slot("health-cache", Role::Fast, 0).unwrap();
+    let client = permit.current_pooled_client();
+    let first = client.allocate_attempt_id();
+    client.record_business_outcome(first, 10, BusinessHttpOutcome::Healthy, 200);
+    let mut observer = OwnerHealthObservation {
+        completed_business: CompletedOwnerBusiness::capture(&permit), ..Default::default()
+    };
+    let metrics = PolyConnectionLaneMetrics::new("health-cache", Role::Fast, 0);
+    metrics.occupied.store(true, Ordering::Release);
+    // The I/O producer has new counters, but its completion is not handed to
+    // the owner yet. A health interrupt must not consume these fields early.
+    let second = client.allocate_attempt_id();
+    client.record_business_outcome(second, 2_000_000_000, BusinessHttpOutcome::TransportUncertain, 0);
+    assert_eq!(permit.business_outcome_totals().0, 1);
+    let (publisher, receiver) = snapshot_lane();
+    let mut publisher = Some(publisher);
+    publish_poly_owner_health(&permit, &metrics, &mut publisher, &mut observer);
+    let early = receiver.try_recv().unwrap();
+    assert!(early.busy);
+    assert_eq!(early.business.unwrap().attempt_id, first);
+    assert_eq!((early.cumulative_failures, early.cumulative_no_response), (0, 0));
+    // Only the explicit completed-command boundary advances business evidence.
+    observer.completed_business = CompletedOwnerBusiness::capture(&permit);
+    publish_poly_owner_health(&permit, &metrics, &mut publisher, &mut observer);
+    let completed = receiver.try_recv().unwrap();
+    assert!(completed.busy, "health never clears lifecycle occupancy");
+    assert_eq!(completed.business.unwrap().attempt_id, second);
+    assert_eq!((completed.cumulative_failures, completed.cumulative_no_response), (1, 1));
+    assert!(completed.sequence > early.sequence);
+}
+
+fn publish_poly_owner_health(permit: &hexagent_runtime::http1_pool::Permit,
+    lane_metrics: &PolyConnectionLaneMetrics,
+    health_publisher: &mut Option<SnapshotPublisher<LaneObservation>>,
+    observation_sequence: &mut OwnerHealthObservation) {
+        if let Some(publisher) = health_publisher.as_mut() {
+            observation_sequence.sequence += 1;
+            let repair_snapshot = permit.transport_repair_snapshot();
+            let observed_mono_ns = crate::types::monotonic_now_ns();
+            let busy = lane_metrics.occupied.load(Ordering::Acquire);
+            let repair = observation_sequence.observe(repair_snapshot, observed_mono_ns, busy);
+            let b = observation_sequence.completed_business;
+            publisher.publish(LaneObservation {
+                observed_mono_ns,
+                repair, sequence: observation_sequence.sequence,
+                observed_at_ns: now_ns(),
+                health: permit.health_snapshot(),
+                business: b.outcome,
+                busy,
+                cumulative_failures: b.failures,
+                cumulative_slow: b.slow,
+                cumulative_no_response: b.no_response, cumulative_slow_retired: b.slow_retired,
+                slow_retired_generation: b.slow_retired_generation,
+                no_response_generation: b.no_response_generation,
+                no_response_peer: b.no_response_peer,
+            });
+        }
+}
+
 fn run_poly_connection_owner(
     mut router: LiveRouter,
     permit: hexagent_runtime::http1_pool::Permit,
@@ -16326,8 +16470,12 @@ fn run_poly_connection_owner(
     use hexagent_runtime::http1_pool::Role;
     crate::latency::prepare_polymarket_order_stages();
     crate::latency::prepare_thread_stages(&["polymarket.order.owner_preflight"]);
-    if let Some(wake) = rx.wake_handle() { permit.bind_owner_health_wake(wake); }
-    let mut observation_sequence = 0u64;
+    if let Some(wake) = rx.wake_handle() {
+        permit.bind_owner_health_wake(wake.clone());
+        for route in router.poly_routes.values_mut() { route.bind_private_owner_wake(wake.clone()); }
+        if let Some(route) = router.polymarket.as_mut() { route.bind_private_owner_wake(wake); }
+    }
+    let mut observation_sequence = OwnerHealthObservation::default();
     // Only Fast/Cancel need sub-millisecond idle pickup. Six background
     // Reconcile owners at 50 us consumed 28% of the live shared core during
     // startup; budget their cold requests separately from quote/cancel work.
@@ -16349,25 +16497,13 @@ fn run_poly_connection_owner(
             permit.current_pooled_client().note_instrumented_transport_failure_with_cause(prewarm_url.to_string(),
                 hexagent_runtime::http1_pool::TransportRepairCause::IdleSocketClosed, 0);
         }
-        if let Some(publisher) = health_publisher.as_mut() {
-            let business = permit.business_outcome();
-            let (failures, slow) = permit.business_outcome_totals();
-            let (cumulative_no_response, no_response_generation) = permit.business_no_response_evidence();
-            let (cumulative_slow_retired, slow_retired_generation) = permit.business_slow_retirement_evidence();
-            observation_sequence += 1;
-            publisher.publish(LaneObservation {
-                observed_mono_ns: crate::types::monotonic_now_ns(),
-                repair: permit.transport_repair_snapshot(), sequence: observation_sequence,
-                observed_at_ns: now_ns(),
-                health: permit.health_snapshot(),
-                business,
-                busy: lane_metrics.occupied.load(Ordering::Acquire),
-                cumulative_failures: failures,
-                cumulative_slow: slow,
-                cumulative_no_response, cumulative_slow_retired, slow_retired_generation, no_response_generation,
-                no_response_peer: permit.business_no_response_peer(),
-            });
+        // This loop boundary follows completion/handler/lifecycle delivery of
+        // the previous command. During the next wait, only this frozen business
+        // evidence may be combined with fresh generation/transport health.
+        if health_publisher.is_some() {
+            observation_sequence.completed_business = CompletedOwnerBusiness::capture(&permit);
         }
+        publish_poly_owner_health(&permit, &lane_metrics, &mut health_publisher, &mut observation_sequence);
         // Twelve Cancel owners share a core with a lower-priority dispatcher.
         // A 10 us idle poll saturated that core in the Linux FIFO probe; 50 us
         // leaves publication time for the producer while bounding pickup delay.
@@ -16481,6 +16617,9 @@ fn run_poly_connection_owner(
                             update_tx,
                         },
                         &lane_metrics,
+                        || { if permit.take_owner_health_notification() {
+                            publish_poly_owner_health(&permit, &lane_metrics, &mut health_publisher, &mut observation_sequence);
+                        } },
                     ),
                     Err(update) => {
                         let _ = send_executor_update(&update_tx, update);
@@ -16527,6 +16666,9 @@ fn run_poly_connection_owner(
                         update_tx,
                     },
                     &lane_metrics,
+                    || { if permit.take_owner_health_notification() {
+                        publish_poly_owner_health(&permit, &lane_metrics, &mut health_publisher, &mut observation_sequence);
+                    } },
                 );
             }
             PolyConnectionCommand::Reconcile {
