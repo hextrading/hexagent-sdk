@@ -147,6 +147,39 @@ mod tests {
         }
     }
     #[test]
+    fn health_after_predicate_before_park_is_seen_without_a_business_reply() {
+        let wake = Arc::new(crate::wake::Wake::event());
+        let health = Arc::new(crate::wake::StateNotification::default());
+        health.bind(wake.clone());
+        let mut pool = Pool::with_wake(1, || (), || -1, Some(wake));
+        let (tx, rx, metadata) = pool.checkout(|_| {}).unwrap();
+        let (checked_tx, checked_rx) = crossbeam_channel::bounded(1);
+        let (notified_tx, notified_rx) = crossbeam_channel::bounded(1);
+        let (seen_tx, seen_rx) = crossbeam_channel::bounded(1);
+        let h = health.clone();
+        let owner = std::thread::spawn(move || {
+            let mut first = true;
+            rx.recv_with_control(|| {
+                if h.take_pending() { seen_tx.try_send(()).unwrap(); }
+                if first {
+                    first = false;
+                    checked_tx.send(()).unwrap();
+                    notified_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+                }
+            }).unwrap()
+        });
+        checked_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        health.notify();
+        notified_tx.send(()).unwrap();
+        // A business reply must not be needed to rescue the racing health wake.
+        seen_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert!(pool.checkout(|_| {}).is_none());
+        tx.try_send(42).unwrap();
+        assert_eq!(owner.join().unwrap(), 42);
+        drop(metadata);
+        assert!(pool.checkout(|_| {}).is_some());
+    }
+    #[test]
     fn reactor_poll_keeps_slow_and_abandoned_slots_independent() {
         let wake = Arc::new(crate::wake::Wake::default());
         let mut pool = Pool::with_wake(2, || (), || -1, Some(wake.clone()));

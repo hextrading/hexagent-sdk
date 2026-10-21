@@ -314,9 +314,12 @@ impl<T> Receiver<T> {
                 Err(TryRecvError::Disconnected) => return Err(crossbeam_channel::RecvError),
                 Err(TryRecvError::Empty) => {}
             }
-            control();
             if self.has_wake() {
                 self.arm_wake();
+                // One check after arming covers both an already pending hint
+                // and a racing publisher. Checking before arming as well only
+                // rereads the producer's cache line on every completion wait.
+                // A later hint clears the armed word, so wait cannot miss it.
                 control();
                 match self.try_recv() {
                     Ok(value) => { self.cancel_wake(); return Ok(value); }
@@ -329,6 +332,7 @@ impl<T> Receiver<T> {
                 offline_loop.wait();
                 self.wait_for_wake(Duration::from_secs(60));
             } else {
+                control();
                 #[cfg(feature = "offline-delivery-probe")]
                 offline_loop.wait();
                 std::thread::sleep(IDLE_POLL);
