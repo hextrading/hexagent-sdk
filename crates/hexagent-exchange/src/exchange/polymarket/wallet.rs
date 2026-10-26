@@ -6091,7 +6091,7 @@ fn run_maintenance_job(
             unix_now_secs(),
         ) {
             log::warn!("[Maintenance] Split rejected before execution: {}", reason);
-            if let Some(s) = status {
+            if let Some(s) = status.as_ref() {
                 s.store(MaintenanceStatus::SplitFailedOrPending { reason });
             }
             // Recovery and confirmed replay above ran on this same serialized
@@ -6103,6 +6103,14 @@ fn run_maintenance_job(
                     deadline, unix_now_secs(), &account.maintenance_operations_for_condition(cid),
                     &split_allocations)
                 {
+                    if let Some(s) = status.as_ref() {
+                        // No uncertain chain work remains. Later scheduled-off
+                        // events may seed their real zero inventory normally;
+                        // attempted events still require the scoped proof below.
+                        s.store(MaintenanceStatus::Skipped {
+                            reason: "split deadline closed without inventory".into(),
+                        });
+                    }
                     return Some(InventorySeedClosed { condition_id: cid.to_owned(),
                         token_ids: split_target_token_ids, execute_before_secs: deadline });
                 }
