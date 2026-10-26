@@ -380,8 +380,30 @@ pub struct InventoryReady {
     pub amount_usdc: f64,
 }
 
-pub type InventoryReadySender = crossbeam_channel::Sender<InventoryReady>;
-pub type InventoryReadyReceiver = crossbeam_channel::Receiver<InventoryReady>;
+/// Terminal negative proof from the serialized wallet worker after recovery,
+/// exact-owner journal inspection, and the deadline. Never a pending timeout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InventorySeedClosed {
+    pub condition_id: String,
+    pub token_ids: Vec<String>,
+    pub execute_before_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InventorySeedResult {
+    Ready(InventoryReady),
+    ClosedWithoutInventory(InventorySeedClosed),
+}
+
+impl From<InventoryReady> for InventorySeedResult {
+    fn from(ready: InventoryReady) -> Self { Self::Ready(ready) }
+}
+
+// One serialized cold wallet producer per account; one strategy owner consumes
+// each channel. FIFO/lossless, capacity 64, only the cold producer may block.
+// Disconnection is logged; restart/retry replays proof from the durable journal.
+pub type InventoryReadySender = crossbeam_channel::Sender<InventorySeedResult>;
+pub type InventoryReadyReceiver = crossbeam_channel::Receiver<InventorySeedResult>;
 
 /// Create the per-strategy notification channel used by live maintenance.
 pub fn inventory_ready_channel() -> (InventoryReadySender, InventoryReadyReceiver) {
@@ -5455,7 +5477,7 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
     );
     let ready_condition_id = job.split_target_condition_id.clone();
     let ready_token_ids = job.split_target_token_ids.clone();
-    run_maintenance_job(job, allocations);
+    let closed = run_maintenance_job(job, allocations);
     let terminal = statuses.first().map(MaintenanceStatusHandle::load);
     if let Some(ref terminal) = terminal {
         for status in statuses.iter().skip(1) {
@@ -5467,13 +5489,13 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
         .is_some_and(MaintenanceStatus::produced_seed_inventory)
     {
         if let Some(condition_id) = ready_condition_id.filter(|condition| !condition.is_empty()) {
-            for (instance_id, amount_usdc, sender) in inventory_ready_subscribers {
+            for (instance_id, amount_usdc, sender) in &inventory_ready_subscribers {
                 let notification = InventoryReady {
                     condition_id: condition_id.clone(),
                     token_ids: ready_token_ids.clone(),
-                    amount_usdc,
+                    amount_usdc: *amount_usdc,
                 };
-                if let Err(error) = sender.send(notification) {
+                if let Err(error) = sender.send(notification.into()) {
                     log::warn!(
                         "[Maintenance] inventory-ready delivery failed instance={} cid={}: {}",
                         instance_id,
@@ -5488,6 +5510,15 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
                         amount_usdc,
                     );
                 }
+            }
+        }
+    }
+    if let Some(closed) = closed {
+        for (instance_id, _, sender) in inventory_ready_subscribers {
+            if let Err(error) = sender.send(InventorySeedResult::ClosedWithoutInventory(closed.clone())) {
+                log::warn!("[Maintenance] seed-closed delivery failed instance={} cid={}: {}", instance_id, closed.condition_id, error);
+            } else {
+                log::info!("[Maintenance] seed-closed without inventory instance={} cid={} deadline={}", instance_id, closed.condition_id, closed.execute_before_secs);
             }
         }
     }
@@ -5943,10 +5974,29 @@ fn confirmed_seed_replay(
     }
 }
 
+// Any unresolved operation blocks closure. Confirmed inventory for a
+// requested owner must be replayed positively, even if partial/mismatched.
+fn seed_closed_without_inventory_allowed(
+    cid: &str, tokens: &[String], deadline: u64, now: u64,
+    operations: &[hexagent_account::account::shared_account::MaintenanceOperation],
+    allocations: &std::collections::HashMap<String, f64>,
+) -> bool {
+    use hexagent_account::account::shared_account::{MaintenanceOperationKind as Kind, MaintenanceOperationStatus as Status};
+    !cid.is_empty() && tokens.len() == 2 && !tokens[0].is_empty()
+        && !tokens[1].is_empty() && tokens[0] != tokens[1] && now >= deadline
+        && !allocations.is_empty() && allocations.values().all(|v| v.is_finite() && *v > 0.0)
+        && operations.iter().all(|op| op.condition_id == cid && match op.status {
+            Status::Failed => true,
+            Status::Confirmed => op.kind != Kind::Split
+                || !op.allocations.keys().any(|iid| allocations.contains_key(iid)),
+            Status::Reserved | Status::Submitted | Status::Uncertain => false,
+        })
+}
+
 fn run_maintenance_job(
     job: MaintenanceJob,
     split_allocations: std::collections::HashMap<String, f64>,
-) {
+) -> Option<InventorySeedClosed> {
     let MaintenanceJob {
         split_series_id,
         split_end_date_min_secs: _,
@@ -5988,7 +6038,7 @@ fn run_maintenance_job(
                         reason: format!("load_wallet: {}", e),
                     });
                 }
-                return;
+                return None;
             }
         };
         if let Some(account) = account_state.as_ref() {
@@ -6003,7 +6053,7 @@ fn run_maintenance_job(
                         reason: format!("maintenance recovery: {error}"),
                     });
                 }
-                return;
+                return None;
             }
         }
 
@@ -6022,11 +6072,11 @@ fn run_maintenance_job(
                         log::info!("[Maintenance] replaying confirmed seed inventory account={} cid={}", account_id, cid);
                         if let Some(s) = status { s.store(MaintenanceStatus::Succeeded); }
                     }
-                    return;
+                    return None;
                 }
                 Err(reason) => {
                     if let Some(s) = status { s.store(MaintenanceStatus::SplitFailedOrPending { reason }); }
-                    return;
+                    return None;
                 }
                 Ok(false) => {}
             }
@@ -6044,7 +6094,20 @@ fn run_maintenance_job(
             if let Some(s) = status {
                 s.store(MaintenanceStatus::SplitFailedOrPending { reason });
             }
-            return;
+            // Recovery and confirmed replay above ran on this same serialized
+            // worker. Never infer terminal absence from the error string.
+            if let (Some(account), Some(cid), Some(deadline)) =
+                (account_state.as_ref(), split_target_condition_id.as_deref(), split_execute_before_secs)
+            {
+                if seed_closed_without_inventory_allowed(cid, &split_target_token_ids,
+                    deadline, unix_now_secs(), &account.maintenance_operations_for_condition(cid),
+                    &split_allocations)
+                {
+                    return Some(InventorySeedClosed { condition_id: cid.to_owned(),
+                        token_ids: split_target_token_ids, execute_before_secs: deadline });
+                }
+            }
+            return None;
         }
 
 
@@ -6306,6 +6369,7 @@ fn run_maintenance_job(
             log::info!("[Maintenance] Complete.");
         }
     }
+    None
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -6774,7 +6838,7 @@ mod maintenance_status_tests {
             condition_id: "condition-a".to_string(),
             token_ids: vec!["up-a".to_string(), "down-a".to_string()],
             amount_usdc: 30.0,
-        })
+        }.into())
         .unwrap();
         assert_eq!(
             rx.recv().unwrap(),
@@ -6782,7 +6846,7 @@ mod maintenance_status_tests {
                 condition_id: "condition-a".to_string(),
                 token_ids: vec!["up-a".to_string(), "down-a".to_string()],
                 amount_usdc: 30.0,
-            },
+            }.into(),
         );
     }
 
@@ -6807,5 +6871,64 @@ mod maintenance_status_tests {
                 blocking
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod seed_closure_tests {
+    use super::*;
+    use hexagent_account::account::shared_account::{MaintenanceOperation, MaintenanceOperationKind as Kind, MaintenanceOperationStatus as Status};
+
+    fn operation(status: Status, owner: &str) -> MaintenanceOperation {
+        MaintenanceOperation {
+            operation_id: "split-a".into(), kind: Kind::Split, condition_id: "cid-a".into(),
+            up_token_id: "up".into(), down_token_id: "down".into(),
+            allocations: [(owner.into(), 160.0)].into_iter().collect(),
+            tx_id: Some("tx-a".into()), wallet_submission: None, status,
+            created_at_ms: 1, updated_at_ms: 2, detail: None,
+        }
+    }
+
+    #[test]
+    fn seed_closure_requires_deadline_and_terminal_owner_proof() {
+        let tokens = vec!["up".into(), "down".into()];
+        let allocations = [("btc03".into(), 160.0)].into_iter().collect();
+        let allowed = |now, ops: &[MaintenanceOperation]| seed_closed_without_inventory_allowed(
+            "cid-a", &tokens, 100, now, ops, &allocations);
+        assert!(!allowed(99, &[]));
+        assert!(allowed(100, &[])); // rejected before reserving/submitting
+        assert!(allowed(100, &[operation(Status::Failed, "btc03")]));
+        for status in [Status::Reserved, Status::Submitted, Status::Uncertain, Status::Confirmed] {
+            assert!(!allowed(100, &[operation(status, "btc03")]));
+        }
+        // A sibling's confirmed split does not seed this instance. Pending
+        // sibling work still blocks the account-wide recovery prerequisite.
+        assert!(allowed(100, &[operation(Status::Confirmed, "sibling")]));
+        assert!(!allowed(100, &[operation(Status::Submitted, "sibling")]));
+        let mut partial = operation(Status::Confirmed, "btc03");
+        partial.allocations.insert("btc03".into(), 1.0);
+        assert!(!allowed(100, &[partial]));
+        assert!(!seed_closed_without_inventory_allowed("cid-a", &["up".into(), "up".into()], 100, 100, &[], &allocations));
+        let mut wrong = operation(Status::Failed, "btc03"); wrong.condition_id = "other".into();
+        assert!(!allowed(100, &[wrong]));
+        assert!(!seed_closed_without_inventory_allowed("cid-a", &tokens, 100, 100, &[], &Default::default()));
+    }
+
+    #[test]
+    fn seed_closure_channel_is_fifo_lossless_bounded_and_owner_isolated() {
+        let (tx, rx) = inventory_ready_channel();
+        let (_, sibling) = inventory_ready_channel();
+        let closed = InventorySeedResult::ClosedWithoutInventory(InventorySeedClosed {
+            condition_id: "cid-a".into(), token_ids: vec!["up".into(), "down".into()], execute_before_secs: 100,
+        });
+        let ready = InventorySeedResult::Ready(InventoryReady {
+            condition_id: "cid-b".into(), token_ids: vec!["up-b".into(), "down-b".into()], amount_usdc: 160.0,
+        });
+        for _ in 0..32 { tx.try_send(closed.clone()).unwrap(); tx.try_send(ready.clone()).unwrap(); }
+        assert!(matches!(tx.try_send(closed.clone()), Err(crossbeam_channel::TrySendError::Full(_))));
+        for _ in 0..32 { assert_eq!(rx.recv().unwrap(), closed); assert_eq!(rx.recv().unwrap(), ready); }
+        assert!(sibling.is_empty());
+        drop(rx);
+        assert!(matches!(tx.try_send(closed), Err(crossbeam_channel::TrySendError::Disconnected(_))));
     }
 }
