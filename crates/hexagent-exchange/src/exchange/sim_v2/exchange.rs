@@ -454,7 +454,7 @@ pub struct FillAuditRow {
 /// Enabled only with the backtest fill-audit switch.  These immutable/request
 /// fields plus causal queue transitions are the sim half of the live
 /// `[order_attempt]` replica join; none feed back into matching.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct MakerOrderAuditRow {
     pub slug: String,
     pub iid: String,
@@ -507,6 +507,39 @@ pub struct MakerOrderAuditRow {
     pub cancel_result: &'static str,
     pub q_ahead_final: f64,
     pub remaining_final: f64,
+}
+
+fn add_maker_exposure(row: &mut FillAuditRow, order: &MakerOrderAuditRow) {
+    if order.cancel_result == "open" {
+        row.maker_open_orders += 1;
+        if order.post_only {
+            row.passive_open_orders += 1;
+        }
+    } else if matches!(order.cancel_result, "cancelled" | "event_retired") {
+        row.maker_cancel_orders += 1;
+        row.maker_cancel_qty += order.remaining_final.max(0.0);
+        if order.post_only {
+            row.passive_cancel_orders += 1;
+            row.passive_cancel_qty += order.remaining_final.max(0.0);
+        }
+    }
+    if order.fill_qty > EPS {
+        row.maker_orders_with_fill += 1;
+        if order.post_only {
+            row.passive_orders_with_fill += 1;
+            row.passive_fill_qty += order.fill_qty;
+        }
+    }
+    row.maker_rest_time_ns = row
+        .maker_rest_time_ns
+        .saturating_add(order.rest_time_ns as u128);
+    row.maker_rest_qty_ns += order.rest_qty_ns;
+    if order.post_only {
+        row.passive_rest_time_ns = row
+            .passive_rest_time_ns
+            .saturating_add(order.rest_time_ns as u128);
+        row.passive_rest_qty_ns += order.rest_qty_ns;
+    }
 }
 
 fn flip(s: Side) -> Side {
@@ -635,6 +668,13 @@ pub struct SimExchangeV2 {
     /// of thousands of orders.  BTreeMap keeps output deterministic by coid.
     maker_order_audit_enabled: bool,
     maker_order_audit: BTreeMap<String, MakerOrderAuditRow>,
+    // Sole owner: offline matching coordinator. Retired rows transfer directly
+    // to its buffered diagnostic writer, never through live private lanes.
+    maker_order_exposure: BTreeMap<(String, String), FillAuditRow>,
+    maker_audit_retirement_pending: bool,
+    maker_audit_high_water: usize,
+    maker_audit_created: u64,
+    maker_audit_drained: u64,
     // Sole writer: the backtest matching core. This is not live account state.
     order_evidence: BTreeMap<String, SimOrderEvidence>,
     order_evidence_overflows: u64,
@@ -951,6 +991,11 @@ impl SimExchangeV2 {
             selection: super::selection::Selection::default(),
             maker_order_audit_enabled: false,
             maker_order_audit: BTreeMap::new(),
+            maker_order_exposure: BTreeMap::new(),
+            maker_audit_retirement_pending: false,
+            maker_audit_high_water: 0,
+            maker_audit_created: 0,
+            maker_audit_drained: 0,
             order_evidence: BTreeMap::new(),
             order_evidence_overflows: 0,
             order_evidence_high_water: 0,
@@ -1414,54 +1459,89 @@ impl SimExchangeV2 {
 
     pub fn fill_audit_rows(&self) -> Vec<FillAuditRow> {
         let mut rows = self.fill_audit.clone();
+        for (key, archived) in &self.maker_order_exposure {
+            let row = rows.entry(key.clone()).or_insert_with(|| FillAuditRow {
+                slug: key.0.clone(), iid: key.1.clone(), ..FillAuditRow::default()
+            });
+            row.maker_open_orders += archived.maker_open_orders;
+            row.passive_open_orders += archived.passive_open_orders;
+            row.maker_cancel_orders += archived.maker_cancel_orders;
+            row.maker_cancel_qty += archived.maker_cancel_qty;
+            row.passive_cancel_orders += archived.passive_cancel_orders;
+            row.passive_cancel_qty += archived.passive_cancel_qty;
+            row.maker_orders_with_fill += archived.maker_orders_with_fill;
+            row.passive_orders_with_fill += archived.passive_orders_with_fill;
+            row.passive_fill_qty += archived.passive_fill_qty;
+            row.maker_rest_qty_ns += archived.maker_rest_qty_ns;
+            row.passive_rest_qty_ns += archived.passive_rest_qty_ns;
+            row.maker_rest_time_ns = row.maker_rest_time_ns.saturating_add(archived.maker_rest_time_ns);
+            row.passive_rest_time_ns = row.passive_rest_time_ns.saturating_add(archived.passive_rest_time_ns);
+        }
         for order in self.maker_order_audit.values() {
             let key = (order.slug.clone(), order.iid.clone());
             let row = rows.entry(key.clone()).or_insert_with(|| FillAuditRow {
-                slug: key.0,
-                iid: key.1,
-                ..FillAuditRow::default()
+                slug: key.0, iid: key.1, ..FillAuditRow::default()
             });
             let mut snapshot = order.clone();
             if snapshot.cancel_result == "open" {
                 let remaining = snapshot.remaining_final;
                 accrue_order_exposure(&mut snapshot, self.audit_clock_ns, remaining);
-                row.maker_open_orders += 1;
-                if snapshot.post_only {
-                    row.passive_open_orders += 1;
-                }
-            } else if matches!(snapshot.cancel_result, "cancelled" | "event_retired") {
-                row.maker_cancel_orders += 1;
-                row.maker_cancel_qty += snapshot.remaining_final.max(0.0);
-                if snapshot.post_only {
-                    row.passive_cancel_orders += 1;
-                    row.passive_cancel_qty += snapshot.remaining_final.max(0.0);
-                }
             }
-            if snapshot.fill_qty > EPS {
-                row.maker_orders_with_fill += 1;
-                if snapshot.post_only {
-                    row.passive_orders_with_fill += 1;
-                    row.passive_fill_qty += snapshot.fill_qty;
-                }
-            }
-            row.maker_rest_time_ns = row
-                .maker_rest_time_ns
-                .saturating_add(snapshot.rest_time_ns as u128);
-            row.maker_rest_qty_ns += snapshot.rest_qty_ns;
-            if snapshot.post_only {
-                row.passive_rest_time_ns = row
-                    .passive_rest_time_ns
-                    .saturating_add(snapshot.rest_time_ns as u128);
-                row.passive_rest_qty_ns += snapshot.rest_qty_ns;
-            }
+            add_maker_exposure(row, &snapshot);
         }
         rows.into_values().collect()
+    }
+
+    pub fn has_retired_maker_order_audit(&self) -> bool {
+        self.maker_audit_retirement_pending
+    }
+
+    /// Called only by the offline engine after a replay step. Scan once per
+    /// event retirement, never per tick. A retained scheduler reference delays
+    /// transfer until a later retirement (or the final lossless shutdown drain).
+    pub fn drain_maker_order_audit(&mut self, final_drain: bool)
+        -> impl Iterator<Item = MakerOrderAuditRow> + '_
+    {
+        self.maker_audit_retirement_pending = false;
+        let tokens = &self.event_slug_by_token;
+        let evidence = &self.order_evidence;
+        let clock = self.audit_clock_ns;
+        let totals = &mut self.maker_order_exposure;
+        let drained = &mut self.maker_audit_drained;
+        self.maker_order_audit.extract_if(.., move |coid, row| {
+            final_drain || (!tokens.contains_key(&row.token)
+                && evidence.get(coid).is_none_or(|owner| owner.pending_messages == 0))
+        }).map(move |(_, mut row)| {
+            if row.cancel_result == "open" {
+                let remaining = row.remaining_final;
+                accrue_order_exposure(&mut row, clock, remaining);
+            }
+            let key = (row.slug.clone(), row.iid.clone());
+            let total = totals.entry(key.clone()).or_insert_with(|| FillAuditRow {
+                slug: key.0, iid: key.1, ..FillAuditRow::default()
+            });
+            add_maker_exposure(total, &row);
+            *drained += 1;
+            row
+        })
+    }
+
+    pub fn maker_order_audit_stats(&self) -> serde_json::Value {
+        serde_json::json!({"created": self.maker_audit_created, "drained": self.maker_audit_drained,
+            "retained": self.maker_order_audit.len(), "high_water": self.maker_audit_high_water,
+            "capacity": MAX_ORDER_EVIDENCE, "overflows": 0,
+            "policy": "abort_on_capacity; retire only after final pending simulator message; offline owned transfer"})
     }
 
     pub fn configure_maker_order_audit(&mut self, enabled: bool) {
         self.maker_order_audit_enabled = enabled;
         if !enabled {
             self.maker_order_audit.clear();
+            self.maker_order_exposure.clear();
+            self.maker_audit_retirement_pending = false;
+            self.maker_audit_created = 0;
+            self.maker_audit_drained = 0;
+            self.maker_audit_high_water = 0;
         }
     }
 
@@ -3946,6 +4026,7 @@ impl SimExchangeV2 {
     /// order also frees its `locked_usdc`/share reservation, identical to the
     /// cancel path; verified result-neutral by the 5-day per-event PnL key.
     fn retire_event(&mut self, condition: &str, tokens: &[String; 2]) {
+        self.maker_audit_retirement_pending |= self.maker_order_audit_enabled;
         // Residual orders for this dead event — finalize their exposure at the
         // current causal exchange clock before retiring the tokens. Leaving the
         // audit row "open" would otherwise snapshot it through the end of the
@@ -5164,6 +5245,12 @@ impl SimExchangeV2 {
         if self.maker_order_audit_enabled {
             if let Some((slug, _)) = self.audit_key(&o.symbol, &o.instance_id) {
                 let exposure_end_ns = event_exposure_end_ns(&slug);
+                assert!(self.maker_order_audit.len() < MAX_ORDER_EVIDENCE,
+                    "bounded maker diagnostic capacity exhausted; drain retired offline records");
+                assert!(!self.maker_order_audit.contains_key(&o.client_order_id),
+                    "duplicate maker diagnostic identity");
+                self.maker_audit_created += 1;
+                self.maker_audit_high_water = self.maker_audit_high_water.max(self.maker_order_audit.len()+1);
                 self.maker_order_audit.insert(
                     o.client_order_id.clone(),
                     MakerOrderAuditRow {
@@ -7759,6 +7846,121 @@ mod tests {
         let other_instance = probe(1.0, "other");
         assert_eq!(other_instance.status, OrderStatus::Filled);
         assert!((other_instance.avg_fill_price - 0.62).abs() < EPS);
+    }
+
+    #[test]
+    #[should_panic(expected = "bounded maker diagnostic capacity exhausted")]
+    fn maker_diagnostic_capacity_exhaustion_aborts_instead_of_dropping() {
+        let mut c=core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book("up",vec![(0.60,10.)],vec![(0.62,80.)]));
+        c.submit_order(&order("template","up",Side::Buy,0.60,1.,true,OrderType::Limit),1);
+        let template=c.maker_order_audit_rows().pop().unwrap();
+        c.maker_order_audit.clear();
+        for i in 0..MAX_ORDER_EVIDENCE {
+            c.maker_order_audit.insert(format!("stored-{i}"),template.clone());
+        }
+        c.submit_order(&order("overflow","up",Side::Buy,0.60,1.,true,OrderType::Limit),2);
+    }
+
+    #[test]
+    #[ignore = "focused offline diagnostic handoff benchmark"]
+    fn maker_diagnostic_handoff_latency_distribution() {
+        use std::{hint::black_box,time::Instant};
+        const BATCHES:usize=64;
+        const ROWS:usize=512;
+        let mut c=core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book("up",vec![(0.60,10.)],vec![(0.62,80.)]));
+        c.submit_order(&order("template","up",Side::Buy,0.60,1.,true,OrderType::Limit),1);
+        let template=c.maker_order_audit_rows().pop().unwrap();
+        c.maker_order_audit.clear();
+        for streaming in [false,true] {
+            let mut samples=Vec::with_capacity(BATCHES);
+            for _ in 0..BATCHES {
+                for i in 0..ROWS {
+                    let mut row=template.clone();
+                    row.coid=format!("row-{i:05}");
+                    row.cancel_result="cancelled";
+                    c.maker_order_audit.insert(row.coid.clone(),row);
+                }
+                let started=Instant::now();
+                if streaming {
+                    for row in c.drain_maker_order_audit(true) { black_box(row); }
+                } else {
+                    black_box(c.maker_order_audit_rows());
+                }
+                samples.push(started.elapsed().as_nanos());
+                c.maker_order_audit.clear();
+            }
+            samples.sort_unstable();
+            println!("maker_handoff streaming={streaming} events={BATCHES} rows_per_event={ROWS} total_rows={} median_ns={} p99_ns={} p999_ns={} maximum_ns={} queue_depth=0 overflow=0 boundary=ready_maker_map_to_owned_records_excludes_IO_and_matching",
+                ROWS*BATCHES,samples[BATCHES/2],samples[BATCHES*99/100],samples[BATCHES-1],samples[BATCHES-1]);
+        }
+    }
+
+    #[test]
+    fn retired_maker_diagnostics_transfer_once_and_preserve_exposure() {
+        let mut c = core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book("up", vec![(0.60, 10.0)], vec![(0.62, 80.0)]));
+        assert_eq!(c.submit_order(&order("m", "up", Side::Buy, 0.60, 5.0, true, OrderType::Limit), 1).status,
+            OrderStatus::Accepted);
+        c.cancel_order(Exchange::Polymarket, "m", 150);
+        let prior = c.fill_audit_rows();
+        c.retire_event("cond1", &["up".into(), "down".into()]);
+        assert!(c.has_retired_maker_order_audit());
+        let moved: Vec<_> = c.drain_maker_order_audit(false).collect();
+        assert_eq!(moved.len(),1);
+        assert_eq!(moved[0].coid,"m");
+        assert!(!c.has_retired_maker_order_audit());
+        assert_eq!(c.drain_maker_order_audit(false).count(),0);
+        assert_eq!(c.drain_maker_order_audit(true).count(),0);
+        let after=c.fill_audit_rows();
+        assert_eq!(after[0].passive_cancel_orders,prior[0].passive_cancel_orders);
+        assert_eq!(after[0].maker_rest_time_ns,prior[0].maker_rest_time_ns);
+        assert_eq!(after[0].passive_rest_qty_ns,prior[0].passive_rest_qty_ns);
+        let stats=c.maker_order_audit_stats();
+        assert_eq!(stats["created"],1);
+        assert_eq!(stats["drained"],1);
+        assert_eq!(stats["retained"],0);
+    }
+
+    #[test]
+    fn maker_diagnostic_retirement_waits_for_private_delivery_reference() {
+        let mut c=core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book("up",vec![(0.60,10.)],vec![(0.62,80.)]));
+        c.submit_order(&order("m","up",Side::Buy,0.60,5.,true,OrderType::Limit),1);
+        c.retain_order_message("m");
+        c.retire_event("cond1", &["up".into(),"down".into()]);
+        assert_eq!(c.drain_maker_order_audit(false).count(),0);
+        assert!(c.order_owner("m").is_some());
+        c.record_fill_delivery("m",350);
+        c.release_order_message("m");
+        c.retire_event("next", &["other_up".into(),"other_down".into()]);
+        let rows:Vec<_>=c.drain_maker_order_audit(false).collect();
+        assert_eq!(rows.len(),1);
+        assert_eq!(rows[0].last_fill_delivery_ns,350);
+        assert_eq!(rows[0].cancel_result,"event_retired");
+        assert_eq!(c.drain_maker_order_audit(true).count(),0);
+    }
+
+    #[test]
+    fn partial_diagnostic_consumption_keeps_unconsumed_rows_owned() {
+        let mut c=core();
+        c.configure_maker_order_audit(true);
+        c.on_orderbook(&book("up",vec![(0.60,10.)],vec![(0.62,80.)]));
+        for coid in ["a","b"] {
+            c.submit_order(&order(coid,"up",Side::Buy,0.60,1.,true,OrderType::Limit),1);
+        }
+        c.retire_event("cond1", &["up".into(),"down".into()]);
+        { let mut rows=c.drain_maker_order_audit(false); assert_eq!(rows.next().unwrap().coid,"a"); }
+        assert_eq!(c.maker_order_audit_stats()["retained"],1);
+        let final_rows:Vec<_>=c.drain_maker_order_audit(true).collect();
+        assert_eq!(final_rows.len(),1);
+        assert_eq!(final_rows[0].coid,"b");
+        assert_eq!(c.maker_order_audit_stats()["drained"],2);
     }
 
     #[test]

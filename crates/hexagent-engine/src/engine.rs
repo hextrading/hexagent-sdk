@@ -6354,6 +6354,13 @@ impl Engine {
         };
 
         // Offline simulator coordinator, outside strategy callback/quote processing.
+        // Offline coordinator owns this bounded buffer. Ownership transfers
+        // directly from the simulator; no new thread or private lifecycle lane.
+        let mut maker_order_writer = if bt.sim_v2_fill_audit {
+            Some(std::io::BufWriter::with_capacity(256*1024,
+                std::fs::File::create("sim_maker_order_audit.jsonl")?))
+        } else { None };
+        let mut maker_order_written = 0_u64;
         let mut selection_writer = if bt.sim_v2_selection_audit {
             Some(std::io::BufWriter::with_capacity(256*1024,std::fs::File::create("sim_selection_audit.jsonl")?))
         } else {None};
@@ -7023,6 +7030,16 @@ impl Engine {
                 }
             }
 
+            if sim.has_retired_maker_order_audit() {
+                if let Some(writer) = maker_order_writer.as_mut() {
+                    for row in sim.drain_maker_order_audit(false) {
+                        serde_json::to_writer(&mut *writer, &row)?;
+                        std::io::Write::write_all(writer, b"\n")?;
+                        maker_order_written += 1;
+                    }
+                }
+            }
+
             if let Some(writer) = execution_timing_writer.as_mut() {
                 for row in sim.drain_execution_timing_audit() {
                     serde_json::to_writer(&mut *writer, &row)?;
@@ -7531,61 +7548,23 @@ impl Engine {
                     a.taker_fill_qty,
                 );
             }
-            for a in sim.maker_order_audit_rows() {
-                info!(
-                    "  Sim v2 maker order audit: slug={} iid={} coid={} token={} side={} order_type={:?} price={} quantity={} post_only={} strategy_emit_ns={} trigger_exchange_ns={} trigger_local_ns={} place_arrival_ns={} rest_ms={:.6} rest_qty_s={:.6} await_fresh_book={} visible_depth_at_entry={:.4} entry_mid={:.6} queue_seq={} q_init={:.4} simulated_own_ahead_qty={:.4} own_cancel_queue_advance_qty={:.4} replay_self_depth_credit={:.4} trade_match_n={} trade_match_qty={:.4} queue_drained_qty={:.4} candidate_qty={:.4} maker_toxicity_suppressed_qty={:.4} depletion_observed_qty={:.4} depletion_exec_qty={:.4} depletion_cancel_advance_qty={:.4} depletion_candidate_qty={:.4} depletion_budget_suppressed_qty={:.4} depletion_fill_qty={:.4} inferred_residual_floor={:.6} inferred_residual_suppressed_qty={:.6} book_through_candidate_qty={:.4} book_through_fill_qty={:.4} book_markout_qty={:.4} book_markout_cost_usdc={:.4} fill_qty={:.4} first_fill_ns={} last_fill_ns={} first_fill_delivery_ns={} last_fill_delivery_ns={} cancel_arrival_ns={} cancel_result={} q_ahead_final={:.4} remaining_final={:.4}",
-                    a.slug,
-                    a.iid,
-                    a.coid,
-                    a.token,
-                    a.side,
-                    a.order_type,
-                    a.price,
-                    a.quantity,
-                    a.post_only,
-                    a.strategy_emit_ns,
-                    a.trigger_exchange_ns,
-                    a.trigger_local_ns,
-                    a.place_arrival_ns,
-                    a.rest_time_ns as f64 / 1_000_000.0,
-                    a.rest_qty_ns / 1_000_000_000.0,
-                    a.await_fresh_book,
-                    a.visible_depth_at_entry,
-                    a.entry_mid,
-                    a.queue_seq,
-                    a.q_init,
-                    a.simulated_own_ahead_qty,
-                    a.own_cancel_queue_advance_qty,
-                    a.replay_self_depth_credit,
-                    a.trade_match_n,
-                    a.trade_match_qty,
-                    a.queue_drained_qty,
-                    a.candidate_qty,
-                    a.maker_toxicity_suppressed_qty,
-                    a.depletion_observed_qty,
-                    a.depletion_exec_qty,
-                    a.depletion_cancel_advance_qty,
-                    a.depletion_candidate_qty,
-                    a.depletion_budget_suppressed_qty,
-                    a.depletion_fill_qty,
-                    a.inferred_residual_floor,
-                    a.inferred_residual_suppressed_qty,
-                    a.book_through_candidate_qty,
-                    a.book_through_fill_qty,
-                    a.book_markout_qty,
-                    a.book_markout_cost_usdc,
-                    a.fill_qty,
-                    a.first_fill_ns,
-                    a.last_fill_ns,
-                    a.first_fill_delivery_ns,
-                    a.last_fill_delivery_ns,
-                    a.cancel_arrival_ns,
-                    a.cancel_result,
-                    a.q_ahead_final,
-                    a.remaining_final,
-                );
+            if let Some(writer) = maker_order_writer.as_mut() {
+                for row in sim.drain_maker_order_audit(true) {
+                    serde_json::to_writer(&mut *writer, &row)?;
+                    std::io::Write::write_all(writer, b"\n")?;
+                    maker_order_written += 1;
+                }
+                std::io::Write::flush(writer)?;
             }
+            let mut summary = sim.maker_order_audit_stats();
+            summary["written"] = serde_json::json!(maker_order_written);
+            anyhow::ensure!(summary["created"] == summary["drained"]
+                && summary["drained"] == summary["written"] && summary["retained"] == 0,
+                "incomplete lossless maker diagnostic drain");
+            std::fs::write("sim_maker_order_summary.json", serde_json::to_vec_pretty(&summary)?)?;
+            info!("  Sim v2:   maker order audit {}", summary);
         }
+
         let replay_perf = crate::recorder::replayer_stats();
         let (deadline_pending, deadline_high_water, deadline_capacity) = sim.http_deadline_stats();
         let (recovery_pending, recovery_high_water, recovery_capacity) =

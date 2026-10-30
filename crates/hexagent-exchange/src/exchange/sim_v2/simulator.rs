@@ -1305,6 +1305,20 @@ impl Simulator {
         self.core.configure_maker_order_audit(enabled);
     }
 
+    pub fn has_retired_maker_order_audit(&self) -> bool {
+        self.core.has_retired_maker_order_audit()
+    }
+
+    pub fn drain_maker_order_audit(&mut self, final_drain: bool)
+        -> impl Iterator<Item = MakerOrderAuditRow> + '_
+    {
+        self.core.drain_maker_order_audit(final_drain)
+    }
+
+    pub fn maker_order_audit_stats(&self) -> serde_json::Value {
+        self.core.maker_order_audit_stats()
+    }
+
     pub fn maker_order_audit_rows(&self) -> Vec<MakerOrderAuditRow> {
         self.core.maker_order_audit_rows()
     }
