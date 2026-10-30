@@ -3093,6 +3093,9 @@ pub struct MaintenanceWalletSubmission {
     pub nonce: String,
     pub body_hash: String,
     pub deadline_secs: u64,
+    /// Business cutoff for retrying this exact request; absent legacy intents are query-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_until_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -16467,6 +16470,7 @@ impl SharedAccount {
             || submission.nonce.parse::<u128>().is_err() || submission.body_hash.len() != 64
             || !submission.body_hash.bytes().all(|b| b.is_ascii_hexdigit())
             || submission.deadline_secs == 0
+            || submission.retry_until_secs.is_some_and(|t|t==0 || t>submission.deadline_secs)
         {
             return Err("invalid maintenance WALLET submission identity".into());
         }
@@ -16563,6 +16567,12 @@ impl SharedAccount {
         }
         let mut state = self.lock_state_for_persistence();
         if let Some(operation) = state.maintenance_ops.get_mut(operation_id) {
+            // A delayed/duplicate recovery observation cannot resurrect a
+            // terminal operation or grow the WAL on every retry tick.
+            if matches!(operation.status, MaintenanceOperationStatus::Confirmed | MaintenanceOperationStatus::Failed)
+                || (operation.status==MaintenanceOperationStatus::Uncertain && operation.detail.as_ref()==Some(&detail)) {
+                return;
+            }
             operation.status = MaintenanceOperationStatus::Uncertain;
             operation.updated_at_ms = wall_clock_ms();
             operation.detail = Some(detail.clone());
@@ -29575,6 +29585,30 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     }
 
     #[test]
+    fn duplicate_uncertain_does_not_churn_or_resurrect_terminal_maintenance() {
+        for confirmed in [false,true] {
+            let account=seeded_account();
+            account.reserve_maintenance_operation("op",MaintenanceOperationKind::Split,"cid","UP","DOWN",
+                &HashMap::from([("a".into(),10.0)])).unwrap();
+            account.mark_maintenance_operation_uncertain("op","503 paused");
+            let before=account.maintenance_operation("op").unwrap();
+            account.mark_maintenance_operation_uncertain("op","503 paused");
+            assert_eq!(account.maintenance_operation("op").unwrap(),before);
+            if confirmed {
+                account.mark_maintenance_operation_submitted("op","confirmed-tx").unwrap();
+                account.confirm_maintenance_operation("op").unwrap();
+            }
+            else {account.fail_maintenance_operation("op","finalized absence");}
+            let terminal=account.maintenance_operation("op").unwrap();
+            account.set_risk_blocker("independent:test","must stay closed");
+            account.mark_maintenance_operation_uncertain("op","late timeout after terminal proof");
+            assert_eq!(account.maintenance_operation("op").unwrap(),terminal);
+            assert_eq!(account.monitoring_snapshot().reserved_cash,0.0);
+            assert!(account.is_uncertain());
+        }
+    }
+
+    #[test]
     fn maintenance_admission_timeout_cleans_late_reservation_once_on_owner() {
         let _guard = persistence_test_guard();
         let path = std::env::temp_dir().join(format!("late-maintenance-{}-{}.json", std::process::id(), wall_clock_ms()));
@@ -29663,7 +29697,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
                 if with_intent {
                     op.wallet_submission = Some(MaintenanceWalletSubmission {
                         signer: "signer".into(), deposit_wallet: "wallet".into(), nonce: "7".into(),
-                        body_hash: "body".into(), deadline_secs: 99,
+                        body_hash: "body".into(), deadline_secs: 99, retry_until_secs: None,
                     });
                 }
             }
@@ -29991,7 +30025,7 @@ f865122559664df0686a02e148f1fb9115e4ce7ecdc9ff1c343955832d208861";
     fn prepared_wallet_intent_survives_restart_without_transaction_id() {
         let _guard = persistence_test_guard();
         let path = std::env::temp_dir().join(format!("hexagent-wallet-intent-{}-{}.json", std::process::id(), wall_clock_ms()));
-        let intent = MaintenanceWalletSubmission { signer: "signer".into(), deposit_wallet: "wallet".into(), nonce: "10832".into(), body_hash: "a".repeat(64), deadline_secs: 12345 };
+        let intent = MaintenanceWalletSubmission { signer: "signer".into(), deposit_wallet: "wallet".into(), nonce: "10832".into(), body_hash: "a".repeat(64), deadline_secs: 12345, retry_until_secs: None };
         {
             let account = SharedAccount::new_persistent("maintenance", &path).unwrap();
             account.register_instance("a", 1.0);

@@ -106,7 +106,7 @@ fn relayer_http(
 ) -> Result<serde_json::Value> {
     let client = crate::async_rt::http_client();
     crate::async_rt::block_on_runtime(async move {
-        let mut req = client.request(method, &url);
+        let mut req = client.request(method, &url).timeout(std::time::Duration::from_secs(5));
         for (k, v) in headers.as_builder_pairs() {
             req = req.header(k, v);
         }
@@ -4393,6 +4393,27 @@ fn recover_pending_maintenance_operations(
         .try_pending_maintenance_operations()
         .map_err(|error| format!("retryable account-owner maintenance snapshot: {error}"))?;
     for operation in pending {
+        if operation.kind == MaintenanceOperationKind::Split {
+            if let Some(intent) = &operation.wallet_submission {
+                // Canonical finalized nonce is independent of the short-lived
+                // relayer index. Errors never release the economic reservation.
+                if !intent.signer.eq_ignore_ascii_case(&wallet.signer_address)
+                    || wallet.deposit_wallet_active().is_none_or(|dw|!intent.deposit_wallet.eq_ignore_ascii_case(dw)) {
+                    return Err(format!("split journal owner mismatch: {}",operation.operation_id));
+                }
+                if chrono::Utc::now().timestamp().max(0) as u64 > intent.deadline_secs {
+                    match super::split_recovery::finalize_expired(account,&operation.operation_id,intent,super::onchain_tx::rpc_call) {
+                        Ok(true)=> {
+                            super::deposit_wallet::forget_proven_expired_wallet_nonce(&intent.signer,intent.nonce.parse().map_err(|_|"invalid nonce")?)
+                                .map_err(|e|e.to_string())?;
+                            continue;
+                        },
+                        Ok(false)=>{},
+                        Err(e)=>log::warn!("[Maintenance] expired split proof unavailable operation={}: {e}; preserving reservation and trying positive finality",operation.operation_id),
+                    }
+                }
+            }
+        }
         let tx_id = if let Some(tx_id) = operation.tx_id.clone() {
             tx_id
         } else if operation.kind == MaintenanceOperationKind::Split {
@@ -4409,7 +4430,7 @@ fn recover_pending_maintenance_operations(
             let amount_wei = (total * 1_000_000.0).round().max(0.0) as u128;
             let recovered = if let Some(submission) = &operation.wallet_submission {
                 super::deposit_wallet::recover_journaled_dw_split(
-                    &wallet.builder_auth, &wallet.signer_address, deposit_wallet,
+                    &wallet.builder_auth, &wallet.signing_key, &wallet.signer_address, deposit_wallet,
                     &operation.condition_id, amount_wei, &operation.operation_id, submission,
                 )
             } else {
@@ -4571,6 +4592,7 @@ fn run_split_one(
     amount_usdc: f64,
     min_safety_balance_usdc: f64,
     gas_via_signer: bool,
+    retry_until_secs: Option<u64>,
     journal: Option<(
         &hexagent_account::account::shared_account::SharedAccount,
         &str,
@@ -4623,6 +4645,7 @@ fn run_split_one(
             &wallet.builder_auth,
             condition_id,
             amount_wei,
+            retry_until_secs,
             |submission| {
                 if let Some((account, operation_id)) = journal {
                     account.prepare_maintenance_wallet_submission(operation_id, submission)
@@ -5021,6 +5044,7 @@ const MAINTENANCE_TARGET_CACHE_CAPACITY: usize = 256;
 
 #[derive(Default)]
 struct WalletActorState {
+    recovery_backoff: super::split_recovery::RecoveryBackoff,
     maintenance_targets:
         std::collections::HashMap<MaintenanceTargetKey, MaintenanceTargetCacheEntry>,
 }
@@ -5118,6 +5142,11 @@ fn partition_adjacent_maintenance_targets(burst: Vec<MaintenanceQueueItem>) -> V
 }
 
 fn run_maintenance_actor_batch(state: &mut WalletActorState, mut burst: Vec<MaintenanceQueueItem>) {
+    let remaining=state.recovery_backoff.remaining(std::time::Instant::now());
+    if !remaining.is_zero() {
+        defer_maintenance_group(burst,remaining);
+        return;
+    }
     for (job, _, _) in &mut burst {
         resolve_maintenance_split_target(&mut state.maintenance_targets, job);
     }
@@ -5129,7 +5158,7 @@ fn run_maintenance_actor_batch(state: &mut WalletActorState, mut burst: Vec<Main
         } else if wants_redeem {
             redeem_claimed = true;
         }
-        run_maintenance_group(group);
+        run_maintenance_group(group, &mut state.recovery_backoff);
     }
 }
 
@@ -5193,8 +5222,13 @@ fn enqueue_maintenance(job: MaintenanceJob, done: Option<crossbeam_channel::Send
 }
 
 fn maintenance_jobs_share_target(left: &MaintenanceJob, right: &MaintenanceJob) -> bool {
-    if left.gas_via_signer != right.gas_via_signer {
+    if left.gas_via_signer != right.gas_via_signer || left.account_id != right.account_id {
         return false;
+    }
+    match (&left.account_state,&right.account_state) {
+        (Some(a),Some(b)) if !std::sync::Arc::ptr_eq(a,b)=>return false,
+        (Some(_),None)|(None,Some(_))=>return false,
+        _=>{},
     }
     match (
         left.split_target_condition_id.as_deref(),
@@ -5408,30 +5442,67 @@ pub fn run_maintenance_blocking(job: MaintenanceJob) {
 /// redeem (if enabled) → fetch next event → split-seed → write terminal
 /// status. Body is unchanged from the former `spawn_maintenance_thread`
 /// closure (now driven by the executor instead of a per-call thread).
-fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
+fn defer_maintenance_group(items:Vec<MaintenanceQueueItem>,remaining:std::time::Duration) {
+    for (item,done,_) in items {
+        if let Some(status)=item.status {status.store(MaintenanceStatus::SplitFailedOrPending {
+            reason:format!("wallet recovery backoff: retry after {}ms",remaining.as_millis())});}
+        if let Some(done)=done {let _=done.send(());}
+    }
+}
+
+/// Requests specify one owner's target seed, not an incremental deposit.
+/// Replayed identical jobs must not multiply the split amount or reservation.
+fn coalesced_split_amounts(items:&[MaintenanceQueueItem]) -> std::result::Result<(f64,std::collections::HashMap<String,f64>),String> {
+    let mut allocations=std::collections::HashMap::new();let mut total=0.0;
+    for (job,_,_) in items {
+        let amount=job.split_amount_usdc;
+        if !amount.is_finite() || amount<0.0 {return Err("invalid coalesced seed amount".into());}
+        if amount>0.0 && !job.instance_id.is_empty() {
+            if let Some(old)=allocations.get(&job.instance_id) {
+                if *old!=amount {return Err("conflicting seed retries for same owner and condition".into());}
+                continue;
+            }
+            allocations.insert(job.instance_id.clone(),amount);
+        }
+        total+=amount;
+        if !total.is_finite() {return Err("coalesced seed amount overflow".into());}
+    }
+    Ok((total,allocations))
+}
+
+fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>, backoff: &mut super::split_recovery::RecoveryBackoff) {
     if items.is_empty() {
         return;
     }
+    let remaining=backoff.remaining(std::time::Instant::now());
+    if !remaining.is_zero() {defer_maintenance_group(items,remaining);return;}
     for (item, _, enqueued_at) in &items {
         if let Some(account) = &item.account_state {
             account.record_maintenance_queue_wait(enqueued_at.elapsed());
         }
     }
+    let (total,allocations)=match coalesced_split_amounts(&items) {
+        Ok(v)=>v,
+        Err(reason)=> {
+            for (job,done,_) in items {
+                if let Some(status)=job.status {status.store(MaintenanceStatus::SplitFailedOrPending {reason:reason.clone()});}
+                if let Some(done)=done {let _=done.send(());}
+            }
+            return;
+        }
+    };
     let (mut job, first_done, _) = items.remove(0);
+    let first_amount=job.split_amount_usdc;
+    job.split_amount_usdc=total;
     let mut done = vec![first_done];
     let mut statuses: Vec<MaintenanceStatusHandle> = job.status.iter().cloned().collect();
     let mut inventory_ready_subscribers: Vec<(String, f64, InventoryReadySender)> = job
         .inventory_ready_tx
         .take()
-        .map(|sender| (job.instance_id.clone(), job.split_amount_usdc, sender))
+        .map(|sender| (job.instance_id.clone(), first_amount, sender))
         .into_iter()
         .collect();
-    let mut allocations = std::collections::HashMap::<String, f64>::new();
-    if !job.instance_id.is_empty() && job.split_amount_usdc > 0.0 {
-        allocations.insert(job.instance_id.clone(), job.split_amount_usdc);
-    }
     for (sibling, sibling_done, _) in items {
-        job.split_amount_usdc += sibling.split_amount_usdc;
         job.split_end_date_min_secs = job
             .split_end_date_min_secs
             .max(sibling.split_end_date_min_secs);
@@ -5449,11 +5520,6 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
         job.redeem_enabled |= sibling.redeem_enabled;
         if job.account_state.is_none() {
             job.account_state = sibling.account_state.clone();
-        }
-        if !sibling.instance_id.is_empty() && sibling.split_amount_usdc > 0.0 {
-            *allocations
-                .entry(sibling.instance_id.clone())
-                .or_insert(0.0) += sibling.split_amount_usdc;
         }
         if let Some(status) = sibling.status {
             statuses.push(status);
@@ -5477,8 +5543,12 @@ fn run_maintenance_group(mut items: Vec<MaintenanceQueueItem>) {
     );
     let ready_condition_id = job.split_target_condition_id.clone();
     let ready_token_ids = job.split_target_token_ids.clone();
+    let retry_identity = job.account_id.clone();
     let closed = run_maintenance_job(job, allocations);
     let terminal = statuses.first().map(MaintenanceStatusHandle::load);
+    if matches!(terminal,Some(MaintenanceStatus::SplitFailedOrPending {..} | MaintenanceStatus::RedeemFailed {..})) {
+        backoff.failed(std::time::Instant::now(),retry_identity.as_bytes());
+    } else {backoff.reset();}
     if let Some(ref terminal) = terminal {
         for status in statuses.iter().skip(1) {
             status.store(terminal.clone());
@@ -6218,6 +6288,7 @@ fn run_maintenance_job(
                             split_amount_usdc,
                             min_safety_balance_usdc,
                             gas_via_signer,
+                            split_execute_before_secs,
                             journal,
                         );
                         if let Some(account) = account_state
@@ -6505,6 +6576,28 @@ pub fn run_split() -> Result<()> {
 #[cfg(test)]
 mod maintenance_status_tests {
     use super::*;
+
+    #[test]
+    fn duplicate_seed_jobs_reserve_once_and_conflicting_owner_amounts_fail_closed() {
+        let make=|id:&str,amount:f64| {
+            let mut job=maintenance_job(Some("same-event"),100);
+            job.instance_id=id.into();job.split_amount_usdc=amount;
+            (job,None,std::time::Instant::now())
+        };
+        let items=vec![make("a",25.0),make("a",25.0),make("b",30.0)];
+        let (total,allocations)=coalesced_split_amounts(&items).unwrap();
+        assert_eq!(total,55.0);assert_eq!(allocations["a"],25.0);assert_eq!(allocations["b"],30.0);
+        let mut conflict=vec![make("a",25.0),make("a",26.0)];
+        assert!(coalesced_split_amounts(&conflict).is_err());
+        let status=new_maintenance_status_handle();conflict[0].0.status=Some(status.clone());
+        run_maintenance_group(conflict,&mut Default::default());
+        assert!(matches!(status.load(),MaintenanceStatus::SplitFailedOrPending {..}));
+        let mut a=make("a",25.0).0;let mut b=make("b",30.0).0;
+        b.account_id=format!("{}-other",a.account_id);assert!(!maintenance_jobs_share_target(&a,&b));
+        b.account_id=a.account_id.clone();
+        a.account_state=Some(std::sync::Arc::new(hexagent_account::account::shared_account::SharedAccount::new("a")));
+        assert!(!maintenance_jobs_share_target(&a,&b));
+    }
 
     #[test]
     fn recovered_seed_replay_requires_exact_owner_tokens_and_confirmed_amount() {
