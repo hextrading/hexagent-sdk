@@ -1,0 +1,11 @@
+{
+  "date": "2026-10-30",
+  "purpose": "Consolidate existing SDK worktrees and remove linked checkouts after main merge",
+  "snapshot_commit": "9ab8e1c77198318241b19c3ae332a70fb95c1dad",
+  "prior_main": "dada6fc9413a03e28d68e8ce1f15fff0572129dd",
+  "source_tree_unchanged": true,
+  "unchanged_tree": "160d1a0981ed114a8e2da50bb43c8c6ec7e8ecb0",
+  "validation_reused": "docs/split_relayer_recovery_20261030.json: account 387 / exchange 1064 / engine 200 passed; source tree identical so no redundant rerun",
+  "runtime_order_audit": "preserved outside source repository in changed-file archive",
+  "recovery_archive": "/Users/Admin1/projects/worktree-consolidation-20261030"
+}
