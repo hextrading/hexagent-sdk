@@ -1,0 +1,44 @@
+{
+  "date": "2026-10-30",
+  "scope": "cold split recovery; no live deployment or ledger edits",
+  "tests": {
+    "command": "cargo test -p hexagent-account -p hexagent-exchange -p hexagent-engine --lib",
+    "account": {
+      "passed": 387,
+      "ignored": 27
+    },
+    "exchange": {
+      "passed": 1064,
+      "ignored": 64
+    },
+    "engine": {
+      "passed": 200,
+      "ignored": 17
+    },
+    "failed": 0,
+    "log_sha256": "a27be06e7e8629b23667bf8f4c78b8baa591308c606bba729b39f9bb546afd82"
+  },
+  "source_sha256": {
+    "crates/hexagent-account/src/account/shared_account.rs": "39f531502577b45d599f3c35130139b1bfcca7b476dca8cf744c05388795fa9f",
+    "crates/hexagent-exchange/src/exchange/polymarket/deposit_wallet.rs": "10ad92a28954e2a9465c0899695cf0b55a68356d442a9efd1cdd630085e7860f",
+    "crates/hexagent-exchange/src/exchange/polymarket/mod.rs": "61d1a82d46239c59d4e8197d733c5e9b89f96aaac73435ec1183298f6ee065ca",
+    "crates/hexagent-exchange/src/exchange/polymarket/onchain_tx.rs": "3660349824b5a98ac7cc23a4543c4af3d79a50c54af2f3e1062b6d11caf5242a",
+    "crates/hexagent-exchange/src/exchange/polymarket/wallet.rs": "c63c5169638e13dbf377f976228c246438841d658e6910cc3f4585833be93669",
+    "crates/hexagent-exchange/src/exchange/polymarket/split_recovery.rs": "c8a7def106a8e5a5947f8135015a6a2554249d6f6b1bc895295794cd349126ec"
+  },
+  "contract": {
+    "chain_id": 137,
+    "implementation": "0x58CA52ebe0DadfdF531Cde7062e76746de4Db1eB",
+    "verification": "runtime and creation exact_match",
+    "source_sha256": "16f0e82589aab09a41bf06f81941f3fc87e2e6393747c9e1555c07d644a10279",
+    "source_url": "https://sourcify.dev/server/v2/contract/137/0x58CA52ebe0DadfdF531Cde7062e76746de4Db1eB?fields=sources"
+  },
+  "architecture": {
+    "new_workers": 0,
+    "new_quote_path_io": false,
+    "inventory_result_queue_capacity": 64,
+    "onchain_control_queue_capacity": 256,
+    "unknown_outcome": "reservation and existing admission protection retained; no timeout-only release"
+  },
+  "platform": "macOS-26.6.2-x86_64-i386-64bit-Mach-O"
+}

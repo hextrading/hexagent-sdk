@@ -714,8 +714,17 @@ fn record_rpc_failure(url: &str) -> Duration {
 ///
 /// Exposed as `pub(super)` so `deploy_wallet::eth_call` uses the same
 /// tuned client + retry path.
+// A provider may support ordinary reads while lacking finalized tags or
+// EIP-1898 canonical hash reads. Fail over the IDENTICAL read, never downgrade
+// to latest and never apply this policy to side-effecting RPC methods.
+fn canonical_read_capability(method:&str,params:&serde_json::Value) -> bool {
+    matches!(method,"eth_call"|"eth_getStorageAt"|"eth_getCode"|"eth_getBlockByNumber")
+        && params.as_array().is_some_and(|args|args.iter().any(|p|p=="finalized" || p.get("blockHash").is_some()))
+}
+
 pub(super) fn rpc_call(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
     let urls = polygon_rpc_urls()?;
+    let canonical_read = canonical_read_capability(method,&params);
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": method,
@@ -765,7 +774,8 @@ pub(super) fn rpc_call(method: &str, params: serde_json::Value) -> Result<serde_
                 Ok(v) => {
                     if let Some(rpc_err) = v.get("error") {
                         let code = rpc_err.get("code").and_then(|c| c.as_i64());
-                        let is_node_fault = matches!(code, Some(-32000) | Some(-32603));
+                        let is_node_fault = matches!(code, Some(-32000) | Some(-32603))
+                            || (canonical_read && matches!(code,Some(-32601)|Some(-32602)));
                         if is_node_fault {
                             // Same URL won't change its mind — switch URL.
                             last_err = Some(anyhow!("rpc error: {}", rpc_err));
@@ -1039,6 +1049,16 @@ fn trim_leading_zeros(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_capability_failover_never_retries_mutations_or_changes_read_tags() {
+        let tag=serde_json::json!({"blockHash":"0xabc","requireCanonical":true});
+        assert!(canonical_read_capability("eth_call",&serde_json::json!([{},tag])));
+        assert!(canonical_read_capability("eth_getBlockByNumber",&serde_json::json!(["finalized",false])));
+        assert!(!canonical_read_capability("eth_sendRawTransaction",&serde_json::json!([tag])));
+        assert!(!canonical_read_capability("eth_call",&serde_json::json!([{},"latest"])));
+    }
+
 
     #[test]
     fn rpc_health_sticks_to_success_and_quarantines_failures() {

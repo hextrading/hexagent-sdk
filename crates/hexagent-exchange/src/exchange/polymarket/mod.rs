@@ -5,6 +5,7 @@ pub mod cli_account;
 pub mod auth;
 pub mod deploy_wallet;
 pub mod deposit_wallet;
+mod split_recovery;
 pub mod live_position;
 pub mod market;
 pub mod execution_peer_failure;
