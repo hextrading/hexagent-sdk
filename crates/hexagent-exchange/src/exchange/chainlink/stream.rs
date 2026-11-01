@@ -18,13 +18,15 @@ use log::{info, warn};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::Request;
-use tokio_tungstenite::tungstenite::Message;
 
-use crate::exchange::{ws_send, ExchangeMarket, WS_CONNECT_TIMEOUT};
+use crate::exchange::{ExchangeMarket, WS_CONNECT_TIMEOUT};
 use crate::types::*;
+
+#[path = "stream_session.rs"]
+mod session;
 
 const DEFAULT_WS_URL: &str = "wss://ws.dataengine.chain.link";
 const WS_PATH: &str = "/api/v1/ws";
@@ -98,6 +100,10 @@ async fn chainlink_stream_ws_task(
     tls: crate::exchange::ws_tls::WsTlsConfig,
 ) {
     let mut backoff = crate::exchange::ReconnectBackoff::new(200, 30_000);
+    // Task-local identity, stable across reconnects; no process-global state.
+    let stream_id = uuid::Uuid::new_v4();
+    let mut attempt = 0_u64;
+    let settings = session::Settings::default();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -108,7 +114,11 @@ async fn chainlink_stream_ws_task(
         let path = format!("{}?feedIDs={}", WS_PATH, feed_ids_param);
         let full_url = format!("{}{}", ws_url, path);
 
-        info!("[ChainlinkStream] Connecting to {}", full_url);
+        attempt += 1;
+        info!(
+            "[ChainlinkStream] Connecting stream_id={} session={} to {}",
+            stream_id, attempt, full_url
+        );
 
         let (auth, timestamp, signature) = match auth_headers(&api_key, &user_secret, "GET", &path)
         {
@@ -176,8 +186,8 @@ async fn chainlink_stream_ws_task(
             Ok(Err(e)) => {
                 let delay = backoff.next_delay();
                 warn!(
-                    "[ChainlinkStream] WS connect failed: {}, retry in {:.1}s",
-                    e,
+                    "[ChainlinkStream] WS connect failed stream_id={} session={}: {}, retry in {:.1}s",
+                    stream_id, attempt, e,
                     delay.as_secs_f64()
                 );
                 tokio::time::sleep(delay).await;
@@ -186,85 +196,42 @@ async fn chainlink_stream_ws_task(
             Err(_) => {
                 let delay = backoff.next_delay();
                 warn!(
-                    "[ChainlinkStream] WS connect stalled >{:.0}s (TLS handshake never \
-                     completed), retry in {:.1}s",
-                    WS_CONNECT_TIMEOUT.as_secs_f64(),
+                    "[ChainlinkStream] WS connect stalled stream_id={} session={} >{:.0}s (connection/upgrade did not complete), retry in {:.1}s",
+                    stream_id, attempt, WS_CONNECT_TIMEOUT.as_secs_f64(),
                     delay.as_secs_f64(),
                 );
                 tokio::time::sleep(delay).await;
                 continue;
             }
         };
-        info!("[ChainlinkStream] Connected ({})", response.status());
+        info!(
+            "[ChainlinkStream] Connected stream_id={} session={} status={} read_timeout_ms={} ping_interval_ms={} pong_timeout_ms={}",
+            stream_id, attempt, response.status(), settings.read_timeout.as_millis(),
+            settings.ping_interval.as_millis(), settings.pong_timeout.as_millis(),
+        );
         backoff.reset();
-        let (mut write, mut read) = stream.split();
+        let (write, read) = stream.split();
 
         info!(
             "[ChainlinkStream] Connected, streaming {} feeds: {:?}",
             feed_ids.len(),
             symbols
         );
-
-        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
-        ping_interval.tick().await;
-
-        // Stall watchdog: chainlink streams emit per-feed reports
-        // every few seconds at most. 60 s of silence is anomalous and
-        // matches the engine-level data_timeout for chainlink (30 s);
-        // we go slightly looser here so the engine layer fires first
-        // when active and this in-task guard handles only true zombie
-        // hangs the engine watchdog can't break out of cleanly.
-        const STALE_THRESHOLD: Duration = Duration::from_secs(60);
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = ping_interval.tick() => {
-                    if let Err(e) = ws_send(&mut write, Message::Ping(Vec::new())).await {
-                        warn!("[ChainlinkStream] Ping send failed: {}", e);
-                        break;
-                    }
-                }
-                read_result = tokio::time::timeout(STALE_THRESHOLD, read.next()) => {
-                    let msg = match read_result {
-                        Ok(Some(Ok(m))) => m,
-                        Ok(Some(Err(e))) => { warn!("[ChainlinkStream] WS read error: {}", e); break; }
-                        Ok(None) => { warn!("[ChainlinkStream] WS closed"); break; }
-                        Err(_elapsed) => {
-                            warn!("[ChainlinkStream] No message for {:.0}s (stall watchdog) — reconnecting",
-                                STALE_THRESHOLD.as_secs_f64());
-                            break;
-                        }
-                    };
-                    let parsed: Option<serde_json::Value> = match msg {
-                        Message::Binary(data) => serde_json::from_slice(&data).ok(),
-                        Message::Text(text) => serde_json::from_str(&text).ok(),
-                        Message::Ping(payload) => {
-                            let _ = ws_send(&mut write, Message::Pong(payload)).await;
-                            None
-                        }
-                        Message::Close(reason) => {
-                            warn!("[ChainlinkStream] Server closed: {:?}", reason);
-                            break;
-                        }
-                        _ => None,
-                    };
-                    if let Some(data) = parsed {
-                        if let Some(event) = parse_report(&data, &feed_ids, &symbols) {
-                            if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
-                        }
-                    }
-                }
-            }
-            if shutdown.load(Ordering::Relaxed) {
-                return;
-            }
-        }
-
-        if shutdown.load(Ordering::Relaxed) {
+        let ended = session::run(
+            write, read, &feed_ids, &symbols, &event_tx, &shutdown, settings,
+        )
+        .await;
+        let stop = shutdown.load(Ordering::Relaxed) || ended.should_stop();
+        let delay = if stop {
+            None
+        } else {
+            Some(backoff.next_delay())
+        };
+        ended.log(stream_id, attempt, delay);
+        if stop {
             break;
         }
-        let delay = backoff.next_delay();
+        let delay = delay.expect("reconnecting session has a delay");
         tokio::time::sleep(delay).await;
     }
     info!("[ChainlinkStream] WS task exiting");
