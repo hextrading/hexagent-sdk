@@ -16535,8 +16535,14 @@ fn run_poly_connection_owner(
                     business.attempt_id, health.quarantined) {
                     // Normal quarantine + asynchronous prewarm + generation
                     // fencing; GET success never verifies business health.
-                    permit.current_pooled_client().rotate_instrumented_for_diagnostic(
-                        prewarm_url.to_string(), business.attempt_id);
+                    let client = permit.current_pooled_client();
+                    // A concurrent ordinary repair may have completed since
+                    // the policy snapshot. Do not rotate that replacement
+                    // using a completion from the preceding generation.
+                    if client.pool_generation() == business.pool_generation {
+                        client.rotate_instrumented_for_diagnostic(
+                            prewarm_url.to_string(), business.attempt_id);
+                    }
                 }
             }
         }
