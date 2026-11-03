@@ -545,18 +545,33 @@ impl MarketEventPublisher for PublicMarketPublisher {
         let replaceable = replaceable_market_event(&event);
         let event = QueuedMarketEvent { event, enqueued_ns: crate::types::monotonic_now_ns() };
         if replaceable {
-            if let Err(event) = self.latest.try_push(event) {
-                if let Some(audit) = &self.progress.audit { audit.event(stage, "first_push_failed", &event.event, self.latest.len()); }
-                if let Some(evicted) = self.latest.try_pop() {
-                    if let Some(audit) = &self.progress.audit { audit.event(stage, "evicted", &evicted.event, self.latest.len()); }
-                    PUBLIC_MARKET_OVERFLOW_REPLACEMENTS.fetch_add(1, Ordering::Relaxed);
-                }
-                if let Err(event) = self.latest.try_push(event) {
-                    if let Some(audit) = &self.progress.audit { audit.event(stage, "dropped", &event.event, self.latest.len()); }
-                    self.progress.contention_drops.fetch_add(1, Ordering::Relaxed);
-                    PUBLIC_MARKET_OVERFLOW_DROPS.fetch_add(1, Ordering::Relaxed);
+            use hexagent_runtime::try_queue::TryPushError;
+            let mut retained = event;
+            let mut evicted_once = false;
+            // Fixed budget; no waiting for another thread's publication. Only
+            // a confirmed full ring permits oldest-first eviction. A lost CAS
+            // below capacity must never remove an unrelated oracle tick.
+            for _ in 0..8 {
+                match self.latest.try_push_classified(retained) {
+                    Ok(()) => return Ok(()),
+                    Err(TryPushError::Contended(event)) => {
+                        if let Some(audit) = &self.progress.audit { audit.event(stage, "contention_retry", &event.event, self.latest.len()); }
+                        retained = event;
+                    }
+                    Err(TryPushError::Full(event)) => {
+                        retained = event;
+                        if evicted_once { break; }
+                        if let Some(evicted) = self.latest.try_pop() {
+                            evicted_once = true;
+                            if let Some(audit) = &self.progress.audit { audit.event(stage, "evicted_full", &evicted.event, self.latest.len()); }
+                            PUBLIC_MARKET_OVERFLOW_REPLACEMENTS.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
             }
+            if let Some(audit) = &self.progress.audit { audit.event(stage, "retry_exhausted", &retained.event, self.latest.len()); }
+            self.progress.contention_drops.fetch_add(1, Ordering::Relaxed);
+            PUBLIC_MARKET_OVERFLOW_DROPS.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         // A producer resumed after preemption can lose its first tail CAS to
