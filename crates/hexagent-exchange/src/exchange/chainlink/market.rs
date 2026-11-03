@@ -1,7 +1,7 @@
 //! Chainlink price feed via Polymarket RTDS WebSocket.
 //!
 //! Endpoint: wss://ws-live-data.polymarket.com
-//! Topic: crypto_prices_chainlink
+//! Topics: crypto_prices_chainlink (spot), crypto_prices_twap_sixty (60s TWAP)
 //! Symbols: "btc/usd", "eth/usd", "sol/usd", etc.
 //!
 //! Emits MarketEvent::SpotPrice with source = "chainlink".
@@ -143,11 +143,17 @@ async fn chainlink_ws_task(
         //      nothing while looking connected.
         // The unfiltered topic is tiny (~7 symbols × ~1 msg/s), so the
         // client-side filter costs nothing.
-        let subs: Vec<serde_json::Value> = vec![serde_json::json!({
+        let mut subs: Vec<serde_json::Value> = vec![serde_json::json!({
             "topic": "crypto_prices_chainlink",
             "type": "*",
         })];
 
+        let needs_twap = symbols.iter().any(|s| s.ends_with("/twap/60s"));
+        if needs_twap {
+            subs.push(serde_json::json!({"topic": "crypto_prices_twap_sixty", "type": "*"}));
+        }
+        let mut last_spot_frame = Instant::now();
+        let mut last_twap_frame = Instant::now();
         let sub_msg = serde_json::json!({
             "action": "subscribe",
             "subscriptions": subs,
@@ -209,7 +215,9 @@ async fn chainlink_ws_task(
                     // RTDS_TOPIC_STALL_THRESHOLD: this feed has no legitimate
                     // 90 s quiet period, and silence that deep has never been
                     // observed to self-heal.
-                    if health.topic_is_stale(now, RTDS_TOPIC_STALL_THRESHOLD) {
+                    if now.duration_since(last_spot_frame) >= RTDS_TOPIC_STALL_THRESHOLD
+                        || (needs_twap && now.duration_since(last_twap_frame) >= RTDS_TOPIC_STALL_THRESHOLD)
+                    {
                         warn!(
                             "[Chainlink] RTDS no topic frame for {:.0}s (topic stall watchdog) \
                              — reconnecting; {}",
@@ -296,41 +304,22 @@ async fn chainlink_ws_task(
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
-                            let topic = match data.get("topic").and_then(|v| v.as_str()) {
-                                Some(t) if t == "crypto_prices_chainlink" => t.to_string(),
+                            let Some(topic) = data.get("topic").and_then(|v| v.as_str()) else { continue; };
+                            match topic {
+                                "crypto_prices_chainlink" => last_spot_frame = received_at,
+                                "crypto_prices_twap_sixty" if needs_twap => last_twap_frame = received_at,
                                 _ => continue,
-                            };
+                            }
                             health.record_topic_frame(received_at);
-                            let payload = match data.get("payload") {
-                                Some(p) => p.clone(),
-                                None => continue,
-                            };
-                            let symbol = match payload.get("symbol").and_then(|v| v.as_str()) {
-                                Some(s) => s.to_string(),
-                                None => continue,
-                            };
-                            let price = match payload.get("value").and_then(json_f64) {
-                                Some(p) => p,
-                                None => continue,
-                            };
-                            let server_ts_ms = data.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
-
-                            if symbol.eq_ignore_ascii_case("btc/usd") {
+                            let Some(payload) = data.get("payload") else { continue; };
+                            let Some(tick) = decode_rtds_tick(topic, payload, now_ns()) else { continue; };
+                            if tick.symbol == "btc/usd" {
                                 health.record_btc_price(received_at);
                             }
-
-                            if !symbols.iter().any(|f| f.eq_ignore_ascii_case(&symbol)) {
-                                log::trace!("[Chainlink] Filtered out: topic={} symbol={} price={}", topic, symbol, price);
+                            if !symbols.iter().any(|f| f.eq_ignore_ascii_case(&tick.symbol)) {
                                 continue;
                             }
-
-                            let event = MarketEvent::SpotPrice(SpotPrice {
-                                source: "chainlink".to_string(),
-                                symbol,
-                                price,
-                                timestamp_ns: server_ts_ms * 1_000_000,
-                                local_timestamp_ns: now_ns(),
-                            });
+                            let event = MarketEvent::SpotPrice(tick);
                             if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                         }
                         _ => {}
@@ -355,6 +344,34 @@ async fn chainlink_ws_task(
         tokio::time::sleep(delay).await;
     }
     info!("[Chainlink] WS task exiting");
+}
+
+/// Decode only live updates, never replay a subscription snapshot into the live
+/// oracle cache. RTDS's envelope timestamp is publication time; the payload
+/// timestamp is the Chainlink observation used for event boundary selection.
+fn decode_rtds_tick(topic: &str, payload: &serde_json::Value, received_ns: u64) -> Option<SpotPrice> {
+    let twap = match topic {
+        "crypto_prices_chainlink" => false,
+        "crypto_prices_twap_sixty" => true,
+        _ => return None,
+    };
+    if twap && payload.get("window_s")?.as_u64()? != 60 { return None; }
+    let symbol = payload.get("symbol")?.as_str()?;
+    if !symbol.ends_with("/usd") { return None; }
+    let timestamp_ms = payload.get("timestamp")?.as_u64()?;
+    if timestamp_ms == 0 { return None; }
+    let price = match payload.get("full_accuracy_value") {
+        Some(value) => value.as_str()?.parse::<f64>().ok()? / 1e18,
+        None => json_f64(payload.get("value")?)?,
+    };
+    if !price.is_finite() || price <= 0.0 { return None; }
+    Some(SpotPrice {
+        source: "chainlink".to_owned(),
+        symbol: if twap { format!("{symbol}/twap/60s") } else { symbol.to_owned() },
+        price,
+        timestamp_ns: timestamp_ms.checked_mul(1_000_000)?,
+        local_timestamp_ns: received_ns,
+    })
 }
 
 fn json_f64(value: &serde_json::Value) -> Option<f64> {
@@ -411,5 +428,36 @@ impl ExchangeMarket for ChainlinkMarket {
 
     fn name(&self) -> &str {
         "chainlink"
+    }
+}
+
+#[cfg(test)]
+mod rtds_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn observation_clock_and_twap_are_not_spot_or_publication_clock() {
+        let payload = json!({"symbol":"btc/usd","timestamp":1793679200000u64,
+            "full_accuracy_value":"76763196801204162134016","value":1,"window_s":60});
+        let tick = decode_rtds_tick("crypto_prices_twap_sixty", &payload, 1793679201900000000).unwrap();
+        assert_eq!(tick.symbol, "btc/usd/twap/60s");
+        assert_eq!(tick.timestamp_ns, 1793679200000000000);
+        assert_eq!(tick.local_timestamp_ns, 1793679201900000000);
+        assert!((tick.price - 76763.19680120416).abs() < 1e-9);
+        let spot = decode_rtds_tick("crypto_prices_chainlink", &payload, 1).unwrap();
+        assert_eq!(spot.symbol, "btc/usd");
+    }
+
+    #[test]
+    fn malformed_or_unsupported_updates_do_not_become_prices() {
+        let base = json!({"symbol":"btc/usd","timestamp":1000,"value":123,"window_s":60});
+        assert!(decode_rtds_tick("other", &base, 1).is_none());
+        for (key,value) in [("timestamp",json!(0)), ("timestamp",json!(u64::MAX)),
+            ("window_s",json!(30)), ("value",json!(-1)), ("full_accuracy_value",json!("bad"))] {
+            let mut p=base.clone(); p[key]=value;
+            assert!(decode_rtds_tick("crypto_prices_twap_sixty", &p, 1).is_none());
+        }
+        assert!(decode_rtds_tick("crypto_prices_chainlink", &json!({"symbol":"btc/usd","data":[]}),1).is_none());
     }
 }

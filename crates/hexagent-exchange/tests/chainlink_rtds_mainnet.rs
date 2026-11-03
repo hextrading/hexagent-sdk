@@ -22,7 +22,7 @@ use hexagent_exchange::types::MarketEvent;
 fn rtds_multi_symbol_subscription_receives_all() {
     let _ = hexagent_exchange::async_rt::init();
     let mut feed = ChainlinkMarket::new();
-    feed.subscribe(&["btc/usd".to_string(), "eth/usd".to_string(), "sol/usd".to_string()])
+    feed.subscribe(&["btc/usd".to_string(), "eth/usd".to_string(), "sol/usd".to_string(), "btc/usd/twap/60s".to_string(), "eth/usd/twap/60s".to_string(), "sol/usd/twap/60s".to_string()])
         .unwrap();
     feed.connect().unwrap();
 
@@ -42,7 +42,7 @@ fn rtds_multi_symbol_subscription_receives_all() {
     feed.disconnect();
 
     println!("30s spot-price counts: {counts:?}");
-    for sym in ["btc/usd", "eth/usd", "sol/usd"] {
+    for sym in ["btc/usd", "eth/usd", "sol/usd", "btc/usd/twap/60s", "eth/usd/twap/60s", "sol/usd/twap/60s"] {
         assert!(
             counts.get(sym).copied().unwrap_or(0) >= 5,
             "no/too few pushes for {sym}: {counts:?}"
@@ -50,5 +50,5 @@ fn rtds_multi_symbol_subscription_receives_all() {
     }
     // Client-side filter must still drop unsubscribed topic symbols
     // (xrp/doge/bnb/hype stream on the unfiltered topic).
-    assert_eq!(counts.len(), 3, "unsubscribed symbols leaked through: {counts:?}");
+    assert_eq!(counts.len(), 6, "unsubscribed symbols leaked through: {counts:?}");
 }
