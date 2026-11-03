@@ -28,3 +28,4 @@ mod virtual_owner;
 mod virtual_recovery;
 
 mod preparation_schedule;
+mod clob_connection_ab;

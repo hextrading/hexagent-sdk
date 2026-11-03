@@ -1179,6 +1179,7 @@ pub enum TransportRepairCause {
     RepeatedSlowResponse = 2,
     AccountReset = 3,
     IdleSocketClosed = 4,
+    DiagnosticRotation = 5,
 }
 
 #[derive(Default)]
@@ -1617,6 +1618,14 @@ impl PooledClient {
     pub fn note_instrumented_transport_failure_avoiding(&self, prewarm_url: String,
         avoid_peer: Option<IpAddr>) -> bool {
         self.retire_instrumented(prewarm_url, avoid_peer, TransportRepairCause::AccountReset, 0)
+    }
+
+    /// Experimental rotation uses ordinary DNS selection, not the unhealthy
+    /// peer avoidance hint. Analysis must stratify by actual peer address.
+    /// This records no failed business outcome and grants no health evidence.
+    pub fn rotate_instrumented_for_diagnostic(&self, prewarm_url: String,
+        trigger_attempt: u64) -> bool {
+        self.retire_instrumented(prewarm_url, None, TransportRepairCause::DiagnosticRotation, trigger_attempt)
     }
 
     fn retire_instrumented(&self, prewarm_url: String, avoid_peer: Option<IpAddr>,
