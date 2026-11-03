@@ -7708,6 +7708,12 @@ impl PolymarketTrade {
     pub fn prewarm_connections(&self) {
         let start = std::time::Instant::now();
         let clob_base_url = self.shared.clob_base_url.clone();
+        // The Data API root was retired with v1. Warm a bounded v2 read;
+        // this response is discarded and never used as an account snapshot.
+        let data_api_url = format!(
+            "https://data-api.polymarket.com/v2/positions?user={}&status=OPEN&limit=1",
+            self.shared.order_maker_address,
+        );
         TRANSPORT_PREWARMED.get_or_init(|| {
             let clob_clients = crate::http1_pool::pooled_clients_all();
             let query_clients =
@@ -7729,7 +7735,7 @@ impl PolymarketTrade {
                 prewarm_clients_staggered(
                     "data-api",
                     query_clients,
-                    "https://data-api.polymarket.com/".into(),
+                    data_api_url,
                 )
                 .await;
             });
