@@ -16508,6 +16508,11 @@ fn run_poly_connection_owner(
     if let Some(route) = router.polymarket.as_mut() { route.bind_private_owner_wake(completion_wake.clone()); }
     let mut cold_completions = crate::exchange::polymarket::trade::OwnerHttpCompletions::new(Some(completion_wake));
     let mut observation_sequence = OwnerHealthObservation::default();
+    // Startup-only opt-in; each Fast owner owns its experiment state. Cancel,
+    // safety and lifecycle routes retain their existing scheduling.
+    let mut connection_ab = (role == Role::Fast).then(||
+        crate::clob_connection_ab::Rotation::from_env(&lane_metrics.account_id)
+            .map(|p| p.with_slot(permit.slot()))).flatten();
     // Only Fast/Cancel need sub-millisecond idle pickup. Six background
     // Reconcile owners at 50 us consumed 28% of the live shared core during
     // startup; budget their cold requests separately from quote/cancel work.
@@ -16520,6 +16525,27 @@ fn run_poly_connection_owner(
         // Clear before reading state. A concurrent change leaves another hint.
         permit.take_owner_health_notification();
         let maintenance_started = hexagent_types::types::monotonic_now_ns();
+        if connection_ab.as_ref().is_some_and(|ab| ab.expired(now_ns())) {
+            connection_ab = None;
+        }
+        if let Some(ab) = connection_ab.as_mut() {
+            if let Some(business) = permit.business_outcome() {
+                let health = permit.health_snapshot();
+                if ab.completed(now_ns(), health.pool_generation, business.pool_generation,
+                    business.attempt_id, health.quarantined) {
+                    // Normal quarantine + asynchronous prewarm + generation
+                    // fencing; GET success never verifies business health.
+                    let client = permit.current_pooled_client();
+                    // A concurrent ordinary repair may have completed since
+                    // the policy snapshot. Do not rotate that replacement
+                    // using a completion from the preceding generation.
+                    if client.pool_generation() == business.pool_generation {
+                        client.rotate_instrumented_for_diagnostic(
+                            prewarm_url.to_string(), business.attempt_id);
+                    }
+                }
+            }
+        }
         // The socket driver publishes retirement even while no business is in
         // flight. Repair on the existing runtime before the next quote needs
         // TLS; generation fencing and quarantine remain the admission authority.
