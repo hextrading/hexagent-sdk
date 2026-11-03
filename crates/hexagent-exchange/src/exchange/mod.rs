@@ -1,3 +1,4 @@
+pub mod market_audit;
 pub(crate) mod ws_tls;
 pub mod aster;
 pub mod binance;
@@ -89,6 +90,7 @@ fn queue_stage(event: &MarketEvent, adapter: bool) -> &'static str {
 
 struct PublicMarketProgress {
     adapter: bool,
+    audit: Option<market_audit::AuditSink>,
     alive: AtomicBool,
     origin: Instant,
     contention_drops: AtomicU64,
@@ -282,11 +284,16 @@ pub fn market_event_channel(capacity: usize) -> (PublicMarketPublisher, PublicMa
 }
 
 fn market_event_channel_with_role(capacity: usize, adapter: bool) -> (PublicMarketPublisher, PublicMarketReceiver) {
+    market_event_channel_audited(capacity, adapter, None)
+}
+
+pub fn market_event_channel_audited(capacity: usize, adapter: bool, audit: Option<market_audit::AuditSink>) -> (PublicMarketPublisher, PublicMarketReceiver) {
     let capacity = capacity.max(1);
     let ordered = Arc::new(hexagent_runtime::try_queue::TryQueue::new(capacity));
     let latest = Arc::new(hexagent_runtime::try_queue::TryQueue::new(capacity));
     let progress = Arc::new(PublicMarketProgress {
         adapter,
+        audit,
         alive: AtomicBool::new(true),
         origin: Instant::now(),
         contention_drops: AtomicU64::new(0),
@@ -320,6 +327,7 @@ pub(crate) fn public_market_channel() -> (PublicMarketPublisher, PublicMarketRec
 }
 
 impl PublicMarketPublisher {
+    pub fn audit_sink(&self) -> Option<market_audit::AuditSink> { self.progress.audit.clone() }
     pub fn consumer_progress(&self) -> PublicMarketConsumerProgress {
         let now = self
             .progress
@@ -532,18 +540,38 @@ impl MarketEventPublisher for PublicMarketPublisher {
         if !self.progress.alive.load(Ordering::Acquire) {
             return Err(crossbeam_channel::SendError(event));
         }
+        let stage = if self.progress.adapter { "adapter_enqueue" } else { "root_enqueue" };
+        if let Some(audit) = &self.progress.audit { audit.event(stage, "attempt", &event, self.latest.len()); }
         let replaceable = replaceable_market_event(&event);
         let event = QueuedMarketEvent { event, enqueued_ns: crate::types::monotonic_now_ns() };
         if replaceable {
-            if let Err(event) = self.latest.try_push(event) {
-                if self.latest.try_pop().is_some() {
-                    PUBLIC_MARKET_OVERFLOW_REPLACEMENTS.fetch_add(1, Ordering::Relaxed);
-                }
-                if self.latest.try_push(event).is_err() {
-                    self.progress.contention_drops.fetch_add(1, Ordering::Relaxed);
-                    PUBLIC_MARKET_OVERFLOW_DROPS.fetch_add(1, Ordering::Relaxed);
+            use hexagent_runtime::try_queue::TryPushError;
+            let mut retained = event;
+            let mut evicted_once = false;
+            // Fixed budget; no waiting for another thread's publication. Only
+            // a confirmed full ring permits oldest-first eviction. A lost CAS
+            // below capacity must never remove an unrelated oracle tick.
+            for _ in 0..8 {
+                match self.latest.try_push_classified(retained) {
+                    Ok(()) => return Ok(()),
+                    Err(TryPushError::Contended(event)) => {
+                        if let Some(audit) = &self.progress.audit { audit.event(stage, "contention_retry", &event.event, self.latest.len()); }
+                        retained = event;
+                    }
+                    Err(TryPushError::Full(event)) => {
+                        retained = event;
+                        if evicted_once { break; }
+                        if let Some(evicted) = self.latest.try_pop() {
+                            evicted_once = true;
+                            if let Some(audit) = &self.progress.audit { audit.event(stage, "evicted_full", &evicted.event, self.latest.len()); }
+                            PUBLIC_MARKET_OVERFLOW_REPLACEMENTS.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
             }
+            if let Some(audit) = &self.progress.audit { audit.event(stage, "retry_exhausted", &retained.event, self.latest.len()); }
+            self.progress.contention_drops.fetch_add(1, Ordering::Relaxed);
+            PUBLIC_MARKET_OVERFLOW_DROPS.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         // A producer resumed after preemption can lose its first tail CAS to

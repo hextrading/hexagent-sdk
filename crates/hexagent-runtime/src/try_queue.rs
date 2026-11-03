@@ -106,6 +106,10 @@ pub struct TryQueue<T> {
 unsafe impl<T: Send> Send for TryQueue<T> {}
 unsafe impl<T: Send> Sync for TryQueue<T> {}
 
+/// A failed tail CAS is contention, never evidence that eviction is needed.
+#[derive(Debug)]
+pub enum TryPushError<T> { Full(T), Contended(T) }
+
 impl<T> TryQueue<T> {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0);
@@ -173,6 +177,33 @@ impl<T> TryQueue<T> {
     /// no lock, allocation, syscall, retry loop, or peer-completion wait.
     pub fn try_push(&self, value: T) -> Result<(), T> {
         self.push_with(value, || {})
+    }
+
+    /// Same bounded operation as try_push, but distinguishes actual capacity
+    /// exhaustion from a competing producer or an unreleased consumer slot.
+    pub fn try_push_classified(&self, value: T) -> Result<(), TryPushError<T>> {
+        self.push_classified_with(value, || {})
+    }
+
+    #[inline]
+    fn push_classified_with(&self, value: T, before_cas: impl FnOnce()) -> Result<(), TryPushError<T>> {
+        let tail = self.tail.0.load(Ordering::Relaxed);
+        let slot = &self.slots[tail & (self.lap - 1)];
+        if slot.stamp.load(Ordering::Acquire) != tail {
+            // A full ring has advanced exactly one lap beyond its head. An
+            // already reserved consumer slot is unavailable, but not full.
+            return Err(if self.head.0.load(Ordering::Acquire).wrapping_add(self.lap) == tail {
+                TryPushError::Full(value)
+            } else { TryPushError::Contended(value) });
+        }
+        before_cas(); // deterministic competing producer seam; before ownership
+        if self.tail.0.compare_exchange(tail, self.next(tail), Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return Err(TryPushError::Contended(value));
+        }
+        // SAFETY: successful tail CAS exclusively owns the vacant slot.
+        unsafe { (*slot.value.get()).write(value); }
+        slot.stamp.store(tail.wrapping_add(1), Ordering::Release);
+        Ok(())
     }
 
     /// Move ownership on success; retain the exact message on full/contention.
@@ -614,5 +645,35 @@ mod tests {
         }).unwrap();
         assert_eq!(q.try_pop(), Some(1));
         assert_eq!(q.try_pop(), Some(2));
+    }
+}
+
+#[cfg(test)]
+mod classified_tests {
+    use super::*;
+    #[test]
+    fn losing_tail_cas_is_contention_and_does_not_remove_peer() {
+        let q = TryQueue::new(10_000);
+        assert!(matches!(q.push_classified_with(2, || q.try_push(1).unwrap()), Err(TryPushError::Contended(2))));
+        assert_eq!(q.len(), 1);
+        q.try_push_classified(2).unwrap();
+        assert_eq!(q.try_pop(), Some(1)); assert_eq!(q.try_pop(), Some(2));
+    }
+    #[test]
+    fn full_is_distinct_from_consumer_releasing_a_reserved_slot() {
+        for capacity in [1, 2, 3, 4, 7] {
+            let q = TryQueue::new(capacity);
+            for round in 0..8 {
+                for n in 0..capacity { q.try_push_classified(n).unwrap(); }
+                assert!(matches!(q.try_push_classified(99), Err(TryPushError::Full(99))));
+                assert_eq!(q.pop_with(|| {
+                    // head advanced but its slot not released; capacity=1
+                    // exercises unavailable storage with zero logical depth.
+                    if capacity == 1 { assert!(matches!(q.try_push_classified(99), Err(TryPushError::Contended(99)))); }
+                }), Some(0));
+                for n in 1..capacity { assert_eq!(q.try_pop(), Some(n)); }
+                assert_eq!(q.len(),0,"round {round}");
+            }
+        }
     }
 }
