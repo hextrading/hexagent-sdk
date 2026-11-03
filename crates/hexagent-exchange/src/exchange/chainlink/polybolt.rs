@@ -19,6 +19,8 @@ use tokio_tungstenite::tungstenite::Message;
 const URL: &str = "wss://ws-live-v2.polymarket.com/ws";
 const CHANNELS: [&str; 2] = ["price.crypto", "price.crypto.twap"];
 const PRICE_STALL: Duration = Duration::from_secs(15);
+const CONNECTIONS: u64 = 2;
+const MERGE_BUDGET: usize = 32;
 
 /// No Debug implementation: authentication material must never enter logs.
 pub struct PolyBoltMarket {
@@ -27,6 +29,9 @@ pub struct PolyBoltMarket {
     symbols: Vec<String>,
     rx: Option<PublicMarketReceiver>,
     shutdown: Arc<AtomicBool>,
+    // Sole writer: public adapter consumer. Allocated at connect, never grown
+    // while polling. Independent sockets publish to the existing bounded lane.
+    merged: Vec<PriceState>,
 }
 impl PolyBoltMarket {
     pub fn new(key: &str, secret: &str, passphrase: &str) -> Self {
@@ -42,6 +47,7 @@ impl PolyBoltMarket {
             symbols: Vec::new(),
             rx: None,
             shutdown: Arc::new(AtomicBool::new(false)),
+            merged: Vec::new(),
         }
     }
 }
@@ -154,12 +160,13 @@ async fn task(
     tx: PublicMarketPublisher,
     shutdown: Arc<AtomicBool>,
     tls: crate::exchange::ws_tls::WsTlsConfig,
+    lane: u64,
 ) {
     let audit = tx.audit_sink();
-    let mut connection = 0u64;
+    let mut connection = lane;
     let mut backoff = crate::exchange::ReconnectBackoff::new(500, 30_000);
     while !shutdown.load(Ordering::Relaxed) {
-        connection += 1;
+        connection += CONNECTIONS;
         let connected = Instant::now();
         let result: Result<()> = async {
             let (stream, _) = tokio::time::timeout(WS_CONNECT_TIMEOUT,
@@ -180,6 +187,7 @@ async fn task(
                     }
                 }
             }).await??;
+            log::info!("[Chainlink/PolyBolt] lane={} connection={} authenticated=true", lane, connection);
             for (i, p) in prices.iter_mut().enumerate() {
                 p.accepted = false; p.fresh_at = Instant::now();
                 let mut filter = json!({"symbol":p.wire_symbol,"provider":"chainlink"});
@@ -240,7 +248,21 @@ async fn task(
                                 let symbol = payload.get("symbol").and_then(Value::as_str).ok_or_else(|| anyhow!("missing PolyBolt symbol"))?;
                                 let Some(p) = prices.iter_mut().find(|p| p.channel == channel && p.wire_symbol == symbol) else { continue; };
                                 if !p.accepted { bail!("price received before subscription acceptance"); }
-                                if data.get("snapshot").and_then(Value::as_bool) == Some(true) { continue; }
+                                if data.get("snapshot").and_then(Value::as_bool) == Some(true) {
+                                    // Historical evidence only: never update freshness, the live
+                                    // watermark, recorder market lane or settlement/strike caches.
+                                    if let (Some(audit), Some(points)) = (&audit, payload.get("data").and_then(Value::as_array)) {
+                                        for point in points {
+                                            let Some(source_ns) = point["timestamp"].as_u64().and_then(|n| n.checked_mul(1_000_000)) else { continue; };
+                                            let Some(price) = point["full_accuracy_value"].as_str().and_then(|s| s.parse::<f64>().ok()).filter(|p| p.is_finite() && *p > 0.) else { continue; };
+                                            let mut r = crate::exchange::market_audit::AuditRecord::empty("polybolt_history", "snapshot");
+                                            r.connection = connection; r.seq = data["seq"].as_u64().unwrap_or(0); r.channel = channel;
+                                            r.source_ns = source_ns; r.received_ns = received_ns; r.price = price;
+                                            r.symbol_id = crate::exchange::market_audit::symbol_id(&p.label); audit.record(r);
+                                        }
+                                    }
+                                    continue;
+                                }
                                 let (source_ns, price) = decode(payload, channel)?;
                                 let fresh = p.observe(source_ns, price, Instant::now())?;
                                 if let Some(audit) = &audit {
@@ -265,7 +287,11 @@ async fn task(
             break;
         }
         if let Err(error) = result {
-            log::warn!("[Chainlink/PolyBolt] {}", error);
+            log::warn!("[Chainlink/PolyBolt] lane={} connection={} error={}", lane, connection, error);
+            for p in &prices {
+                log::warn!("[Chainlink/PolyBolt] lane={} connection={} symbol={} accepted={} last_source_ns={} fresh_age_ms={}",
+                    lane, connection, p.label, p.accepted, p.source_ns, p.fresh_at.elapsed().as_millis());
+            }
         }
         if connected.elapsed() >= Duration::from_secs(30) {
             backoff.reset();
@@ -296,7 +322,7 @@ impl ExchangeMarket for PolyBoltMarket {
             bail!("PolyBolt requires subscribed price symbols");
         }
         let tls = crate::exchange::ws_tls::WsTlsConfig::load_native()?;
-        let prices = self
+        self.merged = self
             .symbols
             .iter()
             .map(|s| PriceState::new(s))
@@ -304,27 +330,32 @@ impl ExchangeMarket for PolyBoltMarket {
         let (tx, rx) = crate::exchange::market_event_channel_audited(crate::exchange::PUBLIC_MARKET_ADAPTER_LANE_CAPACITY, true, self.audit.clone());
         self.rx = Some(rx);
         self.shutdown = Arc::new(AtomicBool::new(false));
-        crate::async_rt::handle().spawn(task(
-            URL.to_owned(),
-            self.auth.clone(),
-            prices,
-            tx,
-            self.shutdown.clone(),
-            tls,
-        ));
+        for lane in 0..CONNECTIONS {
+            let prices = self.symbols.iter().map(|s| PriceState::new(s)).collect::<Result<Vec<_>>>()?;
+            crate::async_rt::handle().spawn(task(URL.to_owned(), self.auth.clone(), prices,
+                tx.clone(), self.shutdown.clone(), tls.clone(), lane));
+        }
         Ok(())
     }
     fn next_event(&mut self) -> Result<Option<MarketEvent>> {
-        match self
-            .rx
-            .as_ref()
-            .ok_or_else(|| anyhow!("PolyBolt not connected"))?
-            .try_recv()
-        {
-            Ok(e) => Ok(Some(e)),
-            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => bail!("PolyBolt task ended"),
+        if self.shutdown.load(Ordering::Relaxed) { bail!("PolyBolt stopped"); }
+        for _ in 0..MERGE_BUDGET {
+            let event = match self.rx.as_ref().ok_or_else(|| anyhow!("PolyBolt not connected"))?.try_recv() {
+                Ok(e) => e,
+                Err(crossbeam_channel::TryRecvError::Empty) => return Ok(None),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => bail!("PolyBolt tasks ended"),
+            };
+            if let MarketEvent::SpotPrice(p) = &event {
+                let state = self.merged.iter_mut().find(|s| s.label == p.symbol)
+                    .ok_or_else(|| anyhow!("unexpected PolyBolt merge symbol"))?;
+                match state.observe(p.timestamp_ns, p.price, Instant::now()) {
+                    Ok(true) => return Ok(Some(event)),
+                    Ok(false) => continue,
+                    Err(e) => { self.shutdown.store(true, Ordering::Relaxed); return Err(e); }
+                }
+            }
         }
+        Ok(None)
     }
     fn disconnect(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
@@ -338,6 +369,88 @@ impl ExchangeMarket for PolyBoltMarket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn merge_fixture(capacity: usize) -> (PolyBoltMarket, PublicMarketPublisher) {
+        let mut market = PolyBoltMarket::new("key", "secret", "pass");
+        market.subscribe(&["btc/usd".into(), "btc/usd/twap/60s".into()]).unwrap();
+        market.merged = market.symbols.iter().map(|s| PriceState::new(s).unwrap()).collect();
+        let (tx, rx) = crate::exchange::market_event_channel_audited(capacity, true, None);
+        market.rx = Some(rx);
+        (market, tx)
+    }
+
+    fn tick(symbol: &str, stamp: u64, received: u64, price: f64) -> MarketEvent {
+        MarketEvent::SpotPrice(SpotPrice { source: "chainlink".into(), symbol: symbol.into(),
+            timestamp_ns: stamp, local_timestamp_ns: received, price })
+    }
+
+    #[test]
+    fn redundant_merge_covers_twelve_second_stall_and_replay_without_changing_clocks() {
+        let (mut market, tx) = merge_fixture(128);
+        let mut stamps = Vec::new();
+        for second in 1..=30 {
+            // Socket A loses 12 observations. Socket B continues independently.
+            if !(10..22).contains(&second) {
+                crate::exchange::publish_market_event(&tx, tick("btc/usd", second, second+100, 10.)).unwrap();
+            }
+            crate::exchange::publish_market_event(&tx, tick("btc/usd", second, second+200, 10.)).unwrap();
+            while let Some(MarketEvent::SpotPrice(p)) = market.next_event().unwrap() {
+                stamps.push(p.timestamp_ns);
+                assert_eq!(p.local_timestamp_ns, second + if (10..22).contains(&second) {200} else {100});
+            }
+        }
+        assert_eq!(stamps, (1..=30).collect::<Vec<_>>());
+        // Delayed/reconnected socket cannot roll back live time or re-emit history.
+        for second in 10..=30 { crate::exchange::publish_market_event(&tx, tick("btc/usd", second, 999, 10.)).unwrap(); }
+        assert!(market.next_event().unwrap().is_none());
+        crate::exchange::publish_market_event(&tx, tick("btc/usd/twap/60s", 20, 300, 11.)).unwrap();
+        assert!(market.next_event().unwrap().is_some(), "TWAP has its own watermark");
+        let (mut independent, other_tx) = merge_fixture(2);
+        crate::exchange::publish_market_event(&other_tx, tick("btc/usd", 1, 2, 9.)).unwrap();
+        assert!(independent.next_event().unwrap().is_some(), "instances cannot share merge state");
+    }
+
+    #[test]
+    fn merge_is_bounded_and_conflicts_fail_closed() {
+        let (mut market, tx) = merge_fixture(128);
+        for _ in 0..70 { crate::exchange::publish_market_event(&tx, tick("btc/usd", 1, 2, 10.)).unwrap(); }
+        assert!(market.next_event().unwrap().is_some());
+        assert!(market.next_event().unwrap().is_none());
+        assert!(market.rx.as_ref().unwrap().try_recv().is_ok(), "bounded duplicate drain yields to other feeds");
+        while market.rx.as_ref().unwrap().try_recv().is_ok() {}
+        crate::exchange::publish_market_event(&tx, tick("btc/usd", 1, 3, 11.)).unwrap();
+        assert!(market.next_event().is_err());
+        assert!(market.shutdown.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn merge_overflow_remains_bounded_drop_oldest_and_monotone() {
+        let (mut market, tx) = merge_fixture(2);
+        for n in 1..=10 { crate::exchange::publish_market_event(&tx, tick("btc/usd", n, n+10, 10.)).unwrap(); }
+        let mut seen=Vec::new();
+        while let Some(MarketEvent::SpotPrice(p)) = market.next_event().unwrap() {seen.push(p.timestamp_ns);}
+        assert_eq!(seen, vec![9,10]);
+    }
+
+    #[test]
+    #[ignore = "optimized before/after bounded receive-to-merge benchmark"]
+    fn redundant_merge_benchmark() {
+        use std::hint::black_box;
+        for merged in [false, true] {
+            let (mut market, tx) = merge_fixture(16);
+            let mut samples = Vec::with_capacity(200_000);
+            for n in 1..=200_000 {
+                crate::exchange::publish_market_event(&tx, tick("btc/usd", n, n+1, 10.)).unwrap();
+                let begin = Instant::now();
+                let event = if merged { market.next_event().unwrap().unwrap() }
+                    else { market.rx.as_ref().unwrap().try_recv().unwrap() };
+                black_box(&event);
+                samples.push(begin.elapsed().as_nanos());
+            }
+            samples.sort_unstable();
+            println!("redundant_merge={merged} n={} median_ns={} p99_ns={} p999_ns={} max_ns={} queue_high_water=1 overflow=0 boundary=adapter_try_recv_through_validation_excludes_event_allocation_network_and_strategy",samples.len(),samples[100_000],samples[198_000],samples[199_800],samples[199_999]);
+        }
+    }
     #[test]
     fn decimal_source_clock_and_provider_are_explicit() {
         let p = json!({"symbol":"btcusd","source":"chainlink","full_accuracy_value":"76457.775242712579047424","value":1,"timestamp":1793688862000u64,"window_seconds":60});
@@ -408,6 +521,55 @@ mod tests {
             .unwrap();
     }
     #[tokio::test]
+    async fn independent_socket_keeps_delivering_during_twelve_second_wire_stall() {
+        use futures_util::SinkExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut sessions = Vec::new();
+            for lane in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                sessions.push(tokio::spawn(async move {
+                    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                    ws.next().await.unwrap().unwrap();
+                    ws.send(Message::Text(json!({"op":"authed"}).to_string())).await.unwrap();
+                    ws.next().await.unwrap().unwrap();
+                    ws.send(Message::Text(json!({"op":"subscribed","rid":"0","channel":"price.crypto"}).to_string())).await.unwrap();
+                    for second in 1..=14u64 {
+                        // One real socket stalls, while the sibling progresses.
+                        // On return its old observation must not roll back time.
+                        if lane == 0 && second == 2 {tokio::time::sleep(Duration::from_secs(12)).await;}
+                        let frame=json!({"v":1,"channel":"price.crypto","seq":second,"ts":second*1000,
+                            "payload":{"symbol":"btcusd","source":"chainlink","timestamp":second*1000,"full_accuracy_value":"123.25"}});
+                        if ws.send(Message::Text(frame.to_string())).await.is_err() {break;}
+                        if lane == 1 {tokio::time::sleep(Duration::from_secs(1)).await;}
+                    }
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }));
+            }
+            for session in sessions {session.await.unwrap();}
+        });
+        let (mut market, tx) = merge_fixture(128);
+        let mut owners=Vec::new();
+        for lane in 0..2 {
+            owners.push(tokio::spawn(task(url.clone(), "{\"op\":\"auth\"}".into(),
+                vec![PriceState::new("btc/usd").unwrap()],tx.clone(),market.shutdown.clone(),
+                crate::exchange::ws_tls::WsTlsConfig::load_native().unwrap(),lane)));
+        }
+        let mut stamps=Vec::new();
+        tokio::time::timeout(Duration::from_secs(18), async {
+            while stamps.len()<14 {
+                if let Some(MarketEvent::SpotPrice(p))=market.next_event().unwrap() {stamps.push(p.timestamp_ns);}
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(stamps,(1..=14).map(|n|n*1_000_000_000).collect::<Vec<_>>());
+        market.disconnect();
+        for owner in owners {owner.abort();}
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn wire_auth_snapshots_replay_gap_and_reconnect() {
         use futures_util::SinkExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -454,6 +616,7 @@ mod tests {
             tx,
             stop.clone(),
             crate::exchange::ws_tls::WsTlsConfig::load_native().unwrap(),
+            0,
         ));
         let mut stamps = Vec::new();
         tokio::time::timeout(Duration::from_secs(5), async {

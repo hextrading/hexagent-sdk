@@ -700,7 +700,7 @@ fn spawn_execution_diagnostics(
                         depth, high_water, rejected, retry.0, retry.1, retry.2, retry.3,
                     ),
                     ExecutionDiagnostic::Admission { account, snapshot, paused_total_ns, place_blocked_total_ns, capacity, replaced_snapshots, no_response_resets, cancel_outbox, event_audit_queue, lane_evidence_dropped } => info!(
-                        "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0 no_response_resets={} cancel_outbox_depth={} cancel_outbox_high_water={} cancel_outbox_oldest_ns={} cancel_coalesced={} cancel_outbox_overflow={} event_audit_depth={} event_audit_sampled_high_water={} event_audit_rejected={} event_audit_capacity=512 place_blocked_total_ms={} reason={} ready_fast={} verified_free={} probation_free={} probation_busy={} eligible_cancel={} ready_mask={} verified_mask={} busy_mask={} observed_at_ns={} blockers={} pause_until_ns={} recovery_successes={} recovery_required={} probe_dispatched_at_ns={} probe_attempt_after={} lane_evidence_dropped={}",
+                        "[execution_admission] account={} state={:?} epoch={} available_place_slots={} paused_total_ms={} snapshot_replaced={} snapshot_capacity=1 lifecycle_dropped=0 no_response_resets={} cancel_outbox_depth={} cancel_outbox_high_water={} cancel_outbox_oldest_ns={} cancel_coalesced={} cancel_outbox_overflow={} event_audit_depth={} event_audit_sampled_high_water={} event_audit_rejected={} event_audit_capacity=512 place_blocked_total_ms={} reason={} ready_fast={} verified_free={} probation_free={} probation_busy={} eligible_cancel={} ready_cancel={} failed_cancel_mask={} ready_mask={} verified_mask={} busy_mask={} observed_at_ns={} blockers={} pause_until_ns={} recovery_successes={} recovery_required={} probe_dispatched_at_ns={} probe_attempt_after={} lane_evidence_dropped={}",
                         account, snapshot.state, snapshot.epoch, snapshot.available_place_slots,
                         paused_total_ns / 1_000_000, replaced_snapshots, no_response_resets,
                         cancel_outbox.depth, cancel_outbox.high_water, cancel_outbox.oldest_ns,
@@ -708,7 +708,7 @@ fn spawn_execution_diagnostics(
                         event_audit_queue.0, event_audit_queue.1, event_audit_queue.2,
                         place_blocked_total_ns / 1_000_000, capacity.reason,
                         capacity.ready_fast, capacity.verified_free, capacity.probation_free,
-                        capacity.probation_busy, capacity.eligible_cancel,
+                        capacity.probation_busy, capacity.eligible_cancel, capacity.ready_cancel, capacity.failed_cancel_mask,
                         capacity.ready_mask, capacity.verified_mask, capacity.busy_mask,
                         snapshot.observed_at_ns, capacity.blockers, capacity.pause_until_ns,
                         capacity.recovery_successes, capacity.recovery_required,
