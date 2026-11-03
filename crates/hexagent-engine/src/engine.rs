@@ -5027,7 +5027,14 @@ impl Engine {
             );
         }
 
-        let (market_tx, market_rx) = crate::exchange::market_event_channel(CHANNEL_CAPACITY);
+        // Explicit opt-in, RECORD only. Existing recorder owns all audit I/O.
+        let (audit_sink, mut audit_writer) = if std::env::var_os("HEX_MARKET_AUDIT").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            let dir = std::path::Path::new(&self.config.recording.output_dir);
+            std::fs::create_dir_all(dir)?;
+            let (sink, writer) = crate::exchange::market_audit::AuditWriter::create(&dir.join("market-audit.jsonl"), 65_536)?;
+            (Some(sink), Some(writer))
+        } else { (None, None) };
+        let (market_tx, market_rx) = crate::exchange::market_event_channel_audited(CHANNEL_CAPACITY, false, audit_sink.clone());
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_tx = market_tx.clone();
 
@@ -5208,6 +5215,9 @@ impl Engine {
                 // to gate the probe target onto `first_poly_series` only.
                 let mut current_event_series: Option<String> = None;
                 loop {
+                    if let Some(writer) = audit_writer.as_mut() {
+                        if let Err(error) = writer.drain(256) { error!("[Recorder] Market audit failed: {error}"); request_feed_process_shutdown("market audit write failed"); break; }
+                    }
                     if let Some(protocol) = protocol.as_mut() {
                         if let Err(error) = protocol.drain(&mut recorder, 256) { error!("[Recorder] Protocol evidence incomplete: {}", error); }
                     }
@@ -5217,6 +5227,7 @@ impl Engine {
                     };
                     match incoming {
                         Ok(event) => {
+                            if let Some(audit) = &audit_sink { audit.event("record_receive", "received", &event, 0); }
                             if matches!(event, MarketEvent::Exit) { break; }
                             // all_probe: keep the probe's target fresh — the
                             // current polymarket event's high-priced side.
@@ -5306,6 +5317,9 @@ impl Engine {
                 }
                 if let Some(protocol) = protocol.as_mut() {
                     if let Err(error) = protocol.finish(&mut recorder) { error!("[Recorder] Protocol shutdown incomplete: {}", error); }
+                }
+                if let Some(writer) = audit_writer.as_mut() {
+                    if let Err(error) = writer.finish() { error!("[Recorder] Market audit finish failed: {error}"); }
                 }
                 info!("[Recorder] Flushing {} events...", recorder.event_count());
                 if let Err(e) = recorder.flush() {
@@ -11105,7 +11119,7 @@ impl Engine {
                             match cfg.source.as_str() {
                                 "polybolt" => Box::new(crate::exchange::chainlink::PolyBoltMarket::new(
                                     &cfg.api_key, &cfg.api_secret, &cfg.api_passphrase,
-                                )),
+                                ).with_audit(tx.audit_sink())),
                                 "stream" => Box::new(crate::exchange::chainlink::ChainlinkStreamMarket::new(
                                     &cfg.api_key, &cfg.api_secret, &cfg.wss_url,
                                 )),

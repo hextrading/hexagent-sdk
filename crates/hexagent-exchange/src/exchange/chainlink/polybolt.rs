@@ -23,6 +23,7 @@ const PRICE_STALL: Duration = Duration::from_secs(15);
 /// No Debug implementation: authentication material must never enter logs.
 pub struct PolyBoltMarket {
     auth: String,
+    audit: Option<crate::exchange::market_audit::AuditSink>,
     symbols: Vec<String>,
     rx: Option<PublicMarketReceiver>,
     shutdown: Arc<AtomicBool>,
@@ -37,11 +38,16 @@ impl PolyBoltMarket {
         };
         Self {
             auth,
+            audit: None,
             symbols: Vec::new(),
             rx: None,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
+}
+
+impl PolyBoltMarket {
+    pub fn with_audit(mut self, audit: Option<crate::exchange::market_audit::AuditSink>) -> Self { self.audit = audit; self }
 }
 
 struct PriceState {
@@ -149,8 +155,11 @@ async fn task(
     shutdown: Arc<AtomicBool>,
     tls: crate::exchange::ws_tls::WsTlsConfig,
 ) {
+    let audit = tx.audit_sink();
+    let mut connection = 0u64;
     let mut backoff = crate::exchange::ReconnectBackoff::new(500, 30_000);
     while !shutdown.load(Ordering::Relaxed) {
+        connection += 1;
         let connected = Instant::now();
         let result: Result<()> = async {
             let (stream, _) = tokio::time::timeout(WS_CONNECT_TIMEOUT,
@@ -214,6 +223,17 @@ async fn task(
                                 }
                                 let channel = CHANNELS.iter().position(|c| data.get("channel").and_then(Value::as_str) == Some(c))
                                     .ok_or_else(|| anyhow!("unexpected PolyBolt channel"))?;
+                                if let Some(audit) = &audit {
+                                    use crate::exchange::market_audit::{AuditRecord, symbol_id};
+                                    let payload = &data["payload"];
+                                    let mut r = AuditRecord::empty("polybolt_ingress", if data["snapshot"] == true { "snapshot" } else { "live" });
+                                    r.connection = connection; r.seq = data["seq"].as_u64().unwrap_or(0); r.channel = channel;
+                                    r.received_ns = received_ns;
+                                    r.source_ns = payload["timestamp"].as_u64().unwrap_or(0).saturating_mul(1_000_000);
+                                    r.price = payload["full_accuracy_value"].as_str().and_then(|s| s.parse().ok()).filter(|p: &f64| p.is_finite()).unwrap_or(0.);
+                                    r.symbol_id = symbol_id(payload["symbol"].as_str().unwrap_or(""));
+                                    audit.record(r);
+                                }
                                 seq.accept(channel, &data)?;
                                 let payload = data.get("payload").ok_or_else(|| anyhow!("missing PolyBolt payload"))?;
                                 if payload.get("source").and_then(Value::as_str) != Some("chainlink") { bail!("PolyBolt provider changed"); }
@@ -222,7 +242,14 @@ async fn task(
                                 if !p.accepted { bail!("price received before subscription acceptance"); }
                                 if data.get("snapshot").and_then(Value::as_bool) == Some(true) { continue; }
                                 let (source_ns, price) = decode(payload, channel)?;
-                                if !p.observe(source_ns, price, Instant::now())? { continue; }
+                                let fresh = p.observe(source_ns, price, Instant::now())?;
+                                if let Some(audit) = &audit {
+                                    let mut r = crate::exchange::market_audit::AuditRecord::empty("polybolt_filter", if fresh { "accepted" } else { "stale_or_duplicate" });
+                                    r.connection = connection; r.seq = data["seq"].as_u64().unwrap_or(0); r.channel = channel;
+                                    r.source_ns = source_ns; r.received_ns = received_ns; r.price = price;
+                                    r.symbol_id = crate::exchange::market_audit::symbol_id(&p.label); audit.record(r);
+                                }
+                                if !fresh { continue; }
                                 let event = MarketEvent::SpotPrice(SpotPrice { source: "chainlink".to_owned(), symbol: p.label.clone(), price,
                                     timestamp_ns: source_ns, local_timestamp_ns: received_ns });
                                 // Existing bounded public lane; receiver destruction ends this owner.
@@ -274,7 +301,7 @@ impl ExchangeMarket for PolyBoltMarket {
             .iter()
             .map(|s| PriceState::new(s))
             .collect::<Result<Vec<_>>>()?;
-        let (tx, rx) = crate::exchange::public_market_channel();
+        let (tx, rx) = crate::exchange::market_event_channel_audited(crate::exchange::PUBLIC_MARKET_ADAPTER_LANE_CAPACITY, true, self.audit.clone());
         self.rx = Some(rx);
         self.shutdown = Arc::new(AtomicBool::new(false));
         crate::async_rt::handle().spawn(task(
