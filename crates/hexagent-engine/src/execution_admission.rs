@@ -125,10 +125,20 @@ pub(crate) struct AdmissionCapacityDetail {
     pub eligible_cancel: u16,
     pub ready_cancel: u16,
     pub failed_cancel_mask: u64,
+    pub unready_cancel_mask: u64,
+    pub unverified_fast_mask: u64,
+    pub failed_fast_mask: u64,
     pub ready_mask: u64,
     pub verified_mask: u64,
     pub busy_mask: u64,
     pub reason: &'static str,
+    /// Healthy-predicate blockers, independent of available trading capacity:
+    /// 1 stale Fast, 2 unready Fast transport, 4 unverified Fast business,
+    /// 8 stale ordinary Cancel, 16 unready ordinary Cancel transport,
+    /// 32 failed ordinary Cancel business, 64 stale reserved Cancel.
+    /// Diagnostic only; never used for admission or lane selection.
+    pub health_blockers: u8,
+    pub health_reason: &'static str,
     /// Overlapping blockers: 1 no Fast, 2 no cancel, 4 backoff, 8 old/busy Fast,
     /// 16 probe in flight, 32 recovery evidence incomplete. Diagnostic only.
     pub blockers: u8,
@@ -589,7 +599,11 @@ impl AccountExecutionAdmission {
             probe_attempt_after: self.probe.map_or(0, |p| p.after_attempt),
             ..Default::default() };
         for (slot, lane) in self.fast.iter().enumerate() {
-            let ready = lane.fresh(now_ns, self.config.stale_after_ns) && lane.ready();
+            let fresh = lane.fresh(now_ns, self.config.stale_after_ns);
+            let ready = fresh && lane.ready();
+            detail.health_blockers |= u8::from(!fresh)
+                | (u8::from(!lane.ready()) << 1)
+                | (u8::from(!lane.verified) << 2);
             detail.ready_fast += u16::from(ready);
             detail.verified_free += u16::from(ready && lane.verified && !lane.busy);
             detail.probation_free += u16::from(ready && !lane.verified && !lane.busy);
@@ -599,6 +613,8 @@ impl AccountExecutionAdmission {
                 detail.ready_mask |= u64::from(ready) << slot;
                 detail.verified_mask |= u64::from(ready && lane.verified) << slot;
                 detail.busy_mask |= u64::from(lane.busy) << slot;
+                detail.unverified_fast_mask |= u64::from(!lane.verified) << slot;
+                detail.failed_fast_mask |= u64::from(lane.business_failed) << slot;
             }
         }
         detail.eligible_cancel = self.cancel.iter().filter(|lane| {
@@ -608,9 +624,34 @@ impl AccountExecutionAdmission {
         detail.ready_cancel = self.cancel.iter().filter(|lane| !lane.reserved_cancel
             && lane.fresh(now_ns, self.config.stale_after_ns) && lane.cancel_ready())
             .count().min(u16::MAX as usize) as u16;
-        for (slot, lane) in self.cancel.iter().take(64).enumerate() {
-            detail.failed_cancel_mask |= u64::from(!lane.reserved_cancel && lane.business_failed) << slot;
+        for (slot, lane) in self.cancel.iter().enumerate() {
+            let fresh = lane.fresh(now_ns, self.config.stale_after_ns);
+            if lane.reserved_cancel {
+                // The existing Healthy predicate checks every owner's lease,
+                // including the reserved lane. Transport readiness of that
+                // emergency-only lane is not ordinary cancel admission.
+                detail.health_blockers |= u8::from(!fresh) << 6;
+            } else {
+                detail.health_blockers |= (u8::from(!fresh) << 3)
+                    | (u8::from(!lane.ready()) << 4)
+                    | (u8::from(lane.business_failed) << 5);
+                if slot < 64 {
+                    detail.failed_cancel_mask |= u64::from(lane.business_failed) << slot;
+                    detail.unready_cancel_mask |= u64::from(!fresh || !lane.ready()) << slot;
+                }
+            }
         }
+        detail.health_reason = match detail.health_blockers {
+            0 => "none",
+            1 => "fast_stale",
+            2 => "fast_transport_unready",
+            4 => "fast_business_unverified",
+            8 => "cancel_stale",
+            16 => "cancel_transport_unready",
+            32 => "cancel_business_failed",
+            64 => "reserved_cancel_stale",
+            _ => "multiple",
+        };
         detail.blockers = u8::from(detail.ready_fast == 0)
             | (u8::from(detail.eligible_cancel == 0) << 1)
             | (u8::from(now_ns < self.pause_until_ns) << 2)
@@ -836,6 +877,113 @@ mod tests {
         assert!(!h.state.lane_place_allowed(1, h.now));
         h.outcome(Role::Fast, 1, BusinessHttpOutcome::Healthy);
         assert!(!h.state.lane_place_allowed(1, h.now), "retired generation cannot be resurrected");
+    }
+
+    #[test]
+    #[ignore = "focused admission diagnostic copy benchmark; release nocapture"]
+    fn admission_health_diagnostic_benchmark() {
+        const N: usize = 200_000;
+        let mut healthy = Harness::healthy(4, 4);
+        healthy.state.reserve_cancel_slot(0);
+        let mut degraded = Harness::healthy(4, 4);
+        degraded.state.reserve_cancel_slot(0);
+        degraded.outcome(Role::Fast, 0, BusinessHttpOutcome::SlowResponded);
+        degraded.outcome(Role::Cancel, 1, BusinessHttpOutcome::SlowResponded);
+        let mut samples = Vec::with_capacity(N);
+        for index in 0..N + 1000 {
+            let h = std::hint::black_box(if index % 2 == 0 { &healthy } else { &degraded });
+            let start = std::time::Instant::now();
+            std::hint::black_box(h.state.capacity_detail(std::hint::black_box(h.now)));
+            let elapsed = start.elapsed().as_nanos() as u64;
+            if index >= 1000 { samples.push(elapsed); }
+        }
+        samples.sort_unstable();
+        eprintln!("admission_diagnostic boundary=immutable-capacity-detail events={N} median_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0 detail_bytes={}",
+            samples[(N-1)/2], samples[(N-1)*99/100], samples[(N-1)*999/1000], samples[N-1],
+            std::mem::size_of::<AdmissionCapacityDetail>());
+    }
+
+    #[test]
+    fn degraded_health_reason_tracks_the_live_overlapping_slow_response_case() {
+        let mut h = Harness::healthy(4, 4);
+        let other = Harness::healthy(4, 4);
+        h.state.reserve_cancel_slot(0);
+        h.outcome(Role::Fast, 0, BusinessHttpOutcome::SlowResponded);
+        let detail = h.state.capacity_detail(h.now);
+        assert_eq!(h.state.current().state, ExecutionAdmissionState::Degraded);
+        assert_eq!(detail.reason, "open", "capacity is not business health");
+        assert_eq!(detail.health_reason, "fast_business_unverified");
+        assert_eq!(detail.health_blockers, 4);
+        assert_eq!(detail.unverified_fast_mask, 1);
+        assert_eq!(detail.failed_fast_mask, 1);
+        assert_eq!(detail.failed_cancel_mask, 0);
+
+        h.outcome(Role::Cancel, 1, BusinessHttpOutcome::SlowResponded);
+        h.outcome(Role::Fast, 0, BusinessHttpOutcome::SlowRetired);
+        let detail = h.state.capacity_detail(h.now);
+        assert_eq!(detail.health_blockers, 2 | 4 | 32);
+        assert_eq!(detail.health_reason, "multiple");
+        assert_eq!(detail.failed_cancel_mask, 2);
+        assert_eq!(detail.unready_cancel_mask, 0, "slow response is not a dead socket");
+        h.outcome(Role::Fast, 0, BusinessHttpOutcome::Healthy);
+        assert_eq!(h.state.capacity_detail(h.now).health_blockers, 2 | 4 | 32,
+            "late success cannot resurrect a retired generation");
+        h.emit(Role::Fast, 0, |o| o.health.pool_generation += 1);
+        assert_eq!(h.state.capacity_detail(h.now).health_blockers, 4 | 32,
+            "a prewarmed replacement is not verified business health");
+        h.success(0);
+        assert_eq!(h.state.capacity_detail(h.now).health_reason, "cancel_business_failed");
+        assert_eq!(h.state.capacity_detail(h.now).unverified_fast_mask, 0);
+        assert_eq!(h.state.current().state, ExecutionAdmissionState::Degraded);
+        h.outcome(Role::Cancel, 1, BusinessHttpOutcome::Healthy);
+        assert_eq!(h.state.current().state, ExecutionAdmissionState::Healthy);
+        assert_eq!(h.state.capacity_detail(h.now).health_blockers, 0);
+        assert_eq!(other.state.capacity_detail(other.now).health_blockers, 0);
+    }
+
+    #[test]
+    fn diagnostic_health_preserves_the_exact_slow_threshold_and_duplicate_fence() {
+        let mut h = Harness::healthy(4, 4);
+        h.attempt += 1;
+        let attempt = h.attempt;
+        h.emit(Role::Fast, 0, |o| {
+            o.business = Some(BusinessHttpOutcomeSnapshot {
+                attempt_id: attempt, pool_generation: o.health.pool_generation,
+                elapsed_ns: SLOW_HTTP_NS, outcome: BusinessHttpOutcome::Healthy, status_code: 200,
+            });
+        });
+        assert_eq!(h.state.current().state, ExecutionAdmissionState::Degraded);
+        assert_eq!(h.state.capacity_detail(h.now).health_blockers, 4);
+        h.emit(Role::Fast, 0, |o| o.business.as_mut().unwrap().elapsed_ns = SLOW_HTTP_NS - 1);
+        assert_eq!(h.state.current().state, ExecutionAdmissionState::Degraded,
+            "changing a replayed result cannot supply new healthy evidence");
+        h.attempt += 1;
+        let attempt = h.attempt;
+        h.emit(Role::Fast, 0, |o| o.business.as_mut().unwrap().attempt_id = attempt);
+        assert_eq!(h.state.current().state, ExecutionAdmissionState::Healthy);
+        assert_eq!(h.state.capacity_detail(h.now).health_blockers, 0);
+    }
+
+    #[test]
+    fn health_diagnostics_explain_reserved_lease_expiry_without_relaxing_it() {
+        let mut h = Harness::healthy(4, 4);
+        h.state.reserve_cancel_slot(0);
+        for _ in 0..31 {
+            h.now += 100_000_000;
+            for slot in 0..4 { h.emit(Role::Fast, slot, |_| {}); }
+            for slot in 1..4 { h.emit(Role::Cancel, slot, |_| {}); }
+        }
+        let detail = h.state.capacity_detail(h.now);
+        assert_eq!(h.state.current().state, ExecutionAdmissionState::Degraded);
+        assert_eq!(detail.health_reason, "reserved_cancel_stale");
+        assert_eq!(detail.health_blockers, 64);
+        assert_eq!(detail.ready_fast, 4);
+        assert_eq!(detail.ready_cancel, 3);
+        assert_eq!(detail.failed_cancel_mask, 0);
+        assert_eq!(detail.unverified_fast_mask, 0);
+        h.emit(Role::Cancel, 0, |_| {});
+        assert_eq!(h.state.current().state, ExecutionAdmissionState::Healthy);
+        assert_eq!(h.state.capacity_detail(h.now).health_blockers, 0);
     }
 
     #[test]
