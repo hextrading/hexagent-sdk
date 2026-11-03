@@ -51,6 +51,33 @@ const STALE_THRESHOLD: Duration = Duration::from_secs(60);
 const RTDS_TOPIC_STALL_THRESHOLD: Duration = Duration::from_secs(90);
 const TOPIC_STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Copy)]
+struct RtdsPriceLiveness {
+    last_fresh: Instant,
+    source_ns: u64,
+}
+
+impl RtdsPriceLiveness {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_fresh: now,
+            source_ns: 0,
+        }
+    }
+
+    fn observe(&mut self, source_ns: u64, now: Instant) {
+        // Replayed/duplicate observations cannot disguise a frozen oracle.
+        if source_ns > self.source_ns {
+            self.source_ns = source_ns;
+            self.last_fresh = now;
+        }
+    }
+
+    fn is_stale(&self, now: Instant) -> bool {
+        now.duration_since(self.last_fresh) >= RTDS_TOPIC_STALL_THRESHOLD
+    }
+}
+
 pub struct ChainlinkMarket {
     tls: Option<crate::exchange::ws_tls::WsTlsConfig>,
     symbols: Vec<String>,
@@ -90,7 +117,10 @@ async fn chainlink_ws_task(
         let stream = match tokio::time::timeout(
             WS_CONNECT_TIMEOUT,
             tokio_tungstenite::connect_async_tls_with_config(
-                RTDS_URL, None, false, Some(tls.connector()),
+                RTDS_URL,
+                None,
+                false,
+                Some(tls.connector()),
             ),
         )
         .await
@@ -125,6 +155,8 @@ async fn chainlink_ws_task(
         // off. Reset only after the connection proves stable (≥30s), below.
         let connected_at = Instant::now();
         let mut health = WsHealth::new(connected_at);
+        // Task-local, fixed length for this connection. No steady-state growth.
+        let mut requested_prices = vec![RtdsPriceLiveness::new(connected_at); symbols.len()];
         let (mut write, mut read) = stream.split();
 
         // ALWAYS subscribe the whole topic unfiltered and filter client-side
@@ -217,6 +249,7 @@ async fn chainlink_ws_task(
                     // observed to self-heal.
                     if now.duration_since(last_spot_frame) >= RTDS_TOPIC_STALL_THRESHOLD
                         || (needs_twap && now.duration_since(last_twap_frame) >= RTDS_TOPIC_STALL_THRESHOLD)
+                        || requested_prices.iter().any(|price| price.is_stale(now))
                     {
                         warn!(
                             "[Chainlink] RTDS no topic frame for {:.0}s (topic stall watchdog) \
@@ -311,14 +344,14 @@ async fn chainlink_ws_task(
                                 _ => continue,
                             }
                             health.record_topic_frame(received_at);
+                            if data.get("type").and_then(|v| v.as_str()) != Some("update") { continue; }
                             let Some(payload) = data.get("payload") else { continue; };
                             let Some(tick) = decode_rtds_tick(topic, payload, now_ns()) else { continue; };
                             if tick.symbol == "btc/usd" {
                                 health.record_btc_price(received_at);
                             }
-                            if !symbols.iter().any(|f| f.eq_ignore_ascii_case(&tick.symbol)) {
-                                continue;
-                            }
+                            let Some(index) = symbols.iter().position(|f| f.eq_ignore_ascii_case(&tick.symbol)) else { continue; };
+                            requested_prices[index].observe(tick.timestamp_ns, received_at);
                             let event = MarketEvent::SpotPrice(tick);
                             if crate::exchange::publish_market_event(&event_tx, event).is_err() { return; }
                         }
@@ -349,25 +382,41 @@ async fn chainlink_ws_task(
 /// Decode only live updates, never replay a subscription snapshot into the live
 /// oracle cache. RTDS's envelope timestamp is publication time; the payload
 /// timestamp is the Chainlink observation used for event boundary selection.
-fn decode_rtds_tick(topic: &str, payload: &serde_json::Value, received_ns: u64) -> Option<SpotPrice> {
+fn decode_rtds_tick(
+    topic: &str,
+    payload: &serde_json::Value,
+    received_ns: u64,
+) -> Option<SpotPrice> {
     let twap = match topic {
         "crypto_prices_chainlink" => false,
         "crypto_prices_twap_sixty" => true,
         _ => return None,
     };
-    if twap && payload.get("window_s")?.as_u64()? != 60 { return None; }
+    if twap && payload.get("window_s")?.as_u64()? != 60 {
+        return None;
+    }
     let symbol = payload.get("symbol")?.as_str()?;
-    if !symbol.ends_with("/usd") { return None; }
+    if !symbol.ends_with("/usd") {
+        return None;
+    }
     let timestamp_ms = payload.get("timestamp")?.as_u64()?;
-    if timestamp_ms == 0 { return None; }
+    if timestamp_ms == 0 {
+        return None;
+    }
     let price = match payload.get("full_accuracy_value") {
         Some(value) => value.as_str()?.parse::<f64>().ok()? / 1e18,
         None => json_f64(payload.get("value")?)?,
     };
-    if !price.is_finite() || price <= 0.0 { return None; }
+    if !price.is_finite() || price <= 0.0 {
+        return None;
+    }
     Some(SpotPrice {
         source: "chainlink".to_owned(),
-        symbol: if twap { format!("{symbol}/twap/60s") } else { symbol.to_owned() },
+        symbol: if twap {
+            format!("{symbol}/twap/60s")
+        } else {
+            symbol.to_owned()
+        },
         price,
         timestamp_ns: timestamp_ms.checked_mul(1_000_000)?,
         local_timestamp_ns: received_ns,
@@ -437,10 +486,32 @@ mod rtds_tests {
     use serde_json::json;
 
     #[test]
+    fn requested_prices_cannot_mask_each_other_or_refresh_from_replay() {
+        let start = Instant::now();
+        let mut prices = [RtdsPriceLiveness::new(start); 3]; // BTC, BTC TWAP, ETH
+        prices[0].observe(100, start);
+        prices[0].observe(100, start + Duration::from_secs(80));
+        prices[0].observe(99, start + Duration::from_secs(85));
+        prices[1].observe(200, start + Duration::from_secs(80));
+        prices[2].observe(300, start + Duration::from_secs(89));
+        let now = start + RTDS_TOPIC_STALL_THRESHOLD;
+        assert!(prices[0].is_stale(now));
+        assert!(!prices[1].is_stale(now));
+        assert!(!prices[2].is_stale(now));
+        prices[0].observe(101, now);
+        assert!(!prices[0].is_stale(now));
+        // A reconnect gets a new grace interval and accepts its first source ID.
+        prices[0] = RtdsPriceLiveness::new(now);
+        prices[0].observe(1, now);
+        assert_eq!(prices[0].source_ns, 1);
+    }
+
+    #[test]
     fn observation_clock_and_twap_are_not_spot_or_publication_clock() {
         let payload = json!({"symbol":"btc/usd","timestamp":1793679200000u64,
             "full_accuracy_value":"76763196801204162134016","value":1,"window_s":60});
-        let tick = decode_rtds_tick("crypto_prices_twap_sixty", &payload, 1793679201900000000).unwrap();
+        let tick =
+            decode_rtds_tick("crypto_prices_twap_sixty", &payload, 1793679201900000000).unwrap();
         assert_eq!(tick.symbol, "btc/usd/twap/60s");
         assert_eq!(tick.timestamp_ns, 1793679200000000000);
         assert_eq!(tick.local_timestamp_ns, 1793679201900000000);
@@ -453,11 +524,22 @@ mod rtds_tests {
     fn malformed_or_unsupported_updates_do_not_become_prices() {
         let base = json!({"symbol":"btc/usd","timestamp":1000,"value":123,"window_s":60});
         assert!(decode_rtds_tick("other", &base, 1).is_none());
-        for (key,value) in [("timestamp",json!(0)), ("timestamp",json!(u64::MAX)),
-            ("window_s",json!(30)), ("value",json!(-1)), ("full_accuracy_value",json!("bad"))] {
-            let mut p=base.clone(); p[key]=value;
+        for (key, value) in [
+            ("timestamp", json!(0)),
+            ("timestamp", json!(u64::MAX)),
+            ("window_s", json!(30)),
+            ("value", json!(-1)),
+            ("full_accuracy_value", json!("bad")),
+        ] {
+            let mut p = base.clone();
+            p[key] = value;
             assert!(decode_rtds_tick("crypto_prices_twap_sixty", &p, 1).is_none());
         }
-        assert!(decode_rtds_tick("crypto_prices_chainlink", &json!({"symbol":"btc/usd","data":[]}),1).is_none());
+        assert!(decode_rtds_tick(
+            "crypto_prices_chainlink",
+            &json!({"symbol":"btc/usd","data":[]}),
+            1
+        )
+        .is_none());
     }
 }
