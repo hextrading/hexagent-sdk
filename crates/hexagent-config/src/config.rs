@@ -1644,9 +1644,13 @@ pub struct ExchangeConfig {
     /// API rate limit: max requests per second per wallet account.
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_second: u32,
-    /// Data source variant (e.g. chainlink: "rtds" or "stream"). Default: empty (auto).
+    /// Data source variant (chainlink: "polybolt", legacy "rtds", or "stream").
     #[serde(default)]
     pub source: String,
+    /// CLOB credential identity for PolyBolt prices, from [poly.<account>] in
+    /// general.secrets_file. Loads only API credentials, never the wallet key.
+    #[serde(default)]
+    pub polybolt_auth_account: String,
     /// Chainlink Data Streams feed IDs (hex) keyed by their event/archive
     /// labels (for example `eth/usd` or `eth/usd/twap/60s`). For
     /// `name = "chainlink", source = "stream"`, this is the canonical
@@ -1815,6 +1819,27 @@ fn default_account_allocation_weight() -> f64 {
 }
 
 impl ExchangeConfig {
+    /// Bind only CLOB price credentials before feed owners/threads start.
+    /// Parsing a config stays usable offline, without requiring production secrets.
+    pub fn bind_polybolt_credentials(&mut self, secrets_path: &Path) -> Result<()> {
+        if self.name != "chainlink" { return Ok(()); }
+        if !matches!(self.source.as_str(), "polybolt" | "rtds" | "stream" | "") {
+            anyhow::bail!("unsupported Chainlink source (expected polybolt, rtds or stream)");
+        }
+        if self.source != "polybolt" { return Ok(()); }
+        if !self.polybolt_auth_account.is_empty() {
+            let secrets = SecretsFile::load(secrets_path)?;
+            let credentials = secrets.poly_for(&self.polybolt_auth_account)?;
+            self.api_key = credentials.api_key.clone();
+            self.api_secret = credentials.api_secret.clone();
+            self.api_passphrase = credentials.api_passphrase.clone();
+        }
+        if [&self.api_key, &self.api_secret, &self.api_passphrase].iter().any(|v| v.is_empty()) {
+            anyhow::bail!("PolyBolt requires complete CLOB price credentials or polybolt_auth_account");
+        }
+        Ok(())
+    }
+
     /// Derive the settlement feed/archive label from the canonical window.
     /// `None` is fail-closed for an empty spot symbol or a zero-second window.
     pub fn settlement_twap_label(&self, spot_symbol: &str) -> Option<String> {
@@ -2759,4 +2784,22 @@ fn feed_idle_poll_defaults_and_fifo_safe_bounds() {
     assert_eq!(parse("name = 'binance'").unwrap().idle_poll_us, 100);
     assert_eq!(parse("name = 'coinbase'\nidle_poll_us = 25").unwrap().idle_poll_us, 25);
     for value in [0, 9, 1001] { assert!(parse(&format!("name = 'binance'\nidle_poll_us = {value}")).is_err()); }
+}
+
+#[cfg(test)]
+mod polybolt_tests {
+    use super::*;
+    #[test]
+    fn price_auth_binds_only_api_fields_and_fails_on_missing_credentials() {
+        let path=std::env::temp_dir().join(format!("polybolt-test-{}-{}.toml",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::write(&path,"[poly.prices]\napi_key='api'\napi_secret='secret'\napi_passphrase='phrase'\nprivate_key='must-not-load'\n").unwrap();
+        let mut cfg:ExchangeConfig=toml::from_str("name='chainlink'\nsource='polybolt'\npolybolt_auth_account='prices'\n").unwrap();
+        cfg.bind_polybolt_credentials(&path).unwrap();
+        assert_eq!((&*cfg.api_key,&*cfg.api_secret,&*cfg.api_passphrase),("api","secret","phrase"));
+        assert!(cfg.private_key.is_empty()); assert!(cfg.account_address.is_empty());
+        cfg.polybolt_auth_account="missing".into(); assert!(cfg.bind_polybolt_credentials(&path).is_err());
+        let mut incomplete:ExchangeConfig=toml::from_str("name='chainlink'\nsource='polybolt'\napi_key='legacy-stream-key'\napi_secret='legacy-stream-secret'").unwrap();
+        assert!(incomplete.bind_polybolt_credentials(&path).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
 }

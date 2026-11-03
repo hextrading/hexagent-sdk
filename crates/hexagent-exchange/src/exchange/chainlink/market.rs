@@ -382,7 +382,7 @@ async fn chainlink_ws_task(
 /// Decode only live updates, never replay a subscription snapshot into the live
 /// oracle cache. RTDS's envelope timestamp is publication time; the payload
 /// timestamp is the Chainlink observation used for event boundary selection.
-fn decode_rtds_tick(
+pub(super) fn decode_rtds_tick(
     topic: &str,
     payload: &serde_json::Value,
     received_ns: u64,

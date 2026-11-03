@@ -10975,7 +10975,15 @@ impl Engine {
     ) -> Result<Vec<thread::JoinHandle<()>>> {
         let mut handles = Vec::new();
 
-        for exchange_cfg in &self.config.exchanges {
+        // Validate price authentication before starting ANY feed thread.
+        let mut exchanges = self.config.exchanges.clone();
+        let price_secrets = crate::config::SecretsFile::resolve_path_with_override(
+            std::path::Path::new("config.toml"), &self.config.general.secrets_file,
+        );
+        for exchange in exchanges.iter_mut().filter(|e| e.enabled) {
+            exchange.bind_polybolt_credentials(&price_secrets)?;
+        }
+        for exchange_cfg in &exchanges {
             if !exchange_cfg.enabled {
                 continue;
             }
@@ -11095,6 +11103,9 @@ impl Engine {
                         "bybit" => Box::new(crate::exchange::bybit::BybitMarket::new()),
                         "chainlink" => {
                             match cfg.source.as_str() {
+                                "polybolt" => Box::new(crate::exchange::chainlink::PolyBoltMarket::new(
+                                    &cfg.api_key, &cfg.api_secret, &cfg.api_passphrase,
+                                )),
                                 "stream" => Box::new(crate::exchange::chainlink::ChainlinkStreamMarket::new(
                                     &cfg.api_key, &cfg.api_secret, &cfg.wss_url,
                                 )),

@@ -202,6 +202,7 @@ pub fn inject_spot_feed_symbols(cfg: &StrategyConfig, full: &mut Config) {
             max_connections: 1,
             rate_limit_per_second: 10,
             source: String::new(),
+            polybolt_auth_account: String::new(),
             feed_ids: HashMap::new(),
             settlement_twap_secs: crate::config::DEFAULT_SETTLEMENT_TWAP_SECS,
             signature_type: String::new(),
