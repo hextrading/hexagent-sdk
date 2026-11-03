@@ -13,6 +13,9 @@ use hexagent_types::types::{Exchange, ExecutionAdmission, ExecutionAdmissionStat
 use std::net::IpAddr;
 
 const SLOW_HTTP_NS: u64 = 500_000_000;
+// After transport backoff, let one starved ordinary cancel lane compete in
+// round-robin again. A timer grants a trial, never business-health evidence.
+const CANCEL_PROBATION_WAIT_NS: u64 = 30_000_000_000;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AdmissionConfig {
@@ -120,6 +123,8 @@ pub(crate) struct AdmissionCapacityDetail {
     pub probation_free: u16,
     pub probation_busy: u16,
     pub eligible_cancel: u16,
+    pub ready_cancel: u16,
+    pub failed_cancel_mask: u64,
     pub ready_mask: u64,
     pub verified_mask: u64,
     pub busy_mask: u64,
@@ -600,6 +605,12 @@ impl AccountExecutionAdmission {
             !lane.reserved_cancel && lane.fresh(now_ns, self.config.stale_after_ns)
                 && lane.cancel_probe_eligible(now_ns)
         }).count().min(u16::MAX as usize) as u16;
+        detail.ready_cancel = self.cancel.iter().filter(|lane| !lane.reserved_cancel
+            && lane.fresh(now_ns, self.config.stale_after_ns) && lane.cancel_ready())
+            .count().min(u16::MAX as usize) as u16;
+        for (slot, lane) in self.cancel.iter().take(64).enumerate() {
+            detail.failed_cancel_mask |= u64::from(!lane.reserved_cancel && lane.business_failed) << slot;
+        }
         detail.blockers = u8::from(detail.ready_fast == 0)
             | (u8::from(detail.eligible_cancel == 0) << 1)
             | (u8::from(now_ns < self.pause_until_ns) << 2)
@@ -621,9 +632,25 @@ impl AccountExecutionAdmission {
     pub(crate) fn cancel_lane_rank(&self, slot: usize, now_ns: u64) -> u8 {
         match self.cancel.get(slot) {
             Some(lane) if lane.fresh(now_ns, self.config.stale_after_ns) && lane.cancel_ready() && lane.verified => 0,
+            Some(_) if self.cancel_probation_slot(now_ns) == Some(slot) => 0,
             Some(lane) if lane.fresh(now_ns, self.config.stale_after_ns) && lane.cancel_probe_eligible(now_ns) => 1,
             _ => 2,
         }
+    }
+
+    fn cancel_probation_slot(&self, now_ns: u64) -> Option<usize> {
+        if !self.cancel.iter().any(|lane| !lane.reserved_cancel
+            && lane.fresh(now_ns, self.config.stale_after_ns) && lane.cancel_ready() && lane.verified) {
+            return None;
+        }
+        // Select one fixed oldest candidate even while it is busy. Otherwise
+        // successive dispatches could promote every failed lane concurrently.
+        self.cancel.iter().enumerate().filter(|(_, lane)| !lane.reserved_cancel
+            && lane.business_failed && lane.fresh(now_ns, self.config.stale_after_ns)
+            && lane.cancel_probe_eligible(now_ns)
+            && now_ns >= lane.failure_eligible_after_ns.saturating_add(CANCEL_PROBATION_WAIT_NS))
+            .min_by_key(|(slot, lane)| (lane.failure_eligible_after_ns, *slot))
+            .map(|(slot, _)| slot)
     }
 
     pub(crate) fn lane_generation(&self, slot: usize) -> Option<u64> {
@@ -726,6 +753,68 @@ impl AccountExecutionAdmission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "optimized before/after cancel ranking benchmark"]
+    fn cancel_probation_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        let mut h = Harness::healthy(4,4);
+        for i in 1..4 {h.outcome(Role::Cancel, i, BusinessHttpOutcome::Healthy);}
+        h.outcome(Role::Cancel, 1, BusinessHttpOutcome::SlowResponded);
+        h.now += CANCEL_PROBATION_WAIT_NS + 3_000_000_000;
+        for i in 0..4 {h.emit(Role::Fast,i, |_| {});h.emit(Role::Cancel,i, |_| {});}
+        for updated in [false, true] {
+            let mut samples=Vec::with_capacity(200_000);
+            for _ in 0..200_000 {
+                let begin=Instant::now();
+                for slot in 0..4 {
+                    let rank=if updated {h.state.cancel_lane_rank(black_box(slot),black_box(h.now))} else {
+                        match h.state.cancel.get(black_box(slot)) {
+                            Some(l) if l.fresh(black_box(h.now),h.state.config.stale_after_ns) && l.cancel_ready() && l.verified => 0,
+                            Some(l) if l.fresh(black_box(h.now),h.state.config.stale_after_ns) && l.cancel_probe_eligible(h.now) => 1,
+                            _ => 2,
+                        }
+                    };
+                    black_box(rank);
+                }
+                samples.push(begin.elapsed().as_nanos());
+            }
+            samples.sort_unstable();
+            println!("cancel_probation={updated} n={} median_ns={} p99_ns={} p999_ns={} max_ns={} queue_depth=0 overflow=0 boundary=rank_four_cancel_lanes_excludes_dispatch_network_strategy",samples.len(),samples[100_000],samples[198_000],samples[199_800],samples[199_999]);
+        }
+    }
+
+    #[test]
+    fn starved_cancel_gets_one_round_robin_trial_without_timer_healing() {
+        let mut h = Harness::healthy(4, 4);
+        let other = Harness::healthy(4, 4);
+        for i in 1..4 { h.outcome(Role::Cancel, i, BusinessHttpOutcome::Healthy); }
+        h.outcome(Role::Cancel, 1, BusinessHttpOutcome::SlowResponded);
+        h.outcome(Role::Cancel, 2, BusinessHttpOutcome::SlowResponded);
+        assert_eq!(h.state.cancel_probation_slot(h.now), None);
+        h.now += CANCEL_PROBATION_WAIT_NS + 3_000_000_000;
+        for i in 0..4 { h.emit(Role::Fast, i, |_| {}); h.emit(Role::Cancel, i, |_| {}); }
+        assert_eq!(h.state.cancel_probation_slot(h.now), Some(1));
+        assert_eq!(h.state.cancel_lane_rank(1, h.now), 0);
+        assert_eq!(h.state.cancel_lane_rank(2, h.now), 1);
+        assert!(h.state.cancel[1].business_failed, "timer only grants routing trial");
+        assert_eq!(h.state.capacity_detail(h.now).failed_cancel_mask, 6);
+        h.emit(Role::Cancel, 1, |o| o.busy = true);
+        assert_eq!(h.state.cancel_probation_slot(h.now), Some(1), "busy trial must not promote another");
+        assert_eq!(h.state.cancel_lane_rank(2, h.now), 1);
+        h.outcome(Role::Cancel, 1, BusinessHttpOutcome::Healthy);
+        assert_eq!(h.state.cancel_probation_slot(h.now), Some(2));
+        h.outcome(Role::Cancel, 2, BusinessHttpOutcome::Healthy);
+        assert_eq!(h.state.capacity_detail(h.now).failed_cancel_mask, 0);
+        // The clustered failure / lease expiry still requires the existing
+        // three real place successes; cancel fairness cannot bypass recovery.
+        for _ in 0..3 { h.success(0); }
+        assert_eq!(h.state.current().state, ExecutionAdmissionState::Healthy);
+        assert_eq!(other.state.capacity_detail(other.now).failed_cancel_mask, 0);
+        h.now += h.state.config.stale_after_ns + 1;
+        assert_eq!(h.state.cancel_probation_slot(h.now), None);
+        assert_eq!(h.state.cancel_lane_rank(1, h.now), 2);
+    }
 
     #[test]
     fn one_slow_response_uses_one_probation_without_losing_verified_capacity() {
