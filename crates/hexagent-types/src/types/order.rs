@@ -251,7 +251,12 @@ impl Default for OrderSlot {
 /// Registration-time validated uint256 token. Original decimal bytes fence the
 /// cache against symbol changes; callers cannot construct an inconsistent word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PreparedToken { decimal: [u8; 78], len: u8, word: [u8; 32] }
+pub struct PreparedToken {
+    decimal: [u8; 78], len: u8, word: [u8; 32],
+    // Immutable metadata, prepared at instrument registration. Retired events
+    // retain their own value in outstanding orders; no account-wide selector.
+    polymarket_protocol_v2: bool,
+}
 impl PreparedToken {
     pub fn parse(token: &str) -> Option<Self> {
         if token.is_empty() || token.len() > 78 { return None; }
@@ -266,10 +271,18 @@ impl PreparedToken {
         }
         if word == [0; 32] { return None; }
         let mut decimal = [0; 78]; decimal[..token.len()].copy_from_slice(token.as_bytes());
-        Some(Self { decimal, len: token.len() as u8, word })
+        Some(Self { decimal, len: token.len() as u8, word,
+            polymarket_protocol_v2: Self::is_polymarket_protocol_v2_word(&word) })
     }
     pub fn matches(&self, token: &str) -> bool { &self.decimal[..self.len as usize] == token.as_bytes() }
     pub fn word(&self) -> [u8; 32] { self.word }
+    #[inline]
+    pub fn is_polymarket_protocol_v2(&self) -> bool { self.polymarket_protocol_v2 }
+    /// Protocol V2's reserved bits, supported binary modules and outcome byte.
+    /// Cold preparation only; signers read the cached flag above.
+    pub fn is_polymarket_protocol_v2_word(word: &[u8; 32]) -> bool {
+        matches!(word[0], 1 | 2 | 3) && word[19..27] == [0; 8] && word[31] <= 1
+    }
 }
 
 /// Request to place a new order

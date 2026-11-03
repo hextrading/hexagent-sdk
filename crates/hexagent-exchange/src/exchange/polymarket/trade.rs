@@ -79,7 +79,7 @@ impl ClobVersion {
 /// into the canonical name. Override via `api_url_prefix` only if
 /// you need to point at a non-prod environment.
 const DEFAULT_CLOB_BASE_URL: &str = "https://clob.polymarket.com";
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const AUTHENTICATED_TRADES_PATH: &str = "/data/trades";
 const REQUEST_BUFFER_SLOTS: usize = 64;
 const REQUEST_BUFFER_BYTES: usize = 2_048;
@@ -1313,11 +1313,18 @@ fn parse_placement_response(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let error_msg = object
+    let mut error_msg = object
         .get("errorMsg")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
+
+    if !success {
+        if let Some(seconds) = object.get("retry_after_seconds").and_then(serde_json::Value::as_u64) {
+            use std::fmt::Write;
+            let _ = write!(error_msg, " retry_after_seconds={seconds}");
+        }
+    }
 
     if success && order_id.is_empty() {
         return Err("successful placement response is missing orderID".to_string());
@@ -1479,7 +1486,7 @@ impl HttpErr {
     /// response reached us. Keep this separate from `is_unknown_state` so
     /// adding the transport case does not change cancel/GET semantics.
     pub(crate) fn is_submit_unknown_state(&self) -> bool {
-        (self.is_unknown_state() && !self.is_trading_disabled_rejection())
+        (self.is_unknown_state() && !self.is_trading_disabled_rejection() && !self.is_venue_restriction())
             || matches!(self, HttpErr::Transport(_) | HttpErr::InvalidResponse(_))
     }
 
@@ -1502,11 +1509,18 @@ impl HttpErr {
         )
     }
 
-    /// A completed 4xx placement response is authoritative rejection evidence.
-    /// 425 remains unknown-state because Polymarket uses it for transient
-    /// service backpressure and may have accepted the signed request.
+    /// Documented placement restrictions are authoritative rejections.
+    /// Cancellation uncertainty retains its separate recovery classification.
+    fn is_venue_restriction(&self) -> bool {
+        match self {
+            HttpErr::Status(425, _) => true,
+            HttpErr::Status(_, body) => super::restrictions::cooldown_secs(body).is_some(),
+            _ => false,
+        }
+    }
+
     fn is_definitive_submit_rejection(&self) -> bool {
-        self.is_trading_disabled_rejection()
+        self.is_venue_restriction() || self.is_trading_disabled_rejection()
             || matches!(self, HttpErr::Status(code, _) if (400..500).contains(code) && *code != 425)
     }
 }
@@ -2783,7 +2797,13 @@ static TRANSPORT_PREWARMED: OnceLock<()> = OnceLock::new();
 /// Logging cadence:
 ///   - success (all pings ok): TRACE per tick
 ///   - any failure:           WARN per tick (with first error)
-///   - every 30 ticks (5 min): INFO summary
+///   - every 60 ticks (5 min): INFO summary
+fn heartbeat_cadence() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
 async fn heartbeat_loop(
     auth: PolyAuth,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -2793,12 +2813,13 @@ async fn heartbeat_loop(
         "[PolyHeartbeat] Started (interval={}s, one signed request per account)",
         HEARTBEAT_INTERVAL.as_secs(),
     );
-    const SUMMARY_TICKS: u32 = 30;
+    const SUMMARY_TICKS: u32 = 60;
     let mut tick_ok = 0u32;
     let mut tick_err = 0u32;
     let mut ticks_since_summary = 0u32;
+    let mut interval = heartbeat_cadence();
     loop {
-        tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+        interval.tick().await;
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
@@ -2828,7 +2849,7 @@ async fn heartbeat_loop(
                 &url,
                 request_headers,
                 Bytes::new(),
-                Duration::from_secs(5),
+                Duration::from_secs(3),
             )
             .await;
         let (err_n, first_err) = match result {
@@ -3225,10 +3246,12 @@ async fn execute_http_on(
     let status = response.status;
     let bytes = response.body;
     let reply = if !status.is_success() {
-        Err(HttpErr::Status(
-            status.as_u16(),
-            String::from_utf8_lossy(&bytes).into_owned(),
-        ))
+        let mut detail = String::from_utf8_lossy(&bytes).into_owned();
+        if let Some(seconds) = response.retry_after_secs {
+            use std::fmt::Write;
+            let _ = write!(detail, " retry_after_seconds={seconds}");
+        }
+        Err(HttpErr::Status(status.as_u16(), detail))
     } else {
         serde_json::from_slice(&bytes).map_err(|error| {
             let raw_body = String::from_utf8_lossy(&bytes);
@@ -7647,7 +7670,7 @@ impl PolymarketTrade {
         let hb_span = tracing::info_span!("heartbeat", acct = %self.shared.instance_id);
         // Order runtime: any connection the heartbeat (re)establishes on
         // its Query slot must be owned by the order reactor, matching
-        // keep-warm/prewarm ownership. Load is one request per 10 s.
+        // keep-warm/prewarm ownership. Load is one request per 5 s.
         let task_handle = async_rt::order_handle()
             .spawn(heartbeat_loop(auth, shutdown, base_url).instrument(hb_span));
         // Return a std JoinHandle so existing engine shutdown code can
@@ -16670,8 +16693,8 @@ mod tests {
             "425 must route through unknown_state so the cancel path treats it as transient"
         );
         assert!(
-            HttpErr::Status(425, "service not ready".to_string()).is_submit_unknown_state(),
-            "service-not-ready must create a placement orphan"
+            !HttpErr::Status(425, "service not ready".to_string()).is_submit_unknown_state(),
+            "restart rejects placement; it must not create a placement orphan"
         );
         assert!(
             HttpErr::Status(503, "Service Unavailable".to_string()).is_unknown_state(),
@@ -16701,6 +16724,29 @@ mod tests {
             !HttpErr::Status(503, "Service Unavailable".to_string()).is_explicit_not_found(),
             "a reconcile 5xx is unavailable evidence, not not-found",
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_cadence_does_not_add_request_latency_or_burst_after_stall() {
+        let start = tokio::time::Instant::now();
+        let mut cadence = heartbeat_cadence();
+        cadence.tick().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        cadence.tick().await;
+        assert_eq!(start.elapsed(),Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        cadence.tick().await;
+        cadence.tick().await;
+        assert_eq!(start.elapsed(),Duration::from_secs(20));
+    }
+
+    #[test]
+    fn placement_restriction_preserves_per_order_retry_after() {
+        let response = parse_placement_response(&serde_json::json!({"success":false,
+            "errorMsg":"post_only_mode", "retry_after_seconds":300})).unwrap();
+        assert_eq!(super::super::restrictions::cooldown_secs(&response.error_msg),Some(300));
+        assert!(!HttpErr::Status(503,response.error_msg).is_submit_unknown_state());
+        assert!(HttpErr::Timeout.is_submit_unknown_state());
     }
 
     #[test]
@@ -16934,7 +16980,7 @@ mod tests {
             "HTTP 400 has a definitive response"
         );
         assert!(HttpErr::Status(400, "bad request".to_string()).is_definitive_submit_rejection());
-        assert!(!HttpErr::Status(425, "too early".to_string()).is_definitive_submit_rejection());
+        assert!(HttpErr::Status(425, "too early".to_string()).is_definitive_submit_rejection());
         assert!(!HttpErr::Status(503, "unavailable".to_string()).is_definitive_submit_rejection());
         let trading_disabled =
             HttpErr::Status(503, r#"{"error":"trading is disabled"}"#.to_string());

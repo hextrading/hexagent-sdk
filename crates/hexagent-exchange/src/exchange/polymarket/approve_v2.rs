@@ -7,7 +7,7 @@
 //! Without these, the v2 Exchange returns `"not enough balance /
 //! allowance"` and the CTF adapter reverts split/merge.
 //!
-//! Eight distinct operator → contract pairs get checked; each is
+//! CTF and Protocol V2 operator → contract pairs get checked; each is
 //! no-op'd if already approved, else submitted as a Safe
 //! `execTransaction`. Gas-payer is config-driven — same flag as
 //! redeem/split (`gas_via_signer_wallet`):
@@ -26,8 +26,8 @@
 //!    5  setApprovalForAll CTF   → CTFExchangeV2                          SELL outcome tokens std
 //!    6  setApprovalForAll CTF   → NegRiskCTFExchangeV2                   SELL outcome tokens neg-risk
 //!
-//! Cost: 6 Safe `execTransaction` calls × ~80k gas each at Polygon
-//! base fee ≈ 0.005-0.01 MATIC total. One-time per Safe.
+//! Protocol V2 additionally grants pUSD spending and PositionManager operator
+//! permission to ExchangeV3 and Router. Existing CTF permissions are retained.
 //!
 //! Usage:
 //!   hexbot approve_v2              # check + set any missing approvals
@@ -114,6 +114,10 @@ pub(crate) enum ApprovalKind {
 
 pub(crate) fn v2_approval_steps() -> Vec<ApprovalStep> {
     vec![
+        ApprovalStep { label: "pUSD → ExchangeV3", token: PUSD_ADDRESS, spender: super::protocol::EXCHANGE_V3, kind: ApprovalKind::Erc20Approve },
+        ApprovalStep { label: "pUSD → Protocol V2 Router", token: PUSD_ADDRESS, spender: super::protocol::ROUTER, kind: ApprovalKind::Erc20Approve },
+        ApprovalStep { label: "PositionManager → ExchangeV3", token: super::protocol::POSITION_MANAGER, spender: super::protocol::EXCHANGE_V3, kind: ApprovalKind::Erc1155Set },
+        ApprovalStep { label: "PositionManager → Router", token: super::protocol::POSITION_MANAGER, spender: super::protocol::ROUTER, kind: ApprovalKind::Erc1155Set },
         ApprovalStep { label: "pUSD → CTFExchange v2",            token: PUSD_ADDRESS, spender: CTF_EXCHANGE_V2,           kind: ApprovalKind::Erc20Approve },
         ApprovalStep { label: "pUSD → NegRisk CTFExchange v2",    token: PUSD_ADDRESS, spender: NEG_RISK_CTF_EXCHANGE_V2,  kind: ApprovalKind::Erc20Approve },
         ApprovalStep { label: "pUSD → CtfCollateralAdapter",      token: PUSD_ADDRESS, spender: CTF_COLLATERAL_ADAPTER,    kind: ApprovalKind::Erc20Approve },

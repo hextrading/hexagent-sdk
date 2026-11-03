@@ -1,4 +1,7 @@
 pub mod active_event;
+pub(crate) mod data_api;
+pub mod protocol;
+pub mod restrictions;
 pub mod approve_v2;
 pub mod auth_check;
 pub mod cli_account;

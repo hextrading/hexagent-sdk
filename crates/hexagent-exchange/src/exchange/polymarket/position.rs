@@ -5,14 +5,13 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use log::{info, warn};
+use log::info;
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use serde::Deserialize;
 
 use crate::account::position::Position;
 
-const DATA_API_BASE: &str = "https://data-api.polymarket.com";
 const CLOB_API_BASE: &str = "https://clob.polymarket.com";
 const SETTLEMENT_REQUEST_SPACING: Duration = Duration::from_millis(250);
 const SETTLEMENT_IN_FLIGHT_LEASE: Duration = Duration::from_secs(5 * 60);
@@ -23,13 +22,14 @@ const SETTLEMENT_MAX_CONCURRENT_REQUESTS: usize = 1;
 
 /// Raw position record from Polymarket Data API.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct ApiPosition {
     /// CLOB token ID (decimal string representing a 256-bit ERC1155 id).
     /// This is the "symbol" we key by internally — one entry per outcome.
+    #[serde(rename = "token_id")]
     asset: String,
     condition_id: String,
+    #[serde(rename = "current_size")]
     size: f64,
     avg_price: f64,
     /// Mark-to-market USDC value = size × cur_price. For settled events the
@@ -723,6 +723,13 @@ async fn fetch_authoritative_resolution(
     client: &reqwest::Client,
     condition_id: &str,
 ) -> std::result::Result<Option<HashMap<String, f64>>, SettlementFetchError> {
+    if super::protocol::is_v2_condition(condition_id) {
+        return super::protocol::resolution(condition_id).await.map(Some).map_err(|error| SettlementFetchError {
+            message: error.to_string(),
+            retry_after: ACTIVE_MARKET_RECHECK,
+            rate_limited: false,
+        });
+    }
     let url = format!("{}/markets/{}", CLOB_API_BASE, condition_id);
     let response = client
         .get(&url)
@@ -837,51 +844,7 @@ async fn fetch_authoritative_resolutions(condition_ids: HashSet<String>) -> Hash
 ///
 /// API: `GET https://data-api.polymarket.com/positions?user={wallet}&sizeThreshold=0`
 fn fetch_position_rows(wallet_address: &str) -> Result<Vec<ApiPosition>> {
-    info!("[Polymarket] Fetching positions for {}", wallet_address);
-
-    // Route through the shared async runtime + HTTP/2 client.
-    let client = crate::async_rt::http_client();
-    let wallet = wallet_address.to_string();
-    crate::async_rt::block_on_runtime(async move {
-        const PAGE_SIZE: usize = 500;
-        const MAX_PAGES: usize = 100;
-        let mut all = Vec::new();
-        for page in 0..MAX_PAGES {
-            let offset = page * PAGE_SIZE;
-            let url = format!(
-                "{}/positions?user={}&sizeThreshold=0&limit={}&offset={}",
-                DATA_API_BASE, wallet, PAGE_SIZE, offset,
-            );
-            let r = client.get(&url).send().await.map_err(|e| {
-                anyhow::anyhow!("fetch_positions page={} offset={}: {}", page + 1, offset, e)
-            })?;
-            if !r.status().is_success() {
-                return Err(anyhow::anyhow!(
-                    "fetch_positions page={} offset={}: status {}",
-                    page + 1,
-                    offset,
-                    r.status(),
-                ));
-            }
-            let mut rows = r.json::<Vec<ApiPosition>>().await.map_err(|e| {
-                anyhow::anyhow!(
-                    "fetch_positions parse page={} offset={}: {}",
-                    page + 1,
-                    offset,
-                    e,
-                )
-            })?;
-            let complete = rows.len() < PAGE_SIZE;
-            all.append(&mut rows);
-            if complete {
-                return Ok(all);
-            }
-        }
-        Err(anyhow::anyhow!(
-            "fetch_positions exceeded {} pages; refusing a potentially incomplete authoritative snapshot",
-            MAX_PAGES,
-        ))
-    })
+    super::data_api::fetch_positions(wallet_address)
 }
 
 fn log_position_snapshot(snapshot: &PositionSnapshot, raw_records: usize) {

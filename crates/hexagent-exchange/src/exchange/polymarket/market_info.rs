@@ -27,7 +27,7 @@ pub fn run_market() -> Result<()> {
         eprintln!(
             "Usage: hexbot market <condition_id> [path_template]\n\
              \n\
-             <condition_id>: 32-byte hex, `0x` + 64 hex chars. The on-chain\n\
+             <condition_id>: 32-byte hex, or Protocol V2 bytes31. The on-chain\n\
                  condition hash from `BinaryOption.condition_id` — NOT the\n\
                  20-byte Ethereum address and NOT the outcome token ID.\n\
              [path_template]: URL path with `{{conditionId}}` placeholder.\n\
@@ -42,7 +42,10 @@ pub fn run_market() -> Result<()> {
         );
         return Err(anyhow!("missing condition_id"));
     }
-    let condition_id = args[0].trim().to_string();
+    let mut condition_id = args[0].trim().to_string();
+    if condition_id.len() == 64 && super::protocol::is_v2_condition(&condition_id) {
+        condition_id.push_str("00");
+    }
 
     // Input validation — catch common mistakes before round-tripping
     // a 404 through the server.

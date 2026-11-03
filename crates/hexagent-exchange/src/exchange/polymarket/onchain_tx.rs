@@ -564,7 +564,7 @@ pub(super) fn polygon_rpc_urls() -> Result<Vec<String>> {
 /// Build an ephemeral Polygon RPC client. RPC is maintenance traffic, not a
 /// quoting hot path: it is intentionally excluded from startup prewarm and
 /// keeps no idle/TCP-alive connection after a request.
-fn rpc_http_client() -> reqwest::Client {
+pub(super) fn rpc_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .http1_only()
         .pool_max_idle_per_host(0)

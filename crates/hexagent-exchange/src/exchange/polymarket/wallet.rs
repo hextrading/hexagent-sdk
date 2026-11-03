@@ -1700,7 +1700,6 @@ pub(crate) fn poll_transaction(auth: &PolyAuth, tx_id: &str) -> Result<(String, 
 // positions command
 // ════════════════════════════════════════════════════════════════
 
-const DATA_API_BASE: &str = "https://data-api.polymarket.com";
 const CTF_CONTRACT: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 /// v2 adapter for `splitPosition` / `mergePositions` / `redeemPositions`
 /// on standard binary markets. Exposes the SAME Solidity ABI as the v1
@@ -1792,50 +1791,49 @@ const ERC1155_BALANCE_OF_SELECTOR: [u8; 4] = [0x00, 0xfd, 0xd5, 0x8e]; // balanc
 const ERC1155_BALANCE_OF_BATCH_SELECTOR: [u8; 4] = [0x4e, 0x12, 0x73, 0xf4]; // balanceOfBatch(address[],uint256[])
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct PositionRecord {
-    /// CLOB outcome token id used by the account ledger.
-    #[serde(default)]
+    #[serde(rename = "token_id")]
     asset: String,
-    #[serde(default, rename = "conditionId")]
     condition_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_string")]
     title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_string")]
     outcome: String,
-    /// 0-based outcome index from the data-api (Up/Yes=0, Down/No=1). The
-    /// on-chain ERC-1155 positionId leg is `indexSet = 1 << outcome_index`.
-    #[serde(default, rename = "outcomeIndex")]
     outcome_index: i64,
-    #[serde(default)]
+    #[serde(rename = "current_size")]
     size: f64,
-    #[serde(default, rename = "avgPrice")]
     avg_price: f64,
-    #[serde(default, rename = "curPrice")]
+    #[serde(rename = "current_price")]
     cur_price: f64,
-    #[serde(default, rename = "initialValue")]
+    #[serde(rename = "entry_cost_usdc")]
     initial_value: f64,
-    #[serde(default, rename = "currentValue")]
     current_value: f64,
-    #[serde(default, rename = "cashPnl")]
+    #[serde(rename = "total_pnl")]
     cash_pnl: f64,
-    #[serde(default, rename = "percentPnl")]
     percent_pnl: f64,
-    #[serde(default)]
     redeemable: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_string")]
     slug: String,
-    #[serde(default, rename = "eventSlug")]
+    #[serde(default, deserialize_with = "null_string")]
     event_slug: String,
-    #[serde(default, rename = "endDate")]
+    #[serde(default, deserialize_with = "null_string")]
     end_date: String,
+}
+
+fn null_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<String, D::Error> {
+    <Option<String> as serde::Deserialize>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// Compute the on-chain ERC-1155 positionId of one outcome leg in `collateral`'s
 /// id-space, via the CTF's pure view functions (getCollectionId → getPositionId).
 /// Returns a 0x-hex uint256 ready for an ERC-1155 balanceOf, or None on RPC error.
 fn ctf_position_id(condition_id: &str, index_set: u64, collateral: &str) -> Option<String> {
+    if super::protocol::is_v2_condition(condition_id) {
+        let (yes, no) = super::protocol::outcome_ids(condition_id).ok()?;
+        let token = match index_set { 1 => yes, 2 => no, _ => return None };
+        return Some(format!("0x{}", hex::encode(super::protocol::token_word(&token).ok()?)));
+    }
     let cid_bytes = hex::decode(condition_id.strip_prefix("0x").unwrap_or(condition_id)).ok()?;
     let mut cid_padded = [0u8; 32];
     let start = 32 - cid_bytes.len().min(32);
@@ -1893,7 +1891,8 @@ fn ctf_erc1155_balance_checked(owner: &str, position_id_hex: &str) -> Result<f64
     data.extend_from_slice(&ERC1155_BALANCE_OF_SELECTOR);
     data.extend_from_slice(&address_to_bytes32(owner));
     data.extend_from_slice(&pid_padded);
-    let result = deploy_wallet::eth_call(CTF_CONTRACT, &format!("0x{}", hex::encode(&data)))
+    let contract = if super::protocol::is_v2_word(&pid_padded) { super::protocol::POSITION_MANAGER } else { CTF_CONTRACT };
+    let result = deploy_wallet::eth_call(contract, &format!("0x{}", hex::encode(&data)))
         .ok_or_else(|| anyhow::anyhow!("CTF balanceOf RPC failed for `{position_id_hex}`"))?;
     let h = result.strip_prefix("0x").unwrap_or(&result);
     let trimmed = h.trim_start_matches('0');
@@ -1928,6 +1927,20 @@ pub fn ctf_outcome_token_balances_checked(
 /// batching keeps a complete snapshot at one Polygon RPC request regardless
 /// of that scope size.
 pub fn ctf_token_balances_batch_checked(owner: &str, token_ids: &[String]) -> Result<Vec<f64>> {
+    let (v2, ctf): (Vec<_>, Vec<_>) = token_ids.iter().enumerate()
+        .partition(|(_, token)| super::protocol::is_v2_token(token));
+    let mut balances = vec![0.0; token_ids.len()];
+    for (rows, contract) in [(ctf, CTF_CONTRACT), (v2, super::protocol::POSITION_MANAGER)] {
+        if rows.is_empty() { continue; }
+        let tokens: Vec<_> = rows.iter().map(|(_, token)| (*token).clone()).collect();
+        for ((index, _), balance) in rows.into_iter().zip(token_balances_on_contract(owner, &tokens, contract)?) {
+            balances[index] = balance;
+        }
+    }
+    Ok(balances)
+}
+
+fn token_balances_on_contract(owner: &str, token_ids: &[String], contract: &str) -> Result<Vec<f64>> {
     if token_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1946,7 +1959,7 @@ pub fn ctf_token_balances_batch_checked(owner: &str, token_ids: &[String]) -> Re
     for token_id in token_ids {
         data.extend_from_slice(&ctf_position_id_bytes(token_id)?);
     }
-    let result = deploy_wallet::eth_call(CTF_CONTRACT, &format!("0x{}", hex::encode(&data)))
+    let result = deploy_wallet::eth_call(contract, &format!("0x{}", hex::encode(&data)))
         .ok_or_else(|| anyhow::anyhow!("CTF balanceOfBatch RPC failed for {count} tokens"))?;
     decode_balance_of_batch_result(&result, count)
 }
@@ -2071,18 +2084,7 @@ pub fn run_positions() -> Result<()> {
     // "balance" below is used for net-worth math.
     let balance = pusd;
 
-    // Fetch positions
-    let url = format!(
-        "{}/positions?user={}&sizeThreshold=0&limit=500",
-        DATA_API_BASE, wallet_addr
-    );
-    let mut positions: Vec<PositionRecord> = match crate::async_rt::blocking_get_text(&url) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(e) => {
-            println!("Failed to fetch positions: {}", e);
-            return Ok(());
-        }
-    };
+    let mut positions: Vec<PositionRecord> = super::data_api::fetch_positions(&wallet_addr)?;
 
     if positions.is_empty() {
         println!("No open positions.");
@@ -2382,14 +2384,7 @@ pub fn run_token_check() -> Result<()> {
 /// on-chain ghost gate + closed scan in `run_redeem_all`; that path is separate
 /// and unchanged.)
 fn prompt_redeemable_from_dataapi(addr: &str) -> Result<Vec<String>> {
-    let url = format!(
-        "{}/positions?user={}&sizeThreshold=0&limit=500",
-        DATA_API_BASE, addr
-    );
-    let positions: Vec<PositionRecord> = match crate::async_rt::blocking_get_text(&url) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(e) => return Err(anyhow!("Failed to fetch positions: {}", e)),
-    };
+    let positions: Vec<PositionRecord> = super::data_api::fetch_positions(addr)?;
 
     // Filter redeemable positions, group by conditionId (preserve insertion order).
     let mut condition_ids: Vec<String> = Vec::new();
@@ -2570,6 +2565,12 @@ pub fn run_redeem() -> Result<()> {
         );
         std::io::stdout().flush()?;
 
+        if super::protocol::is_v2_condition(cid) {
+            redeem_protocol_v2(&wallet, cid, gas_via_signer)?;
+            println!("done (Protocol V2)");
+            continue;
+        }
+
         // Build redeemPositions calldata
         // redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)
         let condition_bytes =
@@ -2698,6 +2699,9 @@ fn balance_allowance_update_one(
     // "/balance-allowance/update"`, params live in the URL only). Signing the
     // query too yields `401 Unauthorized/Invalid api key`.
     const SIGN_PATH: &str = "/balance-allowance/update";
+    let asset_type = if asset_type == "CONDITIONAL" && token_id.is_some_and(super::protocol::is_v2_token) {
+        "CONDITIONAL-V2"
+    } else { asset_type };
     let query = match token_id {
         Some(t) => format!(
             "?asset_type={}&token_id={}&signature_type={}",
@@ -4047,6 +4051,31 @@ fn record_confirmed_redeem_legs(result: &mut RedeemResult, legs: Option<&Vec<&Po
     }
 }
 
+/// Protocol V2 Safe/EOA maintenance. Each confirmed leg is idempotent on
+/// restart because the Router amount is read from its current ledger balance.
+fn redeem_protocol_v2(wallet: &WalletInfo, condition: &str, gas_via_signer: bool) -> Result<()> {
+    let calls = super::protocol::redemption_calldata(wallet.primary_address(), condition)?;
+    for data in calls {
+        let tx = if wallet.is_eoa() {
+            super::onchain_tx::submit_eoa_tx_onchain(&wallet.signing_key,
+                &wallet.signer_address, super::protocol::ROUTER, &data)?
+        } else {
+            submit_safe_tx_with_id(&wallet.builder_auth, &wallet.signing_key,
+                &wallet.signer_address, &wallet.safe_address, super::protocol::ROUTER,
+                &data, gas_via_signer)?.0
+        };
+        let mut confirmed = false;
+        for _ in 0..30 {
+            let (state, _) = poll_transaction(&wallet.builder_auth, &tx)?;
+            if state.contains("CONFIRMED") || state.contains("MINED") { confirmed = true; break; }
+            if state.contains("FAILED") { return Err(anyhow!("Protocol V2 redemption failed: {tx}")); }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        if !confirmed { return Err(anyhow!("Protocol V2 redemption pending: {tx}")); }
+    }
+    Ok(())
+}
+
 /// Execute redemption of all currently redeemable positions for the wallet.
 /// Each redemption is an on-chain Safe tx submitted serially + polled to
 /// completion. Logs the full redeemable list (table) before starting, then
@@ -4076,14 +4105,9 @@ fn run_redeem_all(wallet: &WalletInfo, gas_via_signer: bool) -> RedeemResult {
     let redeem_addr = wallet
         .deposit_wallet_active()
         .unwrap_or(&wallet.safe_address);
-    let url = format!(
-        "{}/positions?user={}&sizeThreshold=0&limit=500",
-        DATA_API_BASE, redeem_addr,
-    );
     let mut result = RedeemResult::default();
-
-    let positions: Vec<PositionRecord> = match crate::async_rt::blocking_get_text(&url) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+    let positions: Vec<PositionRecord> = match super::data_api::fetch_positions(redeem_addr) {
+        Ok(rows) => rows,
         Err(e) => {
             log::warn!("[Maintenance] Fetch positions failed: {}", e);
             result.first_failure = Some(format!("fetch positions: {}", e));
@@ -4193,6 +4217,13 @@ fn run_redeem_all(wallet: &WalletInfo, gas_via_signer: bool) -> RedeemResult {
     for (i, cid) in condition_ids.iter().enumerate() {
         let cid_short: String = cid.chars().take(16).collect();
 
+        if super::protocol::is_v2_condition(cid) && wallet.deposit_wallet_active().is_none() {
+            match redeem_protocol_v2(wallet, cid, gas_via_signer) {
+                Ok(()) => { result.confirmed += 1; record_confirmed_redeem_legs(&mut result, grouped.get(cid)); },
+                Err(error) => { result.submit_failed += 1; result.first_failure.get_or_insert_with(|| error.to_string()); },
+            }
+            continue;
+        }
         // POLY_1271: redeem FROM the deposit wallet via WALLET batch.
         if let Some(dw) = wallet.deposit_wallet_active() {
             match super::deposit_wallet::dw_redeem(
@@ -4819,6 +4850,13 @@ fn run_split_one(
     calldata.extend_from_slice(&u256_bytes(1)); // partition[0] = 1 (Up)
     calldata.extend_from_slice(&u256_bytes(2)); // partition[1] = 2 (Down)
     let data_hex = format!("0x{}", hex::encode(&calldata));
+    let (target_contract, data_hex) = if super::protocol::is_v2_condition(condition_id) {
+        match super::protocol::router_calldata("split", condition_id, 0, amount_wei) {
+            Ok(data) => (super::protocol::ROUTER, data),
+            Err(error) => return SplitOutcome::SubmitFailed(error.to_string()),
+        }
+    } else { (target_contract, data_hex) };
+
 
     let cid_short: String = condition_id.chars().take(16).collect();
     log::info!(
@@ -5899,6 +5937,13 @@ fn run_merge_one(
     calldata.extend_from_slice(&u256_bytes(1));
     calldata.extend_from_slice(&u256_bytes(2));
     let data_hex = format!("0x{}", hex::encode(calldata));
+    let (target_contract, data_hex) = if super::protocol::is_v2_condition(condition_id) {
+        match super::protocol::router_calldata("merge", condition_id, 0, amount_wei) {
+            Ok(data) => (super::protocol::ROUTER, data),
+            Err(error) => return MergeOutcome::SubmitFailed(error.to_string()),
+        }
+    } else { (target_contract, data_hex) };
+
     log::info!(
         "[Maintenance] Merge request cid={} amount={} target={} dry_run={}",
         condition_id,
@@ -5995,6 +6040,7 @@ fn run_merge_one(
 /// Derive the decimal CLOB token ids for a standard binary condition. CLOB
 /// tokens use the USDC.e collateral id-space in both v1 and v2.
 pub(crate) fn ctf_outcome_token_ids(condition_id: &str) -> Result<(String, String)> {
+    if super::protocol::is_v2_condition(condition_id) { return super::protocol::outcome_ids(condition_id); }
     let derive = |index_set| -> Result<String> {
         let position =
             ctf_position_id(condition_id, index_set, USDCE_ADDRESS).ok_or_else(|| {
