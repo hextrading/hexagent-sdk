@@ -24,6 +24,15 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tower_service::Service;
 
+fn retry_after(status: StatusCode, headers: &reqwest::header::HeaderMap, now_secs: i64) -> Option<u64> {
+    if status.is_success() { return None; }
+    headers.get("retry-after").and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok().or_else(|| {
+            chrono::DateTime::parse_from_rfc2822(value).ok().map(|date|
+                (date.timestamp() - now_secs).max(0) as u64)
+        }))
+}
+
 type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 
 /// Connection establishment is cold work, including synchronous certificate
@@ -467,6 +476,7 @@ impl Http1PhaseTimings {
 #[derive(Debug)]
 pub struct InstrumentedHttp1Response {
     pub status: StatusCode,
+    pub retry_after_secs: Option<u64>,
     pub body: Bytes,
     pub timings: Http1PhaseTimings,
 }
@@ -699,6 +709,10 @@ impl InstrumentedHttp1Client {
             }
             self.trace.phase.store(PHASE_BODY, Ordering::Release);
             let status = response.status();
+            // No extra wall-clock read on successful order acknowledgements.
+            let retry_after_secs = if status.is_success() { None } else {
+                retry_after(status, response.headers(), chrono::Utc::now().timestamp())
+            };
             response_trace = crate::http_response_trace::HttpResponseTrace::capture(status.as_u16(), response.headers());
             let body_started = Instant::now();
             let body = response
@@ -708,10 +722,10 @@ impl InstrumentedHttp1Client {
                 .map_err(|error| (InstrumentedHttp1ErrorKind::Transport, http_error_chain(&error)))?
                 .to_bytes();
             let body_ns = duration_ns(body_started.elapsed());
-            Ok::<_, (InstrumentedHttp1ErrorKind, String)>((status, body, headers_ns, body_ns))
+            Ok::<_, (InstrumentedHttp1ErrorKind, String)>((status, body, headers_ns, body_ns, retry_after_secs))
         };
         let mut result = match tokio::time::timeout_at(deadline, operation).await {
-            Ok(Ok((status, body, headers_ns, body_ns))) => {
+            Ok(Ok((status, body, headers_ns, body_ns, retry_after_secs))) => {
                 let timings = self.snapshot(
                     attempts_before,
                     generation_before,
@@ -723,6 +737,7 @@ impl InstrumentedHttp1Client {
                 );
                 Ok(InstrumentedHttp1Response {
                     status,
+                    retry_after_secs,
                     body,
                     timings,
                 })
@@ -879,6 +894,20 @@ fn duration_ns(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retry_after_preserves_seconds_dates_and_skips_success() {
+        use super::*;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "301".parse().unwrap());
+        assert_eq!(retry_after(StatusCode::SERVICE_UNAVAILABLE,&headers,0),Some(301));
+        assert_eq!(retry_after(StatusCode::OK,&headers,0),None);
+        headers.insert("retry-after", "Thu, 01 Jan 1970 00:05:00 GMT".parse().unwrap());
+        assert_eq!(retry_after(StatusCode::TOO_MANY_REQUESTS,&headers,100),Some(200));
+        assert_eq!(retry_after(StatusCode::TOO_MANY_REQUESTS,&headers,400),Some(0));
+        headers.insert("retry-after", "malformed".parse().unwrap());
+        assert_eq!(retry_after(StatusCode::SERVICE_UNAVAILABLE,&headers,0),None);
+    }
+
     #[test]
     fn terminal_diagnostics_do_not_expand_success_return_layout() {
         use super::{InstrumentedHttp1Error, InstrumentedHttp1Response};

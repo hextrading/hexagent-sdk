@@ -148,6 +148,7 @@ pub struct OrderSignerV2 {
     /// so the hot order path pays 0 instead of 8 keccaks for it (it was
     /// recomputed once for the signature and once for the orderID).
     domain_sep: [u8; 32],
+    domain_v3: [u8; 32],
     maker_word: [u8; 32],
     signer_word: [u8; 32],
     /// `builder_code` in wire form (`0x…` hex), formatted once.
@@ -212,6 +213,7 @@ impl OrderSignerV2 {
             funder: None,
             maker_word: address_to_bytes32(&maker_address),
             signer_word: address_to_bytes32(&signer_address),
+            domain_v3: compute_domain_separator(super::protocol::EXCHANGE_V3, b"3"),
             domain_sep, builder_hex, salt_sequence, signer_address, maker_address,
         })
     }
@@ -273,12 +275,13 @@ impl OrderSignerV2 {
         price: f64, size: f64, side: crate::types::Side,
     ) -> Result<NumericSignedOrderV2<'_>> {
         super::signer::validate_price_size(price, size)?;
-        let token_word = if let Some(token) = prepared {
+        let (token_word, domain) = if let Some(token) = prepared {
             if !token.matches(token_id) { return Err(anyhow!("prepared token does not match order symbol")); }
-            token.word()
+            (token.word(), self.domain_for_prepared(token))
         } else {
             super::signer::validate_u256_decimal("token_id", token_id, false)?;
-            u256_from_decimal(token_id)
+            let word = u256_from_decimal(token_id);
+            (word, self.domain_for_token(&word))
         };
         let (maker_amount, taker_amount) = super::signer::compute_amounts_numeric(price, size, side);
         let salt = self.salt_sequence.next_u64();
@@ -295,8 +298,8 @@ impl OrderSignerV2 {
             u256_bytes(if side == crate::types::Side::Buy { 0 } else { 1 }),
             u256_bytes(self.signature_type as u128), u256_bytes(timestamp as u128), [0; 32], self.builder_code,
         ]);
-        let digest = eip712_digest(&self.domain_sep, &contents);
-        let signature = if poly1271 { self.sign_order_poly1271(contents, self.maker_word)? } else { self.sign_digest(&digest)? };
+        let digest = eip712_digest(&domain, &contents);
+        let signature = if poly1271 { self.sign_order_poly1271(contents, self.maker_word, domain)? } else { self.sign_digest(&digest)? };
         Ok(NumericSignedOrderV2 {
             salt, timestamp, maker_amount, taker_amount, signature,
             maker: &self.maker_address, signer: signer_address,
@@ -319,7 +322,7 @@ impl OrderSignerV2 {
     }
 
     pub fn order_digest(&self, order: &OrderV2) -> [u8; 32] {
-        eip712_digest(&self.domain_sep, &order_v2_struct_hash(order))
+        eip712_digest(&self.domain_for_token(&u256_from_decimal(&order.token_id)), &order_v2_struct_hash(order))
     }
 
     pub fn order_hash_hex(&self, order: &OrderV2) -> String {
@@ -365,7 +368,7 @@ impl OrderSignerV2 {
         };
         validate_order_v2_numbers(&order)?;
 
-        let digest = eip712_digest(&self.domain_sep, &order_v2_struct_hash_prepared(
+        let digest = eip712_digest(&self.domain_for_token(&u256_from_decimal(token_id)), &order_v2_struct_hash_prepared(
             &order, self.maker_word, self.signer_word, self.builder_code));
         let signature = self.sign_digest(&digest)?;
         let order_hash = prefixed_hex(&digest);
@@ -424,8 +427,9 @@ impl OrderSignerV2 {
         } else { address_to_bytes32(funder) };
         let contents_hash = order_v2_struct_hash_prepared(
             &order, funder_word, funder_word, self.builder_code);
-        let signature = self.sign_order_poly1271(contents_hash, funder_word)?;
-        let order_hash = prefixed_hex(&eip712_digest(&self.domain_sep, &contents_hash));
+        let domain = self.domain_for_token(&u256_from_decimal(token_id));
+        let signature = self.sign_order_poly1271(contents_hash, funder_word, domain)?;
+        let order_hash = prefixed_hex(&eip712_digest(&domain, &contents_hash));
         Ok(SignedOrderV2 { order, signature, order_hash })
     }
 
@@ -435,8 +439,7 @@ impl OrderSignerV2 {
     /// `0x || inner(65) || appDomainSep(32) || contentsHash(32) ||
     ///  ORDER_TYPE_STRING || uint16(len)`. The wallet "app domain"
     /// verifyingContract is `order.signer` (= the deposit wallet).
-    fn sign_order_poly1271(&self, contents_hash: [u8; 32], funder_word: [u8; 32]) -> Result<String> {
-        let app_domain_sep = self.domain_separator();
+    fn sign_order_poly1271(&self, contents_hash: [u8; 32], funder_word: [u8; 32], app_domain_sep: [u8; 32]) -> Result<String> {
 
         let tds_hash = hash_words(&[
             solady_order_type_hash(), contents_hash, deposit_wallet_name_hash(),
@@ -459,6 +462,16 @@ impl OrderSignerV2 {
         Ok(wrapped)
     }
 
+    #[inline]
+    fn domain_for_token(&self, token: &[u8; 32]) -> [u8; 32] {
+        if super::protocol::is_v2_word(token) { self.domain_v3 } else { self.domain_sep }
+    }
+
+    #[inline]
+    fn domain_for_prepared(&self, token: &crate::types::PreparedToken) -> [u8; 32] {
+        if token.is_polymarket_protocol_v2() { self.domain_v3 } else { self.domain_sep }
+    }
+
     fn domain_separator(&self) -> [u8; 32] {
         self.domain_sep
     }
@@ -467,9 +480,13 @@ impl OrderSignerV2 {
 /// v2 domain separator (version "2"). Constant per exchange address;
 /// computed once in `OrderSignerV2::new` and cached.
 fn compute_domain_separator_v2(exchange_address: &str) -> [u8; 32] {
+    compute_domain_separator(exchange_address, b"2")
+}
+
+fn compute_domain_separator(exchange_address: &str, version: &[u8]) -> [u8; 32] {
     let type_hash = eip712_domain_type_hash();
     let name_hash = keccak256(b"Polymarket CTF Exchange");
-    let version_hash = keccak256(b"2");
+    let version_hash = keccak256(version);
     let chain_id = u256_bytes(CHAIN_ID as u128);
     let contract = address_to_bytes32(exchange_address);
 
@@ -615,6 +632,79 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "focused release benchmark; no network or credentials"]
+    fn protocol_domain_digest_benchmark() {
+        use std::{hint::black_box,time::Instant};
+        let signer = OrderSignerV2::new("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",false,SignatureType::Eoa,"").unwrap();
+        let legacy = crate::types::PreparedToken::parse("115792089237316195423570985008687907853269984665640564039457584007913129639935").unwrap();
+        let modern = crate::types::PreparedToken::parse("452312848583266388373324160190187140051835877600158453279131187530910662912").unwrap();
+        let hash = [0x42;32];
+        const N: usize = 200_000;
+        let mut before = vec![0u64;N]; let mut after = vec![0u64;N];
+        for i in 0..N {
+            let token = black_box(if i%2 == 0 { &legacy } else { &modern });
+            let start = Instant::now();
+            black_box(eip712_digest(black_box(&signer.domain_sep),black_box(&hash)));
+            before[i] = start.elapsed().as_nanos() as u64;
+            let start = Instant::now();
+            black_box(eip712_digest(&signer.domain_for_prepared(token),black_box(&hash)));
+            after[i] = start.elapsed().as_nanos() as u64;
+        }
+        for (label, samples) in [("cached-v1",&mut before),("prepared-v1-v2",&mut after)] {
+            samples.sort_unstable();
+            eprintln!("domain+digest {label} n={N} median={}ns p99={}ns p999={}ns max={}ns queue_depth=NA overflow=NA (synchronous; excludes ECDSA/network/dispatch)",
+                samples[N/2],samples[N*99/100],samples[N*999/1000],samples[N-1]);
+        }
+    }
+
+    #[test]
+    fn protocol_v2_matches_independent_viem_domain_digest_and_signature() {
+        // viem 2.38.6 hashDomain/hashTypedData/signTypedData; official domain
+        // and Order fields from the Protocol V2 migration guide. Test key only.
+        let signer = OrderSignerV2::new("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            false, SignatureType::Eoa, "").unwrap();
+        assert_eq!(hex::encode(signer.domain_v3),"466c63910185bbd55e8679264200c4e0abdcbb0c6264eb3d41d13326022e095b");
+        let eoa = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+        let order = OrderV2 { salt:"1234567890".into(),maker:eoa.into(),signer:eoa.into(),
+            token_id:"452312848583266388373324160190187140051835877600158453279131187530910662912".into(),
+            maker_amount:"55000000".into(),taker_amount:"100000000".into(),side:0,signature_type:0,
+            timestamp:"1700000000000".into(),metadata:METADATA_ZERO_HEX.into(),builder:METADATA_ZERO_HEX.into(),
+            taker:"0x0000000000000000000000000000000000000000".into(),expiration:"0".into() };
+        assert_eq!(hex::encode(signer.order_digest(&order)),"12ae24b61fea82bdfc5748718c4db7fba2b904e68da4cca142b07259b643bd6c");
+        assert_eq!(signer.sign_order(&order).unwrap(),"0xa2286d17155ea8205f37ce4fcfd6bd4eb21859a63593bfb2f120fdf2e9743eea75de889d1c54c49444d0c07d540e3e32f311d1634903142626dc780d518b1fe41b");
+        let wrapped = signer.build_signed_order_poly1271(eoa,&order.token_id,0.55,100.0,crate::types::Side::Buy).unwrap();
+        let bytes = hex::decode(wrapped.signature.trim_start_matches("0x")).unwrap();
+        assert_eq!(&bytes[65..97],&signer.domain_v3);
+    }
+
+    #[test]
+    fn prepared_protocol_identity_survives_event_rotation_for_all_wallet_types() {
+        let legacy = "50303916472381649224674364401111317755258653723694532482715411789597335197187";
+        let modern = "452312848583266388373324160190187140051835877600158453279131187530910662912";
+        let old = crate::types::PreparedToken::parse(legacy).unwrap();
+        let next = crate::types::PreparedToken::parse(modern).unwrap();
+        assert!(!old.is_polymarket_protocol_v2()); assert!(next.is_polymarket_protocol_v2());
+        for kind in [SignatureType::Eoa,SignatureType::PolyProxy,SignatureType::PolyGnosisSafe,SignatureType::Poly1271] {
+            let signer = OrderSignerV2::new("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",false,kind,"").unwrap()
+                .with_funder("0x1234567890123456789012345678901234567890");
+            // New event, then a still-live order from the retired event.
+            for (id,prepared,domain) in [(modern,&next,signer.domain_v3),(legacy,&old,signer.domain_sep)] {
+                assert_eq!(signer.domain_for_prepared(prepared),domain);
+                for side in [crate::types::Side::Buy,crate::types::Side::Sell] {
+                    let signed = signer.build_signed_order_numeric(id,Some(prepared),0.5,10.0,side).unwrap();
+                    let order = OrderV2 {salt:signed.salt.to_string(),timestamp:signed.timestamp.to_string(),
+                        maker:signed.maker.into(),signer:signed.signer.into(),token_id:id.into(),
+                        maker_amount:signed.maker_amount.to_string(),taker_amount:signed.taker_amount.to_string(),
+                        side:if side==crate::types::Side::Buy {0} else {1},signature_type:kind as u8,
+                        metadata:METADATA_ZERO_HEX.into(),builder:signed.builder.into(),taker:"0x0000000000000000000000000000000000000000".into(),expiration:"0".into()};
+                    assert_eq!(signed.order_hash,signer.order_hash_hex(&order));
+                }
+            }
+            assert!(signer.build_signed_order_numeric(modern,Some(&old),0.5,10.0,crate::types::Side::Buy).is_err());
+        }
+    }
+
+    #[test]
     fn numeric_live_signer_matches_compatibility_digest_signature_and_amounts() {
         let key = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
         let token = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
@@ -635,7 +725,7 @@ mod tests {
                             builder: signed.builder.to_owned(), taker: "0x0000000000000000000000000000000000000000".into(), expiration: "0".into() };
                         assert_eq!(signed.order_hash, signer.order_hash_hex(&order));
                         let signature = if matches!(kind, SignatureType::Poly1271) {
-                            signer.sign_order_poly1271(order_v2_struct_hash(&order), address_to_bytes32(&order.signer)).unwrap()
+                            signer.sign_order_poly1271(order_v2_struct_hash(&order), address_to_bytes32(&order.signer), signer.domain_for_token(&u256_from_decimal(&order.token_id))).unwrap()
                         } else { signer.sign_order(&order).unwrap() };
                         assert_eq!(signed.signature, signature);
                     }

@@ -496,7 +496,7 @@ fn parse_market_info_inner(json: &Value, expected_condition_id: Option<&str>) ->
     if let Some(expected) = expected_condition_id {
         let actual = response_condition_id
             .ok_or_else(|| anyhow!("market-info payload has no condition id"))?;
-        if !actual.eq_ignore_ascii_case(expected) {
+        if !super::protocol::conditions_match(actual, expected) {
             return Err(anyhow!(
                 "market-info condition mismatch: expected {}, got {}",
                 expected,

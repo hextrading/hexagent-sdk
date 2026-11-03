@@ -524,8 +524,12 @@ where
 /// A single market within a Polymarket event.
 /// Each market has a question (e.g. "Will BTC go up?") and 2+ outcomes (e.g. Yes/No, Up/Down).
 /// Each outcome has a CLOB token ID for trading on the orderbook.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PolyMarketInfo {
+    #[serde(default)]
+    pub version: String,
+    #[serde(default, rename = "positionIds")]
+    pub position_ids: Option<Vec<String>>,
     pub id: String,
     pub question: String,
     #[serde(default, rename = "conditionId")]
@@ -576,12 +580,95 @@ pub struct PolyMarketInfo {
     pub fee_schedule: FeeSchedule,
 }
 
+#[derive(Deserialize)]
+#[serde(remote = "PolyMarketInfo")]
+struct PolyMarketWire {
+    #[serde(default)]
+    pub version: String,
+    #[serde(default, rename = "positionIds")]
+    pub position_ids: Option<Vec<String>>,
+    pub id: String,
+    pub question: String,
+    #[serde(default, rename = "conditionId")]
+    pub condition_id: String,
+    #[serde(default)]
+    pub slug: String,
+    /// CLOB token IDs for each outcome (e.g. [YES_TOKEN_ID, NO_TOKEN_ID])
+    #[serde(
+        default,
+        deserialize_with = "deserialize_json_string_array",
+        rename = "clobTokenIds"
+    )]
+    pub clob_token_ids: Vec<String>,
+    /// Outcome labels — stringified JSON array in the API: `"[\"Yes\",\"No\"]"`
+    #[serde(default, deserialize_with = "deserialize_json_string_array")]
+    pub outcomes: Vec<String>,
+    /// Outcome prices — stringified JSON array in the API: `"[\"0.65\",\"0.35\"]"`
+    #[serde(
+        default,
+        deserialize_with = "deserialize_json_string_array",
+        rename = "outcomePrices"
+    )]
+    pub outcome_prices: Vec<String>,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub closed: bool,
+    #[serde(default, rename = "volumeNum")]
+    pub volume: f64,
+    #[serde(default, rename = "liquidityNum")]
+    pub liquidity: f64,
+    #[serde(default, rename = "orderPriceMinTickSize")]
+    pub tick_size: f64,
+    #[serde(default, rename = "orderMinSize")]
+    pub order_min_size: f64,
+    /// Group item title (e.g. "Anthropic", "OpenAI") for categorical markets
+    #[serde(default, rename = "groupItemTitle")]
+    pub group_item_title: String,
+    /// Event start time (ISO 8601 string from API, e.g. "2026-03-29T06:10:00Z").
+    #[serde(default, rename = "eventStartTime")]
+    pub event_start_time: String,
+    /// Taker base fee in basis points, from the event API.
+    #[serde(default, rename = "takerBaseFee")]
+    pub base_fee: u32,
+    /// Fee schedule from the event API's `feeSchedule` object.
+    /// Provides `exponent` and `rate`.
+    #[serde(default, rename = "feeSchedule")]
+    pub fee_schedule: FeeSchedule,
+}
+
+impl<'de> Deserialize<'de> for PolyMarketInfo {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let mut market = PolyMarketWire::deserialize(deserializer)?;
+        // Version, never the presence of positionIds, selects the trading ID.
+        if market.version == "v2" {
+            if market.condition_id.len() == 64 { market.condition_id.push_str("00"); }
+            market.clob_token_ids = market.position_ids.clone().unwrap_or_default();
+        }
+        if matches!(market.version.as_str(), "v1" | "v2") && market.clob_token_ids.iter().any(|id|
+            crate::types::PreparedToken::parse(id).is_none()) {
+            return Err(serde::de::Error::custom("market contains a non-decimal or out-of-range trading ID"));
+        }
+        Ok(market)
+    }
+}
+
 impl PolyMarketInfo {
     /// Validate the binary-market structure before token IDs can reach a
     /// strategy. Gamma returns parallel arrays, so accepting an empty,
     /// duplicate, or length-mismatched response would make outcome identity
     /// depend on array position alone.
     pub fn validate_binary_structure(&self) -> Result<()> {
+        match self.version.as_str() {
+            "v1" => {},
+            "v2" => {
+                let (yes, no) = super::protocol::outcome_ids(&self.condition_id)?;
+                if self.clob_token_ids != [yes, no] {
+                    return Err(anyhow!("Protocol V2 position IDs do not match condition/outcomes"));
+                }
+            },
+            _ => return Err(anyhow!("missing or unsupported market protocol version")),
+        }
         if self.condition_id.trim().is_empty() {
             return Err(anyhow!("missing condition id"));
         }
@@ -10893,6 +10980,8 @@ mod pick_current_event_tests {
         event.id = format!("{name}-event-{start_secs}");
         event.slug = format!("{name}-updown-5m-{start_secs}");
         event.markets.push(PolyMarketInfo {
+            version: "v1".into(),
+            position_ids: None,
             id: format!("{name}-market-{start_secs}"),
             question: format!("{name} up or down?"),
             condition_id: format!("{name}-condition-{start_secs}"),
@@ -11092,6 +11181,8 @@ mod pick_current_event_tests {
         let (rotation_tx, rotation_rx) = crossbeam_channel::bounded(1);
         let mut next_event = mk_event(now() - 1, now() + 299);
         next_event.markets.push(PolyMarketInfo {
+            version: "v1".into(),
+            position_ids: None,
             id: "new-market".to_string(),
             question: "BTC up or down?".to_string(),
             condition_id: "new-condition".to_string(),
@@ -11174,6 +11265,8 @@ mod pick_current_event_tests {
         let series_id = format!("rest-promotion-{started_ns}");
         let mut next_event = mk_event(current_end_secs, current_end_secs + 300);
         next_event.markets.push(PolyMarketInfo {
+            version: "v1".into(),
+            position_ids: None,
             id: "rest-market".to_string(),
             question: "BTC up or down?".to_string(),
             condition_id: "rest-condition".to_string(),
@@ -11399,6 +11492,8 @@ mod pick_current_event_tests {
     fn simultaneous_series_rotations_emit_one_combined_resubscribe() {
         let started_ns = now_ns();
         let make_market = |name: &str| PolyMarketInfo {
+            version: "v1".into(),
+            position_ids: None,
             id: format!("{name}-market"),
             question: format!("{name} up or down?"),
             condition_id: format!("{name}-condition"),
@@ -12522,6 +12617,8 @@ mod pick_current_event_tests {
     #[test]
     fn binary_market_structure_rejects_ambiguous_token_arrays() {
         let market = |tokens: Vec<&str>, outcomes: Vec<&str>| PolyMarketInfo {
+            version: "v1".into(),
+            position_ids: None,
             id: "market".into(),
             question: "question".into(),
             condition_id: "condition".into(),
@@ -12552,6 +12649,29 @@ mod pick_current_event_tests {
         assert!(market(vec!["up"], vec!["Up"])
             .validate_binary_structure()
             .is_err());
+    }
+
+    #[test]
+    fn gamma_protocol_version_selects_ids_and_unknown_versions_fail_closed() {
+        let cid = "0x01000000000000000000000000000000000000000000000000000000000001";
+        let (yes,no) = super::super::protocol::outcome_ids(cid).unwrap();
+        let mut wire = serde_json::json!({"id":"test","question":"test","conditionId":cid,
+            "version":"v1","clobTokenIds":"[\"11\",\"12\"]","positionIds":[yes,no],"outcomes":"[\"Yes\",\"No\"]",
+            "orderPriceMinTickSize":0.01,"orderMinSize":5});
+        let legacy: PolyMarketInfo = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(legacy.clob_token_ids,["11","12"]);
+        assert!(legacy.validate_binary_structure().is_ok());
+        wire["version"] = serde_json::json!("v2");
+        let modern: PolyMarketInfo = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(modern.clob_token_ids,[yes,no]);
+        assert_eq!(modern.condition_id,format!("{cid}00"));
+        assert!(modern.validate_binary_structure().is_ok());
+        wire["positionIds"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<PolyMarketInfo>(wire.clone()).unwrap().validate_binary_structure().is_err());
+        for version in ["", "v3"] {
+            wire["version"] = serde_json::json!(version);
+            assert!(serde_json::from_value::<PolyMarketInfo>(wire.clone()).unwrap().validate_binary_structure().is_err());
+        }
     }
 
     #[test]

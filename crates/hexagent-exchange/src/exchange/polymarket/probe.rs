@@ -8,7 +8,7 @@
 //!   3. Place ONE deep, intentionally **non-marketable** BUY on that
 //!      token (rests in the book, won't fill) — `POST /order`.
 //!   4. Query the account's open orders — `GET /data/orders`.
-//!   5. Query the account's positions — `GET /positions` (data-api).
+//!   5. Query the account's positions — `GET /v2/positions` (data-api).
 //!   6. Cancel the order it just placed — `DELETE /order`.
 //!
 //! Every network call prints its method + URL + body, the raw response,
@@ -158,6 +158,8 @@ pub fn run_probe() -> Result<()> {
             "no tradeable market with ≥2 CLOB token ids in event '{}' — \
              run `hexbot active_event` to inspect.", event.title))?;
 
+    market.validate_binary_structure()?;
+
     println!("market:        {}", market.question);
     println!("condition_id:  {}", market.condition_id);
     println!("tick_size:     {}   min_size: {}", market.tick_size, market.order_min_size);
@@ -260,9 +262,9 @@ pub fn run_probe() -> Result<()> {
     summarize_open_orders(&orders.text, server_oid.as_deref());
     println!();
 
-    // ── Step 4: positions (GET /positions, data-api) ──────────────
-    println!("── Step 4 · Positions (GET /positions) ────────────────");
-    let pos_url = format!("{}/positions?user={}&sizeThreshold=0&limit=500", DATA_API_BASE, funds_wallet);
+    // ── Step 4: positions (GET /v2/positions, data-api) ──────────────
+    println!("── Step 4 · Positions (GET /v2/positions) ────────────────");
+    let pos_url = format!("{}/v2/positions?user={}&status=OPEN&include_archived=true&filter_type=TOKENS&filter_amount=0&limit=500", DATA_API_BASE, funds_wallet);
     print_request("GET", &pos_url, None, None);
     let positions = timed_request(reqwest::Method::GET, pos_url, None, None)?;
     print_response_rtt(&positions);
@@ -299,7 +301,7 @@ pub fn run_probe() -> Result<()> {
     println!("── RTT summary ────────────────────────────────────────");
     println!("  POST   /order        {:>8.1} ms  [{}]", ms(place.rtt), place.status);
     println!("  GET    /data/orders  {:>8.1} ms  [{}]", ms(orders.rtt), orders.status);
-    println!("  GET    /positions    {:>8.1} ms  [{}]", ms(positions.rtt), positions.status);
+    println!("  GET    /v2/positions    {:>8.1} ms  [{}]", ms(positions.rtt), positions.status);
     match cancel_rtt {
         Some(d) => println!("  DELETE /order        {:>8.1} ms", ms(d)),
         None    => println!("  DELETE /order              -      (skipped)"),
@@ -454,10 +456,17 @@ fn summarize_open_orders(text: &str, probe_oid: Option<&str>) {
     }
 }
 
-/// Parse data-api `/positions` and list those for `condition_id` (plus a
+/// Parse data-api `/v2/positions` and list those for `condition_id` (plus a
 /// total count of all open positions).
 fn summarize_positions(text: &str, condition_id: &str) {
-    let arr: Vec<serde_json::Value> = serde_json::from_str(text).unwrap_or_default();
+    let page: super::data_api::Page = match serde_json::from_str(text) {
+        Ok(page) => page,
+        Err(error) => { println!("  invalid Data API v2 response: {error}"); return; }
+    };
+    if page.pagination.next_cursor.is_some() {
+        println!("  (first page only; more positions available)");
+    }
+    let arr = page.data;
     if arr.is_empty() {
         println!("  (no open positions)");
         return;
@@ -465,12 +474,12 @@ fn summarize_positions(text: &str, condition_id: &str) {
     println!("  open positions: {}", arr.len());
     let mut matched = 0usize;
     for p in &arr {
-        let cid = p.get("conditionId").and_then(|v| v.as_str()).unwrap_or("");
-        if !cid.eq_ignore_ascii_case(condition_id) { continue; }
+        let cid = p.get("condition_id").and_then(|v| v.as_str()).unwrap_or("");
+        if !super::protocol::conditions_match(cid, condition_id) { continue; }
         let outcome = p.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
-        let size = p.get("size").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let avg = p.get("avgPrice").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let cur = p.get("curPrice").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let size = p.get("current_size").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let avg = p.get("avg_price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let cur = p.get("current_price").and_then(|v| v.as_f64()).unwrap_or(0.0);
         println!("  • {:<6} size={:.4}  avg={:.4}  cur={:.4}   (this market)", outcome, size, avg, cur);
         matched += 1;
     }

@@ -785,6 +785,9 @@ pub(crate) fn recover_dw_split_job_id(
     amount_wei: u128,
     operation_id: &str,
 ) -> Result<Option<String>> {
+    if super::protocol::is_v2_condition(condition_id) {
+        return Err(anyhow!("Protocol V2 split recovery requires its durable WALLET submission journal"));
+    }
     let expected_calldata = split_position_calldata(PUSD_TOKEN, condition_id, amount_wei);
     let path = "/transactions";
     let headers = builder_auth.sign_request("GET", path, "");
@@ -831,8 +834,7 @@ pub(crate) fn recover_journaled_dw_split(
     let nonce = submission.nonce.parse::<u128>()?;
     if let Some(action) = find_wallet_action_by_signer_nonce(builder_auth, signer, nonce)? {
         if action.get("depositWalletParams").is_some() {
-            let expected = [Call { target: CTF_COLLATERAL_ADAPTER.to_string(),
-                data: split_position_calldata(PUSD_TOKEN, condition_id, amount_wei) }];
+            let expected = [split_call(condition_id, amount_wei)?];
             if !action_matches_wallet_batch(&action, deposit_wallet, &expected)
             { return Err(anyhow!("WALLET journal nonce matched a different split for {operation_id}")); }
             return Ok(action.get("transactionID").and_then(serde_json::Value::as_str).map(str::to_string));
@@ -847,7 +849,7 @@ pub(crate) fn recover_journaled_dw_split(
         let body=journaled_split_body(key,signer,deposit_wallet,condition_id,amount_wei,submission)?;
         let _signer=acquire_wallet_onchain(WalletOnchainResource::Signer(signer.to_ascii_lowercase()))?;
         let _acceptance=acquire_wallet_onchain(WalletOnchainResource::RelayerNewState)?;
-        let calls=[Call {target:CTF_COLLATERAL_ADAPTER.into(),data:split_position_calldata(PUSD_TOKEN,condition_id,amount_wei)}];
+        let calls=[split_call(condition_id, amount_wei)?];
         let action=submit_with_ambiguous_recovery_deadline(signer,nonce,
             || {
                 // Reconciliation immediately precedes EVERY background POST.
@@ -889,7 +891,7 @@ pub(crate) fn recover_journaled_dw_split(
 fn journaled_split_body(key:&SigningKey,signer:&str,wallet:&str,condition:&str,amount:u128,
     intent:&hexagent_account::account::shared_account::MaintenanceWalletSubmission) -> Result<String> {
     if !intent.signer.eq_ignore_ascii_case(signer) || !intent.deposit_wallet.eq_ignore_ascii_case(wallet) {return Err(anyhow!("resumed WALLET journal owner mismatch"));}
-    let calls=[Call {target:CTF_COLLATERAL_ADAPTER.into(),data:split_position_calldata(PUSD_TOKEN,condition,amount)}];
+    let calls=[split_call(condition, amount)?];
     let body=build_wallet_batch_body(key,signer,wallet,&calls,intent.nonce.parse()?,intent.deadline_secs)?;
     if !hex::encode(keccak256(body.as_bytes())).eq_ignore_ascii_case(&intent.body_hash) {return Err(anyhow!("resumed WALLET signed body differs from durable intent"));}
     Ok(body)
@@ -905,6 +907,9 @@ fn journaled_split_receipt_matches(receipt:&serde_json::Value,hash:&str,wallet:&
         && l["address"].as_str().is_some_and(|a|a.eq_ignore_ascii_case(wallet))
         && l["topics"][0].as_str().is_some_and(|t|t.eq_ignore_ascii_case(&batch_topic))
         && l["topics"][1].as_str().is_some_and(|t|t.eq_ignore_ascii_case(&nonce_topic)));
+    if super::protocol::is_v2_condition(condition) {
+        return Ok(exact_batch && super::protocol::receipt_proves_split(logs, hash, wallet, condition, amount)?);
+    }
     Ok(exact_batch && exact_dw_split_log_transaction(logs,wallet,condition,amount)?.as_deref()==Some(hash))
 }
 
@@ -1408,6 +1413,16 @@ fn redeem_calldata(collateral: &str, condition_id: &str) -> String {
 
 // ── Maintenance hooks (called from wallet.rs for POLY_1271 accounts) ──
 
+fn split_call(condition: &str, amount: u128) -> Result<Call> {
+    if super::protocol::is_v2_condition(condition) {
+        Ok(Call { target: super::protocol::ROUTER.into(),
+            data: super::protocol::router_calldata("split", condition, 0, amount)? })
+    } else {
+        Ok(Call { target: CTF_COLLATERAL_ADAPTER.into(),
+            data: split_position_calldata(PUSD_TOKEN, condition, amount) })
+    }
+}
+
 /// Split `amount_wei` pUSD → Up+Down shares FROM the deposit wallet, via a
 /// `splitPosition` on the CTF in a relayer WALLET batch. Blocks until the
 /// tx confirms; returns the tx id (Err on submit/confirm failure).
@@ -1431,10 +1446,7 @@ where
     // ones the CLOB actually trades (clob_token_id). Splitting pUSD directly on
     // the CTF minted pUSD-space tokens the CLOB can't sell (`balance: 0`).
     // Verified via `--test-split --via-adapter --collateral pusd` + token_check.
-    let calls = vec![Call {
-        target: CTF_COLLATERAL_ADAPTER.to_string(),
-        data: split_position_calldata(PUSD_TOKEN, condition_id, amount_wei),
-    }];
+    let calls = vec![split_call(condition_id, amount_wei)?];
     submit_wallet_batch_with_hook(
         key,
         eoa,
@@ -1460,10 +1472,14 @@ pub(crate) fn dw_redeem(
     builder_auth: &PolyAuth,
     condition_id: &str,
 ) -> Result<String> {
-    let calls = vec![Call {
-        target: CTF_COLLATERAL_ADAPTER.to_string(),
-        data: redeem_calldata(PUSD_TOKEN, condition_id),
-    }];
+    let calls = if super::protocol::is_v2_condition(condition_id) {
+        super::protocol::redemption_calldata(dw, condition_id)?.into_iter()
+            .map(|data| Call { target: super::protocol::ROUTER.to_string(), data }).collect()
+    } else {
+        vec![Call { target: CTF_COLLATERAL_ADAPTER.to_string(),
+            data: redeem_calldata(PUSD_TOKEN, condition_id) }]
+    };
+    if calls.is_empty() { return Ok("already redeemed".to_string()); }
     submit_wallet_batch(
         key,
         eoa,
@@ -1514,10 +1530,13 @@ pub(crate) fn dw_merge(
     key: &SigningKey, eoa: &str, dw: &str, builder_auth: &PolyAuth,
     condition_id: &str, amount_wei: u128, dry_run: bool,
 ) -> Result<String> {
-    let calls = vec![Call {
-        target: CTF_COLLATERAL_ADAPTER.to_string(),
-        data: merge_position_calldata(PUSD_TOKEN, condition_id, amount_wei),
-    }];
+    let calls = if super::protocol::is_v2_condition(condition_id) {
+        vec![Call { target: super::protocol::ROUTER.to_string(),
+            data: super::protocol::router_calldata("merge", condition_id, 0, amount_wei)? }]
+    } else {
+        vec![Call { target: CTF_COLLATERAL_ADAPTER.to_string(),
+            data: merge_position_calldata(PUSD_TOKEN, condition_id, amount_wei) }]
+    };
     submit_wallet_batch(key, eoa, dw, builder_auth, &calls, false, dry_run)
 }
 
@@ -1548,6 +1567,10 @@ pub(crate) fn dw_approvals(
         erc1155: bool,
     }
     let steps = [
+        Step { label: "pUSD → ExchangeV3", target: PUSD_TOKEN, spender: super::protocol::EXCHANGE_V3, erc1155: false },
+        Step { label: "pUSD → Protocol V2 Router", target: PUSD_TOKEN, spender: super::protocol::ROUTER, erc1155: false },
+        Step { label: "PositionManager → ExchangeV3", target: super::protocol::POSITION_MANAGER, spender: super::protocol::EXCHANGE_V3, erc1155: true },
+        Step { label: "PositionManager → Router", target: super::protocol::POSITION_MANAGER, spender: super::protocol::ROUTER, erc1155: true },
         Step { label: "pUSD → CTF",                  target: PUSD_TOKEN, spender: CTF_TOKEN,              erc1155: false },
         Step { label: "pUSD → ExchangeV2",           target: PUSD_TOKEN, spender: EXCHANGE_V2,            erc1155: false },
         Step { label: "pUSD → CtfCollateralAdapter", target: PUSD_TOKEN, spender: CTF_COLLATERAL_ADAPTER, erc1155: false },
